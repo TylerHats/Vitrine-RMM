@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  vitrine-rmm:
+    image: tylerhats/vitrine-rmm:latest
+    container_name: vitrine-rmm
+    ports:
+      - "8080:8080"
+    volumes:
+      # Persistent database, credentials vault, and custom white-label branding
+      - ./data:/app/data
+      - ./branding:/app/branding
+    environment:
+      - PORT=8080
+      - DATA_DIR=/app/data
+      - NODE_ENV=production
+    restart: unless-stopped
+
+  # Optional local MeshCentral 2 Remote Engine container
+  meshcentral:
+    image: ghcr.io/ylianst/meshcentral:latest
+    container_name: vitrine-meshcentral
+    restart: unless-stopped
+    ports:
+      - "4430:443"
+    environment:
+      - HOSTNAME=127.0.0.1
+      - REVERSE_PROXY=false
+    volumes:
+      - ./meshcentral/data:/opt/meshcentral/meshcentral-data
+      - ./meshcentral/files:/opt/meshcentral/meshcentral-files
+    profiles:
+      - full-stack

@@ -1,0 +1,23 @@
+{
+  "name": "vitrine-rmm",
+  "version": "1.0.0",
+  "description": "Modern, glassmorphic self-hosted RMM powered by MeshCentral 2.",
+  "private": true,
+  "scripts": {
+    "build": "npm run build --prefix frontend && npm run build --prefix backend",
+    "start": "npm run start --prefix backend",
+    "dev:backend": "npm run dev --prefix backend",
+    "dev:frontend": "npm run dev --prefix frontend",
+    "install:all": "npm install && npm install --prefix backend && npm install --prefix frontend"
+  },
+  "keywords": [
+    "rmm",
+    "meshcentral",
+    "remote-monitoring",
+    "glassmorphism",
+    "fleet-management",
+    "patch-management"
+  ],
+  "author": "TylerHats",
+  "license": "GPL-3.0-only"
+}
