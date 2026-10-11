@@ -17,11 +17,13 @@
     "better-sqlite3": "^11.8.1",
     "content-disposition": "^0.5.4",
     "fastify": "^4.28.1",
+    "nodemailer": "^10.1.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^20.17.24",
+    "@types/nodemailer": "^8.0.2",
     "@types/ws": "^8.5.14",
     "tsx": "^4.23.15",
     "typescript": "^5.7.3"

@@ -624,12 +624,137 @@
   font-weight: 600;
 }
 
-.terminal-input {
-  flex: 1;
+/* Responsive Breakpoints & Mobile Optimization */
+.mobile-menu-btn {
+  display: none;
   background: transparent;
   border: none;
-  outline: none;
-  color: #f8fafc;
-  font-family: var(--font-mono);
-  font-size: 0.85rem;
+  color: var(--text-main);
+  cursor: pointer;
+  padding: 0.4rem;
+  border-radius: var(--border-radius-sm);
+}
+
+.sidebar-overlay {
+  display: none;
+}
+
+@media (max-width: 1024px) {
+  :root {
+    --sidebar-width: 220px;
+  }
+  .content-container {
+    padding: 1.25rem;
+  }
+  .metrics-grid {
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  }
+}
+
+@media (max-width: 900px) {
+  .mobile-menu-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .sidebar {
+    transform: translateX(-100%);
+    box-shadow: none;
+    width: 280px;
+  }
+
+  .sidebar.mobile-open {
+    transform: translateX(0);
+    box-shadow: 0 0 50px rgba(0, 0, 0, 0.8), 0 0 30px rgba(0, 242, 254, 0.2);
+  }
+
+  .sidebar-overlay.mobile-open {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    backdrop-filter: blur(4px);
+    z-index: 45;
+  }
+
+  .main-wrapper {
+    margin-left: 0 !important;
+  }
+
+  .topbar {
+    padding: 0 1rem;
+  }
+
+  .topbar-left {
+    gap: 0.75rem;
+  }
+
+  .topbar-search input {
+    width: 180px;
+  }
+
+  .topbar-search input:focus {
+    width: 220px;
+  }
+
+  .mesh-status-indicator span {
+    display: none;
+  }
+
+  .content-container {
+    padding: 1rem;
+    gap: 1.25rem;
+  }
+
+  .metrics-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .glass-modal {
+    max-width: 95vw !important;
+    max-height: 95vh !important;
+    border-radius: var(--border-radius-lg);
+  }
+
+  .modal-body {
+    padding: 1.25rem;
+  }
+}
+
+@media (max-width: 600px) {
+  .metrics-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .topbar-search {
+    display: none;
+  }
+
+  #btn-gen-installer span {
+    display: none;
+  }
+
+  .tab-list {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .tab-btn span {
+    font-size: 0.78rem;
+  }
+
+  .modal-header {
+    padding: 1rem;
+  }
+
+  .modal-title {
+    font-size: 1rem;
+  }
+
+  .terminal-window {
+    height: 320px;
+    font-size: 0.75rem;
+  }
 }

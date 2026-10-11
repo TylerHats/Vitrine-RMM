@@ -35,6 +35,7 @@ export function App() {
   const [selectedTenantId, setSelectedTenantId] = useState('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedDeviceForDetail, setSelectedDeviceForDetail] = useState<Device | null>(null);
+  const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
 
   // Modals
   const [remoteModal, setRemoteModal] = useState<{ open: boolean; device: Device | null; isGhost: boolean }>({
@@ -121,12 +122,15 @@ export function App() {
         onSelectView={(v) => {
           setCurrentView(v);
           setSelectedDeviceForDetail(null);
+          setIsMobileSidebarOpen(false);
         }}
         theme={theme}
         onToggleTheme={toggleTheme}
         brandName={settings?.brand_name || 'Vitrine RMM'}
         onOpenOnboarding={() => setOnboardingOpen(true)}
         onOpenQbr={() => setQbrOpen(true)}
+        isMobileOpen={isMobileSidebarOpen}
+        onCloseMobile={() => setIsMobileSidebarOpen(false)}
       />
 
       <div className="main-wrapper">
@@ -137,6 +141,7 @@ export function App() {
           selectedTenantId={selectedTenantId}
           onTenantChange={setSelectedTenantId}
           onDownloadInstaller={handleDownloadInstaller}
+          onToggleMobileSidebar={() => setIsMobileSidebarOpen(!isMobileSidebarOpen)}
         />
 
         <main className="content-container">

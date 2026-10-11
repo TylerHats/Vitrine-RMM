@@ -5,6 +5,11 @@ import { getLapsCredential, rotateLapsPassword } from '../services/laps/index.js
 import { resolveEffectiveDevicePolicy } from '../services/policy/index.js';
 
 export async function registerApiRoutes(server: FastifyInstance) {
+  // System Health
+  server.get('/api/health', async () => {
+    return { status: 'healthy', uptime: process.uptime(), timestamp: new Date().toISOString() };
+  });
+
   // Settings & Onboarding
   server.get('/api/settings', async () => {
     return db.prepare('SELECT * FROM settings WHERE id = 1').get();
@@ -248,11 +253,42 @@ export async function registerApiRoutes(server: FastifyInstance) {
   // Outbound SMTP Testing
   server.post('/api/smtp/test', async (request) => {
     const body = request.body as any;
+    const { sendAlertEmail } = await import('../services/smtp/index.js');
+    const result = await sendAlertEmail(
+      {
+        host: body.host || '127.0.0.1',
+        port: parseInt(body.port, 10) || 2525,
+        user: body.user,
+        pass: body.pass,
+        from: body.from || 'alerts@vitrine-rmm.internal'
+      },
+      {
+        to: body.to || 'admin@vitrine-rmm.internal',
+        subject: 'Vitrine RMM Test Notification - Endpoint Health Status',
+        headline: 'Automated Test Notification from Vitrine RMM',
+        bodyContent: 'This message confirms that outbound SMTP alerting is successfully configured and active in your Vitrine RMM installation.',
+        severity: 'Info',
+        targetDevice: 'WIN11-PRO-EXEC'
+      }
+    );
+
     return {
-      success: true,
-      message: `Test email dispatched to ${body.to || 'admin@vitrine-rmm.internal'} via ${body.host || 'smtp.mailgun.org'}:587 (TLS)`,
+      success: result.success,
+      message: result.success
+        ? `Test email dispatched to ${body.to || 'admin@vitrine-rmm.internal'} via ${body.host || '127.0.0.1'}:${body.port || 2525}. MessageID: ${result.messageId}`
+        : `SMTP dispatch error: ${result.error}`,
+      error: result.error,
       timestamp: new Date().toISOString()
     };
+  });
+
+  // Automated Code Signing Pipeline (Feature 5)
+  server.post('/api/signing/sign', async (request) => {
+    const body = request.body as any;
+    const { codeSigningService } = await import('../services/signing/index.js');
+    const targetFile = body.filePath || '/tmp/test_agent.ps1';
+    const result = await codeSigningService.signFile(targetFile);
+    return result;
   });
 
   // Network Discovery & SNMP Probes

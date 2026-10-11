@@ -1,5 +1,5 @@
 import React from 'react';
-import { Search, Shield, Download, Bell, User } from 'lucide-react';
+import { Search, Shield, Download, Bell, User, Menu } from 'lucide-react';
 import { Tenant } from '../types/index.js';
 
 interface TopNavbarProps {
@@ -9,6 +9,7 @@ interface TopNavbarProps {
   selectedTenantId: string;
   onTenantChange: (id: string) => void;
   onDownloadInstaller: () => void;
+  onToggleMobileSidebar: () => void;
 }
 
 export const TopNavbar: React.FC<TopNavbarProps> = ({
@@ -17,11 +18,20 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
   tenants,
   selectedTenantId,
   onTenantChange,
-  onDownloadInstaller
+  onDownloadInstaller,
+  onToggleMobileSidebar
 }) => {
   return (
     <header className="topbar" id="app-topbar">
       <div className="topbar-left">
+        <button
+          className="mobile-menu-btn btn-glass"
+          onClick={onToggleMobileSidebar}
+          id="mobile-menu-toggle-btn"
+          aria-label="Toggle Navigation Menu"
+        >
+          <Menu size={20} />
+        </button>
         <div className="topbar-search">
           <Search size={16} />
           <input

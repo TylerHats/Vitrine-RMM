@@ -23,6 +23,8 @@ interface SidebarProps {
   brandName: string;
   onOpenOnboarding: () => void;
   onOpenQbr: () => void;
+  isMobileOpen?: boolean;
+  onCloseMobile?: () => void;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -32,7 +34,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onToggleTheme,
   brandName,
   onOpenOnboarding,
-  onOpenQbr
+  onOpenQbr,
+  isMobileOpen = false,
+  onCloseMobile
 }) => {
   const navItems = [
     { id: 'dashboard', label: 'Fleet Dashboard', icon: LayoutDashboard },
@@ -46,8 +50,19 @@ export const Sidebar: React.FC<SidebarProps> = ({
     { id: 'settings', label: 'White-Label & Setup', icon: Settings }
   ];
 
+  const handleNavClick = (id: string) => {
+    onSelectView(id);
+    if (onCloseMobile) onCloseMobile();
+  };
+
   return (
-    <aside className="sidebar" id="app-sidebar">
+    <>
+      <div
+        className={`sidebar-overlay ${isMobileOpen ? 'mobile-open' : ''}`}
+        onClick={onCloseMobile}
+        id="sidebar-mobile-overlay"
+      />
+      <aside className={`sidebar ${isMobileOpen ? 'mobile-open' : ''}`} id="app-sidebar">
       <div className="sidebar-header">
         <img src="/logo.png" alt="Vitrine Logo" className="brand-logo-img" />
         <span className="brand-title">{brandName || 'Vitrine RMM'}</span>
@@ -63,7 +78,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <button
               key={item.id}
               className={`nav-item ${isActive ? 'active' : ''}`}
-              onClick={() => onSelectView(item.id)}
+              onClick={() => handleNavClick(item.id)}
               id={`nav-${item.id}`}
             >
               <Icon size={18} />
@@ -80,7 +95,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <button
               key={item.id}
               className={`nav-item ${isActive ? 'active' : ''}`}
-              onClick={() => onSelectView(item.id)}
+              onClick={() => handleNavClick(item.id)}
               id={`nav-${item.id}`}
             >
               <Icon size={18} />
@@ -90,11 +105,25 @@ export const Sidebar: React.FC<SidebarProps> = ({
         })}
 
         <div className="nav-section-title">Reports & Tools</div>
-        <button className="nav-item" onClick={onOpenQbr} id="nav-qbr-report">
+        <button
+          className="nav-item"
+          onClick={() => {
+            onOpenQbr();
+            if (onCloseMobile) onCloseMobile();
+          }}
+          id="nav-qbr-report"
+        >
           <FileText size={18} />
           <span>Executive QBR Report</span>
         </button>
-        <button className="nav-item" onClick={onOpenOnboarding} id="nav-setup-wizard">
+        <button
+          className="nav-item"
+          onClick={() => {
+            onOpenOnboarding();
+            if (onCloseMobile) onCloseMobile();
+          }}
+          id="nav-setup-wizard"
+        >
           <Sparkles size={18} style={{ color: '#00f2fe' }} />
           <span>Setup Wizard</span>
         </button>
@@ -115,5 +144,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </div>
       </div>
     </aside>
+    </>
   );
 };
