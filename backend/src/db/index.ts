@@ -1,9 +1,21 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // Database storage location (inside persistent data/ folder)
-const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), '..', 'data');
+const DATA_CANDIDATES = [
+  process.env.DATA_DIR,
+  path.resolve(process.cwd(), 'data'),
+  path.resolve(process.cwd(), '../data'),
+  path.resolve(__dirname, '../../../data'),
+  path.resolve(__dirname, '../../data')
+].filter(Boolean) as string[];
+
+const DATA_DIR = DATA_CANDIDATES.find((p) => fs.existsSync(p)) || DATA_CANDIDATES[0] || path.join(process.cwd(), 'data');
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
@@ -183,7 +195,294 @@ export function initDatabase() {
       priority TEXT NOT NULL DEFAULT 'High',
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS custom_field_definitions (
+      id TEXT PRIMARY KEY,
+      key TEXT NOT NULL UNIQUE,
+      label TEXT NOT NULL,
+      category TEXT NOT NULL DEFAULT 'Custom',
+      field_type TEXT NOT NULL DEFAULT 'text',
+      scope TEXT NOT NULL DEFAULT 'device',
+      options TEXT,
+      description TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS custom_field_values (
+      id TEXT PRIMARY KEY,
+      field_id TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      value TEXT,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (field_id) REFERENCES custom_field_definitions(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS maintenance_windows (
+      id TEXT PRIMARY KEY,
+      device_id TEXT,
+      tenant_id TEXT,
+      title TEXT NOT NULL,
+      start_time TEXT NOT NULL,
+      end_time TEXT NOT NULL,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      suppress_alerts INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS session_recordings (
+      id TEXT PRIMARY KEY,
+      device_id TEXT NOT NULL,
+      technician TEXT NOT NULL DEFAULT 'admin',
+      duration_sec INTEGER NOT NULL DEFAULT 0,
+      file_path TEXT NOT NULL,
+      file_size_mb REAL NOT NULL DEFAULT 0.0,
+      sha256_hash TEXT,
+      is_ghost_session INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS chat_messages (
+      id TEXT PRIMARY KEY,
+      device_id TEXT NOT NULL,
+      sender TEXT NOT NULL,
+      sender_role TEXT NOT NULL DEFAULT 'technician',
+      message TEXT NOT NULL,
+      read_status INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS oem_warranties (
+      device_id TEXT PRIMARY KEY,
+      serial_number TEXT NOT NULL,
+      manufacturer TEXT NOT NULL,
+      purchase_date TEXT,
+      warranty_expiration TEXT,
+      service_level TEXT,
+      status TEXT NOT NULL DEFAULT 'Active',
+      last_checked TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS notifications (
+      id TEXT PRIMARY KEY,
+      type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      message TEXT NOT NULL,
+      severity TEXT NOT NULL DEFAULT 'info',
+      actions_json TEXT,
+      is_read INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS hardware_history (
+      id TEXT PRIMARY KEY,
+      device_id TEXT NOT NULL,
+      change_type TEXT NOT NULL,
+      description TEXT NOT NULL,
+      vendor_id TEXT,
+      device_id_pci TEXT,
+      timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS network_history (
+      id TEXT PRIMARY KEY,
+      device_id TEXT NOT NULL,
+      ssid TEXT,
+      bssid TEXT,
+      gateway_ip TEXT,
+      gateway_mac TEXT,
+      subnet TEXT,
+      interface_name TEXT,
+      connected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      disconnected_at TEXT,
+      is_flagged_drift INTEGER NOT NULL DEFAULT 0,
+      FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS guest_access_grants (
+      id TEXT PRIMARY KEY,
+      vendor_name TEXT NOT NULL,
+      contact_email TEXT,
+      temp_username TEXT NOT NULL,
+      temp_password TEXT NOT NULL,
+      device_ids_json TEXT NOT NULL,
+      can_remote_screen INTEGER NOT NULL DEFAULT 1,
+      can_ghost_session INTEGER NOT NULL DEFAULT 0,
+      can_view_telemetry INTEGER NOT NULL DEFAULT 1,
+      can_view_hardware INTEGER NOT NULL DEFAULT 1,
+      can_view_custom_fields INTEGER NOT NULL DEFAULT 0,
+      can_run_scripts INTEGER NOT NULL DEFAULT 0,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      status TEXT NOT NULL DEFAULT 'active'
+    );
+
+    CREATE TABLE IF NOT EXISTS smart_groups (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT,
+      tenant_id TEXT,
+      criteria_json TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS software_inventory (
+      id TEXT PRIMARY KEY,
+      device_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      version TEXT NOT NULL,
+      publisher TEXT,
+      install_date TEXT,
+      cve_count INTEGER NOT NULL DEFAULT 0,
+      highest_cvss REAL NOT NULL DEFAULT 0.0,
+      cve_list_json TEXT,
+      auto_patchable INTEGER NOT NULL DEFAULT 1,
+      FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS installer_audit_log (
+      id TEXT PRIMARY KEY,
+      token_id TEXT NOT NULL,
+      tenant_id TEXT NOT NULL,
+      site_id TEXT,
+      device_role TEXT NOT NULL DEFAULT 'workstation',
+      technician TEXT NOT NULL,
+      ticket_number TEXT,
+      platform TEXT NOT NULL DEFAULT 'windows',
+      downloaded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      redeemed_at TEXT,
+      redeemed_device_id TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS remediation_logs (
+      id TEXT PRIMARY KEY,
+      monitor_id TEXT NOT NULL,
+      monitor_name TEXT NOT NULL,
+      device_id TEXT NOT NULL,
+      hostname TEXT NOT NULL,
+      script_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'Success',
+      output TEXT NOT NULL,
+      executed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS virtualization_hosts (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      host_type TEXT NOT NULL,
+      ip_address TEXT NOT NULL DEFAULT '192.168.40.5',
+      status TEXT NOT NULL DEFAULT 'Online',
+      cpu_usage_pct REAL NOT NULL DEFAULT 24.8,
+      ram_usage_gb REAL NOT NULL DEFAULT 92.4,
+      ram_total_gb REAL NOT NULL DEFAULT 256.0,
+      storage_free_tb REAL NOT NULL DEFAULT 4.8,
+      storage_total_tb REAL NOT NULL DEFAULT 8.0
+    );
+
+    CREATE TABLE IF NOT EXISTS virtualization_vms (
+      id TEXT PRIMARY KEY,
+      host_id TEXT NOT NULL,
+      vmid INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'Running',
+      os TEXT NOT NULL,
+      cpu INTEGER NOT NULL DEFAULT 4,
+      ram_gb INTEGER NOT NULL DEFAULT 8,
+      last_snapshot TEXT,
+      FOREIGN KEY (host_id) REFERENCES virtualization_hosts(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS topology_ports (
+      id TEXT PRIMARY KEY,
+      switch_name TEXT NOT NULL DEFAULT 'SW-CORE-01 (Cisco Catalyst 9300-48P)',
+      switch_ip TEXT NOT NULL DEFAULT '10.200.10.1',
+      port TEXT NOT NULL,
+      vlan INTEGER NOT NULL DEFAULT 1,
+      status TEXT NOT NULL DEFAULT 'Up',
+      speed TEXT NOT NULL DEFAULT '1000 Mbps',
+      lldp_neighbor TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS topology_subnets (
+      id TEXT PRIMARY KEY,
+      subnet TEXT NOT NULL,
+      probe_host TEXT NOT NULL,
+      total_discovered INTEGER NOT NULL DEFAULT 1,
+      unmanaged INTEGER NOT NULL DEFAULT 0,
+      last_scanned TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS device_notes (
+      id TEXT PRIMARY KEY,
+      device_id TEXT NOT NULL,
+      author TEXT NOT NULL DEFAULT 'admin',
+      content TEXT NOT NULL,
+      is_pinned INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
+    );
   `);
+
+  // Safe migrations for newly added columns
+  const safeAddColumn = (table: string, columnDef: string) => {
+    try {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${columnDef}`);
+    } catch {
+      // Column already exists
+    }
+  };
+
+  safeAddColumn('devices', 'maintenance_until TEXT');
+  safeAddColumn('devices', 'warranty_expiration TEXT');
+  safeAddColumn('devices', 'enrolled_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP');
+  safeAddColumn('devices', 'intel_amt_reachable INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('patches', 'cve_id TEXT');
+  safeAddColumn('patches', 'cvss_score REAL');
+  safeAddColumn('settings', 'code_signing_url TEXT NOT NULL DEFAULT "http://10.10.10.20:5000"');
+  safeAddColumn('settings', 'session_recording_enabled INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('settings', 'session_recording_retention_days INTEGER NOT NULL DEFAULT 90');
+  safeAddColumn('settings', 'session_recording_quality TEXT NOT NULL DEFAULT "high"');
+  safeAddColumn('settings', 'session_recording_visual_indicator INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('settings', 'mesh_sync_enabled INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('settings', 'mesh_client_delete_action TEXT NOT NULL DEFAULT "move_to_unassigned"');
+  safeAddColumn('settings', 'mesh_external_delete_prompt INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('tenants', 'mesh_group_id TEXT');
+  safeAddColumn('scripts', 'enabled INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('scripts', 'required_role TEXT NOT NULL DEFAULT "technician"');
+  safeAddColumn('scripts', 'is_builtin INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('scripts', 'tenant_id TEXT DEFAULT NULL');
+  safeAddColumn('policies', 'max_snooze_hours INTEGER NOT NULL DEFAULT 8');
+  safeAddColumn('policies', 'force_reboot_after_snooze INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('policies', 'final_countdown_sec INTEGER NOT NULL DEFAULT 300');
+  safeAddColumn('policies', 'laps_enabled INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('policies', 'laps_account_name TEXT NOT NULL DEFAULT "LocalAdmin"');
+  safeAddColumn('policies', 'laps_password_length INTEGER NOT NULL DEFAULT 20');
+  safeAddColumn('policies', 'laps_complexity TEXT NOT NULL DEFAULT "alphanumeric_symbols"');
+  safeAddColumn('policies', 'laps_rotation_days INTEGER NOT NULL DEFAULT 30');
+  safeAddColumn('policies', 'laps_rotate_on_access INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('policies', 'laps_post_access_grace_hours INTEGER NOT NULL DEFAULT 2');
+  safeAddColumn('policies', 'require_mfa_for_secrets INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('policies', 'telemetry_history_retention_days INTEGER NOT NULL DEFAULT 90');
+  safeAddColumn('policies', 'hardware_audit_enabled INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('policies', 'network_drift_detection_enabled INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('policies', 'self_healing_max_hourly_runs INTEGER NOT NULL DEFAULT 3');
+  safeAddColumn('policies', 'self_healing_alert_psa INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('policies', 'psa_flap_grace_minutes INTEGER NOT NULL DEFAULT 15');
+  safeAddColumn('policies', 'auto_patch_cve_min_cvss REAL NOT NULL DEFAULT 8.0');
+
+  safeAddColumn('settings', 'code_signing_enabled INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('settings', 'code_signing_sign_scripts INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('settings', 'code_signing_sign_agents INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('settings', 'code_signing_sign_assemblies INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('settings', 'installer_download_role TEXT NOT NULL DEFAULT "technician"');
+  safeAddColumn('settings', 'installer_require_ticket INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('settings', 'session_recording_stealth_for_techs INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('settings', 'maintenance_auto_clear_hours INTEGER NOT NULL DEFAULT 24');
+  safeAddColumn('settings', 'totp_secret TEXT NOT NULL DEFAULT "JBSWY3DPEHPK3PXP"');
+  safeAddColumn('installer_audit_log', 'platform TEXT NOT NULL DEFAULT "windows"');
 
   // Ensure initial settings record exists
   const settingsCount = db.prepare('SELECT COUNT(*) as count FROM settings').get() as { count: number };
@@ -199,6 +498,9 @@ export function initDatabase() {
   if (tenantCount.count === 0) {
     seedInitialData();
   }
+
+  // Seed custom fields if not present
+  seedExtendedData();
 }
 
 function seedInitialData() {
@@ -402,6 +704,55 @@ Write-Output "Full Microsoft Defender Antivirus scan initiated."`,
     'Remediation'
   );
 
+  insertScript.run(
+    'scr-6', 'Enable Wake-on-LAN (OS Drivers, Fast Startup & OEM BIOS WMI)',
+    'Configures NIC advanced driver properties, disables Windows Fast Startup power-cut, and issues Dell/HP/Lenovo WMI BIOS commands to enable WoL in firmware.',
+    'powershell',
+    `# 1. Enable OS NIC Properties
+Get-NetAdapter -Physical | ForEach-Object {
+    Set-NetAdapterAdvancedProperty -Name $_.Name -DisplayName "Wake on Magic Packet" -DisplayValue "Enabled" -ErrorAction SilentlyContinue
+    Set-NetAdapterAdvancedProperty -Name $_.Name -DisplayName "Wake on Pattern Match" -DisplayValue "Enabled" -ErrorAction SilentlyContinue
+    Set-NetAdapterPowerManagement -Name $_.Name -WakeOnMagicPacket $true -ErrorAction SilentlyContinue
+}
+# 2. Disable Windows Fast Startup to preserve NIC standby voltage
+Set-ItemProperty -Path "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power" -Name "HiberbootEnabled" -Value 0 -Force
+# 3. OEM Firmware WMI BIOS Check
+$mfg = (Get-CimInstance Win32_ComputerSystem).Manufacturer
+if ($mfg -match 'Dell') {
+    Get-CimInstance -Namespace root\\dcim\\sysman -ClassName DCIM_BIOSService | Invoke-CimMethod -MethodName SetBIOSAttributes -Arguments @{ AttributeName = @("Wake-On-LAN"); AttributeValue = @("LanOnly") } -ErrorAction SilentlyContinue
+} elseif ($mfg -match 'HP') {
+    Get-CimInstance -Namespace root\\hp\\instrumentedBIOS -ClassName HP_BIOSSettingInterface | Invoke-CimMethod -MethodName SetBIOSSetting -Arguments @{ Name = "Wake on LAN"; Value = "Boot to Network" } -ErrorAction SilentlyContinue
+} elseif ($mfg -match 'Lenovo') {
+    (Get-WmiObject -Namespace root\\wmi -Class Lenovo_SetBiosSetting).SetBiosSetting("WakeOnLAN,Enable"); (Get-WmiObject -Namespace root\\wmi -Class Lenovo_SaveBiosSetting).SaveBiosSettings()
+}
+Write-Output "Wake-on-LAN OS and BIOS firmware settings successfully enabled."`,
+    'Remediation'
+  );
+
+  insertScript.run(
+    'scr-7', 'Intel vPro / AMT Hardware Detection & Zero-Touch Local Provisioning',
+    'Detects Intel MEI hardware, queries AMT capabilities, and performs host-based local activation binding CIRA to the existing agent node without duplicate nodes.',
+    'powershell',
+    `# 1. Check for Intel MEI Driver
+$mei = Get-PnpDevice | Where-Object { $_.FriendlyName -match 'Intel\\(R\\) Management Engine Interface' -or $_.HardwareID -match 'PCI\\\\VEN_8086&DEV_' }
+if (-not $mei) {
+    Write-Output "RESULT: NOT_SUPPORTED - No Intel MEI hardware detected."
+    exit 0
+}
+# 2. Query AMT Status via MeshCmd
+$meshCmd = "$env:ProgramFiles\\Mesh Agent\\meshcmd.exe"
+if (Test-Path $meshCmd) {
+    $info = & $meshCmd amtinfo
+    Write-Output $info
+    if ($info -match 'Not activated|Pre-provisioned|Unconfigured') {
+        & $meshCmd amtconfig --host $env:VITRINE_SERVER_HOST --meshid $env:VITRINE_MESH_ID
+        Write-Output "SUCCESS: Local Host-Based Provisioning complete. Linked to existing node UUID."
+    }
+}
+Write-Output "Intel vPro / AMT state verified and registered with Vitrine."`,
+    'Diagnostic'
+  );
+
   // Seed Self-Healing Monitors
   const insertMonitor = db.prepare(`
     INSERT INTO self_healing_monitors (id, name, condition_type, condition_value, remediation_script_id, cooldown_min, alert_on_failure, enabled)
@@ -441,4 +792,584 @@ Write-Output "Full Microsoft Defender Antivirus scan initiated."`,
   insertAudit.run('aud-1', 'admin', 'dev-win-isolated', 'Cyber Isolation Engaged', 'Quarantined endpoint following Defender threat detection Mimikatz.exe');
   insertAudit.run('aud-2', 'tylerhats', 'dev-win11-corp', 'Remote Shell Session', 'Executed diagnostic command Get-BitLockerVolume via PowerShell background shell');
   insertAudit.run('aud-3', 'admin', 'dev-srv-dc01', 'Policy Updated', 'Configured Sunday maintenance window and disabled auto-reboot');
+}
+
+function seedExtendedData() {
+  const cfCount = (db.prepare('SELECT COUNT(*) as count FROM custom_field_definitions').get() as { count: number }).count;
+  if (cfCount === 0) {
+    const insertDef = db.prepare(`
+      INSERT INTO custom_field_definitions (id, key, label, category, field_type, scope, options, description)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    insertDef.run('cf-1', 'asset_tag', 'Asset Tag ID', 'System', 'text', 'device', null, 'Physical inventory barcode or tag');
+    insertDef.run('cf-2', 'department', 'Assigned Department', 'System', 'dropdown', 'device', JSON.stringify(['Executive', 'Finance', 'Engineering', 'Legal', 'Clinical', 'Operations']), 'Primary departmental cost center');
+    insertDef.run('cf-3', 'primary_user', 'Primary Point of Contact', 'System', 'text', 'device', null, 'Designated employee user account');
+    insertDef.run('cf-4', 'bdr_tier', 'BDR Backup Strategy', 'Security', 'dropdown', 'device', JSON.stringify(['Tier 1 - Hourly VSS + Cloud Immutable', 'Tier 2 - Daily Image', 'Tier 3 - File-Level Restic', 'Unmanaged / Excluded']), 'Backup & Disaster Recovery policy assignment');
+    insertDef.run('cf-5', 'gl_billing_code', 'GL Billing Cost Code', 'Billing', 'text', 'tenant', null, 'ERP sync accounting reference');
+    insertDef.run('cf-6', 'vip_escalation', 'VIP Support SLA Escalation', 'Custom', 'checkbox', 'device', null, 'Enables immediate P1 response paging for executive endpoints');
+
+    const insertVal = db.prepare(`
+      INSERT INTO custom_field_values (id, field_id, entity_id, value)
+      VALUES (?, ?, ?, ?)
+    `);
+
+    insertVal.run('val-1', 'cf-1', 'dev-win11-corp', 'APX-NY-0042');
+    insertVal.run('val-2', 'cf-2', 'dev-win11-corp', 'Executive');
+    insertVal.run('val-3', 'cf-3', 'dev-win11-corp', 'Tyler Hats (CEO)');
+    insertVal.run('val-4', 'cf-4', 'dev-win11-corp', 'Tier 1 - Hourly VSS + Cloud Immutable');
+    insertVal.run('val-5', 'cf-6', 'dev-win11-corp', 'true');
+
+    insertVal.run('val-6', 'cf-1', 'dev-srv-dc01', 'APX-DC-0001');
+    insertVal.run('val-7', 'cf-2', 'dev-srv-dc01', 'Engineering');
+    insertVal.run('val-8', 'cf-4', 'dev-srv-dc01', 'Tier 1 - Hourly VSS + Cloud Immutable');
+  }
+
+  // Seed OEM Warranties if empty
+  const warCount = (db.prepare('SELECT COUNT(*) as count FROM oem_warranties').get() as { count: number }).count;
+  if (warCount === 0) {
+    const insertWar = db.prepare(`
+      INSERT INTO oem_warranties (device_id, serial_number, manufacturer, purchase_date, warranty_expiration, service_level, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    insertWar.run('dev-win11-corp', 'VMW-9842-DLX-991', 'Dell Inc.', '2024-01-15', '2027-01-15', 'Dell ProSupport Plus 24x7 Mission Critical', 'Active');
+    insertWar.run('dev-srv-dc01', 'HPE-USM982019A', 'Hewlett Packard Enterprise', '2023-04-10', '2028-04-10', 'HPE Pointnext Tech Care Critical', 'Active');
+    insertWar.run('dev-srv-db01', 'DEL-SRV-89421-B', 'Dell Inc.', '2023-08-20', '2026-11-20', 'Dell ProSupport 4-Hour Onsite Response', 'Expiring Soon');
+    insertWar.run('dev-lin-proxmox', 'SM-SYS-7049P-TRT', 'Supermicro', '2024-03-01', '2027-03-01', 'Supermicro 3-Year Cross-Ship RMA', 'Active');
+    insertWar.run('dev-win11-reception', 'MJ09X8A1', 'Lenovo', '2023-11-12', '2026-11-12', 'Lenovo Premier Support Warranty', 'Expiring Soon');
+    insertWar.run('dev-macos-creative', 'C02G90ABMD6M', 'Apple Inc.', '2024-05-18', '2027-05-18', 'AppleCare+ for Enterprise Direct Desk', 'Active');
+  }
+
+  // Seed Maintenance Windows if empty
+  const mwCount = (db.prepare('SELECT COUNT(*) as count FROM maintenance_windows').get() as { count: number }).count;
+  if (mwCount === 0) {
+    const insertMw = db.prepare(`
+      INSERT INTO maintenance_windows (id, device_id, tenant_id, title, start_time, end_time, is_active, suppress_alerts)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    insertMw.run(
+      'mw-1',
+      'dev-srv-dc01',
+      't-apex',
+      'Active Directory Schema Upgrade & Reboot Window',
+      new Date().toISOString(),
+      new Date(Date.now() + 4 * 3600 * 1000).toISOString(),
+      1,
+      1
+    );
+  }
+
+  // Update patches with CVE data
+  try {
+    db.prepare("UPDATE patches SET cve_id = 'CVE-2024-38077', cvss_score = 9.8 WHERE kb_id = 'KB5039212'").run();
+    db.prepare("UPDATE patches SET cve_id = 'CVE-2024-30088', cvss_score = 8.8 WHERE kb_id = 'KB5039227'").run();
+    db.prepare("UPDATE patches SET cve_id = 'CVE-2024-7971', cvss_score = 8.8 WHERE kb_id LIKE '%Google%'").run();
+    db.prepare("UPDATE patches SET cve_id = 'CVE-2024-21412', cvss_score = 8.1 WHERE kb_id = 'KB2267602'").run();
+  } catch {
+    // Patches update ignore
+  }
+
+  // Seed Chat Messages if empty
+  const chatCount = (db.prepare('SELECT COUNT(*) as count FROM chat_messages').get() as { count: number }).count;
+  if (chatCount === 0) {
+    const insertChat = db.prepare(`
+      INSERT INTO chat_messages (id, device_id, sender, sender_role, message)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+
+    insertChat.run('chat-1', 'dev-win11-corp', 'Tyler Hats', 'end_user', 'Hello! Print spooler seems stuck after the monthly Windows update.');
+    insertChat.run('chat-2', 'dev-win11-corp', 'IT Support (Admin)', 'technician', 'Hi Tyler! Vitrine self-healing watchdog has already purged the queue and restarted Spooler. Can you test printing now?');
+    insertChat.run('chat-3', 'dev-win11-corp', 'Tyler Hats', 'end_user', 'Confirmed! Test page printed immediately. Thank you for the quick turnaround!');
+  }
+
+  // Seed Session Recordings if empty
+  const recCount = (db.prepare('SELECT COUNT(*) as count FROM session_recordings').get() as { count: number }).count;
+  if (recCount === 0) {
+    const insertRec = db.prepare(`
+      INSERT INTO session_recordings (id, device_id, technician, duration_sec, file_path, file_size_mb, sha256_hash, is_ghost_session)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    insertRec.run(
+      'rec-101',
+      'dev-win11-corp',
+      'admin',
+      340,
+      '/app/data/recordings/rec-101.webm',
+      18.4,
+      'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+      0
+    );
+    insertRec.run(
+      'rec-102',
+      'dev-srv-db01',
+      'tylerhats',
+      580,
+      '/app/data/recordings/rec-102.webm',
+      32.1,
+      '7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069',
+      1
+    );
+  }
+
+  // Seed Built-in Common Admin Scripts
+  const builtinScripts = [
+    {
+      id: 'scr-rename-pc',
+      name: 'Rename Computer & Hostname',
+      description: 'Safely renames local Windows endpoint and stages reboot for Active Directory / Workgroup synchronization.',
+      language: 'powershell',
+      code: `param([Parameter(Mandatory=$true)][string]$NewComputerName)
+Write-Output "Renaming computer to $NewComputerName..."
+Rename-Computer -NewName $NewComputerName -Force -PassThru
+Write-Output "Computer renamed successfully. Restart required to apply changes."`,
+      category: 'Provisioning',
+      required_role: 'admin'
+    },
+    {
+      id: 'scr-net-reset',
+      name: 'Flush DNS & Reset Winsock Network Stack',
+      description: 'Flushes DNS resolver cache, resets Winsock catalog, and resets TCP/IP stack to resolve connectivity anomalies.',
+      language: 'powershell',
+      code: `Clear-DnsClientCache
+netsh winsock reset
+netsh int ip reset
+ipconfig /renew
+Write-Output "DNS flushed and network stack reset complete."`,
+      category: 'Remediation',
+      required_role: 'technician'
+    },
+    {
+      id: 'scr-disk-cleanup',
+      name: 'Deep Temp & DISM Component Store Cleanup',
+      description: 'Purges user/system temp directories, empties recycle bin, and cleans obsolete Windows updates component store.',
+      language: 'powershell',
+      code: `Remove-Item -Path "$env:TEMP\\*" -Force -Recurse -ErrorAction SilentlyContinue
+Remove-Item -Path "C:\\Windows\\Temp\\*" -Force -Recurse -ErrorAction SilentlyContinue
+Clear-RecycleBin -Force -ErrorAction SilentlyContinue
+Dism.exe /Online /Cleanup-Image /StartComponentCleanup /ResetBase
+Write-Output "Deep disk and component cleanup completed."`,
+      category: 'Maintenance',
+      required_role: 'technician'
+    },
+    {
+      id: 'scr-create-localadmin',
+      name: 'Create Break-Glass Local Administrator Account',
+      description: 'Creates a designated local emergency administrator account with random high-entropy credentials.',
+      language: 'powershell',
+      code: `param([string]$AdminUser = "VitrineEmergencyAdmin", [string]$Password = "")
+if (-not $Password) {
+    $Password = [System.Web.Security.Membership]::GeneratePassword(18, 4)
+}
+net user $AdminUser $Password /add /expires:never
+net localgroup administrators $AdminUser /add
+Write-Output "Created break-glass admin user '$AdminUser'. Key archived to audit log."`,
+      category: 'Provisioning',
+      required_role: 'admin'
+    },
+    {
+      id: 'scr-ntp-sync',
+      name: 'Resynchronize Windows Time (NTP)',
+      description: 'Configures reliable time pool and forces immediate clock synchronization via w32tm.',
+      language: 'powershell',
+      code: `w32tm /config /manualpeerlist:"pool.ntp.org,0x1" /syncfromflags:manual /reliable:yes /update
+Stop-Service w32time -Force
+Start-Service w32time
+w32tm /resync /force
+Write-Output "Time synchronization forced against pool.ntp.org."`,
+      category: 'Maintenance',
+      required_role: 'technician'
+    },
+    {
+      id: 'scr-enable-bitlocker',
+      name: 'Verify TPM & Enforce BitLocker Encryption',
+      description: 'Checks TPM 2.0 readiness and initiates full XTS-AES 256 BitLocker encryption on System Drive C:.',
+      language: 'powershell',
+      code: `$tpm = Get-Tpm
+if (-not $tpm.TpmPresent -or -not $tpm.TpmReady) {
+    throw "TPM is not ready or present on this endpoint."
+}
+$status = Get-BitLockerVolume -MountPoint "C:"
+if ($status.VolumeStatus -ne "FullyEncrypted") {
+    Enable-BitLocker -MountPoint "C:" -EncryptionMethod XtsAes256 -UsedSpaceOnly -TpmProtector
+    Write-Output "BitLocker encryption initiated with TPM protector."
+} else {
+    Write-Output "Volume C: is already fully encrypted."
+}`,
+      category: 'Remediation',
+      required_role: 'admin'
+    },
+    {
+      id: 'scr-winget-standard',
+      name: 'Deploy Standard MSP Application Baseline',
+      description: 'Installs Google Chrome, 7-Zip, and Notepad++ silently via Microsoft Winget package manager.',
+      language: 'powershell',
+      code: `winget install --id Google.Chrome -e --silent --accept-package-agreements --accept-source-agreements
+winget install --id 7zip.7zip -e --silent --accept-package-agreements --accept-source-agreements
+winget install --id Notepad++.Notepad++ -e --silent --accept-package-agreements --accept-source-agreements
+Write-Output "Standard application baseline deployment complete."`,
+      category: 'Provisioning',
+      required_role: 'technician'
+    },
+    {
+      id: 'scr-sysinfo-collect',
+      name: 'Collect Diagnostic Logs & System Bundle',
+      description: 'Generates snapshot of hardware specs, recent event logs, network configuration, and running processes.',
+      language: 'powershell',
+      code: `$info = [PSCustomObject]@{
+    ComputerName = $env:COMPUTERNAME
+    OS = (Get-CimInstance Win32_OperatingSystem).Caption
+    UptimeHours = [math]::Round(((Get-Date) - (Get-CimInstance Win32_OperatingSystem).LastBootUpTime).TotalHours, 1)
+    IPv4 = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias "Ethernet*","Wi-Fi*" | Select-Object -First 1).IPAddress
+}
+$info | ConvertTo-Json`,
+      category: 'Diagnostic',
+      required_role: 'readonly'
+    }
+  ];
+
+  const insertBuiltinScript = db.prepare(`
+    INSERT OR IGNORE INTO scripts (id, name, description, language, code, category, enabled, required_role, is_builtin)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?, 1)
+  `);
+
+  for (const s of builtinScripts) {
+    insertBuiltinScript.run(s.id, s.name, s.description, s.language, s.code, s.category, s.required_role);
+  }
+
+  // Seed Notifications if empty
+  const notifCount = (db.prepare('SELECT COUNT(*) as count FROM notifications').get() as { count: number }).count;
+  if (notifCount === 0) {
+    const insertNotif = db.prepare(`
+      INSERT INTO notifications (id, type, title, message, severity, actions_json, is_read)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    insertNotif.run(
+      'notif-1',
+      'mesh_sync',
+      'MeshCentral Device Groups Synchronized',
+      'Bi-directional sync active. 3 Device Groups mapped to Vitrine Clients (Apex Financial, Nexus Health, Vanguard Legal).',
+      'info',
+      null,
+      0
+    );
+
+    insertNotif.run(
+      'notif-2',
+      'pending_reboot',
+      'Update Restart Window Active (WIN11-PRO-EXEC)',
+      'Cumulative Update KB5039212 requires reboot. Max snooze timer: 8h. Transparent HUD countdown armed.',
+      'warning',
+      null,
+      0
+    );
+
+    insertNotif.run(
+      'notif-3',
+      'mesh_conflict_prompt',
+      'MeshCentral Group Deletion Notice: "Demo Lab"',
+      'Device group was removed in MeshCentral. 2 endpoints need action.',
+      'warning',
+      JSON.stringify([
+        { label: 'Keep in Unassigned', action: 'move_to_unassigned' },
+        { label: 'De-provision Agents', action: 'uninstall' }
+      ]),
+      0
+    );
+  }
+
+  // Seed Hardware History if empty
+  const hwCount = (db.prepare('SELECT COUNT(*) as count FROM hardware_history').get() as { count: number }).count;
+  if (hwCount === 0) {
+    const insertHw = db.prepare(`
+      INSERT INTO hardware_history (id, device_id, change_type, description, vendor_id, device_id_pci, timestamp)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    insertHw.run(
+      'hw-1',
+      'dev-win11-corp',
+      'RAM',
+      'Physical memory expansion: Upgraded from 16 GB to 32 GB (2x16GB DDR5-5600)',
+      '0x802C (Crucial / Micron)',
+      'DIMM_A1 / DIMM_B1',
+      new Date(Date.now() - 14 * 86400000).toISOString()
+    );
+
+    insertHw.run(
+      'hw-2',
+      'dev-win11-corp',
+      'DISK',
+      'High-speed NVMe storage installed: Samsung 980 Pro 2TB (PCIe 4.0 x4, SMART OK)',
+      '0x144D (Samsung Electronics)',
+      'M.2 NVMe Slot 2',
+      new Date(Date.now() - 30 * 86400000).toISOString()
+    );
+
+    insertHw.run(
+      'hw-3',
+      'dev-win11-corp',
+      'GPU',
+      'Dedicated graphics adapter initialized: NVIDIA GeForce RTX 4070 Ti Super (16GB GDDR6X)',
+      '0x10DE (NVIDIA Corporation)',
+      'PCIe x16 Gen4',
+      new Date(Date.now() - 60 * 86400000).toISOString()
+    );
+  }
+
+  // Seed Network Connection History if empty
+  const netCount = (db.prepare('SELECT COUNT(*) as count FROM network_history').get() as { count: number }).count;
+  if (netCount === 0) {
+    const insertNet = db.prepare(`
+      INSERT INTO network_history (id, device_id, ssid, bssid, gateway_ip, gateway_mac, subnet, interface_name, connected_at, disconnected_at, is_flagged_drift)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    insertNet.run(
+      'net-1',
+      'dev-win11-corp',
+      'Apex-Corporate-Wi-Fi-6E',
+      '70:3A:0E:12:44:A0',
+      '192.168.1.1',
+      '00:1A:2B:3C:4D:5E',
+      '192.168.1.0/24',
+      'Intel Wi-Fi 6E AX211 160MHz',
+      new Date(Date.now() - 4 * 3600000).toISOString(),
+      null,
+      0
+    );
+
+    insertNet.run(
+      'net-2',
+      'dev-win11-corp',
+      'Apex-Corporate-LAN-Gbe',
+      null,
+      '192.168.1.1',
+      '00:1A:2B:3C:4D:5E',
+      '192.168.1.0/24',
+      'Intel Ethernet Controller I225-V (2.5GbE)',
+      new Date(Date.now() - 24 * 3600000).toISOString(),
+      new Date(Date.now() - 4 * 3600000).toISOString(),
+      0
+    );
+
+    insertNet.run(
+      'net-3',
+      'dev-win11-corp',
+      'Mobile_Hotspot_Unrestricted',
+      'F4:8C:50:88:91:0A',
+      '172.20.10.1',
+      'F2:88:21:4B:91:0A',
+      '172.20.10.0/28',
+      'Intel Wi-Fi 6E AX211 160MHz',
+      new Date(Date.now() - 72 * 3600000).toISOString(),
+      new Date(Date.now() - 70 * 3600000).toISOString(),
+      1
+    );
+  }
+
+  // Seed Smart Groups
+  const groupCount = (db.prepare('SELECT COUNT(*) as count FROM smart_groups').get() as { count: number }).count;
+  if (groupCount === 0) {
+    const insertGroup = db.prepare(`
+      INSERT INTO smart_groups (id, name, description, tenant_id, criteria_json)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    insertGroup.run(
+      'grp-win-low-disk',
+      'Windows Endpoints (< 20GB Free)',
+      'High-risk production workstations and laptops with critically low storage volume',
+      null,
+      JSON.stringify({ os_type: 'windows', max_disk_free_gb: 20 })
+    );
+    insertGroup.run(
+      'grp-linux-servers',
+      'Linux Core Servers',
+      'Production database, backend API, and hypervisor Linux infrastructure',
+      null,
+      JSON.stringify({ os_type: 'linux', device_role: 'server' })
+    );
+    insertGroup.run(
+      'grp-reboot-required',
+      'Fleet Pending Reboots',
+      'Endpoints with pending kernel/cumulative update reboot locks',
+      null,
+      JSON.stringify({ pending_reboot: 1 })
+    );
+  }
+
+  // Seed Software Inventory with CVEs
+  const softCount = (db.prepare('SELECT COUNT(*) as count FROM software_inventory').get() as { count: number }).count;
+  if (softCount === 0) {
+    const insertSoft = db.prepare(`
+      INSERT INTO software_inventory (id, device_id, name, version, publisher, install_date, cve_count, highest_cvss, cve_list_json, auto_patchable)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insertSoft.run(
+      'soft-1',
+      'dev-win11-corp',
+      'Google Chrome Enterprise',
+      '128.0.6613.119',
+      'Google LLC',
+      '2026-09-15',
+      1,
+      8.8,
+      JSON.stringify([{ id: 'CVE-2024-7971', cvss: 8.8, severity: 'High', summary: 'V8 Type Confusion zero-day vulnerability in Google Chrome' }]),
+      1
+    );
+    insertSoft.run(
+      'soft-2',
+      'dev-win11-corp',
+      'Zoom Workplace Client',
+      '5.17.5',
+      'Zoom Video Communications, Inc.',
+      '2026-08-10',
+      2,
+      7.5,
+      JSON.stringify([{ id: 'CVE-2024-24691', cvss: 7.5, severity: 'High', summary: 'Improper input validation allowing unauthorized privilege escalation' }]),
+      1
+    );
+    insertSoft.run(
+      'soft-3',
+      'dev-win11-corp',
+      '7-Zip (64-bit Edition)',
+      '23.01',
+      'Igor Pavlov',
+      '2026-06-20',
+      0,
+      0.0,
+      JSON.stringify([]),
+      1
+    );
+    insertSoft.run(
+      'soft-4',
+      'dev-win11-corp',
+      'Python 3.11.4 Runtime',
+      '3.11.4150.0',
+      'Python Software Foundation',
+      '2026-05-12',
+      1,
+      7.5,
+      JSON.stringify([{ id: 'CVE-2023-40217', cvss: 7.5, severity: 'High', summary: 'SSL socket bypass during pre-TLS client handshake' }]),
+      1
+    );
+  }
+
+  // Seed Active Vendor / Guest Access Grant
+  const guestCount = (db.prepare('SELECT COUNT(*) as count FROM guest_access_grants').get() as { count: number }).count;
+  if (guestCount === 0) {
+    const insertGuest = db.prepare(`
+      INSERT INTO guest_access_grants (
+        id, vendor_name, contact_email, temp_username, temp_password,
+        device_ids_json, can_remote_screen, can_ghost_session, can_view_telemetry,
+        can_view_hardware, can_view_custom_fields, can_run_scripts, expires_at, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insertGuest.run(
+      'grant-101',
+      'Siemens Medical Support',
+      'support-desk@siemens-health.com',
+      'v-siemens-849',
+      'Tier4#SiemensSecure2026!',
+      JSON.stringify(['dev-win11-corp']),
+      1,
+      0,
+      1,
+      1,
+      0,
+      0,
+      new Date(Date.now() + 4 * 3600000).toISOString(),
+      'active'
+    );
+  }
+
+  // Seed Self-Healing Remediation Logs
+  const remCount = (db.prepare('SELECT COUNT(*) as count FROM remediation_logs').get() as { count: number }).count;
+  if (remCount === 0) {
+    const insertRem = db.prepare(`
+      INSERT INTO remediation_logs (id, monitor_id, monitor_name, device_id, hostname, script_id, status, output, executed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insertRem.run(
+      'rem-1',
+      'mon-1',
+      'Print Spooler Hung Watchdog',
+      'dev-win11-corp',
+      'WIN11-PRO-EXEC',
+      'scr-1',
+      'Success',
+      'Stopped Spooler, cleared 3 stuck SPL/SHD print jobs in C:\\Windows\\System32\\spool\\PRINTERS, and restarted Spooler.',
+      new Date(Date.now() - 45 * 60000).toISOString()
+    );
+    insertRem.run(
+      'rem-2',
+      'mon-2',
+      'Low Disk Space Auto-Cleanup (<10%)',
+      'dev-win-isolated',
+      'LEGAL-PARALEGAL-09',
+      'scr-2',
+      'Success',
+      'Purged 14.2 GB from SoftwareDistribution\\Download and Windows Temp directories. Free storage recovered to 8.4%.',
+      new Date(Date.now() - 180 * 60000).toISOString()
+    );
+  }
+
+  // Seed Virtualization Hosts & VMs
+  const virtCount = (db.prepare('SELECT COUNT(*) as count FROM virtualization_hosts').get() as { count: number }).count;
+  if (virtCount === 0) {
+    const insertHost = db.prepare(`
+      INSERT INTO virtualization_hosts (id, name, host_type, ip_address, status, cpu_usage_pct, ram_usage_gb, ram_total_gb, storage_free_tb, storage_total_tb)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insertHost.run('pve-node-01', 'Proxmox VE Cluster Node 1', 'Proxmox VE 8.2', '192.168.40.5', 'Online', 24.8, 92.4, 256.0, 4.8, 8.0);
+    insertHost.run('hv-node-01', 'Apex Hyper-V Cluster Core 01', 'Microsoft Hyper-V Server 2022', '10.200.10.15', 'Online', 31.2, 64.0, 128.0, 2.9, 6.0);
+
+    const insertVm = db.prepare(`
+      INSERT INTO virtualization_vms (id, host_id, vmid, name, status, os, cpu, ram_gb, last_snapshot)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insertVm.run('vm-100', 'pve-node-01', 100, 'win11-prod-workstation', 'Running', 'Windows 11', 12, 16, '2026-11-04 03:00 AM');
+    insertVm.run('vm-101', 'pve-node-01', 101, 'debian-dns-pihole', 'Running', 'Debian 12', 2, 4, '2026-11-05 01:00 AM');
+    insertVm.run('vm-102', 'pve-node-01', 102, 'srv-db-backup-staging', 'Stopped', 'Ubuntu 24.04', 0, 16, '2026-11-01 04:00 AM');
+    insertVm.run('vm-201', 'hv-node-01', 201, 'apex-dc02-replica', 'Running', 'Windows Server 2022', 8, 16, '2026-11-05 02:00 AM');
+    insertVm.run('vm-202', 'hv-node-01', 202, 'apex-rds-session-host', 'Running', 'Windows Server 2022', 16, 32, '2026-11-04 23:00 PM');
+  }
+
+  // Seed Network Topology Ports & Subnets
+  const topoPortCount = (db.prepare('SELECT COUNT(*) as count FROM topology_ports').get() as { count: number }).count;
+  if (topoPortCount === 0) {
+    const insertPort = db.prepare(`
+      INSERT INTO topology_ports (id, switch_name, switch_ip, port, vlan, status, speed, lldp_neighbor)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insertPort.run('tp-1', 'SW-CORE-01 (Cisco Catalyst 9300-48P)', '10.200.10.1', 'Gig1/0/1', 10, 'Up', '1000 Mbps', 'APEX-DC01-PROD');
+    insertPort.run('tp-2', 'SW-CORE-01 (Cisco Catalyst 9300-48P)', '10.200.10.1', 'Gig1/0/2', 10, 'Up', '1000 Mbps', 'WIN11-PRO-EXEC');
+    insertPort.run('tp-3', 'SW-CORE-01 (Cisco Catalyst 9300-48P)', '10.200.10.1', 'Gig1/0/24', 1, 'Up', '10000 Mbps', 'FW-GATEWAY-HA01');
+    insertPort.run('tp-4', 'SW-CORE-01 (Cisco Catalyst 9300-48P)', '10.200.10.1', 'Gig1/0/48', 50, 'Up', '10000 Mbps', 'SW-DIST-DR01');
+  }
+
+  const topoSubCount = (db.prepare('SELECT COUNT(*) as count FROM topology_subnets').get() as { count: number }).count;
+  if (topoSubCount === 0) {
+    const insertSub = db.prepare(`
+      INSERT INTO topology_subnets (id, subnet, probe_host, total_discovered, unmanaged)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    insertSub.run('ts-1', '10.200.10.0/24', 'APEX-DC01-PROD', 42, 3);
+    insertSub.run('ts-2', '192.168.40.0/24', 'CLINIC-DESK-04', 18, 1);
+    insertSub.run('ts-3', '172.16.5.0/24', 'MACBOOK-PRO-PARTNER', 14, 2);
+  }
+
+  // Seed Device Runbook Notes
+  const noteCount = (db.prepare('SELECT COUNT(*) as count FROM device_notes').get() as { count: number }).count;
+  if (noteCount === 0) {
+    const insertNote = db.prepare(`
+      INSERT INTO device_notes (id, device_id, author, content, is_pinned)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    insertNote.run('note-1', 'dev-win11-corp', 'tylerhats', 'Executive primary workstation. Always verify active Zoom/Teams calls before triggering manual reboots outside maintenance windows.', 1);
+    insertNote.run('note-2', 'dev-srv-dc01', 'admin', 'Primary FSMO role holder for corp.apexfin.com. Replicate AD schema changes to apex-dc02-replica prior to patching.', 1);
+  }
 }

@@ -7,8 +7,8 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
-    "start": "tsx src/server.ts",
-    "seed": "tsx src/db/seed.ts"
+    "start": "node dist/server.js",
+    "seed": "node --input-type=module -e \"import('./dist/db/index.js').then(m => m.initDatabase())\""
   },
   "dependencies": {
     "@fastify/cors": "^9.0.1",

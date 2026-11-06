@@ -21,6 +21,7 @@ interface SidebarProps {
   theme: string;
   onToggleTheme: () => void;
   brandName: string;
+  brandLogoUrl?: string;
   onOpenOnboarding: () => void;
   onOpenQbr: () => void;
   isMobileOpen?: boolean;
@@ -33,6 +34,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   theme,
   onToggleTheme,
   brandName,
+  brandLogoUrl,
   onOpenOnboarding,
   onOpenQbr,
   isMobileOpen = false,
@@ -64,7 +66,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
       />
       <aside className={`sidebar ${isMobileOpen ? 'mobile-open' : ''}`} id="app-sidebar">
       <div className="sidebar-header">
-        <img src="/logo.png" alt="Vitrine Logo" className="brand-logo-img" />
+        <img src={brandLogoUrl || '/logo.png'} alt="Vitrine Logo" className="brand-logo-img" />
         <span className="brand-title">{brandName || 'Vitrine RMM'}</span>
         <span className="brand-badge">PRO</span>
       </div>

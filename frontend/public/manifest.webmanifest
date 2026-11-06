@@ -1,0 +1,18 @@
+{
+  "name": "Vitrine RMM",
+  "short_name": "Vitrine",
+  "description": "Next-generation, glassmorphic self-hosted RMM powered by MeshCentral 2 and hierarchical policy automation.",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#050b14",
+  "theme_color": "#00f2fe",
+  "icons": [
+    {
+      "src": "/logo.png",
+      "sizes": "192x192 512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

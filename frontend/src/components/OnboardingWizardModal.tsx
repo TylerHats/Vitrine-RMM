@@ -92,6 +92,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                 >
                   {isCompleted ? '✓' : s.num}
                 </div>
+                <Icon size={14} />
                 <span>{s.title}</span>
               </button>
             );

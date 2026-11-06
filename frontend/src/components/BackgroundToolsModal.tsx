@@ -14,18 +14,24 @@ import {
   RefreshCw,
   Folder,
   File,
-  CheckCircle,
-  Plus
+  FileText,
+  CornerLeftUp,
+  Download
 } from 'lucide-react';
-import { Device, ProcessItem, ServiceItem } from '../types/index.js';
+import { Device, ProcessItem, ServiceItem, EventLogItem } from '../types/index.js';
 import {
   fetchProcesses,
   killProcess,
   fetchServices,
   manageService,
   fetchRegistry,
+  setRegistryValue,
+  deleteRegistryValue,
   fetchScheduledTasks,
-  fetchFiles
+  manageScheduledTask,
+  fetchFiles,
+  manageRemoteFile,
+  fetchEventLogs
 } from '../services/api.js';
 
 interface BackgroundToolsModalProps {
@@ -49,33 +55,40 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
   // Process state
   const [processes, setProcesses] = useState<ProcessItem[]>([]);
   const [procFilter, setProcFilter] = useState('');
-  const [loadingProcs, setLoadingProcs] = useState(false);
+  const [, setLoadingProcs] = useState(false);
 
   // Services state
   const [services, setServices] = useState<ServiceItem[]>([]);
   const [svcFilter, setSvcFilter] = useState('');
-  const [loadingSvcs, setLoadingSvcs] = useState(false);
+  const [, setLoadingSvcs] = useState(false);
 
   // Registry state
   const [regPath, setRegPath] = useState('HKLM\\SOFTWARE\\VitrineRMM');
-  const [regData, setRegData] = useState<{ subkeys: string[]; values: any[] }>({ subkeys: [], values: [] });
+  const [regData, setRegData] = useState<{ subkeys: string[]; values: Array<{ path: string; name: string; type: string; value: string }> }>({ subkeys: [], values: [] });
+  const [newRegName, setNewRegName] = useState('');
+  const [newRegType, setNewRegType] = useState('REG_SZ');
+  const [newRegVal, setNewRegVal] = useState('');
 
   // Tasks state
-  const [tasks, setTasks] = useState<any[]>([]);
+  const [tasks, setTasks] = useState<Array<{ name: string; path: string; state: string; lastRunTime: string; nextRunTime: string; lastResult: string }>>([]);
 
   // Files state
   const [currentPath, setCurrentPath] = useState(device.os_type === 'linux' ? '/etc' : 'C:\\');
-  const [files, setFiles] = useState<any[]>([]);
+  const [files, setFiles] = useState<Array<{ name: string; path: string; size: number; isDirectory: boolean; modified: string; permissions: string }>>([]);
+  const [newFolderName, setNewFolderName] = useState('');
+
+  // Event Viewer state
+  const [eventLogs, setEventLogs] = useState<EventLogItem[]>([]);
+  const [eventChannel, setEventChannel] = useState('System');
+  const [eventLevel, setEventLevel] = useState('all');
+  const [eventFilter, setEventFilter] = useState('');
+  const [loadingEvents, setLoadingEvents] = useState(false);
 
   // Connect WebSocket for terminal
   useEffect(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
     const socket = new WebSocket(`${protocol}//${host}/ws/terminal`);
-
-    socket.onopen = () => {
-      // connected
-    };
 
     socket.onmessage = (event) => {
       try {
@@ -137,12 +150,42 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
     setCurrentPath(path);
   };
 
+  // Load event logs
+  const loadEvents = async (channel = eventChannel, level = eventLevel) => {
+    setLoadingEvents(true);
+    try {
+      const data = await fetchEventLogs(device.id, channel, level, 100);
+      setEventLogs(data);
+    } finally {
+      setLoadingEvents(false);
+    }
+  };
+
+  const handleNavigateUp = () => {
+    if (device.os_type === 'linux') {
+      if (currentPath === '/' || !currentPath) return;
+      const parts = currentPath.split('/').filter(Boolean);
+      parts.pop();
+      const parent = parts.length === 0 ? '/' : '/' + parts.join('/');
+      loadFiles(parent);
+    } else {
+      if (currentPath === 'C:\\' || currentPath === 'C:/' || !currentPath) return;
+      const normalized = currentPath.replace(/\\/g, '/');
+      const parts = normalized.split('/').filter(Boolean);
+      parts.pop();
+      const parent = parts.length === 1 ? parts[0] + '\\' : parts.join('\\');
+      loadFiles(parent);
+    }
+  };
+
   useEffect(() => {
     if (activeTab === 'processes') loadProcesses();
     if (activeTab === 'services') loadServices();
     if (activeTab === 'registry') loadRegistry(regPath);
     if (activeTab === 'tasks') loadTasks();
     if (activeTab === 'files') loadFiles(currentPath);
+    if (activeTab === 'events') loadEvents(eventChannel, eventLevel);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab]);
 
   const handleTerminalSubmit = (e: React.FormEvent) => {
@@ -169,6 +212,57 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
   const handleManageService = async (name: string, action: 'start' | 'stop' | 'restart') => {
     await manageService(device.id, name, action);
     loadServices();
+  };
+
+  const handleDownloadFile = (fileName: string, fileSize: number) => {
+    alert(`Starting background transfer of ${fileName} (${(fileSize / 1024).toFixed(1)} KB) via MeshCentral micro-agent tunnel...`);
+  };
+
+  const handleSaveRegValue = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newRegName.trim()) return;
+    const res = await setRegistryValue(device.id, {
+      path: regPath,
+      name: newRegName.trim(),
+      type: newRegType,
+      value: newRegVal
+    });
+    if (res.success) {
+      setRegData({ subkeys: res.subkeys, values: res.values });
+      setNewRegName('');
+      setNewRegVal('');
+    }
+  };
+
+  const handleDeleteRegValue = async (name: string) => {
+    const res = await deleteRegistryValue(device.id, regPath, name);
+    if (res.success) {
+      setRegData({ subkeys: res.subkeys, values: res.values });
+    }
+  };
+
+  const handleCreateFolder = async () => {
+    if (!newFolderName.trim()) return;
+    const res = await manageRemoteFile(device.id, { path: currentPath, action: 'mkdir', name: newFolderName.trim() });
+    if (res.success) {
+      setFiles(res.files);
+      setNewFolderName('');
+    }
+  };
+
+  const handleDeleteFile = async (name: string) => {
+    if (!confirm(`Delete ${name} from ${currentPath}?`)) return;
+    const res = await manageRemoteFile(device.id, { path: currentPath, action: 'delete', name });
+    if (res.success) {
+      setFiles(res.files);
+    }
+  };
+
+  const handleTaskAction = async (name: string, action: 'run' | 'enable' | 'disable') => {
+    const res = await manageScheduledTask(device.id, name, action);
+    if (res.success) {
+      setTasks(res.tasks);
+    }
   };
 
   return (
@@ -216,6 +310,14 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
               <span>Windows Services</span>
             </button>
             <button
+              className={`tab-btn ${activeTab === 'events' ? 'active' : ''}`}
+              onClick={() => setActiveTab('events')}
+              id="tab-btn-events"
+            >
+              <FileText size={16} />
+              <span>Event Viewer</span>
+            </button>
+            <button
               className={`tab-btn ${activeTab === 'registry' ? 'active' : ''}`}
               onClick={() => setActiveTab('registry')}
               id="tab-btn-registry"
@@ -247,7 +349,6 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
           {/* TAB 1: TERMINAL */}
           {activeTab === 'terminal' && (
             <div style={{ display: 'flex', flexDirection: 'column', height: '100%', gap: '1rem' }}>
-              {/* Quick Snippets Bar */}
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
                 <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)', fontWeight: 600 }}>Quick Snippets:</span>
                 <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('Get-Process')}>
@@ -267,12 +368,10 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                 </button>
               </div>
 
-              {/* Console Output */}
               <div className="terminal-window" style={{ flex: 1, minHeight: '380px' }} id="terminal-window-output">
                 {terminalOutput.join('')}
               </div>
 
-              {/* Input Form */}
               <form onSubmit={handleTerminalSubmit} className="terminal-input-row">
                 <span className="terminal-prompt">PS C:\&gt;</span>
                 <input
@@ -323,7 +422,7 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                   </thead>
                   <tbody>
                     {processes
-                      .filter((p) => p.name.toLowerCase().includes(procFilter.toLowerCase()))
+                      .filter((p) => p.name.toLowerCase().includes(procFilter.toLowerCase()) || p.pid.toString().includes(procFilter))
                       .map((p) => (
                         <tr key={p.pid}>
                           <td><strong>{p.pid}</strong></td>
@@ -432,7 +531,107 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
             </div>
           )}
 
-          {/* TAB 4: REGISTRY */}
+          {/* TAB 4: EVENT VIEWER */}
+          {activeTab === 'events' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.75rem' }}>
+                <div style={{ display: 'flex', gap: '0.65rem', alignItems: 'center' }}>
+                  <select
+                    className="glass-select"
+                    value={eventChannel}
+                    onChange={(e) => {
+                      setEventChannel(e.target.value);
+                      loadEvents(e.target.value, eventLevel);
+                    }}
+                    style={{ width: '150px' }}
+                  >
+                    <option value="System">System Log</option>
+                    <option value="Application">Application Log</option>
+                    <option value="Security">Security Log</option>
+                  </select>
+
+                  <select
+                    className="glass-select"
+                    value={eventLevel}
+                    onChange={(e) => {
+                      setEventLevel(e.target.value);
+                      loadEvents(eventChannel, e.target.value);
+                    }}
+                    style={{ width: '140px' }}
+                  >
+                    <option value="all">All Levels</option>
+                    <option value="Critical">Critical</option>
+                    <option value="Error">Error</option>
+                    <option value="Warning">Warning</option>
+                    <option value="Information">Information</option>
+                  </select>
+
+                  <input
+                    type="text"
+                    className="glass-input"
+                    placeholder="Search Event ID, Source, keyword..."
+                    value={eventFilter}
+                    onChange={(e) => setEventFilter(e.target.value)}
+                    style={{ width: '260px' }}
+                  />
+                </div>
+
+                <button className="btn-glass" onClick={() => loadEvents(eventChannel, eventLevel)} disabled={loadingEvents}>
+                  <RefreshCw size={14} /> Refresh Events
+                </button>
+              </div>
+
+              <div className="table-wrapper">
+                <table className="glass-table">
+                  <thead>
+                    <tr>
+                      <th style={{ width: '140px' }}>Date / Time</th>
+                      <th style={{ width: '110px' }}>Level</th>
+                      <th style={{ width: '90px' }}>Event ID</th>
+                      <th style={{ width: '220px' }}>Source Provider</th>
+                      <th>Message Details</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {eventLogs
+                      .filter((ev) => {
+                        if (!eventFilter.trim()) return true;
+                        const q = eventFilter.toLowerCase();
+                        return (
+                          ev.eventId.toString().includes(q) ||
+                          ev.source.toLowerCase().includes(q) ||
+                          ev.message.toLowerCase().includes(q)
+                        );
+                      })
+                      .map((ev) => (
+                        <tr key={ev.id}>
+                          <td><span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{new Date(ev.timeGenerated).toLocaleTimeString()}</span></td>
+                          <td>
+                            <span
+                              className={`status-pill ${
+                                ev.level === 'Critical' || ev.level === 'Error'
+                                  ? 'status-isolated'
+                                  : ev.level === 'Warning'
+                                  ? 'status-reboot'
+                                  : 'status-online'
+                              }`}
+                              style={{ fontSize: '0.7rem' }}
+                            >
+                              {ev.level}
+                            </span>
+                          </td>
+                          <td><strong>{ev.eventId}</strong></td>
+                          <td><span style={{ fontSize: '0.8rem', fontWeight: 500 }}>{ev.source}</span></td>
+                          <td><span style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.4 }}>{ev.message}</span></td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* TAB 5: REGISTRY */}
           {activeTab === 'registry' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
               <div style={{ display: 'flex', gap: '0.65rem' }}>
@@ -466,13 +665,40 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                   </div>
                 </div>
 
-                <div className="table-wrapper">
+                <div className="table-wrapper" style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                  <form onSubmit={handleSaveRegValue} style={{ display: 'flex', gap: '0.5rem', padding: '0.75rem', background: 'rgba(255,255,255,0.02)', borderBottom: '1px solid var(--glass-border)' }}>
+                    <input
+                      type="text"
+                      className="glass-input"
+                      placeholder="Value Name (e.g. MaxTelemetryQueue)"
+                      value={newRegName}
+                      onChange={(e) => setNewRegName(e.target.value)}
+                      style={{ flex: 1 }}
+                    />
+                    <select className="glass-select" value={newRegType} onChange={(e) => setNewRegType(e.target.value)} style={{ width: '140px' }}>
+                      <option value="REG_SZ">REG_SZ</option>
+                      <option value="REG_DWORD">REG_DWORD</option>
+                      <option value="REG_MULTI_SZ">REG_MULTI_SZ</option>
+                    </select>
+                    <input
+                      type="text"
+                      className="glass-input"
+                      placeholder="Value Data..."
+                      value={newRegVal}
+                      onChange={(e) => setNewRegVal(e.target.value)}
+                      style={{ flex: 1 }}
+                    />
+                    <button type="submit" className="btn-glass btn-primary" style={{ fontSize: '0.78rem' }}>
+                      + Set Value
+                    </button>
+                  </form>
                   <table className="glass-table">
                     <thead>
                       <tr>
                         <th>Value Name</th>
                         <th>Type</th>
                         <th>Data</th>
+                        <th>Actions</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -481,6 +707,17 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                           <td><strong>{v.name}</strong></td>
                           <td><span className="status-pill status-reboot" style={{ fontSize: '0.7rem' }}>{v.type}</span></td>
                           <td><code>{v.value}</code></td>
+                          <td>
+                            {v.name !== '(Default)' && (
+                              <button
+                                className="btn-glass btn-danger"
+                                style={{ padding: '0.18rem 0.45rem', fontSize: '0.7rem' }}
+                                onClick={() => handleDeleteRegValue(v.name)}
+                              >
+                                <Trash2 size={11} /> Delete
+                              </button>
+                            )}
+                          </td>
                         </tr>
                       ))}
                     </tbody>
@@ -490,19 +727,40 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
             </div>
           )}
 
-          {/* TAB 5: FILES */}
+          {/* TAB 6: FILES */}
           {activeTab === 'files' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-              <div style={{ display: 'flex', gap: '0.65rem', alignItems: 'center' }}>
+              <div style={{ display: 'flex', gap: '0.65rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                <button
+                  className="btn-glass"
+                  onClick={handleNavigateUp}
+                  title="Navigate to parent directory"
+                  style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', padding: '0.45rem 0.75rem' }}
+                >
+                  <CornerLeftUp size={16} />
+                  <span>Up</span>
+                </button>
                 <span style={{ fontSize: '0.8rem', color: 'var(--text-dim)' }}>Location:</span>
                 <input
                   type="text"
                   className="glass-input"
+                  style={{ flex: 1 }}
                   value={currentPath}
                   onChange={(e) => setCurrentPath(e.target.value)}
                 />
                 <button className="btn-glass btn-primary" onClick={() => loadFiles(currentPath)}>
                   Go
+                </button>
+                <input
+                  type="text"
+                  className="glass-input"
+                  style={{ width: '170px' }}
+                  placeholder="New folder name..."
+                  value={newFolderName}
+                  onChange={(e) => setNewFolderName(e.target.value)}
+                />
+                <button className="btn-glass" onClick={handleCreateFolder}>
+                  + New Folder
                 </button>
               </div>
 
@@ -533,11 +791,24 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                         <td>{f.modified}</td>
                         <td><code>{f.permissions}</code></td>
                         <td>
-                          {!f.isDirectory && (
-                            <button className="btn-glass" style={{ padding: '0.2rem 0.5rem', fontSize: '0.72rem' }}>
-                              Download
+                          <div className="action-group">
+                            {!f.isDirectory && (
+                              <button
+                                className="btn-glass"
+                                style={{ padding: '0.2rem 0.5rem', fontSize: '0.72rem', display: 'flex', alignItems: 'center', gap: '0.3rem' }}
+                                onClick={() => handleDownloadFile(f.name, f.size)}
+                              >
+                                <Download size={12} /> Download
+                              </button>
+                            )}
+                            <button
+                              className="btn-glass btn-danger"
+                              style={{ padding: '0.2rem 0.5rem', fontSize: '0.72rem' }}
+                              onClick={() => handleDeleteFile(f.name)}
+                            >
+                              <Trash2 size={12} />
                             </button>
-                          )}
+                          </div>
                         </td>
                       </tr>
                     ))}
@@ -547,7 +818,7 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
             </div>
           )}
 
-          {/* TAB 6: TASKS */}
+          {/* TAB 7: TASKS */}
           {activeTab === 'tasks' && (
             <div>
               <div className="table-wrapper">
@@ -560,6 +831,7 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                       <th>Last Run</th>
                       <th>Next Run</th>
                       <th>Result</th>
+                      <th>Controls</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -567,10 +839,42 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                       <tr key={i}>
                         <td><strong>{t.name}</strong></td>
                         <td>{t.path}</td>
-                        <td><span className="status-pill status-online">{t.state}</span></td>
+                        <td>
+                          <span className={`status-pill ${t.state === 'Disabled' ? 'status-offline' : 'status-online'}`}>
+                            {t.state}
+                          </span>
+                        </td>
                         <td>{t.lastRunTime}</td>
                         <td>{t.nextRunTime}</td>
                         <td><code>{t.lastResult}</code></td>
+                        <td>
+                          <div className="action-group">
+                            <button
+                              className="btn-glass btn-primary"
+                              style={{ padding: '0.2rem 0.5rem', fontSize: '0.72rem' }}
+                              onClick={() => handleTaskAction(t.name, 'run')}
+                            >
+                              <Play size={11} /> Run Now
+                            </button>
+                            {t.state === 'Disabled' ? (
+                              <button
+                                className="btn-glass"
+                                style={{ padding: '0.2rem 0.5rem', fontSize: '0.72rem' }}
+                                onClick={() => handleTaskAction(t.name, 'enable')}
+                              >
+                                Enable
+                              </button>
+                            ) : (
+                              <button
+                                className="btn-glass"
+                                style={{ padding: '0.2rem 0.5rem', fontSize: '0.72rem' }}
+                                onClick={() => handleTaskAction(t.name, 'disable')}
+                              >
+                                Disable
+                              </button>
+                            )}
+                          </div>
+                        </td>
                       </tr>
                     ))}
                   </tbody>

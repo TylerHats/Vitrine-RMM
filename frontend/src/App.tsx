@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Sidebar } from './components/Sidebar.js';
 import { TopNavbar } from './components/TopNavbar.js';
 import { FleetDashboard } from './views/FleetDashboard.js';
@@ -18,12 +18,30 @@ import { LapsModal } from './components/LapsModal.js';
 import { CyberIsolationModal } from './components/CyberIsolationModal.js';
 import { OnboardingWizardModal } from './components/OnboardingWizardModal.js';
 import { QbrReportModal } from './components/QbrReportModal.js';
+import { AgentInstallerModal } from './components/AgentInstallerModal.js';
+import { GuestAccessModal } from './components/GuestAccessModal.js';
+import { GuestPortalView } from './views/GuestPortalView.js';
 
 import { fetchDevices, fetchTenants, fetchSettings } from './services/api.js';
 import { Device, Tenant, Settings } from './types/index.js';
 
 import './styles/theme.css';
 import './styles/components.css';
+
+function applyVisualSettings(sets: Settings | null) {
+  if (!sets) return;
+  if (sets.primary_color) {
+    document.documentElement.style.setProperty('--primary', sets.primary_color);
+  }
+  if (sets.glass_blur_level) {
+    const blurMap: Record<string, string> = {
+      high: 'blur(20px) saturate(190%)',
+      medium: 'blur(12px) saturate(160%)',
+      low: 'blur(4px) saturate(120%)'
+    };
+    document.documentElement.style.setProperty('--glass-blur', blurMap[sets.glass_blur_level] || blurMap.high);
+  }
+}
 
 export function App() {
   const [currentView, setCurrentView] = useState('dashboard');
@@ -58,28 +76,36 @@ export function App() {
   });
   const [onboardingOpen, setOnboardingOpen] = useState(false);
   const [qbrOpen, setQbrOpen] = useState(false);
+  const [installerModalOpen, setInstallerModalOpen] = useState(false);
+  const [guestAccessModalOpen, setGuestAccessModalOpen] = useState(false);
+
+  const urlParams = new URLSearchParams(window.location.search);
+  const guestGrantId = urlParams.get('grant') || urlParams.get('guest');
 
   // Load initial data
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
+    if (guestGrantId) return;
     try {
       const [devs, tens, sets] = await Promise.all([fetchDevices(), fetchTenants(), fetchSettings()]);
       setDevices(devs);
       setTenants(tens);
       setSettings(sets);
-
-      if (sets?.primary_color) {
-        document.documentElement.style.setProperty('--primary', sets.primary_color);
-      }
+      applyVisualSettings(sets);
     } catch (err) {
       console.error('Error loading fleet data:', err);
     }
-  };
+  }, [guestGrantId]);
 
   useEffect(() => {
     loadData();
     const interval = setInterval(loadData, 15000);
     return () => clearInterval(interval);
-  }, []);
+  }, [loadData]);
+
+  // Check if current URL is a guest vendor session (after all hooks are declared)
+  if (guestGrantId) {
+    return <GuestPortalView grantId={guestGrantId} />;
+  }
 
   // Theme management
   const toggleTheme = () => {
@@ -106,13 +132,13 @@ export function App() {
   };
 
   const handleDownloadInstaller = () => {
-    alert(
-      `Generating on-demand tokenized agent installer for ${
-        selectedTenantId === 'all' ? 'Global Fleet' : selectedTenantId
-      }...\n\nBranded with logo: /branding/logo.png\nRelay Endpoint: ${
-        settings?.meshcentral_url || 'https://127.0.0.1:443'
-      }\nToken Lifetime: 24 Hours`
-    );
+    setInstallerModalOpen(true);
+  };
+
+  const handleSettingsUpdated = (s: Settings) => {
+    setSettings(s);
+    applyVisualSettings(s);
+    loadData();
   };
 
   return (
@@ -127,6 +153,7 @@ export function App() {
         theme={theme}
         onToggleTheme={toggleTheme}
         brandName={settings?.brand_name || 'Vitrine RMM'}
+        brandLogoUrl={settings?.brand_logo_url}
         onOpenOnboarding={() => setOnboardingOpen(true)}
         onOpenQbr={() => setQbrOpen(true)}
         isMobileOpen={isMobileSidebarOpen}
@@ -141,7 +168,14 @@ export function App() {
           selectedTenantId={selectedTenantId}
           onTenantChange={setSelectedTenantId}
           onDownloadInstaller={handleDownloadInstaller}
+          onOpenGuestAccess={() => setGuestAccessModalOpen(true)}
           onToggleMobileSidebar={() => setIsMobileSidebarOpen(!isMobileSidebarOpen)}
+          devices={devices}
+          onSelectDevice={handleDeviceSelect}
+          onSelectView={(v) => {
+            setCurrentView(v);
+            setSelectedDeviceForDetail(null);
+          }}
         />
 
         <main className="content-container">
@@ -173,7 +207,7 @@ export function App() {
             />
           )}
 
-          {currentView === 'policies' && <PoliciesView devices={devices} />}
+          {currentView === 'policies' && <PoliciesView devices={devices} tenants={tenants} />}
           {currentView === 'patching' && <PatchManagementView />}
           {currentView === 'scripts' && <ScriptLibraryView devices={devices} />}
           {currentView === 'self-healing' && <SelfHealingView />}
@@ -183,7 +217,7 @@ export function App() {
           {currentView === 'settings' && (
             <SettingsView
               settings={settings || ({} as Settings)}
-              onUpdated={(s) => setSettings(s)}
+              onUpdated={handleSettingsUpdated}
               onOpenWizard={() => setOnboardingOpen(true)}
             />
           )}
@@ -226,11 +260,32 @@ export function App() {
         <OnboardingWizardModal
           settings={settings || ({} as Settings)}
           onClose={() => setOnboardingOpen(false)}
-          onSaved={(s) => setSettings(s)}
+          onSaved={handleSettingsUpdated}
         />
       )}
 
-      {qbrOpen && <QbrReportModal onClose={() => setQbrOpen(false)} />}
+      {qbrOpen && (
+        <QbrReportModal
+          brandLogoUrl={settings?.brand_logo_url}
+          onClose={() => setQbrOpen(false)}
+        />
+      )}
+
+      {installerModalOpen && (
+        <AgentInstallerModal
+          tenants={tenants}
+          selectedTenantId={selectedTenantId}
+          settings={settings}
+          onClose={() => setInstallerModalOpen(false)}
+        />
+      )}
+
+      {guestAccessModalOpen && (
+        <GuestAccessModal
+          devices={devices}
+          onClose={() => setGuestAccessModalOpen(false)}
+        />
+      )}
     </div>
   );
 }

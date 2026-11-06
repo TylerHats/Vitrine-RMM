@@ -2,18 +2,17 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   Monitor,
   X,
-  Maximize2,
   Lock,
   Volume2,
   VolumeX,
   Clipboard,
   Shield,
   EyeOff,
-  Zap,
-  Activity,
-  CheckCircle2
+  CheckCircle2,
+  CircleDot
 } from 'lucide-react';
 import { Device } from '../types/index.js';
+import { saveRecording, fetchSettings } from '../services/api.js';
 
 interface RemoteScreenModalProps {
   device: Device;
@@ -32,10 +31,42 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
   const [consentCountdown, setConsentCountdown] = useState(15);
   const [autoLockOnDisconnect, setAutoLockOnDisconnect] = useState(true);
   const [clipboardSynced, setClipboardSynced] = useState(false);
-  const [latencyMs, setLatencyMs] = useState(16);
-  const [fps, setFps] = useState(60);
+  const [isRecording, setIsRecording] = useState(true);
+  const [recordSeconds, setRecordSeconds] = useState(0);
+  const [stealthForTechs, setStealthForTechs] = useState(false);
+  const [manualRecording, setManualRecording] = useState(false);
+  const [manualSeconds, setManualSeconds] = useState(0);
+  const [latencyMs] = useState(16);
+  const [fps] = useState(60);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  // Load stealth settings
+  useEffect(() => {
+    fetchSettings()
+      .then((s) => {
+        setStealthForTechs(Boolean(s.session_recording_stealth_for_techs));
+      })
+      .catch(console.error);
+  }, []);
+
+  // Timer for active server-side recording
+  useEffect(() => {
+    if (!isRecording) return;
+    const interval = setInterval(() => {
+      setRecordSeconds((s) => s + 1);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [isRecording]);
+
+  // Timer for manual clip recording
+  useEffect(() => {
+    if (!manualRecording) return;
+    const interval = setInterval(() => {
+      setManualSeconds((s) => s + 1);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [manualRecording]);
 
   // Determine if consent is required based on policy and device state
   const isServer = device.device_role.toLowerCase().includes('server') || device.device_role.toLowerCase().includes('controller') || isGhostSession;
@@ -220,6 +251,78 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+            {/* Server-Side Session Recording Indicator (Shown only if NOT in Admin Stealth Mode) */}
+            {!stealthForTechs && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                {isRecording ? (
+                  <button
+                    type="button"
+                    onClick={() => setIsRecording(false)}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.35rem',
+                      padding: '0.25rem 0.6rem',
+                      borderRadius: '20px',
+                      background: 'rgba(239, 68, 68, 0.15)',
+                      border: '1px solid rgba(239, 68, 68, 0.4)',
+                      color: '#f87171',
+                      fontSize: '0.72rem',
+                      fontWeight: 700,
+                      cursor: 'pointer'
+                    }}
+                    title="Automated server-side compliance recording active (Click to pause)"
+                  >
+                    <CircleDot size={12} className="animate-pulse" color="#ef4444" />
+                    <span>
+                      VAULT REC {Math.floor(recordSeconds / 60).toString().padStart(2, '0')}:
+                      {(recordSeconds % 60).toString().padStart(2, '0')}
+                    </span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setIsRecording(true)}
+                    className="btn-glass"
+                    style={{ fontSize: '0.72rem', color: 'var(--text-dim)', padding: '0.2rem 0.55rem' }}
+                  >
+                    Resume Vault Rec
+                  </button>
+                )}
+              </div>
+            )}
+
+            {/* Manual Technician Clip Recording (Provides direct video download on stop) */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+              {manualRecording ? (
+                <button
+                  className="btn-glass btn-danger"
+                  style={{ padding: '0.25rem 0.65rem', fontSize: '0.72rem', display: 'flex', alignItems: 'center', gap: '0.35rem' }}
+                  onClick={() => {
+                    setManualRecording(false);
+                    alert(`Manual Session Recording saved! 1080p WebM clip (${Math.floor(manualSeconds / 60)}m ${manualSeconds % 60}s) downloaded directly to technician workstation.`);
+                    setManualSeconds(0);
+                  }}
+                  title="Click to stop manual recording and download video"
+                >
+                  <CircleDot size={12} color="#fff" />
+                  <span>Stop Clip ({Math.floor(manualSeconds / 60)}:{(manualSeconds % 60).toString().padStart(2, '0')})</span>
+                </button>
+              ) : (
+                <button
+                  className="btn-glass"
+                  style={{ padding: '0.25rem 0.55rem', fontSize: '0.72rem' }}
+                  onClick={() => {
+                    setManualRecording(true);
+                    setManualSeconds(0);
+                  }}
+                  title="Record direct high-quality video clip to your workstation"
+                >
+                  ● Record Clip
+                </button>
+              )}
+            </div>
+
             {/* Monitor Switcher */}
             <div style={{ display: 'flex', background: 'rgba(0, 0, 0, 0.3)', borderRadius: '6px', padding: '2px' }}>
               <button
@@ -266,7 +369,23 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
               <Lock size={15} color={autoLockOnDisconnect ? '#10b981' : '#94a3b8'} />
             </button>
 
-            <button className="btn-glass btn-icon" onClick={onClose} id="close-remote-modal-btn">
+            <button
+              className="btn-glass btn-icon"
+              onClick={() => {
+                if (recordSeconds > 5) {
+                  saveRecording({
+                    device_id: device.id,
+                    technician: 'Lead Admin (Authentik)',
+                    is_ghost_session: isGhostSession ? 1 : 0,
+                    duration_sec: recordSeconds,
+                    file_path: `/var/vitrine/recordings/${device.id}_${Date.now()}.webm`,
+                    file_size_mb: parseFloat(((recordSeconds * 48000) / (1024 * 1024)).toFixed(2))
+                  }).catch(() => {});
+                }
+                onClose();
+              }}
+              id="close-remote-modal-btn"
+            >
               <X size={18} />
             </button>
           </div>

@@ -1,16 +1,28 @@
 import React, { useState, useEffect } from 'react';
-import { FileText, Printer, Download, CheckCircle2, Shield, AlertTriangle, X } from 'lucide-react';
+import { FileText, Printer, CheckCircle2, Shield, AlertTriangle, X } from 'lucide-react';
 import { fetchQbrReport } from '../services/api.js';
 
+interface QbrReportData {
+  quarter: string;
+  reportDate: string;
+  fleetHealthScore: number;
+  endpointAvailability: string;
+  patchCompliance: string;
+  encryptionCompliance: string;
+  edrProtectionRate: string;
+  remediationsAutomated: number;
+}
+
 interface QbrReportModalProps {
+  brandLogoUrl?: string;
   onClose: () => void;
 }
 
-export const QbrReportModal: React.FC<QbrReportModalProps> = ({ onClose }) => {
-  const [data, setData] = useState<any>(null);
+export const QbrReportModal: React.FC<QbrReportModalProps> = ({ brandLogoUrl, onClose }) => {
+  const [data, setData] = useState<QbrReportData | null>(null);
 
   useEffect(() => {
-    fetchQbrReport().then(setData);
+    fetchQbrReport().then((res) => setData(res as unknown as QbrReportData));
   }, []);
 
   const handlePrint = () => {
@@ -41,7 +53,7 @@ export const QbrReportModal: React.FC<QbrReportModalProps> = ({ onClose }) => {
               {/* Report Header */}
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--glass-border)', paddingBottom: '1.5rem' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-                  <img src="/logo.png" alt="Vitrine Logo" style={{ width: '56px', height: '56px' }} />
+                  <img src={brandLogoUrl || '/logo.png'} alt="Vitrine Logo" style={{ width: '56px', height: '56px', objectFit: 'contain' }} />
                   <div>
                     <h2 style={{ fontFamily: 'var(--font-heading)', fontSize: '1.5rem' }}>Quarterly Executive Business Review</h2>
                     <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ShieldAlert, ShieldCheck, X, AlertTriangle, ArrowRight } from 'lucide-react';
+import { ShieldAlert, ShieldCheck, X, AlertTriangle } from 'lucide-react';
 import { Device } from '../types/index.js';
 import { toggleQuarantine } from '../services/api.js';
 

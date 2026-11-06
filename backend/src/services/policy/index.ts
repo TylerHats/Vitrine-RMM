@@ -13,9 +13,26 @@ export interface PolicyRule {
   patchSchedule: string;
   patchRebootEnforcement: string;
   selfHealingEnabled: boolean;
+  maxSnoozeHours: number;
+  forceRebootAfterSnooze: boolean;
+  finalCountdownSec: number;
+  lapsEnabled: boolean;
+  lapsAccountName: string;
+  lapsPasswordLength: number;
+  lapsComplexity: string;
+  lapsRotationDays: number;
+  lapsRotateOnAccess: boolean;
+  lapsPostAccessGraceHours: number;
+  requireMfaForSecrets: boolean;
+  telemetryHistoryRetentionDays: number;
+  hardwareAuditEnabled: boolean;
+  networkDriftDetectionEnabled: boolean;
+  selfHealingMaxHourlyRuns: number;
+  selfHealingAlertPsa: boolean;
 }
 
 export interface EffectiveDevicePolicy extends PolicyRule {
+  require_mfa_for_secrets?: boolean;
   inheritanceChain: Array<{ tier: string; name: string }>;
 }
 
@@ -40,6 +57,23 @@ export function resolveEffectiveDevicePolicy(deviceId: string): EffectiveDeviceP
     patchSchedule: globalRow?.patch_schedule ?? 'Tuesdays @ 02:00 AM',
     patchRebootEnforcement: globalRow?.patch_reboot_enforcement ?? 'Prompt 4h, then force reboot',
     selfHealingEnabled: Boolean(globalRow?.self_healing_enabled ?? 1),
+    maxSnoozeHours: globalRow?.max_snooze_hours ?? 8,
+    forceRebootAfterSnooze: Boolean(globalRow?.force_reboot_after_snooze ?? 1),
+    finalCountdownSec: globalRow?.final_countdown_sec ?? 300,
+    lapsEnabled: Boolean(globalRow?.laps_enabled ?? 1),
+    lapsAccountName: globalRow?.laps_account_name || 'LocalAdmin',
+    lapsPasswordLength: globalRow?.laps_password_length ?? 20,
+    lapsComplexity: globalRow?.laps_complexity || 'alphanumeric_symbols',
+    lapsRotationDays: globalRow?.laps_rotation_days ?? 30,
+    lapsRotateOnAccess: Boolean(globalRow?.laps_rotate_on_access ?? 1),
+    lapsPostAccessGraceHours: globalRow?.laps_post_access_grace_hours ?? 2,
+    requireMfaForSecrets: Boolean(globalRow?.require_mfa_for_secrets ?? 1),
+    require_mfa_for_secrets: Boolean(globalRow?.require_mfa_for_secrets ?? 1),
+    telemetryHistoryRetentionDays: globalRow?.telemetry_history_retention_days ?? 90,
+    hardwareAuditEnabled: Boolean(globalRow?.hardware_audit_enabled ?? 1),
+    networkDriftDetectionEnabled: Boolean(globalRow?.network_drift_detection_enabled ?? 1),
+    selfHealingMaxHourlyRuns: globalRow?.self_healing_max_hourly_runs ?? 3,
+    selfHealingAlertPsa: Boolean(globalRow?.self_healing_alert_psa ?? 1),
     inheritanceChain: [{ tier: 'global', name: globalRow?.name || 'Global MSP Baseline' }]
   };
 
@@ -58,7 +92,9 @@ export function resolveEffectiveDevicePolicy(deviceId: string): EffectiveDeviceP
   }
 
   // 4. Role Tier Override (e.g. Domain Controller / Server)
-  const rolePolicy = db.prepare("SELECT * FROM policies WHERE tier = 'role' AND target_id = ?").get(device.device_role) as any;
+  const rolePolicy = db.prepare(
+    "SELECT * FROM policies WHERE tier = 'role' AND (? = target_id OR ? LIKE '%' || target_id || '%') LIMIT 1"
+  ).get(device.device_role, device.device_role) as any;
   if (rolePolicy) {
     applyOverrides(effective, rolePolicy);
     effective.inheritanceChain.push({ tier: 'role', name: rolePolicy.name });
@@ -76,4 +112,23 @@ function applyOverrides(target: EffectiveDevicePolicy, source: any) {
   if (source.patch_schedule != null) target.patchSchedule = source.patch_schedule;
   if (source.patch_reboot_enforcement != null) target.patchRebootEnforcement = source.patch_reboot_enforcement;
   if (source.self_healing_enabled != null) target.selfHealingEnabled = Boolean(source.self_healing_enabled);
+  if (source.max_snooze_hours != null) target.maxSnoozeHours = Number(source.max_snooze_hours);
+  if (source.force_reboot_after_snooze != null) target.forceRebootAfterSnooze = Boolean(source.force_reboot_after_snooze);
+  if (source.final_countdown_sec != null) target.finalCountdownSec = Number(source.final_countdown_sec);
+  if (source.laps_enabled != null) target.lapsEnabled = Boolean(source.laps_enabled);
+  if (source.laps_account_name != null) target.lapsAccountName = source.laps_account_name;
+  if (source.laps_password_length != null) target.lapsPasswordLength = Number(source.laps_password_length);
+  if (source.laps_complexity != null) target.lapsComplexity = source.laps_complexity;
+  if (source.laps_rotation_days != null) target.lapsRotationDays = Number(source.laps_rotation_days);
+  if (source.laps_rotate_on_access != null) target.lapsRotateOnAccess = Boolean(source.laps_rotate_on_access);
+  if (source.laps_post_access_grace_hours != null) target.lapsPostAccessGraceHours = Number(source.laps_post_access_grace_hours);
+  if (source.require_mfa_for_secrets != null) {
+    target.requireMfaForSecrets = Boolean(source.require_mfa_for_secrets);
+    target.require_mfa_for_secrets = Boolean(source.require_mfa_for_secrets);
+  }
+  if (source.telemetry_history_retention_days != null) target.telemetryHistoryRetentionDays = Number(source.telemetry_history_retention_days);
+  if (source.hardware_audit_enabled != null) target.hardwareAuditEnabled = Boolean(source.hardware_audit_enabled);
+  if (source.network_drift_detection_enabled != null) target.networkDriftDetectionEnabled = Boolean(source.network_drift_detection_enabled);
+  if (source.self_healing_max_hourly_runs != null) target.selfHealingMaxHourlyRuns = Number(source.self_healing_max_hourly_runs);
+  if (source.self_healing_alert_psa != null) target.selfHealingAlertPsa = Boolean(source.self_healing_alert_psa);
 }

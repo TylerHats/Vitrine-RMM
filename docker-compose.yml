@@ -2,6 +2,7 @@ version: '3.8'
 
 services:
   vitrine-rmm:
+    build: .
     image: tylerhats/vitrine-rmm:latest
     container_name: vitrine-rmm
     ports:

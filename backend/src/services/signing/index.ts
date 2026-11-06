@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { db } from '../../db/index.js';
 
 export interface SigningResult {
   success: boolean;
@@ -15,8 +16,19 @@ export class CodeSigningService {
     this.endpointUrl = endpointUrl;
   }
 
+  public getEndpoint(): string {
+    try {
+      const settings = db.prepare('SELECT code_signing_url FROM settings WHERE id = 1').get() as any;
+      if (settings?.code_signing_url) return settings.code_signing_url;
+    } catch {
+      // DB not ready or column missing
+    }
+    return this.endpointUrl;
+  }
+
   public async signFile(filePath: string): Promise<SigningResult> {
     try {
+      const activeEndpoint = this.getEndpoint();
       const filename = path.basename(filePath);
       const fileData = fs.readFileSync(filePath);
       const boundary = '----WebKitFormBoundary' + Math.random().toString(36).substring(2);
@@ -28,7 +40,7 @@ export class CodeSigningService {
       const post = Buffer.from(`\r\n--${boundary}--\r\n`);
       const body = Buffer.concat([pre, fileData, post]);
 
-      const res = await fetch(`${this.endpointUrl}/sign`, {
+      const res = await fetch(`${activeEndpoint}/sign`, {
         method: 'POST',
         headers: {
           'Content-Type': `multipart/form-data; boundary=${boundary}`
