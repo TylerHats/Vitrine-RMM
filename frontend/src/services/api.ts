@@ -23,7 +23,10 @@ import {
   GuestAccessGrant,
   RbacUser,
   RemediationLog,
-  DeviceNote
+  DeviceNote,
+  NetworkAppliance,
+  WakeOnLanResult,
+  RemoteSessionDescriptor
 } from '../types/index.js';
 
 const API_BASE = '/api';
@@ -404,22 +407,16 @@ export async function fetchDeviceSoftware(deviceId: string): Promise<SoftwareIte
   return res.json();
 }
 
-// Tiered Wake-on-LAN Relay
-export async function wakeDeviceOnLan(deviceId: string): Promise<{
-  success: boolean;
-  targetHostname?: string;
-  targetMac?: string;
-  tieredStrategy?: {
-    tier1_current_subnet_relays: number;
-    tier2_historical_subnets: number;
-    tier3_amt_fallback: boolean;
-  };
-  dispatchedRelays?: string[];
-  confirmationWindowSec?: number;
-  verificationMode?: string;
-  error?: string;
-}> {
-  const res = await fetch(`${API_BASE}/devices/${deviceId}/wake-on-lan`, { method: 'POST' });
+// 5-Tier Same-Company Peer-Relayed Wake-on-LAN & Intel AMT Chain
+export async function wakeDeviceOnLan(
+  deviceId: string,
+  options?: { wakeAndOnline?: boolean; bootTarget?: 'normal' | 'bios_uefi' | 'pxe' }
+): Promise<WakeOnLanResult & { error?: string }> {
+  const res = await fetch(`${API_BASE}/devices/${deviceId}/wake-on-lan`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(options || { wakeAndOnline: true, bootTarget: 'normal' })
+  });
   return res.json();
 }
 
@@ -795,5 +792,59 @@ export async function authenticateGuestPortal(id: string, username: string, pass
   });
   return res.json();
 }
+
+// Remote Screen Control, Headless Ghost Session & Intel AMT Hardware KVM Negotiation
+export async function negotiateRemoteSession(
+  deviceId: string,
+  mode: 'kvm' | 'ghost' | 'amt_kvm',
+  monitor = 1
+): Promise<RemoteSessionDescriptor> {
+  const res = await fetch(`${API_BASE}/devices/${deviceId}/remote-session`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode, monitor })
+  });
+  return res.json();
+}
+
+// Network Appliances & Agent-Relayed SNMP / ICMP Infrastructure Monitors
+export async function fetchNetworkAppliances(): Promise<NetworkAppliance[]> {
+  const res = await fetch(`${API_BASE}/discovery/appliances`);
+  return res.json();
+}
+
+export async function createNetworkAppliance(data: {
+  name: string;
+  appliance_type: 'firewall' | 'switch' | 'ups' | 'nas' | 'printer';
+  vendor_model: string;
+  ip_address: string;
+  mac_address?: string;
+  snmp_version?: string;
+  tenant_id?: string;
+  site_id?: string;
+  probe_device_id?: string;
+}): Promise<{ success: boolean; appliance: NetworkAppliance }> {
+  const res = await fetch(`${API_BASE}/discovery/appliances`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data)
+  });
+  return res.json();
+}
+
+export async function pollNetworkAppliance(id: string): Promise<{ success: boolean; appliance: NetworkAppliance }> {
+  const res = await fetch(`${API_BASE}/discovery/appliances/${id}/poll`, {
+    method: 'POST'
+  });
+  return res.json();
+}
+
+export async function deleteNetworkAppliance(id: string): Promise<{ success: boolean }> {
+  const res = await fetch(`${API_BASE}/discovery/appliances/${id}`, {
+    method: 'DELETE'
+  });
+  return res.json();
+}
+
 
 

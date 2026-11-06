@@ -369,3 +369,77 @@ export interface DeviceNote {
   created_at: string;
 }
 
+export interface NetworkAppliance {
+  id: string;
+  tenant_id: string;
+  tenant_name?: string;
+  site_id: string;
+  site_name?: string;
+  name: string;
+  appliance_type: 'firewall' | 'switch' | 'ups' | 'nas' | 'printer';
+  vendor_model: string;
+  ip_address: string;
+  mac_address: string;
+  snmp_version: string;
+  probe_device_id: string;
+  probe_hostname: string;
+  status: 'online' | 'warning' | 'critical' | 'offline';
+  uptime_days: number;
+  latency_ms: number;
+  packet_loss_pct: number;
+  cpu_pct: number;
+  memory_pct: number;
+  metrics: Record<string, string | number>;
+  alert_summary?: string | null;
+  last_polled: string;
+}
+
+export interface WakeChainStage {
+  tier: number;
+  name: string;
+  protocol: string;
+  relayHost: string;
+  targetEndpoint: string;
+  status: 'success' | 'escalated' | 'skipped';
+  latencyMs: number;
+  detail: string;
+}
+
+export interface WakeOnLanResult {
+  success: boolean;
+  targetDeviceId?: string;
+  targetHostname: string;
+  targetIp?: string;
+  targetMac: string;
+  tenantName?: string;
+  siteName?: string;
+  newStatus?: string;
+  bootTarget?: string;
+  tieredStrategy: {
+    tier1_current_subnet_relays: number;
+    tier2_historical_subnets: number;
+    tier3_amt_fallback: boolean;
+  };
+  dispatchedRelays: string[];
+  stages?: WakeChainStage[];
+  confirmationWindowSec: number;
+  verificationMode: string;
+}
+
+export interface RemoteSessionDescriptor {
+  success: boolean;
+  sessionId: string;
+  deviceId: string;
+  hostname: string;
+  osType: 'windows' | 'linux' | 'macos';
+  mode: 'kvm' | 'ghost' | 'amt_kvm';
+  monitor: number;
+  displayDriver: string;
+  sessionIsolation: string;
+  audioPipeline: string;
+  resolution: string;
+  meshRelayUrl?: string | null;
+  userInterference: string;
+}
+
+

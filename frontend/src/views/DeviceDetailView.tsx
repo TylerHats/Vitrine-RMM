@@ -33,7 +33,7 @@ import {
   Plus,
   Trash2
 } from 'lucide-react';
-import { Device, CustomFieldDefinition, OemWarranty, ChatMessage, HardwareHistoryItem, NetworkHistoryItem, SoftwareItem, DeviceNote, SessionRecording } from '../types/index.js';
+import { Device, CustomFieldDefinition, OemWarranty, ChatMessage, HardwareHistoryItem, NetworkHistoryItem, SoftwareItem, DeviceNote, SessionRecording, WakeOnLanResult } from '../types/index.js';
 import {
   fetchDeviceCustomFields,
   saveDeviceCustomFields,
@@ -96,10 +96,12 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
   const [maintenanceUntil, setMaintenanceUntil] = useState<string | null>(device.maintenance_until || null);
   const [maintenanceDuration, setMaintenanceDuration] = useState(60);
 
-  // Software & CVE state
+  // Software & CVE state + 5-Tier Peer Reachability Chain state
   const [softwareItems, setSoftwareItems] = useState<SoftwareItem[]>([]);
+  const [deviceStatus, setDeviceStatus] = useState<Device['status']>(device.status);
   const [wakingUp, setWakingUp] = useState(false);
   const [wolNotice, setWolNotice] = useState<string | null>(null);
+  const [wolChainResult, setWolChainResult] = useState<WakeOnLanResult | null>(null);
 
   // Warranty state
   const [warranty, setWarranty] = useState<OemWarranty | null>(device.warranty || null);
@@ -205,21 +207,23 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
     }
   };
 
-  const handleWakeOnLan = async () => {
+  const handleWakeOnLan = async (bootTarget: 'normal' | 'bios_uefi' | 'pxe' = 'normal') => {
     setWakingUp(true);
-    setWolNotice('Dispatching Tiered WoL Magic Packet to local subnet peer relays...');
+    setWolNotice('Executing 5-Tier Same-Company & Same-Network Peer Reachability Chain (Cloud CIRA -> Peer LAN AMT 16993 -> Multi-Peer WoL Magic Packets -> Historical Roaming Subnets -> ARP Verification)...');
     try {
-      const res = await wakeDeviceOnLan(device.id);
+      const res = await wakeDeviceOnLan(device.id, { wakeAndOnline: true, bootTarget });
       if (res.success) {
+        setWolChainResult(res);
+        setDeviceStatus('online');
         const relayStr = res.dispatchedRelays?.length
-          ? `Dispatched via ${res.dispatchedRelays.join(', ')}.`
-          : 'Dispatched via subnet broadcast.';
-        setWolNotice(`⚡ WoL magic packet sent to MAC ${res.targetMac}. ${relayStr} Listening for ARP link-up & agent check-in (60s countdown)...`);
+          ? `Relayed via same-company peers: ${res.dispatchedRelays.join(', ')}.`
+          : 'Dispatched via local subnet broadcast.';
+        setWolNotice(`⚡ 5-Tier Wake & AMT Reachability Chain Succeeded for ${res.targetHostname} (${res.targetMac}). ${relayStr} Endpoint verified ONLINE via Peer ARP & Agent TLS Handshake!`);
       } else {
-        setWolNotice(`Failed to send WoL: ${res.error || 'Unknown error'}`);
+        setWolNotice(`Failed to execute reachability chain: ${res.error || 'Unknown error'}`);
       }
     } catch {
-      setWolNotice('Error communicating with WoL relay engine.');
+      setWolNotice('Error communicating with 5-Tier WoL & AMT relay engine.');
     } finally {
       setWakingUp(false);
     }
@@ -336,8 +340,8 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
               <h2 style={{ fontFamily: 'var(--font-heading)', fontSize: '1.6rem', fontWeight: 700, margin: 0 }}>
                 {device.hostname}
               </h2>
-              <span className={`status-pill ${device.quarantined ? 'status-isolated' : isMaintenanceActive ? 'status-reboot' : 'status-online'}`}>
-                {device.quarantined ? 'Quarantined' : isMaintenanceActive ? 'Maintenance Active' : device.status}
+              <span className={`status-pill ${device.quarantined ? 'status-isolated' : isMaintenanceActive ? 'status-reboot' : deviceStatus === 'offline' ? 'status-offline' : 'status-online'}`}>
+                {device.quarantined ? 'Quarantined' : isMaintenanceActive ? 'Maintenance Active' : deviceStatus}
               </span>
               {Boolean(device.intel_amt_enabled) && (
                 <span
@@ -353,7 +357,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                   ⚡ vPro / AMT Ready
                 </span>
               )}
-              {device.status === 'offline' && Boolean(device.intel_amt_reachable) && (
+              {deviceStatus === 'offline' && Boolean(device.intel_amt_reachable) && (
                 <span
                   className="status-pill"
                   style={{
@@ -363,9 +367,9 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                     fontSize: '0.72rem',
                     animation: 'pulse 2s infinite'
                   }}
-                  title="OS Agent offline, but Out-Of-Band Management Controller is directly reachable over network"
+                  title="OS Agent offline, but Out-Of-Band Management Controller is reachable via same-subnet peer relays"
                 >
-                  ⚡ OOB Reachable
+                  ⚡ OOB / Peer Reachable
                 </span>
               )}
             </div>
@@ -377,29 +381,28 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
 
         {/* Quick Action Toolbar */}
         <div style={{ display: 'flex', gap: '0.65rem', flexWrap: 'wrap' }}>
-          {device.status === 'offline' && (
-            <button
-              className="btn-glass"
-              style={{ background: 'rgba(56, 189, 248, 0.15)', color: '#38bdf8', border: '1px solid rgba(56, 189, 248, 0.35)' }}
-              onClick={handleWakeOnLan}
-              disabled={wakingUp}
-              title="Orchestrate Tiered Wake-on-LAN Magic Packet via Online Peer Relays on this Subnet"
-            >
-              <Zap size={15} /> {wakingUp ? 'Relaying WoL...' : 'Wake-on-LAN'}
-            </button>
-          )}
-          {device.status === 'offline' && Boolean(device.intel_amt_reachable) && (
+          <button
+            className="btn-glass"
+            style={{ background: 'rgba(56, 189, 248, 0.16)', color: '#38bdf8', border: '1px solid rgba(56, 189, 248, 0.4)' }}
+            onClick={() => handleWakeOnLan('normal')}
+            disabled={wakingUp}
+            title="Execute 5-Tier Reachability Chain (Cloud CIRA -> Same-Subnet Peer AMT 16993 -> Same-Subnet Peer Magic Packets -> Historical Roaming Subnet Relay -> ARP Link-Up Verification)"
+          >
+            <Zap size={15} /> {wakingUp ? 'Relaying 5-Tier Wake...' : deviceStatus === 'offline' ? '5-Tier Wake (WoL + Peer AMT)' : 'Test 5-Tier Peer Reachability'}
+          </button>
+          {Boolean(device.intel_amt_enabled) && (
             <button
               className="btn-glass"
               style={{ background: 'rgba(245, 158, 11, 0.2)', color: '#fbbf24', border: '1px solid rgba(245, 158, 11, 0.4)' }}
-              onClick={() => alert(`Sending Intel AMT Wake-on-LAN / OOB Hardware Power-On signal to ${device.hostname}...`)}
-              title="Issue Hardware Power On via Intel vPro AMT Out-of-Band Controller"
+              onClick={() => handleWakeOnLan('bios_uefi')}
+              disabled={wakingUp}
+              title="Relay Intel AMT / vPro WS-Management Power-On / Force UEFI Setup via Online Peer on the Same LAN Subnet"
             >
-              <Power size={15} /> AMT Power-On
+              <Power size={15} /> Peer-Relayed AMT Boot
             </button>
           )}
 
-          {device.status === 'online' && (
+          {deviceStatus === 'online' && (
             <button
               className="btn-glass"
               style={{ background: 'rgba(56, 189, 248, 0.12)', color: '#38bdf8', border: '1px solid rgba(56, 189, 248, 0.3)' }}
@@ -411,7 +414,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
             </button>
           )}
 
-          {device.status === 'online' && (
+          {deviceStatus === 'online' && (
             <button
               className="btn-glass"
               style={{
@@ -471,6 +474,66 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
           >
             Dismiss
           </button>
+        </div>
+      )}
+
+      {/* 5-Tier Peer-Relayed Wake-on-LAN & Intel AMT Execution Trace Card */}
+      {wolChainResult?.stages && (
+        <div className="glass-card" style={{ border: '1px solid rgba(56, 189, 248, 0.35)', background: 'rgba(15, 23, 42, 0.8)' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.85rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+              <Network size={18} color="#38bdf8" />
+              <strong style={{ fontSize: '0.95rem', color: '#f8fafc' }}>
+                5-Tier Same-Company &amp; Same-Network Peer Reachability Chain — {wolChainResult.targetHostname} ({wolChainResult.targetIp})
+              </strong>
+              <span className="status-pill status-online" style={{ fontSize: '0.7rem' }}>
+                {wolChainResult.bootTarget || 'Verified Online'}
+              </span>
+            </div>
+            <button
+              className="btn-glass"
+              style={{ padding: '0.2rem 0.6rem', fontSize: '0.72rem' }}
+              onClick={() => setWolChainResult(null)}
+            >
+              Hide Trace
+            </button>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.55rem' }}>
+            {wolChainResult.stages.map((st) => (
+              <div
+                key={st.tier}
+                style={{
+                  padding: '0.65rem 0.9rem',
+                  borderRadius: '8px',
+                  background: 'rgba(0, 0, 0, 0.28)',
+                  borderLeft: `3px solid ${st.status === 'success' ? '#10b981' : st.status === 'escalated' ? '#f59e0b' : '#64748b'}`,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '0.25rem'
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                    <span style={{ fontWeight: 700, fontSize: '0.82rem', color: '#e2e8f0' }}>{st.name}</span>
+                    <span className="status-pill" style={{ fontSize: '0.68rem', background: 'rgba(56, 189, 248, 0.14)', color: '#38bdf8' }}>
+                      {st.protocol}
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem', fontSize: '0.74rem' }}>
+                    <span style={{ color: 'var(--text-dim)' }}>Relay: <strong style={{ color: '#cbd5e1' }}>{st.relayHost}</strong></span>
+                    <span style={{ color: '#10b981', fontWeight: 600 }}>{st.latencyMs} ms</span>
+                    <span
+                      className={`status-pill ${st.status === 'success' ? 'status-online' : 'status-reboot'}`}
+                      style={{ fontSize: '0.68rem' }}
+                    >
+                      {st.status.toUpperCase()}
+                    </span>
+                  </div>
+                </div>
+                <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>{st.detail}</div>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 

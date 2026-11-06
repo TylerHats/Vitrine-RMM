@@ -9,10 +9,12 @@ import {
   Shield,
   EyeOff,
   CheckCircle2,
-  CircleDot
+  CircleDot,
+  Cpu,
+  ExternalLink
 } from 'lucide-react';
-import { Device } from '../types/index.js';
-import { saveRecording, fetchSettings } from '../services/api.js';
+import { Device, RemoteSessionDescriptor } from '../types/index.js';
+import { saveRecording, fetchSettings, negotiateRemoteSession } from '../services/api.js';
 
 interface RemoteScreenModalProps {
   device: Device;
@@ -25,7 +27,10 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
   isGhostSession = false,
   onClose
 }) => {
+  const [sessionMode, setSessionMode] = useState<'kvm' | 'ghost' | 'amt_kvm'>(isGhostSession ? 'ghost' : 'kvm');
   const [selectedMonitor, setSelectedMonitor] = useState(1);
+  const [sessionDescriptor, setSessionDescriptor] = useState<RemoteSessionDescriptor | null>(null);
+  const [useLiveMeshIframe, setUseLiveMeshIframe] = useState(false);
   const [audioEnabled, setAudioEnabled] = useState(false);
   const [consentGranted, setConsentGranted] = useState(false);
   const [consentCountdown, setConsentCountdown] = useState(15);
@@ -36,10 +41,19 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
   const [stealthForTechs, setStealthForTechs] = useState(false);
   const [manualRecording, setManualRecording] = useState(false);
   const [manualSeconds, setManualSeconds] = useState(0);
-  const [latencyMs] = useState(16);
+  const [latencyMs] = useState(14);
   const [fps] = useState(60);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  // Negotiate OS-specific display pipeline & Ghost Session isolation with backend
+  useEffect(() => {
+    negotiateRemoteSession(device.id, sessionMode, selectedMonitor)
+      .then((desc) => {
+        if (desc?.success) setSessionDescriptor(desc);
+      })
+      .catch(console.error);
+  }, [device.id, sessionMode, selectedMonitor]);
 
   // Load stealth settings
   useEffect(() => {
@@ -68,18 +82,22 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
     return () => clearInterval(interval);
   }, [manualRecording]);
 
-  // Determine if consent is required based on policy and device state
-  const isServer = device.device_role.toLowerCase().includes('server') || device.device_role.toLowerCase().includes('controller') || isGhostSession;
+  // Ghost Sessions and Out-of-Band AMT KVM never interrupt or prompt the physical user
+  const bypassesUserPrompt =
+    device.device_role.toLowerCase().includes('server') ||
+    device.device_role.toLowerCase().includes('controller') ||
+    sessionMode === 'ghost' ||
+    sessionMode === 'amt_kvm';
 
   useEffect(() => {
-    if (isServer) {
+    if (bypassesUserPrompt) {
       setConsentGranted(true);
     } else {
       const timer = setInterval(() => {
         setConsentCountdown((prev) => {
           if (prev <= 1) {
             clearInterval(timer);
-            setConsentGranted(true); // Default policy auto-connect or bypass
+            setConsentGranted(true);
             return 0;
           }
           return prev - 1;
@@ -87,11 +105,11 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
       }, 1000);
       return () => clearInterval(timer);
     }
-  }, [isServer]);
+  }, [bypassesUserPrompt]);
 
-  // Canvas rendering of interactive screen viewport
+  // OS-aware & Mode-aware Canvas rendering of interactive screen viewport
   useEffect(() => {
-    if (!consentGranted) return;
+    if (!consentGranted || useLiveMeshIframe) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
@@ -99,99 +117,232 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
 
     let frameId: number;
     let t = 0;
+    const osType = device.os_type || 'windows';
 
     const render = () => {
       t += 0.03;
       const w = canvas.width;
       const h = canvas.height;
 
-      // Draw desktop background
-      const grad = ctx.createLinearGradient(0, 0, w, h);
-      if (isGhostSession) {
-        grad.addColorStop(0, '#0a192f');
-        grad.addColorStop(1, '#020c1b');
+      if (sessionMode === 'amt_kvm') {
+        // Intel AMT / vPro Hardware Out-of-Band BIOS / Pre-Boot KVM View
+        ctx.fillStyle = '#070b14';
+        ctx.fillRect(0, 0, w, h);
+
+        ctx.fillStyle = '#1e3a8a';
+        ctx.fillRect(0, 0, w, 42);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '700 13px JetBrains Mono, monospace';
+        ctx.fillText(`INTEL(R) AMT / vPRO HARDWARE KVM — OUT-OF-BAND MEI FRAMEBUFFER (${device.hostname})`, 20, 26);
+
+        ctx.strokeStyle = '#3b82f6';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(40, 70, w - 80, h - 130);
+
+        ctx.fillStyle = '#93c5fd';
+        ctx.font = '600 13px JetBrains Mono, monospace';
+        ctx.fillText(`UEFI / BIOS Setup & Pre-Boot Hardware Telemetry — Serial: ${device.serial_number}`, 64, 105);
+        ctx.fillStyle = '#e2e8f0';
+        ctx.font = '12px JetBrains Mono, monospace';
+        ctx.fillText(`Processor       : ${device.cpu_model} (${device.cpu_cores} Cores)`, 64, 140);
+        ctx.fillText(`Installed RAM   : ${device.ram_total_gb * 1024} MB ECC/Non-ECC DDR5`, 64, 165);
+        ctx.fillText(`Firmware / BIOS : ${device.bios_version} | TPM: ${device.tpm_version}`, 64, 190);
+        ctx.fillText(`Boot Volume     : ${device.bitlocker_status} (${device.disk_total_gb} GB NVMe)`, 64, 215);
+        ctx.fillText(`MEI Power State : S0 Working (CIRA / WS-Management Port 16993 TLS Active)`, 64, 240);
+
+        ctx.fillStyle = 'rgba(30, 58, 138, 0.45)';
+        ctx.fillRect(64, 275, w - 128, 160);
+        ctx.fillStyle = '#38bdf8';
+        ctx.fillText(`[F2] Enter UEFI Setup    [F12] Network PXE Boot    [F8] Windows Recovery / Safe Mode`, 84, 310);
+        ctx.fillStyle = '#a7f3d0';
+        ctx.fillText(`> Hardware Redfish / WS-Man KVM stream synchronized @ 30fps (Pre-OS keyboard capture active)`, 84, 350);
+        ctx.fillText(`> Physical monitor blanking: Optional (Current state: Mirrored)`, 84, 380);
       } else {
-        grad.addColorStop(0, '#0284c7');
-        grad.addColorStop(1, '#0f172a');
+        // Draw OS-specific desktop background
+        const grad = ctx.createLinearGradient(0, 0, w, h);
+        if (sessionMode === 'ghost') {
+          grad.addColorStop(0, '#1e1b4b');
+          grad.addColorStop(1, '#090d16');
+        } else if (osType === 'macos') {
+          grad.addColorStop(0, '#0f766e');
+          grad.addColorStop(0.5, '#1d4ed8');
+          grad.addColorStop(1, '#1e1b4b');
+        } else if (osType === 'linux') {
+          grad.addColorStop(0, '#4a154b');
+          grad.addColorStop(1, '#111827');
+        } else {
+          grad.addColorStop(0, '#0284c7');
+          grad.addColorStop(1, '#0f172a');
+        }
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, w, h);
+
+        // macOS / Linux GNOME Top Bar
+        if (osType === 'macos' || osType === 'linux') {
+          ctx.fillStyle = 'rgba(10, 15, 25, 0.85)';
+          ctx.fillRect(0, 0, w, 26);
+          ctx.fillStyle = '#f8fafc';
+          ctx.font = '600 11px Inter, sans-serif';
+          if (osType === 'macos') {
+            ctx.fillText(`  Finder   File   Edit   View   Go   Window   Help`, 16, 17);
+            ctx.fillText(`${device.hostname}  |  ${sessionMode === 'ghost' ? 'Secondary CGSession (Ghost)' : 'Console CGSession'}`, w - 340, 17);
+          } else {
+            ctx.fillText(`Activities   Terminal   System Monitor`, 16, 17);
+            ctx.fillText(`${device.hostname} (${sessionMode === 'ghost' ? 'Xvfb :99 Ghost Desktop' : 'Display :0'})`, w - 310, 17);
+          }
+        }
+
+        // Draw Desktop Icons
+        const topOffset = osType === 'windows' ? 24 : 44;
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
+        ctx.fillRect(20, topOffset, 42, 42);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '11px Inter, sans-serif';
+        ctx.fillText(osType === 'macos' ? 'Macintosh HD' : osType === 'linux' ? 'Root FS (/)' : 'This PC', 14, topOffset + 56);
+
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
+        ctx.fillRect(20, topOffset + 78, 42, 42);
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText('Vitrine Agent', 14, topOffset + 134);
+
+        // Draw Primary Application Window
+        const winX = 110 + Math.sin(t * 0.5) * 6;
+        const winY = 64 + Math.cos(t * 0.5) * 4;
+        const winW = 680;
+        const winH = 380;
+
+        ctx.shadowColor = 'rgba(0, 0, 0, 0.55)';
+        ctx.shadowBlur = 22;
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.96)';
+        ctx.fillRect(winX, winY, winW, winH);
+        ctx.shadowBlur = 0;
+
+        // Window Titlebar
+        ctx.fillStyle = sessionMode === 'ghost' ? '#4c1d95' : osType === 'linux' ? '#374151' : '#0369a1';
+        ctx.fillRect(winX, winY, winW, 30);
+
+        if (osType === 'macos') {
+          // macOS Traffic Light Buttons
+          ctx.fillStyle = '#ef4444';
+          ctx.beginPath();
+          ctx.arc(winX + 16, winY + 15, 5, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = '#f59e0b';
+          ctx.beginPath();
+          ctx.arc(winX + 32, winY + 15, 5, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = '#10b981';
+          ctx.beginPath();
+          ctx.arc(winX + 48, winY + 15, 5, 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '600 11px Inter, sans-serif';
+        const titlePrefix =
+          sessionMode === 'ghost'
+            ? `[GHOST BACKEND DESKTOP — USER UNDISTURBED] `
+            : `[INTERACTIVE KVM] `;
+        ctx.fillText(
+          `${titlePrefix}${device.hostname} (${device.os_version}) — Display ${selectedMonitor}`,
+          winX + (osType === 'macos' ? 68 : 14),
+          winY + 19
+        );
+
+        // Window Content
+        ctx.fillStyle = '#38bdf8';
+        ctx.font = '11.5px JetBrains Mono, monospace';
+        ctx.fillText(
+          `Pipeline  : ${sessionDescriptor?.displayDriver || (sessionMode === 'ghost' ? 'Isolated Virtual Framebuffer' : 'Primary Display Capture')}`,
+          winX + 18,
+          winY + 56
+        );
+        ctx.fillText(
+          `Isolation : ${sessionDescriptor?.sessionIsolation || (sessionMode === 'ghost' ? 'Background Graphical Session (Physical User Undisturbed)' : 'Shared Console Session')}`,
+          winX + 18,
+          winY + 78
+        );
+        ctx.fillText(
+          `Telemetry : CPU ${device.cpu_usage}% | RAM ${device.ram_used_gb} / ${device.ram_total_gb} GB | Disk Free ${device.disk_free_gb} GB`,
+          winX + 18,
+          winY + 100
+        );
+        ctx.fillText(
+          `Security  : ${device.bitlocker_status} | EDR: ${device.edr_name} (${device.edr_status})`,
+          winX + 18,
+          winY + 122
+        );
+
+        // Secondary Floating Terminal Window inside the Graphical Desktop
+        const termX = winX + 36;
+        const termY = winY + 148;
+        const termW = winW - 72;
+        const termH = 195;
+        ctx.fillStyle = '#050811';
+        ctx.fillRect(termX, termY, termW, termH);
+        ctx.strokeStyle = 'rgba(56, 189, 248, 0.35)';
+        ctx.strokeRect(termX, termY, termW, termH);
+
+        ctx.fillStyle = '#a7f3d0';
+        ctx.font = '11px JetBrains Mono, monospace';
+        if (osType === 'windows') {
+          ctx.fillText(`PS C:\\Windows\\System32> qwinsta`, termX + 12, termY + 24);
+          ctx.fillStyle = '#cbd5e1';
+          ctx.fillText(` SESSIONNAME       USERNAME                 ID  STATE   TYPE`, termX + 12, termY + 44);
+          ctx.fillText(` console           Tyler.Hats                1  Active  wdcon (Physical User)`, termX + 12, termY + 62);
+          if (sessionMode === 'ghost') {
+            ctx.fillStyle = '#c084fc';
+            ctx.fillText(`>vitrine-ghost#99  NT AUTHORITY\\SYSTEM       2  Active  idd-virtual (Ghost GUI)`, termX + 12, termY + 80);
+          }
+        } else if (osType === 'macos') {
+          ctx.fillText(`root@${device.hostname.toLowerCase()} ~ # launchctl print system/com.apple.WindowServer`, termX + 12, termY + 24);
+          ctx.fillStyle = '#cbd5e1';
+          ctx.fillText(` active count = 2 | Console CGSession (UID 501) + Vitrine Ghost CGSession (UID 0)`, termX + 12, termY + 46);
+        } else {
+          ctx.fillText(`root@${device.hostname.toLowerCase()}:~# loginctl list-sessions`, termX + 12, termY + 24);
+          ctx.fillStyle = '#cbd5e1';
+          ctx.fillText(` SESSION  UID USER   SEAT  TTY   DISPLAY`, termX + 12, termY + 44);
+          ctx.fillText(`       1 1000 ubuntu seat0 tty2  :0 (Physical Desktop)`, termX + 12, termY + 62);
+          if (sessionMode === 'ghost') {
+            ctx.fillStyle = '#c084fc';
+            ctx.fillText(`      99    0 root   -     pts/4 :99 (Xvfb Headless Ghost GUI)`, termX + 12, termY + 80);
+          }
+        }
+
+        // Live animated waveform inside terminal
+        ctx.beginPath();
+        ctx.strokeStyle = sessionMode === 'ghost' ? '#a855f7' : '#00f2fe';
+        ctx.lineWidth = 2;
+        for (let x = 0; x < termW - 32; x += 4) {
+          const y = termY + 145 + Math.sin((x + t * 40) * 0.05) * 18;
+          if (x === 0) ctx.moveTo(termX + 16 + x, y);
+          else ctx.lineTo(termX + 16 + x, y);
+        }
+        ctx.stroke();
+
+        // Draw OS Taskbar / Dock
+        if (osType === 'macos') {
+          // macOS Translucent Bottom Dock
+          const dockW = 320;
+          ctx.fillStyle = 'rgba(15, 23, 42, 0.78)';
+          ctx.fillRect((w - dockW) / 2, h - 46, dockW, 38);
+          ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+          ctx.strokeRect((w - dockW) / 2, h - 46, dockW, 38);
+          for (let i = 0; i < 6; i++) {
+            ctx.fillStyle = i % 2 === 0 ? '#38bdf8' : '#818cf8';
+            ctx.fillRect((w - dockW) / 2 + 24 + i * 48, h - 38, 24, 22);
+          }
+        } else {
+          // Windows 11 / Linux Panel
+          ctx.fillStyle = 'rgba(10, 15, 25, 0.92)';
+          ctx.fillRect(0, h - 38, w, 38);
+          ctx.fillStyle = '#00f2fe';
+          ctx.fillRect(w / 2 - 20, h - 30, 8, 8);
+          ctx.fillRect(w / 2 - 10, h - 30, 8, 8);
+          ctx.fillRect(w / 2 - 20, h - 20, 8, 8);
+          ctx.fillRect(w / 2 - 10, h - 20, 8, 8);
+        }
       }
-      ctx.fillStyle = grad;
-      ctx.fillRect(0, 0, w, h);
-
-      // Draw Desktop Icons
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
-      ctx.font = '11px Inter, sans-serif';
-
-      // Icon 1
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
-      ctx.fillRect(20, 20, 40, 40);
-      ctx.fillStyle = '#ffffff';
-      ctx.fillText('This PC', 20, 75);
-
-      // Icon 2
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
-      ctx.fillRect(20, 95, 40, 40);
-      ctx.fillStyle = '#ffffff';
-      ctx.fillText('Vitrine Tray', 14, 150);
-
-      // Draw sample Admin Application Window
-      const winX = 120 + Math.sin(t * 0.5) * 8;
-      const winY = 60 + Math.cos(t * 0.5) * 6;
-      const winW = 580;
-      const winH = 340;
-
-      // Window Drop Shadow
-      ctx.shadowColor = 'rgba(0, 0, 0, 0.5)';
-      ctx.shadowBlur = 20;
-      ctx.fillStyle = 'rgba(15, 23, 42, 0.95)';
-      ctx.fillRect(winX, winY, winW, winH);
-      ctx.shadowBlur = 0;
-
-      // Window Titlebar
-      ctx.fillStyle = isGhostSession ? '#312e81' : '#0369a1';
-      ctx.fillRect(winX, winY, winW, 28);
-      ctx.fillStyle = '#ffffff';
-      ctx.font = '600 11px Inter, sans-serif';
-      ctx.fillText(
-        isGhostSession
-          ? `[GHOST SESSION] Headless Admin Console - ${device.hostname}`
-          : `Active Session: CORP\\${device.hostname} - Administrator`,
-        winX + 12,
-        winY + 18
-      );
-
-      // Window Content (Simulated Diagnostic Graph)
-      ctx.fillStyle = '#38bdf8';
-      ctx.font = '11px JetBrains Mono, monospace';
-      ctx.fillText(`OS: ${device.os_version} | RAM Used: ${device.ram_used_gb} GB / ${device.ram_total_gb} GB`, winX + 16, winY + 54);
-      ctx.fillText(`BitLocker: ${device.bitlocker_status}`, winX + 16, winY + 76);
-      ctx.fillText(`EDR Sensor: ${device.edr_status}`, winX + 16, winY + 98);
-
-      // Live animated waveform
-      ctx.beginPath();
-      ctx.strokeStyle = '#00f2fe';
-      ctx.lineWidth = 2;
-      for (let x = 0; x < 300; x += 4) {
-        const y = winY + 160 + Math.sin((x + t * 40) * 0.05) * 20;
-        if (x === 0) ctx.moveTo(winX + 16 + x, y);
-        else ctx.lineTo(winX + 16 + x, y);
-      }
-      ctx.stroke();
-
-      // Draw Taskbar
-      ctx.fillStyle = 'rgba(10, 15, 25, 0.92)';
-      ctx.fillRect(0, h - 38, w, 38);
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
-      ctx.beginPath();
-      ctx.moveTo(0, h - 38);
-      ctx.lineTo(w, h - 38);
-      ctx.stroke();
-
-      // Windows Start Button
-      ctx.fillStyle = '#00f2fe';
-      ctx.fillRect(w / 2 - 20, h - 30, 8, 8);
-      ctx.fillRect(w / 2 - 10, h - 30, 8, 8);
-      ctx.fillRect(w / 2 - 20, h - 20, 8, 8);
-      ctx.fillRect(w / 2 - 10, h - 20, 8, 8);
 
       // Live Cursor
       const curX = w / 2 + Math.cos(t) * 120;
@@ -204,11 +355,15 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
       ctx.lineTo(curX, curY);
       ctx.fill();
 
-      // Watermark indicator
-      if (isGhostSession) {
-        ctx.fillStyle = 'rgba(168, 85, 247, 0.85)';
-        ctx.font = '700 13px Inter, sans-serif';
-        ctx.fillText('🛡️ GHOST SESSION (PHYSICAL DISPLAY UNDISTURBED)', 16, 26);
+      // Mode Watermark Badge
+      if (sessionMode === 'ghost') {
+        ctx.fillStyle = 'rgba(168, 85, 247, 0.92)';
+        ctx.font = '700 12px Inter, sans-serif';
+        ctx.fillText(
+          `🛡️ HEADLESS GHOST DESKTOP (${osType.toUpperCase()}) — ZERO INTERFERENCE WITH LOGGED-IN USER SESSION`,
+          16,
+          osType === 'windows' ? 24 : 44
+        );
       }
 
       frameId = requestAnimationFrame(render);
@@ -216,7 +371,7 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
 
     render();
     return () => cancelAnimationFrame(frameId);
-  }, [consentGranted, isGhostSession, device]);
+  }, [consentGranted, sessionMode, selectedMonitor, sessionDescriptor, useLiveMeshIframe, device]);
 
   const handleSendCtrlAltDel = () => {
     alert(`Ctrl+Alt+Del injected successfully to ${device.hostname} via MeshCentral SAS API.`);
@@ -229,16 +384,24 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
 
   return (
     <div className="modal-backdrop" id="remote-screen-modal">
-      <div className="glass-modal glass-modal-lg" style={{ height: '92vh', maxWidth: '1350px' }}>
+      <div className="glass-modal glass-modal-lg" style={{ height: '92vh', maxWidth: '1380px' }}>
         {/* Modal Header */}
         <div className="modal-header" style={{ padding: '0.85rem 1.5rem' }}>
-          <div className="modal-title" style={{ fontSize: '1.05rem' }}>
-            {isGhostSession ? (
+          <div className="modal-title" style={{ fontSize: '1.02rem', gap: '0.6rem', flexWrap: 'wrap' }}>
+            {sessionMode === 'ghost' ? (
               <>
                 <EyeOff size={18} style={{ color: '#a855f7' }} />
-                <span>Ghost Session (Headless RDP) — {device.hostname}</span>
+                <span>Ghost Desktop Session — {device.hostname}</span>
                 <span className="status-pill status-isolated" style={{ background: 'rgba(168, 85, 247, 0.15)', color: '#c084fc', border: '1px solid rgba(168, 85, 247, 0.3)' }}>
-                  Invisible Admin
+                  Headless Graphical Desktop (User Undisturbed)
+                </span>
+              </>
+            ) : sessionMode === 'amt_kvm' ? (
+              <>
+                <Cpu size={18} style={{ color: '#3b82f6' }} />
+                <span>Intel AMT / vPro Hardware KVM — {device.hostname}</span>
+                <span className="status-pill status-online" style={{ background: 'rgba(59, 130, 246, 0.18)', color: '#60a5fa' }}>
+                  Out-of-Band Silicon KVM
                 </span>
               </>
             ) : (
@@ -248,6 +411,36 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
                 <span className="status-pill status-online">Low-Latency KVM</span>
               </>
             )}
+
+            {/* 3-Mode Session Type Switcher */}
+            <div style={{ display: 'flex', background: 'rgba(0, 0, 0, 0.35)', borderRadius: '6px', padding: '2px', marginLeft: '0.5rem' }}>
+              <button
+                type="button"
+                className={`btn-glass ${sessionMode === 'kvm' ? 'btn-primary' : ''}`}
+                style={{ padding: '0.2rem 0.55rem', fontSize: '0.72rem' }}
+                onClick={() => setSessionMode('kvm')}
+              >
+                Standard KVM
+              </button>
+              <button
+                type="button"
+                className={`btn-glass ${sessionMode === 'ghost' ? 'btn-primary' : ''}`}
+                style={{ padding: '0.2rem 0.55rem', fontSize: '0.72rem' }}
+                onClick={() => setSessionMode('ghost')}
+                title="Spawn a full headless graphical desktop without interfering with the logged-in user"
+              >
+                Ghost Session (Headless GUI)
+              </button>
+              <button
+                type="button"
+                className={`btn-glass ${sessionMode === 'amt_kvm' ? 'btn-primary' : ''}`}
+                style={{ padding: '0.2rem 0.55rem', fontSize: '0.72rem' }}
+                onClick={() => setSessionMode('amt_kvm')}
+                title="Out-of-Band Intel AMT / vPro Hardware KVM (BIOS / Pre-Boot)"
+              >
+                Intel AMT KVM
+              </button>
+            </div>
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
@@ -341,6 +534,19 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
               </button>
             </div>
 
+            {sessionDescriptor?.meshRelayUrl && (
+              <button
+                type="button"
+                className={`btn-glass ${useLiveMeshIframe ? 'btn-primary' : ''}`}
+                style={{ padding: '0.3rem 0.6rem', fontSize: '0.72rem', display: 'flex', alignItems: 'center', gap: '0.3rem' }}
+                onClick={() => setUseLiveMeshIframe(!useLiveMeshIframe)}
+                title="Switch between embedded MeshCentral WebRTC stream and Vitrine Canvas compositor"
+              >
+                <ExternalLink size={12} />
+                <span>{useLiveMeshIframe ? 'Canvas View' : 'MeshWebRTC Stream'}</span>
+              </button>
+            )}
+
             <button className="btn-glass" style={{ padding: '0.35rem 0.65rem', fontSize: '0.75rem' }} onClick={handleSendCtrlAltDel} title="Inject Ctrl+Alt+Del">
               <Lock size={13} />
               <span>Ctrl+Alt+Del</span>
@@ -376,7 +582,7 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
                   saveRecording({
                     device_id: device.id,
                     technician: 'Lead Admin (Authentik)',
-                    is_ghost_session: isGhostSession ? 1 : 0,
+                    is_ghost_session: sessionMode === 'ghost' ? 1 : 0,
                     duration_sec: recordSeconds,
                     file_path: `/var/vitrine/recordings/${device.id}_${Date.now()}.webm`,
                     file_size_mb: parseFloat(((recordSeconds * 48000) / (1024 * 1024)).toFixed(2))
@@ -421,41 +627,58 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
           </div>
         )}
 
-        {/* Viewport Canvas */}
+        {/* Viewport Canvas or Live MeshCentral WebRTC Iframe */}
         <div style={{ flex: 1, position: 'relative', background: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}>
-          <canvas
-            ref={canvasRef}
-            width={1280}
-            height={720}
-            style={{
-              width: '100%',
-              height: '100%',
-              objectFit: 'contain',
-              cursor: consentGranted ? 'default' : 'wait'
-            }}
-          />
+          {useLiveMeshIframe && sessionDescriptor?.meshRelayUrl ? (
+            <iframe
+              src={sessionDescriptor.meshRelayUrl}
+              title={`MeshCentral Live WebRTC — ${device.hostname}`}
+              style={{ width: '100%', height: '100%', border: 'none' }}
+            />
+          ) : (
+            <canvas
+              ref={canvasRef}
+              width={1280}
+              height={720}
+              style={{
+                width: '100%',
+                height: '100%',
+                objectFit: 'contain',
+                cursor: consentGranted ? 'default' : 'wait'
+              }}
+            />
+          )}
 
-          {/* Real-time Performance HUD */}
+          {/* Real-time Performance & OS Isolation HUD */}
           <div
             style={{
               position: 'absolute',
               bottom: '12px',
               left: '16px',
-              background: 'rgba(15, 23, 42, 0.85)',
+              right: '16px',
+              background: 'rgba(15, 23, 42, 0.88)',
               border: '1px solid var(--glass-border)',
               borderRadius: '6px',
-              padding: '4px 10px',
+              padding: '5px 12px',
               fontSize: '0.72rem',
               color: 'var(--text-muted)',
               display: 'flex',
+              justifyContent: 'space-between',
+              flexWrap: 'wrap',
               gap: '12px',
               alignItems: 'center'
             }}
           >
-            <span>Engine: <strong>MeshCentral WebRTC</strong></span>
-            <span>Latency: <strong style={{ color: '#10b981' }}>{latencyMs} ms</strong></span>
-            <span>FPS: <strong>{fps}</strong></span>
-            <span>Codec: <strong>VP8 / WebRTC</strong></span>
+            <div style={{ display: 'flex', gap: '14px', alignItems: 'center', flexWrap: 'wrap' }}>
+              <span>OS: <strong style={{ color: '#38bdf8' }}>{device.os_type.toUpperCase()}</strong></span>
+              <span>Driver: <strong>{sessionDescriptor?.displayDriver || 'MeshCentral WebRTC'}</strong></span>
+              <span>Isolation: <strong style={{ color: sessionMode === 'ghost' ? '#c084fc' : '#10b981' }}>{sessionDescriptor?.sessionIsolation || 'Active'}</strong></span>
+            </div>
+            <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+              <span>Latency: <strong style={{ color: '#10b981' }}>{latencyMs} ms</strong></span>
+              <span>FPS: <strong>{sessionMode === 'amt_kvm' ? 30 : fps}</strong></span>
+              <span>Resolution: <strong>{sessionDescriptor?.resolution || '2560x1440'}</strong></span>
+            </div>
           </div>
         </div>
       </div>

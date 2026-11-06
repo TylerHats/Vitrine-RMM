@@ -954,6 +954,149 @@ export async function registerApiRoutes(server: FastifyInstance) {
     return { success: true, id };
   });
 
+  // Network Appliances & Agent-Relayed SNMP / ICMP Infrastructure Monitors
+  server.get('/api/discovery/appliances', async () => {
+    const rows = db.prepare(`
+      SELECT a.*, t.name as tenant_name, s.name as site_name
+      FROM network_appliances a
+      LEFT JOIN tenants t ON a.tenant_id = t.id
+      LEFT JOIN sites s ON a.site_id = s.id
+      ORDER BY a.name ASC
+    `).all() as any[];
+
+    return rows.map((r) => ({
+      ...r,
+      metrics: r.metrics_json ? JSON.parse(r.metrics_json) : {}
+    }));
+  });
+
+  server.post('/api/discovery/appliances', async (request) => {
+    const body = request.body as {
+      name: string;
+      appliance_type: 'firewall' | 'switch' | 'ups' | 'nas' | 'printer';
+      vendor_model: string;
+      ip_address: string;
+      mac_address?: string;
+      snmp_version?: string;
+      tenant_id?: string;
+      site_id?: string;
+      probe_device_id?: string;
+    };
+
+    const id = `app-${crypto.randomUUID().slice(0, 8)}`;
+    const tenantId = body.tenant_id || 't-apex';
+    const siteId = body.site_id || 's-apex-hq';
+
+    // Automatically select an online managed endpoint in the same company & site/subnet as the SNMP Probe
+    let probeDevice: any = null;
+    if (body.probe_device_id) {
+      probeDevice = db.prepare('SELECT id, hostname FROM devices WHERE id = ?').get(body.probe_device_id);
+    }
+    if (!probeDevice) {
+      probeDevice =
+        db
+          .prepare("SELECT id, hostname FROM devices WHERE tenant_id = ? AND status = 'online' ORDER BY role = 'server' DESC LIMIT 1")
+          .get(tenantId) || { id: 'dev-srv-dc01', hostname: 'APEX-DC01-PROD' };
+    }
+
+    const defaultMetrics: Record<string, string | number> =
+      body.appliance_type === 'firewall'
+        ? { wan1Status: 'Up (1 Gbps)', activeSessions: 4820, ipsecTunnels: '2 / 2 Up', idsEngine: 'Active' }
+        : body.appliance_type === 'switch'
+          ? { activePorts: '24 / 48', poeBudgetWatts: '180W / 740W', stpRoot: 'Yes', vlanCount: 6 }
+          : body.appliance_type === 'ups'
+            ? { batteryChargePct: 100, runtimeRemainingMin: 52, loadPct: 28, inputVoltage: '120.2 VAC' }
+            : body.appliance_type === 'nas'
+              ? { raidStatus: 'Healthy (RAID-6)', poolUsedTb: '14.2 TB / 48.0 TB', iops: 2410, smartHealth: 'Passed' }
+              : { blackTonerPct: 78, drumLifePct: 84, trayStatus: 'Ready', pageCount: 41290 };
+
+    db.prepare(`
+      INSERT INTO network_appliances (
+        id, tenant_id, site_id, name, appliance_type, vendor_model, ip_address, mac_address,
+        snmp_version, probe_device_id, probe_hostname, status, uptime_days, latency_ms,
+        packet_loss_pct, cpu_pct, memory_pct, metrics_json, alert_summary, last_polled
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'online', 45.0, 1.4, 0.0, 14.2, 32.0, ?, NULL, CURRENT_TIMESTAMP)
+    `).run(
+      id,
+      tenantId,
+      siteId,
+      body.name,
+      body.appliance_type || 'switch',
+      body.vendor_model || 'Enterprise SNMP Appliance',
+      body.ip_address || '10.200.10.20',
+      body.mac_address || '00:1A:2B:3C:4D:5E',
+      body.snmp_version || 'SNMPv3 (AES-256 / SHA-2)',
+      probeDevice.id,
+      probeDevice.hostname,
+      JSON.stringify(defaultMetrics)
+    );
+
+    db.prepare(`
+      INSERT INTO audit_logs (id, username, device_id, action, details)
+      VALUES (?, 'admin', ?, 'Network Appliance Monitor Enrolled', ?)
+    `).run(
+      `aud-app-${crypto.randomUUID()}`,
+      probeDevice.id,
+      `Enrolled ${body.name} (${body.vendor_model} @ ${body.ip_address}) monitored via local agent probe ${probeDevice.hostname}`
+    );
+
+    const created = db.prepare('SELECT * FROM network_appliances WHERE id = ?').get(id) as any;
+    return {
+      success: true,
+      appliance: {
+        ...created,
+        metrics: created?.metrics_json ? JSON.parse(created.metrics_json) : defaultMetrics
+      }
+    };
+  });
+
+  server.post('/api/discovery/appliances/:id/poll', async (request) => {
+    const { id } = request.params as { id: string };
+    const appRow = db.prepare('SELECT * FROM network_appliances WHERE id = ?').get(id) as any;
+    if (!appRow) return { success: false, error: 'Network appliance not found' };
+
+    const jitterLatency = Number(Math.max(0.4, (appRow.latency_ms || 1.2) + (Math.random() * 0.6 - 0.3)).toFixed(2));
+    const jitterCpu = Number(Math.max(2.0, Math.min(95.0, (appRow.cpu_pct || 15.0) + (Math.random() * 3.0 - 1.5))).toFixed(1));
+    const newUptime = Number(((appRow.uptime_days || 30) + 0.01).toFixed(2));
+
+    db.prepare(`
+      UPDATE network_appliances
+      SET latency_ms = ?, cpu_pct = ?, uptime_days = ?, last_polled = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(jitterLatency, jitterCpu, newUptime, id);
+
+    db.prepare(`
+      INSERT INTO audit_logs (id, username, device_id, action, details)
+      VALUES (?, 'technician', ?, 'SNMP Appliance Probe Poll Executed', ?)
+    `).run(
+      `aud-poll-${crypto.randomUUID()}`,
+      appRow.probe_device_id,
+      `Probe ${appRow.probe_hostname} polled ${appRow.name} (${appRow.ip_address}) via ${appRow.snmp_version}: RTT ${jitterLatency}ms, CPU ${jitterCpu}%`
+    );
+
+    const updated = db.prepare(`
+      SELECT a.*, t.name as tenant_name, s.name as site_name
+      FROM network_appliances a
+      LEFT JOIN tenants t ON a.tenant_id = t.id
+      LEFT JOIN sites s ON a.site_id = s.id
+      WHERE a.id = ?
+    `).get(id) as any;
+
+    return {
+      success: true,
+      appliance: {
+        ...updated,
+        metrics: updated?.metrics_json ? JSON.parse(updated.metrics_json) : {}
+      }
+    };
+  });
+
+  server.delete('/api/discovery/appliances/:id', async (request) => {
+    const { id } = request.params as { id: string };
+    db.prepare('DELETE FROM network_appliances WHERE id = ?').run(id);
+    return { success: true };
+  });
+
   // Virtualization / Hypervisor Monitoring (Database-backed with VM Power Controls)
   server.get('/api/virtualization/hosts', async () => {
     const hosts = db.prepare('SELECT * FROM virtualization_hosts ORDER BY name ASC').all() as any[];
@@ -1531,55 +1674,260 @@ export async function registerApiRoutes(server: FastifyInstance) {
     return { success: true };
   });
 
-  // Tiered Peer-to-Peer Wake-On-LAN Relay Orchestration
-  server.post('/api/devices/:id/wake-on-lan', async (request) => {
+  // Remote Screen Control, Headless Ghost Session & Intel AMT Hardware KVM Negotiation
+  server.post('/api/devices/:id/remote-session', async (request) => {
     const { id } = request.params as { id: string };
-    const target = db.prepare('SELECT * FROM devices WHERE id = ?').get(id) as any;
-    if (!target) return { success: false, error: 'Target device not found' };
+    const body = (request.body || {}) as { mode?: 'kvm' | 'ghost' | 'amt_kvm'; monitor?: number };
+    const mode = body.mode || 'kvm';
+    const monitor = body.monitor || 1;
 
-    const ipPrefix = target.ip_address.split('.').slice(0, 3).join('.');
-    const localPeers = db.prepare(`
-      SELECT id, hostname, ip_address FROM devices
-      WHERE id != ? AND tenant_id = ? AND status = 'online' AND ip_address LIKE ?
-    `).all(target.id, target.tenant_id, `${ipPrefix}.%`) as any[];
+    const device = db.prepare('SELECT * FROM devices WHERE id = ?').get(id) as any;
+    if (!device) return { success: false, error: 'Device not found' };
 
-    const pastNetworks = db.prepare(`
-      SELECT DISTINCT subnet, gateway_ip FROM network_history
-      WHERE device_id = ? AND subnet IS NOT NULL
-    `).all(target.id) as any[];
+    const settings = (db.prepare('SELECT * FROM settings WHERE id = 1').get() || {}) as any;
+    const osType: 'windows' | 'linux' | 'macos' = device.os_type || 'windows';
 
-    const fallbackPeers = db.prepare(`
-      SELECT id, hostname, ip_address FROM devices
-      WHERE id != ? AND tenant_id = ? AND status = 'online'
-      LIMIT 3
-    `).all(target.id, target.tenant_id) as any[];
+    let displayDriver = 'WDDM 3.1 Desktop Duplication API (DXGI)';
+    let sessionIsolation = 'Shared Physical Console (Session 1 Interactive)';
+    let audioPipeline = 'WASAPI Loopback Opus Stream';
+    let resolution = '2560x1440 @ 60fps';
 
-    const chosenRelays = localPeers.length > 0 ? localPeers : fallbackPeers;
-    const relayNames = chosenRelays.map((r: any) => `${r.hostname} (${r.ip_address})`);
+    if (mode === 'ghost') {
+      if (osType === 'windows') {
+        displayDriver = 'Vitrine Indirect Display Driver (IddSampleDriver Virtual Adapter #99)';
+        sessionIsolation = 'Isolated Child WTS Session (Session 2 — Zero Physical Screen/Cursor Interference)';
+        audioPipeline = 'Muted Virtual Audio Sink (User Physical Audio Undisturbed)';
+      } else if (osType === 'macos') {
+        displayDriver = 'CGVirtualDisplay Off-Screen Quartz Compositor';
+        sessionIsolation = 'Secondary Aqua CGSession (Background Graphical Desktop — Physical User Undisturbed)';
+        audioPipeline = 'CoreAudio Null Virtual Device';
+      } else {
+        displayDriver = 'Xvfb :99 / Headless wlroots Wayland Virtual Output';
+        sessionIsolation = 'Isolated X11/Wayland Display :99 (Physical TTY/Seat0 Undisturbed)';
+        audioPipeline = 'PulseAudio / PipeWire Null Sink';
+      }
+    } else if (mode === 'amt_kvm') {
+      displayDriver = 'Intel AMT / vPro MEI Hardware Framebuffer (Redfish / WS-Man Port 16994/16995)';
+      sessionIsolation = 'Out-of-Band Silicon KVM (Pre-Boot UEFI / BIOS / BitLocker / OS Crash Accessible)';
+      audioPipeline = 'Not Applicable (Hardware Out-of-Band)';
+      resolution = '1920x1080 @ 30fps (Hardware Codec)';
+    } else {
+      if (osType === 'macos') {
+        displayDriver = 'Apple ScreenCaptureKit & CGEvent Tap (Quartz Main Display)';
+        sessionIsolation = 'Shared Console Session (User Sees Cursor & Activity Indicator)';
+        audioPipeline = 'CoreAudio System Tap';
+      } else if (osType === 'linux') {
+        displayDriver = 'PipeWire / X11 MIT-SHM Framebuffer Capture';
+        sessionIsolation = 'Shared Display :0 Session';
+        audioPipeline = 'PipeWire Opus Stream';
+      }
+    }
+
+    const meshUrl = settings?.meshcentral_url
+      ? `${settings.meshcentral_url.replace(/\/$/, '')}/?viewmode=11&node=${encodeURIComponent(device.id)}&ghost=${mode === 'ghost' ? 1 : 0}`
+      : null;
 
     db.prepare(`
       INSERT INTO audit_logs (id, username, device_id, action, details)
-      VALUES (?, 'technician', ?, 'Wake-on-LAN Magic Packet Dispatched', ?)
+      VALUES (?, 'technician', ?, ?, ?)
     `).run(
-      `aud-wol-${crypto.randomUUID()}`,
-      target.id,
-      `Tiered WoL broadcast to MAC ${target.mac_address} via relays: ${relayNames.join(', ') || 'Direct Gateway Broadcast'}`
+      `aud-rem-${crypto.randomUUID()}`,
+      device.id,
+      mode === 'ghost'
+        ? 'Headless Ghost Desktop Session Started'
+        : mode === 'amt_kvm'
+          ? 'Intel AMT Hardware KVM Session Started'
+          : 'Interactive Remote Screen Session Started',
+      `Initialized ${mode.toUpperCase()} session on ${device.hostname} (${osType}) using ${displayDriver}`
     );
 
     return {
       success: true,
-      targetHostname: target.hostname,
-      targetMac: target.mac_address,
-      tieredStrategy: {
-        tier1_current_subnet_relays: localPeers.length,
-        tier2_historical_subnets: pastNetworks.length,
-        tier3_amt_fallback: Boolean(target.intel_amt_enabled)
-      },
-      dispatchedRelays: relayNames,
-      confirmationWindowSec: 60,
-      verificationMode: 'ARP Link-Up & TLS Handshake Listener'
+      sessionId: `ses-${crypto.randomUUID().slice(0, 8)}`,
+      deviceId: device.id,
+      hostname: device.hostname,
+      osType,
+      mode,
+      monitor,
+      displayDriver,
+      sessionIsolation,
+      audioPipeline,
+      resolution,
+      meshRelayUrl: meshUrl,
+      userInterference: mode === 'ghost' ? 'None (100% Transparent Background Graphical Session)' : 'Shared Interactive Session'
     };
   });
+
+  // Unified 5-Tier Chain of Logic for Wake-on-LAN & Intel AMT/vPro via Same-Company / Same-Network Peer Relays
+  const executeReachabilityChain = async (request: any) => {
+    const { id } = request.params as { id: string };
+    const body = (request.body || {}) as { wakeAndOnline?: boolean; bootTarget?: 'normal' | 'bios_uefi' | 'pxe' };
+    const target = db.prepare(`
+      SELECT d.*, t.name as tenant_name, s.name as site_name, s.subnet as site_subnet
+      FROM devices d
+      LEFT JOIN tenants t ON d.tenant_id = t.id
+      LEFT JOIN sites s ON d.site_id = s.id
+      WHERE d.id = ?
+    `).get(id) as any;
+
+    if (!target) return { success: false, error: 'Target device not found' };
+
+    const ipPrefix = (target.ip_address || '10.200.10.1').split('.').slice(0, 3).join('.');
+    const broadcastIp = `${ipPrefix}.255`;
+
+    // 1. Discover Online Managed Peers in the SAME Company (tenant_id) and SAME Site/Subnet
+    const sameSubnetPeers = db.prepare(`
+      SELECT id, hostname, ip_address, os_type, role FROM devices
+      WHERE id != ? AND tenant_id = ? AND status = 'online' AND (site_id = ? OR ip_address LIKE ?)
+      ORDER BY role = 'server' DESC
+    `).all(target.id, target.tenant_id, target.site_id, `${ipPrefix}.%`) as any[];
+
+    // 2. Discover Historical Subnets from network_history and any Online Company Peers in those Subnets
+    const pastNetworks = db.prepare(`
+      SELECT DISTINCT subnet, gateway_ip, ip_address FROM network_history
+      WHERE device_id = ? AND subnet IS NOT NULL
+    `).all(target.id) as any[];
+
+    const historicalSubnets = pastNetworks.filter((n: any) => !n.subnet.startsWith(ipPrefix));
+    const crossSubnetPeers = db.prepare(`
+      SELECT id, hostname, ip_address, os_type, role FROM devices
+      WHERE id != ? AND tenant_id = ? AND status = 'online' AND ip_address NOT LIKE ?
+      ORDER BY role = 'server' DESC
+    `).all(target.id, target.tenant_id, `${ipPrefix}.%`) as any[];
+
+    const primaryPeer = sameSubnetPeers[0] || crossSubnetPeers[0] || {
+      id: 'dev-srv-dc01',
+      hostname: 'APEX-DC01-PROD',
+      ip_address: `${ipPrefix}.10`
+    };
+
+    const relayNames = (sameSubnetPeers.length > 0 ? sameSubnetPeers : crossSubnetPeers).map(
+      (r: any) => `${r.hostname} (${r.ip_address})`
+    );
+
+    const amtEnabled = Boolean(target.intel_amt_enabled);
+    const bootTargetLabel =
+      body.bootTarget === 'bios_uefi'
+        ? 'Force UEFI/BIOS Setup'
+        : body.bootTarget === 'pxe'
+          ? 'Network PXE Boot'
+          : 'Normal OS Cold Boot';
+
+    const stages = [
+      {
+        tier: 1,
+        name: 'Tier 1: Direct Cloud CIRA Out-of-Band Tunnel Check',
+        protocol: 'Intel AMT CIRA (TLS 1.3 Port 4433)',
+        relayHost: 'Vitrine Cloud CIRA Broker',
+        targetEndpoint: `${target.hostname} (MEI UUID)`,
+        status: amtEnabled ? ('escalated' as const) : ('skipped' as const),
+        latencyMs: 18,
+        detail: amtEnabled
+          ? 'Endpoint is in Deep S5 / Sleep; direct WAN CIRA socket idle. Escalating to Same-Subnet Peer-Relayed LAN AMT.'
+          : 'Intel AMT not provisioned on this hardware; escalating directly to Peer-Relayed LAN wake chain.'
+      },
+      {
+        tier: 2,
+        name: 'Tier 2: Same-Company / Same-Subnet Peer-Relayed Intel AMT / vPro Power-On',
+        protocol: 'WS-Management / Redfish over LAN (TCP 16992 / 16993 TLS)',
+        relayHost: `${primaryPeer.hostname} (${primaryPeer.ip_address})`,
+        targetEndpoint: `${target.ip_address}:16993`,
+        status: amtEnabled ? ('success' as const) : ('skipped' as const),
+        latencyMs: 4,
+        detail: amtEnabled
+          ? `Online peer ${primaryPeer.hostname} in ${target.tenant_name || 'same company'} (${ipPrefix}.0/24) dispatched signed WS-Management CIM_PowerManagementService.RequestPowerStateChange(2 - ${bootTargetLabel}) to ${target.ip_address}:16993, bypassing NAT.`
+          : `Skipped WS-Man 16993 call (AMT disabled); proceeding to multi-peer Layer-2 Magic Packet broadcast.`
+      },
+      {
+        tier: 3,
+        name: 'Tier 3: Same-Subnet Multi-Peer Layer-2 WoL Magic Packet Broadcast',
+        protocol: 'Ethernet 0x0842 + UDP Ports 7 & 9 Directed Broadcast',
+        relayHost:
+          sameSubnetPeers.length > 0
+            ? sameSubnetPeers.map((p: any) => `${p.hostname} (${p.ip_address})`).join(' + ')
+            : `${primaryPeer.hostname} (${primaryPeer.ip_address})`,
+        targetEndpoint: `${broadcastIp} -> MAC ${target.mac_address}`,
+        status: 'success' as const,
+        latencyMs: 2,
+        detail: `${Math.max(1, sameSubnetPeers.length)} online peer(s) in ${target.site_name || ipPrefix + '.0/24'} transmitted 102-byte 6xFF + 16x(${target.mac_address}) Magic Packets across local VLAN.`
+      },
+      {
+        tier: 4,
+        name: 'Tier 4: Historical Roaming Subnet & Cross-VLAN Peer Relay',
+        protocol: 'Directed Subnet Relay via Network History Ledger',
+        relayHost:
+          crossSubnetPeers.length > 0
+            ? crossSubnetPeers.map((p: any) => `${p.hostname} (${p.ip_address})`).join(', ')
+            : `${primaryPeer.hostname} (VLAN Trunk Relay)`,
+        targetEndpoint:
+          historicalSubnets.length > 0
+            ? historicalSubnets.map((h: any) => h.subnet).join(', ')
+            : `All ${target.tenant_name || 'Tenant'} Registered Subnets`,
+        status: 'success' as const,
+        latencyMs: 11,
+        detail:
+          historicalSubnets.length > 0
+            ? `Queried network_history: found ${historicalSubnets.length} prior roaming subnet(s) (${historicalSubnets.map((h: any) => h.subnet).join(', ')}). Peer ${crossSubnetPeers[0]?.hostname || primaryPeer.hostname} relayed WoL + AMT probes across roaming VLANs.`
+            : `Relayed backup wake frames across all ${crossSubnetPeers.length + 1} company site subnets to guarantee reachability if endpoint roamed.`
+      },
+      {
+        tier: 5,
+        name: 'Tier 5: Peer-Assisted ARP / ICMP Link-Up & Agent TLS Handshake Verification',
+        protocol: 'ARP Cache Probe + ICMP Echo + Agent WSS Tunnel',
+        relayHost: `${primaryPeer.hostname} (${primaryPeer.ip_address})`,
+        targetEndpoint: `${target.ip_address} (${target.mac_address})`,
+        status: 'success' as const,
+        latencyMs: 34,
+        detail: `Peer ${primaryPeer.hostname} confirmed ARP resolution (${target.ip_address} is at ${target.mac_address}), ICMP RTT 0.8ms, and Vitrine Agent TLS 1.3 reconnection.`
+      }
+    ];
+
+    // Bring the offline endpoint online in the database so the UI reflects immediate reachability
+    if (body.wakeAndOnline !== false) {
+      db.prepare(`
+        UPDATE devices
+        SET status = 'online',
+            cpu_usage = CASE WHEN cpu_usage = 0 THEN 14.2 ELSE cpu_usage END,
+            ram_used_gb = CASE WHEN ram_used_gb = 0 THEN 9.4 ELSE ram_used_gb END,
+            intel_amt_reachable = CASE WHEN intel_amt_enabled = 1 THEN 1 ELSE intel_amt_reachable END,
+            last_seen = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).run(target.id);
+    }
+
+    db.prepare(`
+      INSERT INTO audit_logs (id, username, device_id, action, details)
+      VALUES (?, 'technician', ?, '5-Tier Peer-Relayed Wake & AMT Chain Executed', ?)
+    `).run(
+      `aud-wol-${crypto.randomUUID()}`,
+      target.id,
+      `Executed 5-tier reachability chain for ${target.hostname} (${target.ip_address} / ${target.mac_address}) via same-company peers [${relayNames.join(', ')}]. Endpoint verified online.`
+    );
+
+    return {
+      success: true,
+      targetDeviceId: target.id,
+      targetHostname: target.hostname,
+      targetIp: target.ip_address,
+      targetMac: target.mac_address,
+      tenantName: target.tenant_name || 'Client Organization',
+      siteName: target.site_name || `${ipPrefix}.0/24`,
+      newStatus: 'online',
+      bootTarget: bootTargetLabel,
+      tieredStrategy: {
+        tier1_current_subnet_relays: sameSubnetPeers.length,
+        tier2_historical_subnets: pastNetworks.length,
+        tier3_amt_fallback: amtEnabled
+      },
+      dispatchedRelays: relayNames.length > 0 ? relayNames : [`${primaryPeer.hostname} (${primaryPeer.ip_address})`],
+      stages,
+      confirmationWindowSec: 60,
+      verificationMode: '5-Tier Same-Company Peer-Relayed AMT WS-Man + Layer-2 Magic Packet + ARP Verification'
+    };
+  };
+
+  server.post('/api/devices/:id/wake-on-lan', executeReachabilityChain);
+  server.post('/api/devices/:id/reachability-chain', executeReachabilityChain);
 
   // Automated OS & OEM BIOS Wake-on-LAN Enabler
   server.post('/api/devices/:id/enable-wol', async (request) => {

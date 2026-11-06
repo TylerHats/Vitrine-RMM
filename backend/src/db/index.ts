@@ -424,6 +424,29 @@ export function initDatabase() {
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS network_appliances (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL DEFAULT 't-apex',
+      site_id TEXT NOT NULL DEFAULT 's-apex-hq',
+      name TEXT NOT NULL,
+      appliance_type TEXT NOT NULL,
+      vendor_model TEXT NOT NULL,
+      ip_address TEXT NOT NULL,
+      mac_address TEXT NOT NULL,
+      snmp_version TEXT NOT NULL DEFAULT 'v3',
+      probe_device_id TEXT NOT NULL,
+      probe_hostname TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'Healthy',
+      uptime_days REAL NOT NULL DEFAULT 45.2,
+      latency_ms REAL NOT NULL DEFAULT 1.4,
+      packet_loss_pct REAL NOT NULL DEFAULT 0.0,
+      cpu_pct REAL NOT NULL DEFAULT 18.0,
+      memory_pct REAL NOT NULL DEFAULT 34.0,
+      metrics_json TEXT NOT NULL DEFAULT '{}',
+      alert_summary TEXT,
+      last_polled TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
   `);
 
   // Safe migrations for newly added columns
@@ -1371,5 +1394,197 @@ $info | ConvertTo-Json`,
     `);
     insertNote.run('note-1', 'dev-win11-corp', 'tylerhats', 'Executive primary workstation. Always verify active Zoom/Teams calls before triggering manual reboots outside maintenance windows.', 1);
     insertNote.run('note-2', 'dev-srv-dc01', 'admin', 'Primary FSMO role holder for corp.apexfin.com. Replicate AD schema changes to apex-dc02-replica prior to patching.', 1);
+  }
+
+  // Ensure an offline Intel vPro/AMT endpoint exists on 10.200.10.0/24 to showcase the 5-Tier Peer-Relay Wake & AMT Chain
+  const offlinePeerDevice = db.prepare('SELECT id FROM devices WHERE id = ?').get('dev-win11-cfo');
+  if (!offlinePeerDevice) {
+    db.prepare(`
+      INSERT INTO devices (
+        id, mesh_node_id, tenant_id, site_id, hostname, os_type, os_version, os_build,
+        ip_address, mac_address, status, device_role, cpu_model, cpu_cores, cpu_usage,
+        ram_total_gb, ram_used_gb, disk_total_gb, disk_free_gb, smart_status,
+        bitlocker_status, bitlocker_key, tpm_version, bios_version, serial_number,
+        edr_name, edr_status, pending_reboot, quarantined, intel_amt_enabled, intel_amt_reachable
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'dev-win11-cfo', 'node-9012h', 't-apex', 's-apex-hq', 'APEX-CFO-THINKPAD',
+      'windows', 'Windows 11 Enterprise', '23H2 (Build 22631.4169)',
+      '10.200.10.85', '38:F3:AB:71:4C:20', 'offline', 'Workstation',
+      'Intel Core Ultra 7 165U vPro', 12, 0.0,
+      32.0, 0.0, 1024.0, 712.0, 'Healthy',
+      'Encrypted (XTS-AES 256)', '718290-384910-582910-194820-491029-849201', '2.0',
+      'Lenovo ThinkPad X1 Carbon Gen 12 (N3YET62W)', 'PF-4X992L', 'CrowdStrike Falcon Sensor', 'Standby (Host Powered Off)',
+      0, 0, 1, 1
+    );
+
+    // Seed roaming network history for dev-win11-cfo so Tier 4 historical subnet relay is also populated
+    db.prepare(`
+      INSERT INTO network_history (
+        id, device_id, ssid, bssid, gateway_ip, gateway_mac, subnet, interface_name,
+        connected_at, disconnected_at, is_flagged_drift
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'net-cfo-1',
+      'dev-win11-cfo',
+      'Apex_Corp_5GHz_Enterprise',
+      '00:1A:2B:99:88:77',
+      '10.200.50.1',
+      '00:1A:2B:99:88:01',
+      '10.200.50.0/24',
+      'Intel Wi-Fi 6E AX211 160MHz',
+      new Date(Date.now() - 8 * 3600000).toISOString(),
+      new Date(Date.now() - 2 * 3600000).toISOString(),
+      0
+    );
+  }
+
+  // Seed Network Appliances & SNMP Infrastructure Monitors
+  const appCount = (db.prepare('SELECT COUNT(*) as count FROM network_appliances').get() as { count: number }).count;
+  if (appCount === 0) {
+    const insertApp = db.prepare(`
+      INSERT INTO network_appliances (
+        id, tenant_id, site_id, name, appliance_type, vendor_model, ip_address, mac_address,
+        snmp_version, probe_device_id, probe_hostname, status, uptime_days, latency_ms,
+        packet_loss_pct, cpu_pct, memory_pct, metrics_json, alert_summary
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    insertApp.run(
+      'app-fw-01',
+      't-apex',
+      's-apex-hq',
+      'FW-GATEWAY-HA01',
+      'Firewall / UTM',
+      'Fortinet FortiGate 200F (FortiOS 7.4.4)',
+      '10.200.10.254',
+      '90:6C:AC:81:22:01',
+      'SNMP v3 (SHA/AES)',
+      'dev-srv-dc01',
+      'APEX-DC01-PROD',
+      'Healthy',
+      142.6,
+      0.8,
+      0.0,
+      21.4,
+      44.0,
+      JSON.stringify({
+        wan1State: 'Up (1.0 Gbps Fiber - 184 Mbps / 92 Mbps)',
+        wan2State: 'Standby Ready (LTE/5G Failover)',
+        ipsecTunnels: '4 / 4 Active (Site-to-Site DR)',
+        ipsSignatures: 'v28.841 (Active Blocking)',
+        activeSessions: '14,820'
+      }),
+      null
+    );
+
+    insertApp.run(
+      'app-sw-01',
+      't-apex',
+      's-apex-hq',
+      'SW-CORE-01',
+      'Managed Switch',
+      'Cisco Catalyst 9300-48P (IOS-XE 17.9.4)',
+      '10.200.10.1',
+      '00:1A:2B:3C:4D:01',
+      'SNMP v3 (SHA/AES)',
+      'dev-srv-dc01',
+      'APEX-DC01-PROD',
+      'Healthy',
+      218.4,
+      1.1,
+      0.0,
+      14.2,
+      38.5,
+      JSON.stringify({
+        activePorts: '42 / 48 Ports Up',
+        poeBudgetUsed: '385W / 715W (53.8%)',
+        spanningTree: 'Rapid-PVST+ Root Bridge (VLAN 1, 10, 50)',
+        uplinkTenGig: 'Te1/1/1 -> FW-GATEWAY-HA01 (10 Gbps Full)'
+      }),
+      null
+    );
+
+    insertApp.run(
+      'app-ups-01',
+      't-apex',
+      's-apex-hq',
+      'UPS-APC-RACK01',
+      'Smart UPS Battery',
+      'APC Smart-UPS SRT 3000VA RM (AP9641 NMC3)',
+      '10.200.10.6',
+      '00:C0:B7:91:44:12',
+      'SNMP v3 (SHA/AES)',
+      'dev-srv-dc01',
+      'APEX-DC01-PROD',
+      'Healthy',
+      310.0,
+      2.3,
+      0.0,
+      8.0,
+      22.0,
+      JSON.stringify({
+        batteryChargePct: '100% (Online - Float Charging)',
+        estimatedRuntime: '52 mins @ 34% Load (1,020W)',
+        inputOutputVoltage: '120.4V AC In / 120.0V AC Out (60.0 Hz)',
+        batteryTempC: '25.8 °C (Optimal)',
+        lastSelfTest: 'Passed (2026-11-01)'
+      }),
+      null
+    );
+
+    insertApp.run(
+      'app-nas-01',
+      't-nexus',
+      's-nexus-main',
+      'NAS-SYNOLOGY-VAULT',
+      'SAN / NAS Storage',
+      'Synology RackStation RS3621xs+ (DSM 7.2.1)',
+      '192.168.40.20',
+      '00:11:32:AA:81:99',
+      'SNMP v3 (SHA/AES)',
+      'dev-lin-proxmox',
+      'PVE-CLUSTER-NODE01',
+      'Warning',
+      89.5,
+      1.5,
+      0.0,
+      39.2,
+      68.4,
+      JSON.stringify({
+        raidPoolStatus: 'RAID-6 Healthy (12x 16TB Enterprise SAS)',
+        volumeCapacity: '118.4 TB Used / 142.0 TB Total (83.4%)',
+        iscsiLunThroughput: '640 MB/s Read • 410 MB/s Write (4,200 IOPS)',
+        driveSmartAlert: 'Bay 7 (WD Ultrastar) reporting 2 reallocated sectors'
+      }),
+      'Storage volume > 80% threshold & Bay 7 SMART sector warning'
+    );
+
+    insertApp.run(
+      'app-prn-01',
+      't-vanguard',
+      's-vanguard-main',
+      'PRN-LEGAL-RECORDS-01',
+      'Network Printer / MFP',
+      'HP LaserJet Enterprise M611dn (FutureSmart 5)',
+      '172.16.5.150',
+      '48:BA:4E:33:10:88',
+      'SNMP v2c / v3',
+      'dev-macos-creative',
+      'MACBOOK-PRO-PARTNER',
+      'Healthy',
+      19.2,
+      3.4,
+      0.0,
+      6.0,
+      19.0,
+      JSON.stringify({
+        tonerBlackPct: '64% (HP 147X High Yield)',
+        maintenanceKitPct: '88% Remaining',
+        totalPageCount: '148,920 Pages',
+        trayStatus: 'Tray 1: Ready • Tray 2 (Legal): Ready (500 sheets)'
+      }),
+      null
+    );
   }
 }

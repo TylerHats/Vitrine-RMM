@@ -46,10 +46,15 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
   onClose
 }) => {
   const [activeTab, setActiveTab] = useState(initialTab);
+  const osType = device.os_type || 'windows';
 
-  // Terminal state
+  // Terminal state (Supports SYSTEM/root vs Logged-In User context & Multi-Shell selection)
   const [terminalOutput, setTerminalOutput] = useState<string[]>([]);
   const [terminalInput, setTerminalInput] = useState('');
+  const [runAsContext, setRunAsContext] = useState<'system' | 'user'>('system');
+  const [shellType, setShellType] = useState<string>(
+    osType === 'macos' ? 'zsh' : osType === 'linux' ? 'bash' : 'powershell'
+  );
   const [ws, setWs] = useState<WebSocket | null>(null);
 
   // Process state
@@ -62,8 +67,14 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
   const [svcFilter, setSvcFilter] = useState('');
   const [, setLoadingSvcs] = useState(false);
 
-  // Registry state
-  const [regPath, setRegPath] = useState('HKLM\\SOFTWARE\\VitrineRMM');
+  // Registry / sysctl / plist state
+  const [regPath, setRegPath] = useState(
+    osType === 'windows'
+      ? 'HKLM\\SOFTWARE\\VitrineRMM'
+      : osType === 'macos'
+        ? '/Library/Preferences/com.vitrine.agent.plist'
+        : '/etc/sysctl.d/99-vitrine-hardening.conf'
+  );
   const [regData, setRegData] = useState<{ subkeys: string[]; values: Array<{ path: string; name: string; type: string; value: string }> }>({ subkeys: [], values: [] });
   const [newRegName, setNewRegName] = useState('');
   const [newRegType, setNewRegType] = useState('REG_SZ');
@@ -73,22 +84,24 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
   const [tasks, setTasks] = useState<Array<{ name: string; path: string; state: string; lastRunTime: string; nextRunTime: string; lastResult: string }>>([]);
 
   // Files state
-  const [currentPath, setCurrentPath] = useState(device.os_type === 'linux' ? '/etc' : 'C:\\');
+  const [currentPath, setCurrentPath] = useState(osType === 'windows' ? 'C:\\' : '/');
   const [files, setFiles] = useState<Array<{ name: string; path: string; size: number; isDirectory: boolean; modified: string; permissions: string }>>([]);
   const [newFolderName, setNewFolderName] = useState('');
 
   // Event Viewer state
   const [eventLogs, setEventLogs] = useState<EventLogItem[]>([]);
-  const [eventChannel, setEventChannel] = useState('System');
+  const [eventChannel, setEventChannel] = useState('All');
   const [eventLevel, setEventLevel] = useState('all');
   const [eventFilter, setEventFilter] = useState('');
   const [loadingEvents, setLoadingEvents] = useState(false);
 
-  // Connect WebSocket for terminal
+  // Connect WebSocket for terminal with deviceId, runAs, and shell
   useEffect(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
-    const socket = new WebSocket(`${protocol}//${host}/ws/terminal`);
+    const socket = new WebSocket(
+      `${protocol}//${host}/ws/terminal?deviceId=${encodeURIComponent(device.id)}&runAs=${runAsContext}&shell=${encodeURIComponent(shellType)}`
+    );
 
     socket.onmessage = (event) => {
       try {
@@ -106,7 +119,23 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
     return () => {
       socket.close();
     };
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [device.id]);
+
+  const handleSwitchTerminalContext = (nextRunAs: 'system' | 'user', nextShell: string) => {
+    setRunAsContext(nextRunAs);
+    setShellType(nextShell);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(
+        JSON.stringify({
+          type: 'switch_context',
+          deviceId: device.id,
+          runAs: nextRunAs,
+          shell: nextShell
+        })
+      );
+    }
+  };
 
   // Load processes
   const loadProcesses = async () => {
@@ -162,7 +191,7 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
   };
 
   const handleNavigateUp = () => {
-    if (device.os_type === 'linux') {
+    if (osType === 'linux' || osType === 'macos') {
       if (currentPath === '/' || !currentPath) return;
       const parts = currentPath.split('/').filter(Boolean);
       parts.pop();
@@ -188,17 +217,43 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab]);
 
+  const promptLabel =
+    osType === 'windows'
+      ? shellType === 'cmd'
+        ? runAsContext === 'system'
+          ? 'C:\\Windows\\System32>'
+          : 'C:\\Users\\Tyler.Hats>'
+        : runAsContext === 'system'
+          ? 'PS C:\\Windows\\System32>'
+          : 'PS C:\\Users\\Tyler.Hats>'
+      : osType === 'macos'
+        ? `${runAsContext === 'system' ? 'root' : 'tylerhats'}@${device.hostname.toLowerCase()} ${runAsContext === 'system' ? '#' : '%'}`
+        : `${runAsContext === 'system' ? 'root' : 'ubuntu'}@${device.hostname.toLowerCase()}:${runAsContext === 'system' ? '#' : '$'}`;
+
+  const identityBadge =
+    osType === 'windows'
+      ? runAsContext === 'system'
+        ? 'NT AUTHORITY\\SYSTEM'
+        : 'CORP\\Tyler.Hats (User)'
+      : osType === 'macos'
+        ? runAsContext === 'system'
+          ? 'root (UID 0 LaunchDaemon)'
+          : 'tylerhats (UID 501 User)'
+        : runAsContext === 'system'
+          ? 'root (UID 0 systemd)'
+          : 'ubuntu (UID 1000 User)';
+
   const handleTerminalSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!terminalInput.trim() || !ws) return;
-    setTerminalOutput((prev) => [...prev, `\r\nPS> ${terminalInput}`]);
+    setTerminalOutput((prev) => [...prev, `${terminalInput}`]);
     ws.send(JSON.stringify({ type: 'input', data: terminalInput }));
     setTerminalInput('');
   };
 
   const handleSnippet = (cmd: string) => {
     if (!ws) return;
-    setTerminalOutput((prev) => [...prev, `\r\nPS> ${cmd}`]);
+    setTerminalOutput((prev) => [...prev, `${cmd}`]);
     ws.send(JSON.stringify({ type: 'input', data: cmd }));
   };
 
@@ -273,8 +328,14 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
           <div className="modal-title">
             <Terminal size={20} style={{ color: '#00f2fe' }} />
             <span>Silent Background Management Suite — {device.hostname}</span>
-            <span className="status-pill status-online" style={{ fontSize: '0.72rem' }}>
-              NT AUTHORITY\SYSTEM
+            <span
+              className={`status-pill ${runAsContext === 'system' ? 'status-online' : 'status-reboot'}`}
+              style={{ fontSize: '0.72rem' }}
+            >
+              {identityBadge}
+            </span>
+            <span className="status-pill status-isolated" style={{ fontSize: '0.7rem', background: 'rgba(56, 189, 248, 0.15)', color: '#38bdf8' }}>
+              {osType.toUpperCase()} Parity Engine
             </span>
           </div>
           <button className="btn-glass btn-icon" onClick={onClose} id="close-bg-tools-btn">
@@ -282,7 +343,7 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
           </button>
         </div>
 
-        {/* Tab navigation */}
+        {/* Tab navigation (OS-Adaptive Titles for Windows, Linux, and macOS) */}
         <div style={{ padding: '0 1.5rem', background: 'rgba(0, 0, 0, 0.2)' }}>
           <div className="tab-list" style={{ marginBottom: 0 }}>
             <button
@@ -291,7 +352,7 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
               id="tab-btn-terminal"
             >
               <Terminal size={16} />
-              <span>Interactive Shell</span>
+              <span>Live PTY Terminal</span>
             </button>
             <button
               className={`tab-btn ${activeTab === 'processes' ? 'active' : ''}`}
@@ -307,7 +368,13 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
               id="tab-btn-services"
             >
               <Layers size={16} />
-              <span>Windows Services</span>
+              <span>
+                {osType === 'windows'
+                  ? 'Windows Services'
+                  : osType === 'macos'
+                    ? 'launchd Daemons'
+                    : 'systemd Services'}
+              </span>
             </button>
             <button
               className={`tab-btn ${activeTab === 'events' ? 'active' : ''}`}
@@ -315,7 +382,13 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
               id="tab-btn-events"
             >
               <FileText size={16} />
-              <span>Event Viewer</span>
+              <span>
+                {osType === 'windows'
+                  ? 'Event Viewer'
+                  : osType === 'macos'
+                    ? 'Unified Logs'
+                    : 'journald / syslog'}
+              </span>
             </button>
             <button
               className={`tab-btn ${activeTab === 'registry' ? 'active' : ''}`}
@@ -323,7 +396,13 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
               id="tab-btn-registry"
             >
               <FileCode size={16} />
-              <span>Registry Editor</span>
+              <span>
+                {osType === 'windows'
+                  ? 'Registry Editor'
+                  : osType === 'macos'
+                    ? 'plist / defaults'
+                    : 'sysctl & /etc Config'}
+              </span>
             </button>
             <button
               className={`tab-btn ${activeTab === 'files' ? 'active' : ''}`}
@@ -339,7 +418,13 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
               id="tab-btn-tasks"
             >
               <Calendar size={16} />
-              <span>Task Scheduler</span>
+              <span>
+                {osType === 'windows'
+                  ? 'Task Scheduler'
+                  : osType === 'macos'
+                    ? 'launchd Jobs'
+                    : 'Cron & Timers'}
+              </span>
             </button>
           </div>
         </div>
@@ -348,36 +433,178 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
         <div className="modal-body" style={{ padding: '1.25rem' }}>
           {/* TAB 1: TERMINAL */}
           {activeTab === 'terminal' && (
-            <div style={{ display: 'flex', flexDirection: 'column', height: '100%', gap: '1rem' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', height: '100%', gap: '0.85rem' }}>
+              {/* Execution Context (SYSTEM/root vs Logged-In User) & Shell Selector Bar */}
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  flexWrap: 'wrap',
+                  gap: '0.75rem',
+                  padding: '0.6rem 0.9rem',
+                  background: 'rgba(15, 23, 42, 0.65)',
+                  border: '1px solid var(--glass-border)',
+                  borderRadius: '8px'
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)', fontWeight: 600 }}>Run As Context:</span>
+                  <button
+                    type="button"
+                    className={`btn-glass ${runAsContext === 'system' ? 'btn-primary' : ''}`}
+                    style={{ padding: '0.22rem 0.65rem', fontSize: '0.74rem' }}
+                    onClick={() => handleSwitchTerminalContext('system', shellType)}
+                  >
+                    {osType === 'windows' ? 'SYSTEM (NT AUTHORITY\\SYSTEM)' : 'root (UID 0 Daemon)'}
+                  </button>
+                  <button
+                    type="button"
+                    className={`btn-glass ${runAsContext === 'user' ? 'btn-primary' : ''}`}
+                    style={{ padding: '0.22rem 0.65rem', fontSize: '0.74rem' }}
+                    onClick={() => handleSwitchTerminalContext('user', shellType)}
+                  >
+                    {osType === 'windows'
+                      ? 'Logged-In User (CORP\\Tyler.Hats)'
+                      : osType === 'macos'
+                        ? 'Logged-In User (tylerhats)'
+                        : 'Logged-In User (ubuntu)'}
+                  </button>
+                </div>
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)', fontWeight: 600 }}>Shell:</span>
+                  {osType === 'windows' ? (
+                    <>
+                      <button
+                        type="button"
+                        className={`btn-glass ${shellType === 'powershell' ? 'btn-primary' : ''}`}
+                        style={{ padding: '0.2rem 0.55rem', fontSize: '0.73rem' }}
+                        onClick={() => handleSwitchTerminalContext(runAsContext, 'powershell')}
+                      >
+                        PowerShell 7 / 5.1
+                      </button>
+                      <button
+                        type="button"
+                        className={`btn-glass ${shellType === 'cmd' ? 'btn-primary' : ''}`}
+                        style={{ padding: '0.2rem 0.55rem', fontSize: '0.73rem' }}
+                        onClick={() => handleSwitchTerminalContext(runAsContext, 'cmd')}
+                      >
+                        CMD.exe
+                      </button>
+                    </>
+                  ) : osType === 'macos' ? (
+                    <>
+                      <button
+                        type="button"
+                        className={`btn-glass ${shellType === 'zsh' ? 'btn-primary' : ''}`}
+                        style={{ padding: '0.2rem 0.55rem', fontSize: '0.73rem' }}
+                        onClick={() => handleSwitchTerminalContext(runAsContext, 'zsh')}
+                      >
+                        zsh (macOS Default)
+                      </button>
+                      <button
+                        type="button"
+                        className={`btn-glass ${shellType === 'bash' ? 'btn-primary' : ''}`}
+                        style={{ padding: '0.2rem 0.55rem', fontSize: '0.73rem' }}
+                        onClick={() => handleSwitchTerminalContext(runAsContext, 'bash')}
+                      >
+                        bash
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        className={`btn-glass ${shellType === 'bash' ? 'btn-primary' : ''}`}
+                        style={{ padding: '0.2rem 0.55rem', fontSize: '0.73rem' }}
+                        onClick={() => handleSwitchTerminalContext(runAsContext, 'bash')}
+                      >
+                        bash
+                      </button>
+                      <button
+                        type="button"
+                        className={`btn-glass ${shellType === 'sh' ? 'btn-primary' : ''}`}
+                        style={{ padding: '0.2rem 0.55rem', fontSize: '0.73rem' }}
+                        onClick={() => handleSwitchTerminalContext(runAsContext, 'sh')}
+                      >
+                        POSIX sh
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              {/* OS-Specific Quick Snippets */}
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
                 <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)', fontWeight: 600 }}>Quick Snippets:</span>
-                <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('Get-Process')}>
-                  Get-Process
-                </button>
-                <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('Get-BitLockerVolume')}>
-                  Get-BitLockerVolume
-                </button>
-                <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('Get-Service Spooler')}>
-                  Query Spooler
-                </button>
                 <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('whoami')}>
                   whoami
                 </button>
+                <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('id')}>
+                  id / token
+                </button>
+                {osType === 'windows' ? (
+                  <>
+                    <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('Get-Process')}>
+                      Get-Process
+                    </button>
+                    <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('Get-BitLockerVolume')}>
+                      Get-BitLockerVolume
+                    </button>
+                    <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('Get-Service')}>
+                      Get-Service
+                    </button>
+                    <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('winget list')}>
+                      winget list
+                    </button>
+                  </>
+                ) : osType === 'macos' ? (
+                  <>
+                    <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('ps aux')}>
+                      ps aux
+                    </button>
+                    <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('launchctl list')}>
+                      launchctl list
+                    </button>
+                    <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('fdesetup status')}>
+                      fdesetup (FileVault)
+                    </button>
+                    <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('brew list')}>
+                      brew list
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('ps aux')}>
+                      ps aux
+                    </button>
+                    <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('systemctl list-units --type=service')}>
+                      systemctl services
+                    </button>
+                    <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('df -h')}>
+                      df -h
+                    </button>
+                    <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('journalctl -n 20')}>
+                      journalctl
+                    </button>
+                  </>
+                )}
                 <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('clear')}>
                   clear
                 </button>
               </div>
 
-              <div className="terminal-window" style={{ flex: 1, minHeight: '380px' }} id="terminal-window-output">
+              <div className="terminal-window" style={{ flex: 1, minHeight: '350px' }} id="terminal-window-output">
                 {terminalOutput.join('')}
               </div>
 
               <form onSubmit={handleTerminalSubmit} className="terminal-input-row">
-                <span className="terminal-prompt">PS C:\&gt;</span>
+                <span className="terminal-prompt">{promptLabel}</span>
                 <input
                   type="text"
                   className="terminal-input"
-                  placeholder="Enter PowerShell / CMD command..."
+                  placeholder={`Execute ${shellType.toUpperCase()} command as ${identityBadge}...`}
                   value={terminalInput}
                   onChange={(e) => setTerminalInput(e.target.value)}
                   autoFocus
@@ -543,11 +770,29 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                       setEventChannel(e.target.value);
                       loadEvents(e.target.value, eventLevel);
                     }}
-                    style={{ width: '150px' }}
+                    style={{ width: '170px' }}
                   >
-                    <option value="System">System Log</option>
-                    <option value="Application">Application Log</option>
-                    <option value="Security">Security Log</option>
+                    <option value="All">All Log Channels</option>
+                    {osType === 'windows' ? (
+                      <>
+                        <option value="System">System Log</option>
+                        <option value="Application">Application Log</option>
+                        <option value="Security">Security Log</option>
+                      </>
+                    ) : osType === 'macos' ? (
+                      <>
+                        <option value="system">system.log</option>
+                        <option value="securityd">securityd (FileVault/Gatekeeper)</option>
+                        <option value="kernel">kernel (Darwin/SMC)</option>
+                        <option value="install">install.log</option>
+                      </>
+                    ) : (
+                      <>
+                        <option value="journald">systemd-journald</option>
+                        <option value="auth">auth.log (PAM/SSH)</option>
+                        <option value="kern">kern.log (Netfilter)</option>
+                      </>
+                    )}
                   </select>
 
                   <select
@@ -655,8 +900,8 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                       <button
                         key={sub}
                         className="btn-glass"
-                        style={{ textAlign: 'left', justifyContent: 'flex-start', padding: '0.4rem 0.65rem', fontSize: '0.8rem' }}
-                        onClick={() => loadRegistry(`${regPath}\\${sub}`)}
+                        style={{ textAlign: 'left', justifyContent: 'flex-start', padding: '0.4rem 0.65rem', fontSize: '0.78rem' }}
+                        onClick={() => loadRegistry(sub.startsWith('/') ? sub : `${regPath}\\${sub}`)}
                       >
                         <Folder size={14} color="#00f2fe" />
                         <span>{sub}</span>
