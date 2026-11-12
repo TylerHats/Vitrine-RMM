@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Play, CheckCircle2, Copy, Check, Sparkles, User, Shield, Plus, X, Sliders, ToggleLeft, ToggleRight, Building } from 'lucide-react';
+import { Play, CheckCircle2, Copy, Check, Sparkles, User, Shield, Plus, X, Sliders, ToggleLeft, ToggleRight, Building, Trash2, Edit3 } from 'lucide-react';
 import { ScriptItem, Device, Tenant } from '../types/index.js';
-import { fetchScripts, runScript, createScript, updateScript, fetchTenants } from '../services/api.js';
+import { fetchScripts, runScript, createScript, updateScript, deleteScript, fetchTenants } from '../services/api.js';
 
 interface ScriptLibraryViewProps {
   devices: Device[];
@@ -39,6 +39,25 @@ export const ScriptLibraryView: React.FC<ScriptLibraryViewProps> = ({ devices })
   const [newScriptCode, setNewScriptCode] = useState('');
   const [newScriptEnabled, setNewScriptEnabled] = useState(true);
   const [savingNewScript, setSavingNewScript] = useState(false);
+  const [editingCode, setEditingCode] = useState(false);
+  const [editedCodeBuffer, setEditedCodeBuffer] = useState('');
+
+  const handleSaveEditedCode = async () => {
+    if (!selectedScript || !editedCodeBuffer.trim()) return;
+    await updateScript(selectedScript.id, { code: editedCodeBuffer });
+    setEditingCode(false);
+    await loadScripts();
+  };
+
+  const handleDeleteSelectedScript = async () => {
+    if (!selectedScript || selectedScript.is_builtin) return;
+    if (!confirm(`Delete custom script "${selectedScript.name}"?`)) return;
+    const res = await deleteScript(selectedScript.id);
+    if (res.success) {
+      setSelectedScript(null);
+      await loadScripts();
+    }
+  };
 
   const loadScripts = useCallback(async (tenantIdArg?: string) => {
     const tid = tenantIdArg !== undefined ? tenantIdArg : tenantFilter;
@@ -127,7 +146,10 @@ export const ScriptLibraryView: React.FC<ScriptLibraryViewProps> = ({ devices })
 
     setRunning(true);
     try {
-      const res = await runScript(selectedScript.id, selectedDeviceIds);
+      const res = await runScript(selectedScript.id, selectedDeviceIds, {
+        params: scriptParams.trim() ? { args: scriptParams.trim() } : undefined,
+        runAs: runAsContext
+      });
       setRunResult(res as ScriptExecutionResponse);
     } finally {
       setRunning(false);
@@ -362,6 +384,30 @@ export const ScriptLibraryView: React.FC<ScriptLibraryViewProps> = ({ devices })
                   {(selectedScript.enabled ?? 1) !== 0 ? <ToggleRight size={16} color="#10b981" /> : <ToggleLeft size={16} color="#64748b" />}
                   <span>{(selectedScript.enabled ?? 1) !== 0 ? 'Enabled' : 'Disabled'}</span>
                 </button>
+                <button
+                  className="btn-glass"
+                  onClick={() => {
+                    if (editingCode) {
+                      setEditingCode(false);
+                    } else {
+                      setEditedCodeBuffer(selectedScript.code);
+                      setEditingCode(true);
+                    }
+                  }}
+                >
+                  <Edit3 size={14} />
+                  <span>{editingCode ? 'Cancel Edit' : 'Edit'}</span>
+                </button>
+                {editingCode && (
+                  <button className="btn-glass btn-primary" onClick={handleSaveEditedCode}>
+                    <Check size={14} /> Save Code
+                  </button>
+                )}
+                {!selectedScript.is_builtin && (
+                  <button className="btn-glass btn-icon" title="Delete Custom Script" onClick={handleDeleteSelectedScript}>
+                    <Trash2 size={14} color="#ef4444" />
+                  </button>
+                )}
                 <button className="btn-glass" onClick={handleCopyCode}>
                   {copied ? <Check size={14} color="#10b981" /> : <Copy size={14} />}
                   <span>{copied ? 'Copied' : 'Copy'}</span>
@@ -378,10 +424,20 @@ export const ScriptLibraryView: React.FC<ScriptLibraryViewProps> = ({ devices })
               </div>
             </div>
 
-            {/* Code Viewer */}
-            <div className="terminal-window" style={{ height: '220px', color: '#7dd3fc', overflowY: 'auto' }}>
-              {selectedScript.code}
-            </div>
+            {/* Code Viewer / Editor */}
+            {editingCode ? (
+              <textarea
+                rows={9}
+                className="glass-input"
+                style={{ fontFamily: 'var(--font-mono)', fontSize: '0.8rem', resize: 'vertical' }}
+                value={editedCodeBuffer}
+                onChange={(e) => setEditedCodeBuffer(e.target.value)}
+              />
+            ) : (
+              <div className="terminal-window" style={{ height: '220px', color: '#7dd3fc', overflowY: 'auto' }}>
+                {selectedScript.code}
+              </div>
+            )}
 
             {/* Execution Context & Parameters Bar (Ninja Feature) */}
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 220px', gap: '1rem', background: 'rgba(255, 255, 255, 0.02)', padding: '0.85rem', borderRadius: '8px', border: '1px solid var(--glass-border)' }}>

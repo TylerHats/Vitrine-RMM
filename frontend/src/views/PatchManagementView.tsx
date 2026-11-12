@@ -1,14 +1,32 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { CheckCircle2, Play, Clock, Undo2, ShieldAlert, Sparkles } from 'lucide-react';
-import { Patch } from '../types/index.js';
-import { fetchPatches, approvePatch, approvePatchesBulk, scanPatches, rollbackPatch } from '../services/api.js';
+import { Patch, Settings } from '../types/index.js';
+import { fetchPatches, approvePatch, approvePatchesBulk, scanPatches, rollbackPatch, updateSettings } from '../services/api.js';
 
-export const PatchManagementView: React.FC = () => {
+interface PatchManagementViewProps {
+  settings?: Settings | null;
+  onSettingsUpdated?: (s: Settings) => void;
+}
+
+export const PatchManagementView: React.FC<PatchManagementViewProps> = ({ settings, onSettingsUpdated }) => {
   const [patches, setPatches] = useState<Patch[]>([]);
   const [filterCategory, setFilterCategory] = useState('all');
-  const [autoApproveThirdParty, setAutoApproveThirdParty] = useState(true);
-  const [canaryDelayDays, setCanaryDelayDays] = useState(3);
+  const [autoApproveThirdParty, setAutoApproveThirdParty] = useState(
+    settings?.patch_auto_approve_third_party !== undefined ? Boolean(settings.patch_auto_approve_third_party) : true
+  );
+  const [canaryDelayDays, setCanaryDelayDays] = useState(
+    settings?.patch_canary_delay_days !== undefined ? Number(settings.patch_canary_delay_days) : 3
+  );
   const [actionMessage, setActionMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (settings?.patch_auto_approve_third_party !== undefined) {
+      setAutoApproveThirdParty(Boolean(settings.patch_auto_approve_third_party));
+    }
+    if (settings?.patch_canary_delay_days !== undefined) {
+      setCanaryDelayDays(Number(settings.patch_canary_delay_days));
+    }
+  }, [settings?.patch_auto_approve_third_party, settings?.patch_canary_delay_days]);
 
   const loadPatches = useCallback(() => {
     fetchPatches().then(setPatches);
@@ -54,10 +72,40 @@ export const PatchManagementView: React.FC = () => {
 
   const filteredPatches = patches.filter((p) => {
     if (filterCategory === 'all') return true;
-    if (filterCategory === 'os') return p.category.includes('Security') || p.category.includes('Critical');
-    if (filterCategory === 'third_party') return p.category.includes('Winget') || p.category.includes('Third-Party');
+    if (filterCategory === 'os') {
+      return (
+        p.category.includes('Security') ||
+        p.category.includes('Critical') ||
+        p.category.includes('Rollup') ||
+        p.category.includes('Driver') ||
+        p.category.includes('OS')
+      );
+    }
+    if (filterCategory === 'third_party') {
+      return p.category.includes('Winget') || p.category.includes('Third-Party') || p.category.includes('Choco');
+    }
     return true;
   });
+
+  const handleToggleAutoApprove = async (checked: boolean) => {
+    setAutoApproveThirdParty(checked);
+    try {
+      const res = await updateSettings({ patch_auto_approve_third_party: checked ? 1 : 0 });
+      if (res.success && res.settings) onSettingsUpdated?.(res.settings);
+    } catch {
+      // Ignore if client_admin
+    }
+  };
+
+  const handleCanaryChange = async (days: number) => {
+    setCanaryDelayDays(days);
+    try {
+      const res = await updateSettings({ patch_canary_delay_days: days });
+      if (res.success && res.settings) onSettingsUpdated?.(res.settings);
+    } catch {
+      // Ignore if client_admin
+    }
+  };
 
   const pendingCount = filteredPatches.filter((p) => p.status === 'Pending').length;
 
@@ -116,7 +164,7 @@ export const PatchManagementView: React.FC = () => {
               <input
                 type="checkbox"
                 checked={autoApproveThirdParty}
-                onChange={(e) => setAutoApproveThirdParty(e.target.checked)}
+                onChange={(e) => handleToggleAutoApprove(e.target.checked)}
               />
               <span>Auto-approve 3rd-party apps (Winget/Choco)</span>
             </label>
@@ -127,7 +175,7 @@ export const PatchManagementView: React.FC = () => {
                 className="glass-select"
                 style={{ padding: '0.2rem 0.5rem', fontSize: '0.75rem', width: 'auto' }}
                 value={canaryDelayDays}
-                onChange={(e) => setCanaryDelayDays(Number(e.target.value))}
+                onChange={(e) => handleCanaryChange(Number(e.target.value))}
               >
                 <option value={0}>Immediate (0 Days)</option>
                 <option value={3}>3 Days (Canary Stage)</option>
@@ -180,7 +228,7 @@ export const PatchManagementView: React.FC = () => {
             <tbody>
               {filteredPatches.map((p) => (
                 <tr key={p.id}>
-                  <td><strong>{p.hostname || 'WIN11-PRO-EXEC'}</strong></td>
+                  <td><strong>{p.hostname || p.device_id || 'Managed Endpoint'}</strong></td>
                   <td>{p.title}</td>
                   <td><code>{p.kb_id}</code></td>
                   <td>

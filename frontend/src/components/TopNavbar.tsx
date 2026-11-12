@@ -1,6 +1,21 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Search, Download, Bell, User, Menu, AlertTriangle, CheckCircle, Info, RefreshCw, X, UserCheck, Monitor } from 'lucide-react';
-import { Tenant, AppNotification, Device } from '../types/index.js';
+import {
+  Search,
+  Download,
+  Bell,
+  User,
+  Menu,
+  AlertTriangle,
+  CheckCircle,
+  Info,
+  RefreshCw,
+  X,
+  UserCheck,
+  Monitor,
+  LogOut,
+  LifeBuoy
+} from 'lucide-react';
+import { Tenant, AppNotification, Device, AuthUser } from '../types/index.js';
 import { fetchNotifications, markNotificationRead, executeNotificationAction } from '../services/api.js';
 
 interface TopNavbarProps {
@@ -11,11 +26,26 @@ interface TopNavbarProps {
   onTenantChange: (id: string) => void;
   onDownloadInstaller: () => void;
   onOpenGuestAccess?: () => void;
+  onOpenQuickSupportQueue?: () => void;
   onToggleMobileSidebar: () => void;
   devices?: Device[];
   onSelectDevice?: (device: Device) => void;
   onSelectView?: (view: string) => void;
+  currentUser?: AuthUser | null;
+  meshConnected?: boolean;
+  onLogout?: () => void;
 }
+
+const ROLE_LABELS: Record<string, string> = {
+  msp_super_admin: 'MSP Super Admin',
+  super_admin: 'Super Admin',
+  admin: 'Administrator',
+  senior_tech: 'Senior Technician',
+  technician: 'Technician',
+  support_tech: 'Support Technician',
+  client_admin: 'Client Portal Admin',
+  auditor: 'Read-Only Auditor'
+};
 
 export const TopNavbar: React.FC<TopNavbarProps> = ({
   searchQuery,
@@ -25,10 +55,14 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
   onTenantChange,
   onDownloadInstaller,
   onOpenGuestAccess,
+  onOpenQuickSupportQueue,
   onToggleMobileSidebar,
   devices = [],
   onSelectDevice,
-  onSelectView
+  onSelectView,
+  currentUser,
+  meshConnected = false,
+  onLogout
 }) => {
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [isOpen, setIsOpen] = useState(false);
@@ -38,14 +72,16 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
   const searchInputRef = useRef<HTMLInputElement>(null);
   const searchWrapperRef = useRef<HTMLDivElement>(null);
 
+  const isClientAdmin = currentUser?.role === 'client_admin';
+
   const loadNotifications = async () => {
     try {
       const data = await fetchNotifications();
       if (Array.isArray(data)) {
         setNotifications(data);
       }
-    } catch (err) {
-      console.error('Failed to load notifications:', err);
+    } catch {
+      // Non-fatal during polling
     }
   };
 
@@ -55,7 +91,6 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
     return () => clearInterval(interval);
   }, []);
 
-  // Ctrl+K / Cmd+K Quick Jump Shortcut
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
@@ -71,7 +106,6 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
-  // Close dropdowns on outside click
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
       if (notifRef.current && !notifRef.current.contains(e.target as Node)) {
@@ -97,8 +131,6 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
     try {
       await executeNotificationAction(notifId, actionKey, tenantId);
       await loadNotifications();
-    } catch (err) {
-      console.error('Failed to execute notification action:', err);
     } finally {
       setActingId(null);
     }
@@ -109,10 +141,10 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
         .filter((d) => {
           const q = searchQuery.toLowerCase();
           return (
-            d.hostname.toLowerCase().includes(q) ||
-            d.ip_address.toLowerCase().includes(q) ||
-            d.serial_number.toLowerCase().includes(q) ||
-            d.device_role.toLowerCase().includes(q)
+            (d.hostname || '').toLowerCase().includes(q) ||
+            (d.ip_address || '').toLowerCase().includes(q) ||
+            (d.serial_number || '').toLowerCase().includes(q) ||
+            (d.device_role || '').toLowerCase().includes(q)
           );
         })
         .slice(0, 5)
@@ -122,6 +154,7 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
     <header className="topbar" id="app-topbar">
       <div className="topbar-left">
         <button
+          type="button"
           className="mobile-menu-btn btn-glass"
           onClick={onToggleMobileSidebar}
           id="mobile-menu-toggle-btn"
@@ -129,12 +162,13 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
         >
           <Menu size={20} />
         </button>
+
         <div className="topbar-search" ref={searchWrapperRef} style={{ position: 'relative' }}>
           <Search size={16} />
           <input
             ref={searchInputRef}
             type="text"
-            placeholder="Quick search endpoints, IP, BitLocker, role... (Ctrl+K)"
+            placeholder="Quick search endpoints, IP, serial, role... (Ctrl+K)"
             value={searchQuery}
             onFocus={() => setSearchFocused(true)}
             onChange={(e) => {
@@ -145,8 +179,15 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
           />
           {searchQuery && (
             <button
+              type="button"
               onClick={() => onSearchChange('')}
-              style={{ background: 'none', border: 'none', color: 'var(--text-dim)', cursor: 'pointer', padding: '0 4px' }}
+              style={{
+                background: 'none',
+                border: 'none',
+                color: 'var(--text-dim)',
+                cursor: 'pointer',
+                padding: '0 4px'
+              }}
               title="Clear search"
             >
               <X size={14} />
@@ -160,11 +201,10 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
                 top: 'calc(100% + 8px)',
                 left: 0,
                 right: 0,
-                background: 'rgba(15, 23, 42, 0.97)',
-                backdropFilter: 'blur(20px)',
-                border: '1px solid rgba(255, 255, 255, 0.14)',
+                background: 'var(--surface-base)',
+                border: '1px solid var(--glass-border-highlight)',
                 borderRadius: '10px',
-                boxShadow: '0 18px 36px rgba(0, 0, 0, 0.65)',
+                boxShadow: 'var(--glass-shadow)',
                 zIndex: 1100,
                 padding: '0.5rem',
                 display: 'flex',
@@ -172,7 +212,15 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
                 gap: '0.25rem'
               }}
             >
-              <div style={{ fontSize: '0.68rem', color: 'var(--text-dim)', padding: '0.25rem 0.5rem', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+              <div
+                style={{
+                  fontSize: '0.68rem',
+                  color: 'var(--text-dim)',
+                  padding: '0.25rem 0.5rem',
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.05em'
+                }}
+              >
                 Quick Endpoint Jump ({quickMatchingDevices.length})
               </div>
               {quickMatchingDevices.length === 0 ? (
@@ -183,6 +231,7 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
                 quickMatchingDevices.map((d) => (
                   <button
                     key={d.id}
+                    type="button"
                     onClick={() => {
                       if (onSelectDevice) onSelectDevice(d);
                       setSearchFocused(false);
@@ -192,10 +241,10 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
                       alignItems: 'center',
                       justifyContent: 'space-between',
                       padding: '0.55rem 0.75rem',
-                      background: 'rgba(255, 255, 255, 0.03)',
-                      border: '1px solid rgba(255, 255, 255, 0.06)',
+                      background: 'var(--glass-bg)',
+                      border: '1px solid var(--glass-border)',
                       borderRadius: '6px',
-                      color: '#fff',
+                      color: 'var(--text-main)',
                       cursor: 'pointer',
                       textAlign: 'left'
                     }}
@@ -209,7 +258,10 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
                         </div>
                       </div>
                     </div>
-                    <span className={`status-pill status-${d.status === 'online' ? 'online' : 'isolated'}`} style={{ fontSize: '0.68rem' }}>
+                    <span
+                      className={`status-pill status-${d.status === 'online' ? 'online' : d.status === 'isolated' ? 'isolated' : 'offline'}`}
+                      style={{ fontSize: '0.68rem' }}
+                    >
                       {d.status}
                     </span>
                   </button>
@@ -217,6 +269,7 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
               )}
               {onSelectView && (
                 <button
+                  type="button"
                   onClick={() => {
                     onSelectView('dashboard');
                     setSearchFocused(false);
@@ -240,55 +293,84 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
           )}
         </div>
 
-        <select
-          className="glass-select"
-          style={{ width: '220px', padding: '0.45rem 0.85rem' }}
-          value={selectedTenantId}
-          onChange={(e) => onTenantChange(e.target.value)}
-          id="tenant-filter-select"
-        >
-          <option value="all">🏢 All Clients (MSP View)</option>
-          {tenants.map((t) => (
-            <option key={t.id} value={t.id}>
-              {t.name} ({t.device_count} devices)
-            </option>
-          ))}
-        </select>
+        {!isClientAdmin && (
+          <select
+            className="glass-select"
+            style={{ width: '215px', padding: '0.45rem 0.85rem' }}
+            value={selectedTenantId}
+            onChange={(e) => onTenantChange(e.target.value)}
+            id="tenant-filter-select"
+          >
+            <option value="all">All Clients (MSP View)</option>
+            {tenants.map((t) => (
+              <option key={t.id} value={t.id}>
+                {t.name} ({t.device_count} devices)
+              </option>
+            ))}
+          </select>
+        )}
       </div>
 
       <div className="topbar-right">
-        <div className="mesh-status-indicator" title="Connected to MeshCentral 2 Core via WebSocket Relay">
+        <div
+          className={`mesh-status-indicator ${meshConnected ? '' : 'mesh-status-disconnected'}`}
+          title={
+            meshConnected
+              ? 'Connected to MeshCentral 2 Core via authenticated WebSocket Relay'
+              : 'MeshCentral 2 WebSocket bridge is disconnected (Standalone Mode)'
+          }
+        >
           <div className="pulse-dot" />
-          <span>MeshCentral Engine Live</span>
+          <span>{meshConnected ? 'MeshCentral Live' : 'Standalone Mode'}</span>
         </div>
 
-        <button
-          className="btn-glass"
-          onClick={onDownloadInstaller}
-          title="Generate on-demand tokenized agent installer"
-          id="btn-gen-installer"
-        >
-          <Download size={15} />
-          <span>Agent Installer</span>
-        </button>
+        {!isClientAdmin && (
+          <>
+            <button
+              type="button"
+              className="btn-glass"
+              onClick={onDownloadInstaller}
+              title="Generate on-demand tokenized agent installer"
+              id="btn-gen-installer"
+            >
+              <Download size={15} />
+              <span>Agent Installer</span>
+            </button>
 
-        {onOpenGuestAccess && (
-          <button
-            className="btn-glass"
-            onClick={onOpenGuestAccess}
-            title="Manage Vendor / Guest Temporary Access Passes"
-            id="btn-vendor-access"
-          >
-            <UserCheck size={15} />
-            <span>Vendor Access</span>
-          </button>
+            {onOpenQuickSupportQueue && (
+              <button
+                type="button"
+                className="btn-glass"
+                onClick={onOpenQuickSupportQueue}
+                title="View on-demand QuickSupport queue & elevate sessions"
+                id="btn-quicksupport-queue"
+              >
+                <LifeBuoy size={15} />
+                <span>QuickSupport</span>
+              </button>
+            )}
+
+            {onOpenGuestAccess && (
+              <button
+                type="button"
+                className="btn-glass"
+                onClick={onOpenGuestAccess}
+                title="Manage Vendor / Guest Temporary Access Passes"
+                id="btn-vendor-access"
+              >
+                <UserCheck size={15} />
+                <span>Vendor Access</span>
+              </button>
+            )}
+          </>
         )}
 
-        {/* Notification Bell with Badge and Interactive Popup */}
+        {/* Notification Bell */}
         <div style={{ position: 'relative' }} ref={notifRef}>
           <button
+            type="button"
             className="btn-glass btn-icon"
-            title="System & Sync Notifications"
+            title="System & Alert Notifications"
             id="btn-alerts"
             onClick={() => setIsOpen(!isOpen)}
             style={{ position: 'relative' }}
@@ -324,13 +406,12 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
                 position: 'absolute',
                 top: 'calc(100% + 10px)',
                 right: 0,
-                width: '420px',
-                maxHeight: '520px',
-                background: 'rgba(15, 23, 42, 0.95)',
-                backdropFilter: 'blur(20px)',
-                border: '1px solid rgba(255, 255, 255, 0.12)',
+                width: '410px',
+                maxHeight: '500px',
+                background: 'var(--surface-base)',
+                border: '1px solid var(--glass-border-highlight)',
                 borderRadius: '12px',
-                boxShadow: '0 20px 40px rgba(0, 0, 0, 0.6)',
+                boxShadow: 'var(--glass-shadow)',
                 zIndex: 1000,
                 display: 'flex',
                 flexDirection: 'column',
@@ -338,56 +419,40 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
               }}
               id="notifications-dropdown-menu"
             >
-              {/* Header */}
               <div
                 style={{
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'space-between',
-                  padding: '1rem 1.25rem',
-                  borderBottom: '1px solid rgba(255, 255, 255, 0.08)'
+                  padding: '0.9rem 1.15rem',
+                  borderBottom: '1px solid var(--glass-border)'
                 }}
               >
                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                  <Bell size={16} color="var(--accent-primary, #00f2fe)" />
-                  <span style={{ fontWeight: 600, fontSize: '0.95rem' }}>Notifications</span>
-                  {unreadCount > 0 && (
-                    <span
-                      style={{
-                        fontSize: '0.7rem',
-                        padding: '0.15rem 0.5rem',
-                        background: 'rgba(239, 68, 68, 0.2)',
-                        color: '#f87171',
-                        borderRadius: '9999px',
-                        border: '1px solid rgba(239, 68, 68, 0.3)'
-                      }}
-                    >
-                      {unreadCount} new
-                    </span>
-                  )}
+                  <Bell size={16} color="var(--primary)" />
+                  <span style={{ fontWeight: 600, fontSize: '0.92rem' }}>Notifications</span>
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
                   {unreadCount > 0 && (
                     <button
+                      type="button"
                       onClick={async () => {
-                        for (const n of notifications.filter((x) => !x.is_read)) {
-                          await markNotificationRead(n.id);
-                        }
+                        await markNotificationRead('all');
                         setNotifications((prev) => prev.map((n) => ({ ...n, is_read: 1 })));
                       }}
                       style={{
                         background: 'none',
                         border: 'none',
-                        color: 'var(--text-dim)',
+                        color: 'var(--primary)',
                         fontSize: '0.75rem',
-                        cursor: 'pointer',
-                        textDecoration: 'underline'
+                        cursor: 'pointer'
                       }}
                     >
                       Mark all read
                     </button>
                   )}
                   <button
+                    type="button"
                     onClick={() => setIsOpen(false)}
                     style={{ background: 'none', border: 'none', color: 'var(--text-dim)', cursor: 'pointer' }}
                   >
@@ -396,16 +461,28 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
                 </div>
               </div>
 
-              {/* Body */}
-              <div style={{ overflowY: 'auto', padding: '0.75rem 1rem', display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
+              <div
+                style={{
+                  overflowY: 'auto',
+                  padding: '0.75rem 1rem',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '0.65rem'
+                }}
+              >
                 {notifications.length === 0 ? (
                   <div style={{ textAlign: 'center', padding: '2rem 1rem', color: 'var(--text-dim)' }}>
-                    <CheckCircle size={32} style={{ margin: '0 auto 0.5rem', color: 'var(--accent-success, #10b981)' }} />
-                    <p style={{ margin: 0, fontSize: '0.85rem' }}>All caught up! No active alerts.</p>
+                    <CheckCircle size={30} style={{ margin: '0 auto 0.5rem', color: 'var(--accent-success)' }} />
+                    <p style={{ margin: 0, fontSize: '0.84rem' }}>All caught up! No active alerts.</p>
                   </div>
                 ) : (
                   notifications.map((notif) => {
-                    let parsedActions: Array<{ action: string; label: string; tenantId?: string; primary?: boolean; danger?: boolean }> = [];
+                    let parsedActions: Array<{
+                      action: string;
+                      label: string;
+                      tenantId?: string;
+                      danger?: boolean;
+                    }> = [];
                     if (notif.actions_json) {
                       try {
                         parsedActions = JSON.parse(notif.actions_json);
@@ -414,74 +491,71 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
                       }
                     }
 
-                    const isDanger = notif.severity === 'danger' || notif.severity === 'error' || notif.severity === 'critical';
-                    const severityColor = isDanger ? '#ef4444' : notif.severity === 'warning' ? '#f59e0b' : '#38bdf8';
+                    const isDanger =
+                      notif.severity === 'danger' ||
+                      notif.severity === 'error' ||
+                      notif.severity === 'critical';
+                    const severityColor = isDanger
+                      ? '#ef4444'
+                      : notif.severity === 'warning'
+                        ? '#f59e0b'
+                        : '#38bdf8';
 
                     return (
                       <div
                         key={notif.id}
                         style={{
-                          background: notif.is_read ? 'rgba(255, 255, 255, 0.02)' : 'rgba(255, 255, 255, 0.06)',
+                          background: notif.is_read ? 'transparent' : 'var(--glass-bg)',
+                          border: '1px solid var(--glass-border)',
                           borderLeft: `3px solid ${severityColor}`,
                           borderRadius: '8px',
-                          padding: '0.85rem',
+                          padding: '0.8rem',
                           display: 'flex',
                           flexDirection: 'column',
-                          gap: '0.45rem',
-                          transition: 'all 0.2s'
+                          gap: '0.4rem'
                         }}
                       >
                         <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '0.5rem' }}>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                            {notif.type === 'mesh_sync_conflict' ? (
-                              <RefreshCw size={15} color={severityColor} />
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
+                            {notif.type.includes('mesh') ? (
+                              <RefreshCw size={14} color={severityColor} />
                             ) : isDanger ? (
-                              <AlertTriangle size={15} color={severityColor} />
+                              <AlertTriangle size={14} color={severityColor} />
                             ) : (
-                              <Info size={15} color={severityColor} />
+                              <Info size={14} color={severityColor} />
                             )}
-                            <span style={{ fontWeight: 600, fontSize: '0.85rem', color: '#fff' }}>{notif.title}</span>
+                            <span style={{ fontWeight: 600, fontSize: '0.83rem' }}>{notif.title}</span>
                           </div>
                           {!notif.is_read && (
                             <button
+                              type="button"
                               onClick={() => handleMarkAsRead(notif.id)}
                               title="Mark as read"
-                              style={{
-                                background: 'none',
-                                border: 'none',
-                                color: 'var(--text-dim)',
-                                cursor: 'pointer',
-                                padding: '2px'
-                              }}
+                              style={{ background: 'none', border: 'none', color: 'var(--text-dim)', cursor: 'pointer' }}
                             >
                               <CheckCircle size={14} />
                             </button>
                           )}
                         </div>
 
-                        <p style={{ margin: 0, fontSize: '0.78rem', color: 'rgba(255, 255, 255, 0.8)', lineHeight: 1.4 }}>
+                        <p style={{ margin: 0, fontSize: '0.77rem', color: 'var(--text-muted)', lineHeight: 1.4 }}>
                           {notif.message}
                         </p>
 
-                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: '0.2rem' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: '0.15rem' }}>
                           <span style={{ fontSize: '0.68rem', color: 'var(--text-dim)' }}>
-                            {new Date(notif.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} • {notif.type}
+                            {new Date(notif.created_at).toLocaleString()}
                           </span>
-
                           {parsedActions.length > 0 && (
-                            <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
+                            <div style={{ display: 'flex', gap: '0.35rem', flexWrap: 'wrap' }}>
                               {parsedActions.map((act, idx) => (
                                 <button
                                   key={idx}
+                                  type="button"
                                   disabled={actingId === notif.id}
                                   onClick={() => handleExecuteAction(notif.id, act.action, act.tenantId)}
-                                  className={act.danger ? 'btn-danger' : 'btn-glass'}
-                                  style={{
-                                    fontSize: '0.72rem',
-                                    padding: '0.25rem 0.55rem',
-                                    borderRadius: '4px',
-                                    fontWeight: 500
-                                  }}
+                                  className={act.danger ? 'btn-glass btn-danger' : 'btn-glass'}
+                                  style={{ fontSize: '0.7rem', padding: '0.2rem 0.5rem' }}
                                 >
                                   {actingId === notif.id ? 'Processing...' : act.label}
                                 </button>
@@ -498,25 +572,40 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
           )}
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem', marginLeft: '0.5rem' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginLeft: '0.25rem' }}>
           <div
             style={{
-              width: '34px',
-              height: '34px',
+              width: '32px',
+              height: '32px',
               borderRadius: '50%',
-              background: 'linear-gradient(135deg, #00f2fe 0%, #7f00ff 100%)',
+              background: 'linear-gradient(135deg, var(--primary) 0%, #7f00ff 100%)',
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
               color: '#fff'
             }}
           >
-            <User size={18} />
+            <User size={16} />
           </div>
           <div style={{ display: 'flex', flexDirection: 'column' }}>
-            <span style={{ fontSize: '0.85rem', fontWeight: 600 }}>TylerHats</span>
-            <span style={{ fontSize: '0.7rem', color: 'var(--text-dim)' }}>MSP Super Admin</span>
+            <span style={{ fontSize: '0.82rem', fontWeight: 600 }}>
+              {currentUser?.username || 'Authenticated User'}
+            </span>
+            <span style={{ fontSize: '0.68rem', color: 'var(--text-dim)' }}>
+              {ROLE_LABELS[currentUser?.role || ''] || currentUser?.role || 'Technician'}
+            </span>
           </div>
+          {onLogout && (
+            <button
+              type="button"
+              className="btn-glass btn-icon"
+              onClick={onLogout}
+              title="Sign Out"
+              id="logout-btn"
+            >
+              <LogOut size={15} />
+            </button>
+          )}
         </div>
       </div>
     </header>

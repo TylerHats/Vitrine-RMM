@@ -1,6 +1,6 @@
 {
   "name": "vitrine-rmm",
-  "version": "1.0.0",
+  "version": "2.5.0",
   "description": "Modern, glassmorphic self-hosted RMM powered by MeshCentral 2.",
   "private": true,
   "scripts": {

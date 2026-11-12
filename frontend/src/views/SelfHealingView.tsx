@@ -122,7 +122,7 @@ export const SelfHealingView: React.FC = () => {
 
         <div className="glass-card">
           <div className="metric-title">RECORDED REMEDIATIONS</div>
-          <div className="metric-value" style={{ color: '#34d399' }}>{140 + logs.length}</div>
+          <div className="metric-value" style={{ color: '#34d399' }}>{logs.length}</div>
           <div className="metric-subtext">Issues resolved with zero technician tickets</div>
         </div>
 
@@ -159,7 +159,7 @@ export const SelfHealingView: React.FC = () => {
         <p style={{ fontSize: '0.82rem', color: 'var(--text-dim)', margin: 0, lineHeight: 1.5 }}>
           To prevent infinite retry storms or resource exhaustion on failing endpoints, Vitrine enforces circuit-breaker trip thresholds configured per Policy tier. If an automated runbook fails or triggers more than the allowable hourly limit, the monitor automatically dispatches an urgent incident to the connected PSA and suppresses further execution.
         </p>
-        <div style={{ display: 'flex', gap: '1.5rem', flexWrap: 'wrap', fontSize: '0.78rem', color: '#fff', paddingTop: '0.35rem' }}>
+        <div style={{ display: 'flex', gap: '1.5rem', flexWrap: 'wrap', fontSize: '0.78rem', color: 'var(--text-main)', paddingTop: '0.35rem' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
             <Clock size={15} color="var(--primary)" />
             <span><strong>Maintenance Mode Suppression:</strong> Auto-remediations silently muted during scheduled maintenance.</span>
@@ -200,7 +200,7 @@ export const SelfHealingView: React.FC = () => {
                   <td><code>{m.condition_value}</code></td>
                   <td>
                     <span style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', color: 'var(--primary)', fontSize: '0.82rem' }}>
-                      <Play size={12} /> Runbook ID {m.remediation_script_id}
+                      <Play size={12} /> {scripts.find((s) => s.id === m.remediation_script_id)?.name || m.remediation_script_id}
                     </span>
                   </td>
                   <td>{m.cooldown_min} minutes</td>

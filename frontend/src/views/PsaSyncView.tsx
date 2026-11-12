@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { Plus, CheckCircle2, X } from 'lucide-react';
-import { fetchPsaTickets, createPsaTicket, updatePsaTicket } from '../services/api.js';
+import { fetchPsaTickets, createPsaTicket, updatePsaTicket, fetchTenants, fetchDevices } from '../services/api.js';
+import { Tenant, Device } from '../types/index.js';
 
 interface PsaTicket {
   id: string;
@@ -12,12 +13,19 @@ interface PsaTicket {
   status: string;
 }
 
-export const PsaSyncView: React.FC = () => {
+interface PsaSyncViewProps {
+  tenants?: Tenant[];
+  devices?: Device[];
+}
+
+export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, devices: propDevices }) => {
   const [tickets, setTickets] = useState<PsaTicket[]>([]);
+  const [tenants, setTenants] = useState<Tenant[]>(propTenants || []);
+  const [devices, setDevices] = useState<Device[]>(propDevices || []);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [newTitle, setNewTitle] = useState('');
-  const [newClient, setNewClient] = useState('Apex Financial Partners');
-  const [newDevice, setNewDevice] = useState('WIN11-PRO-EXEC');
+  const [newClient, setNewClient] = useState('');
+  const [newDevice, setNewDevice] = useState('');
   const [newPriority, setNewPriority] = useState('High');
 
   const loadTickets = useCallback(() => {
@@ -26,15 +34,29 @@ export const PsaSyncView: React.FC = () => {
 
   useEffect(() => {
     loadTickets();
-  }, [loadTickets]);
+    if (!propTenants) {
+      fetchTenants().then((t) => {
+        setTenants(t);
+        if (t[0] && !newClient) setNewClient(t[0].name);
+      });
+    } else {
+      setTenants(propTenants);
+      if (propTenants[0] && !newClient) setNewClient(propTenants[0].name);
+    }
+    if (!propDevices) {
+      fetchDevices().then(setDevices);
+    } else {
+      setDevices(propDevices);
+    }
+  }, [loadTickets, propTenants, propDevices, newClient]);
 
   const handleCreateTicket = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newTitle.trim()) return;
     await createPsaTicket({
       title: newTitle.trim(),
-      client_name: newClient,
-      device_id: newDevice,
+      client_name: newClient.trim() || 'General MSP Service Desk',
+      device_id: newDevice.trim() || undefined,
       priority: newPriority
     });
     loadTickets();
@@ -68,21 +90,21 @@ export const PsaSyncView: React.FC = () => {
         <div className="glass-card">
           <div className="metric-title">SYNCHRONIZED TICKETS</div>
           <div className="metric-value" style={{ color: 'var(--primary)' }}>{tickets.length}</div>
-          <div className="metric-subtext">Connected to ITFlow instance</div>
+          <div className="metric-subtext">Active &amp; historical service desk queue</div>
         </div>
 
         <div className="glass-card">
-          <div className="metric-title">AUTO-RESOLVED VIA RUNBOOKS</div>
+          <div className="metric-title">RESOLVED INCIDENTS</div>
           <div className="metric-value" style={{ color: '#34d399' }}>
-            {23 + tickets.filter((t) => t.status === 'Resolved').length}
+            {tickets.filter((t) => t.status === 'Resolved').length}
           </div>
-          <div className="metric-subtext">Auto-closed upon self-healing condition resolution</div>
+          <div className="metric-subtext">Closed manually or via condition auto-resolution</div>
         </div>
 
         <div className="glass-card">
           <div className="metric-title">API WEBHOOK BUS</div>
           <div className="metric-value" style={{ color: '#38bdf8' }}>Active</div>
-          <div className="metric-subtext">Listening on /api/psa/webhook</div>
+          <div className="metric-subtext">Listening on /api/psa/webhook (HMAC Verified)</div>
         </div>
       </div>
 
@@ -121,11 +143,7 @@ export const PsaSyncView: React.FC = () => {
                     </span>
                   </td>
                   <td>
-                    <span
-                      className={`status-pill ${
-                        t.status === 'Resolved' ? 'status-online' : 'status-reboot'
-                      }`}
-                    >
+                    <span className={`status-pill ${t.status === 'Resolved' ? 'status-online' : 'status-reboot'}`}>
                       {t.status}
                     </span>
                   </td>
@@ -140,6 +158,13 @@ export const PsaSyncView: React.FC = () => {
                   </td>
                 </tr>
               ))}
+              {tickets.length === 0 && (
+                <tr>
+                  <td colSpan={7} style={{ textAlign: 'center', padding: '2.5rem', color: 'var(--text-muted)' }}>
+                    No PSA tickets recorded yet. Condition alerts and manual tickets will appear here.
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
@@ -172,23 +197,47 @@ export const PsaSyncView: React.FC = () => {
                 <label style={{ fontSize: '0.78rem', color: 'var(--text-dim)', display: 'block', marginBottom: '0.25rem' }}>
                   Client Tenant
                 </label>
-                <select className="glass-select" value={newClient} onChange={(e) => setNewClient(e.target.value)}>
-                  <option value="Apex Financial Partners">Apex Financial Partners</option>
-                  <option value="NovaBio Diagnostics">NovaBio Diagnostics</option>
-                  <option value="Vanguard Logistics">Vanguard Logistics</option>
-                </select>
+                {tenants.length > 0 ? (
+                  <select className="glass-select" value={newClient} onChange={(e) => setNewClient(e.target.value)}>
+                    {tenants.map((ten) => (
+                      <option key={ten.id} value={ten.name}>
+                        {ten.name}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    type="text"
+                    className="glass-input"
+                    placeholder="Client Organization Name"
+                    value={newClient}
+                    onChange={(e) => setNewClient(e.target.value)}
+                  />
+                )}
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.85rem' }}>
                 <div>
                   <label style={{ fontSize: '0.78rem', color: 'var(--text-dim)', display: 'block', marginBottom: '0.25rem' }}>
-                    Endpoint Hostname / ID
+                    Target Endpoint (Optional)
                   </label>
-                  <input
-                    type="text"
-                    className="glass-input"
-                    value={newDevice}
-                    onChange={(e) => setNewDevice(e.target.value)}
-                  />
+                  {devices.length > 0 ? (
+                    <select className="glass-select" value={newDevice} onChange={(e) => setNewDevice(e.target.value)}>
+                      <option value="">System / General</option>
+                      {devices.map((dev) => (
+                        <option key={dev.id} value={dev.hostname}>
+                          {dev.hostname}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      type="text"
+                      className="glass-input"
+                      placeholder="Hostname or ID"
+                      value={newDevice}
+                      onChange={(e) => setNewDevice(e.target.value)}
+                    />
+                  )}
                 </div>
                 <div>
                   <label style={{ fontSize: '0.78rem', color: 'var(--text-dim)', display: 'block', marginBottom: '0.25rem' }}>

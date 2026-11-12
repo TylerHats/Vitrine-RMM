@@ -78,7 +78,7 @@ export const CyberIsolationModal: React.FC<CyberIsolationModalProps> = ({
 
           <div style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>
             Target: <strong>{device.hostname}</strong> ({device.ip_address})<br />
-            Tenant: <strong>{device.tenant_name || 'Apex Financial'}</strong>
+            Tenant: <strong>{device.tenant_name || 'Unassigned Client'}</strong>
           </div>
         </div>
 

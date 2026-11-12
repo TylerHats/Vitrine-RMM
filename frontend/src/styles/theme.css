@@ -1,5 +1,5 @@
 /* ==========================================================================
-   VITRINE RMM - MODERN GLASSMORPHIC DESIGN SYSTEM
+   VITRINE RMM - MODERN GLASSMORPHIC DESIGN SYSTEM (DARK & LIGHT PARITY)
    ========================================================================== */
 
 :root {
@@ -24,18 +24,21 @@
   /* Typography */
   --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   --font-heading: 'Outfit', var(--font-sans);
-  --font-mono: 'JetBrains Mono', monospace;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 
   /* Glassmorphism Tokens (Default: Dark Mode) */
+  color-scheme: dark;
   --bg-gradient: radial-gradient(circle at 15% 15%, #0f172a 0%, #080c14 100%);
   --bg-mesh-1: rgba(0, 242, 254, 0.08);
   --bg-mesh-2: rgba(127, 0, 255, 0.08);
   --surface-base: #090d16;
-  
+  --input-bg: rgba(0, 0, 0, 0.28);
+
   --glass-bg: rgba(15, 23, 42, 0.65);
   --glass-bg-hover: rgba(26, 38, 66, 0.75);
   --glass-bg-active: rgba(30, 41, 59, 0.85);
   --glass-border: rgba(255, 255, 255, 0.10);
+  --border-color: rgba(255, 255, 255, 0.10);
   --glass-border-highlight: rgba(255, 255, 255, 0.22);
   --glass-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.45);
   --glass-blur: blur(16px) saturate(180%);
@@ -56,23 +59,29 @@
   --transition-smooth: 0.4s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-/* Light Theme Overrides */
+/* Light Theme Overrides (WCAG AA Contrast Verified) */
 [data-theme='light'] {
-  --bg-gradient: radial-gradient(circle at 10% 20%, #f1f5f9 0%, #e2e8f0 100%);
-  --bg-mesh-1: rgba(0, 180, 216, 0.12);
-  --bg-mesh-2: rgba(124, 58, 237, 0.10);
-  --surface-base: #f8fafc;
+  color-scheme: light;
+  --primary: #0284c7;
+  --primary-glow: rgba(2, 132, 199, 0.25);
 
-  --glass-bg: rgba(255, 255, 255, 0.72);
-  --glass-bg-hover: rgba(255, 255, 255, 0.88);
-  --glass-bg-active: rgba(241, 245, 249, 0.95);
-  --glass-border: rgba(0, 0, 0, 0.08);
-  --glass-border-highlight: rgba(0, 0, 0, 0.15);
-  --glass-shadow: 0 10px 30px 0 rgba(0, 0, 0, 0.06);
+  --bg-gradient: radial-gradient(circle at 10% 20%, #f8fafc 0%, #e2e8f0 100%);
+  --bg-mesh-1: rgba(2, 132, 199, 0.10);
+  --bg-mesh-2: rgba(124, 58, 237, 0.08);
+  --surface-base: #f8fafc;
+  --input-bg: rgba(241, 245, 249, 0.92);
+
+  --glass-bg: rgba(255, 255, 255, 0.82);
+  --glass-bg-hover: rgba(255, 255, 255, 0.95);
+  --glass-bg-active: rgba(241, 245, 249, 0.98);
+  --glass-border: rgba(15, 23, 42, 0.10);
+  --border-color: rgba(15, 23, 42, 0.12);
+  --glass-border-highlight: rgba(15, 23, 42, 0.20);
+  --glass-shadow: 0 10px 30px 0 rgba(15, 23, 42, 0.08);
 
   --text-main: #0f172a;
   --text-muted: #475569;
-  --text-dim: #94a3b8;
+  --text-dim: #64748b;
 }
 
 /* Global Reset & Base Styles */
@@ -92,7 +101,7 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* Ambient Ambient Glow Underlays */
+/* Ambient Glow Underlays */
 body::before {
   content: '';
   position: fixed;
@@ -126,9 +135,15 @@ body::after {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.15);
+  background: rgba(148, 163, 184, 0.28);
   border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.28);
+  background: rgba(148, 163, 184, 0.45);
+}
+[data-theme='light'] ::-webkit-scrollbar-thumb {
+  background: rgba(15, 23, 42, 0.22);
+}
+[data-theme='light'] ::-webkit-scrollbar-thumb:hover {
+  background: rgba(15, 23, 42, 0.38);
 }

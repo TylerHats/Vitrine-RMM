@@ -107,12 +107,15 @@ export const GuestAccessModal: React.FC<GuestAccessModalProps> = ({ devices, onC
       });
 
       if (res.success && res.id && res.tempUsername && res.tempPassword && res.expiresAt && res.portalUrl) {
+        const resolvedUrl = res.portalUrl.startsWith('http')
+          ? res.portalUrl
+          : `${window.location.origin}${res.portalUrl}`;
         setCreatedResult({
           id: res.id,
           tempUsername: res.tempUsername,
           tempPassword: res.tempPassword,
           expiresAt: res.expiresAt,
-          portalUrl: `${window.location.origin}${res.portalUrl}`
+          portalUrl: resolvedUrl
         });
         loadGrants();
       } else {
@@ -292,13 +295,13 @@ export const GuestAccessModal: React.FC<GuestAccessModalProps> = ({ devices, onC
                             <button
                               className="btn-glass"
                               style={{ fontSize: '0.8rem', padding: '0.35rem 0.65rem' }}
-                              onClick={() => copyToClipboard(`${window.location.origin}/?grant=${grant.id}`, `link-${grant.id}`)}
+                              onClick={() => copyToClipboard(`${window.location.origin}/guest/${grant.id}`, `link-${grant.id}`)}
                             >
                               {copiedId === `link-${grant.id}` ? <CheckCircle2 size={14} color="#34d399" /> : <Copy size={14} />}
                               <span>{copiedId === `link-${grant.id}` ? 'Copied' : 'Copy Link'}</span>
                             </button>
                             <a
-                              href={`/?grant=${grant.id}`}
+                              href={`/guest/${grant.id}`}
                               target="_blank"
                               rel="noreferrer"
                               className="btn-glass"

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Terminal,
   Cpu,
@@ -16,7 +16,8 @@ import {
   File,
   FileText,
   CornerLeftUp,
-  Download
+  Download,
+  Upload
 } from 'lucide-react';
 import { Device, ProcessItem, ServiceItem, EventLogItem } from '../types/index.js';
 import {
@@ -31,8 +32,16 @@ import {
   manageScheduledTask,
   fetchFiles,
   manageRemoteFile,
-  fetchEventLogs
+  getRemoteFileDownloadUrl,
+  fetchEventLogs,
+  getStoredSessionToken
 } from '../services/api.js';
+
+// eslint-disable-next-line no-control-regex
+const ANSI_ESCAPE_REGEX = /\x1b\[[0-9;]*[a-zA-Z]/g;
+function stripAnsi(str: string): string {
+  return String(str || '').replace(ANSI_ESCAPE_REGEX, '');
+}
 
 interface BackgroundToolsModalProps {
   device: Device;
@@ -94,23 +103,28 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
   const [eventLevel, setEventLevel] = useState('all');
   const [eventFilter, setEventFilter] = useState('');
   const [loadingEvents, setLoadingEvents] = useState(false);
+  const terminalWindowRef = useRef<HTMLDivElement | null>(null);
+  const fileUploadInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Connect WebSocket for terminal with deviceId, runAs, and shell
+  // Connect WebSocket for terminal only when on terminal tab, passing auth token
   useEffect(() => {
+    if (activeTab !== 'terminal') return;
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
+    const token = getStoredSessionToken() || '';
     const socket = new WebSocket(
-      `${protocol}//${host}/ws/terminal?deviceId=${encodeURIComponent(device.id)}&runAs=${runAsContext}&shell=${encodeURIComponent(shellType)}`
+      `${protocol}//${host}/ws/terminal?deviceId=${encodeURIComponent(device.id)}&runAs=${runAsContext}&shell=${encodeURIComponent(shellType)}${token ? `&token=${encodeURIComponent(token)}` : ''}`
     );
 
     socket.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data);
         if (msg.type === 'output') {
-          setTerminalOutput((prev) => [...prev, msg.data]);
+          const clean = stripAnsi(msg.data);
+          setTerminalOutput((prev) => [...prev, clean]);
         }
       } catch {
-        setTerminalOutput((prev) => [...prev, event.data]);
+        setTerminalOutput((prev) => [...prev, stripAnsi(String(event.data))]);
       }
     };
 
@@ -118,9 +132,16 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
 
     return () => {
       socket.close();
+      setWs(null);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [device.id]);
+  }, [device.id, activeTab]);
+
+  useEffect(() => {
+    if (terminalWindowRef.current) {
+      terminalWindowRef.current.scrollTop = terminalWindowRef.current.scrollHeight;
+    }
+  }, [terminalOutput]);
 
   const handleSwitchTerminalContext = (nextRunAs: 'system' | 'user', nextShell: string) => {
     setRunAsContext(nextRunAs);
@@ -222,23 +243,23 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
       ? shellType === 'cmd'
         ? runAsContext === 'system'
           ? 'C:\\Windows\\System32>'
-          : 'C:\\Users\\Tyler.Hats>'
+          : 'C:\\Users\\ConsoleUser>'
         : runAsContext === 'system'
           ? 'PS C:\\Windows\\System32>'
-          : 'PS C:\\Users\\Tyler.Hats>'
+          : 'PS C:\\Users\\ConsoleUser>'
       : osType === 'macos'
-        ? `${runAsContext === 'system' ? 'root' : 'tylerhats'}@${device.hostname.toLowerCase()} ${runAsContext === 'system' ? '#' : '%'}`
+        ? `${runAsContext === 'system' ? 'root' : 'localuser'}@${device.hostname.toLowerCase()} ${runAsContext === 'system' ? '#' : '%'}`
         : `${runAsContext === 'system' ? 'root' : 'ubuntu'}@${device.hostname.toLowerCase()}:${runAsContext === 'system' ? '#' : '$'}`;
 
   const identityBadge =
     osType === 'windows'
       ? runAsContext === 'system'
         ? 'NT AUTHORITY\\SYSTEM'
-        : 'CORP\\Tyler.Hats (User)'
+        : 'Interactive User'
       : osType === 'macos'
         ? runAsContext === 'system'
           ? 'root (UID 0 LaunchDaemon)'
-          : 'tylerhats (UID 501 User)'
+          : 'localuser (UID 501 User)'
         : runAsContext === 'system'
           ? 'root (UID 0 systemd)'
           : 'ubuntu (UID 1000 User)';
@@ -246,14 +267,23 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
   const handleTerminalSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!terminalInput.trim() || !ws) return;
-    setTerminalOutput((prev) => [...prev, `${terminalInput}`]);
+    if (terminalInput.trim().toLowerCase() === 'clear' || terminalInput.trim().toLowerCase() === 'cls') {
+      setTerminalOutput([]);
+      setTerminalInput('');
+      return;
+    }
+    setTerminalOutput((prev) => [...prev, `\n${promptLabel} ${terminalInput}\n`]);
     ws.send(JSON.stringify({ type: 'input', data: terminalInput }));
     setTerminalInput('');
   };
 
   const handleSnippet = (cmd: string) => {
+    if (cmd === 'clear') {
+      setTerminalOutput([]);
+      return;
+    }
     if (!ws) return;
-    setTerminalOutput((prev) => [...prev, `${cmd}`]);
+    setTerminalOutput((prev) => [...prev, `\n${promptLabel} ${cmd}\n`]);
     ws.send(JSON.stringify({ type: 'input', data: cmd }));
   };
 
@@ -269,8 +299,30 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
     loadServices();
   };
 
-  const handleDownloadFile = (fileName: string, fileSize: number) => {
-    alert(`Starting background transfer of ${fileName} (${(fileSize / 1024).toFixed(1)} KB) via MeshCentral micro-agent tunnel...`);
+  const handleDownloadFile = (filePath: string) => {
+    window.open(getRemoteFileDownloadUrl(device.id, filePath), '_blank');
+  };
+
+  const handleUploadFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const dataUrl = String(reader.result || '');
+      const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+      const res = await manageRemoteFile(device.id, {
+        path: currentPath,
+        action: 'upload',
+        name: file.name,
+        size: file.size,
+        contentBase64: base64
+      });
+      if (res.success) {
+        setFiles(res.files);
+      }
+      if (fileUploadInputRef.current) fileUploadInputRef.current.value = '';
+    };
+    reader.readAsDataURL(file);
   };
 
   const handleSaveRegValue = async (e: React.FormEvent) => {
@@ -443,7 +495,7 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                   flexWrap: 'wrap',
                   gap: '0.75rem',
                   padding: '0.6rem 0.9rem',
-                  background: 'rgba(15, 23, 42, 0.65)',
+                  background: 'var(--glass-bg)',
                   border: '1px solid var(--glass-border)',
                   borderRadius: '8px'
                 }}
@@ -465,10 +517,10 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                     onClick={() => handleSwitchTerminalContext('user', shellType)}
                   >
                     {osType === 'windows'
-                      ? 'Logged-In User (CORP\\Tyler.Hats)'
+                      ? 'Logged-In User (Interactive)'
                       : osType === 'macos'
-                        ? 'Logged-In User (tylerhats)'
-                        : 'Logged-In User (ubuntu)'}
+                        ? 'Logged-In User (Console)'
+                        : 'Logged-In User (UID 1000)'}
                   </button>
                 </div>
 
@@ -595,7 +647,12 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                 </button>
               </div>
 
-              <div className="terminal-window" style={{ flex: 1, minHeight: '350px' }} id="terminal-window-output">
+              <div
+                ref={terminalWindowRef}
+                className="terminal-window"
+                style={{ flex: 1, minHeight: '350px', overflowY: 'auto', whiteSpace: 'pre-wrap' }}
+                id="terminal-window-output"
+              >
                 {terminalOutput.join('')}
               </div>
 
@@ -1007,6 +1064,18 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                 <button className="btn-glass" onClick={handleCreateFolder}>
                   + New Folder
                 </button>
+                <input
+                  ref={fileUploadInputRef}
+                  type="file"
+                  style={{ display: 'none' }}
+                  onChange={handleUploadFileSelect}
+                />
+                <button
+                  className="btn-glass btn-primary"
+                  onClick={() => fileUploadInputRef.current?.click()}
+                >
+                  <Upload size={14} /> Upload File
+                </button>
               </div>
 
               <div className="table-wrapper">
@@ -1041,7 +1110,7 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                               <button
                                 className="btn-glass"
                                 style={{ padding: '0.2rem 0.5rem', fontSize: '0.72rem', display: 'flex', alignItems: 'center', gap: '0.3rem' }}
-                                onClick={() => handleDownloadFile(f.name, f.size)}
+                                onClick={() => handleDownloadFile(f.path)}
                               >
                                 <Download size={12} /> Download
                               </button>

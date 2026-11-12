@@ -11,10 +11,19 @@ import {
   CheckCircle2,
   CircleDot,
   Cpu,
-  ExternalLink
+  ExternalLink,
+  KeyRound
 } from 'lucide-react';
 import { Device, RemoteSessionDescriptor } from '../types/index.js';
-import { saveRecording, fetchSettings, negotiateRemoteSession } from '../services/api.js';
+import {
+  saveRecording,
+  getRecordingDownloadUrl,
+  fetchSettings,
+  fetchDeviceConsentStatus,
+  negotiateRemoteSession,
+  elevateRemoteAgent
+} from '../services/api.js';
+import { MfaChallengeModal } from './MfaChallengeModal.js';
 
 interface RemoteScreenModalProps {
   device: Device;
@@ -44,7 +53,24 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
   const [latencyMs] = useState(14);
   const [fps] = useState(60);
 
+  // Tech-Side Remote Self-Elevation state
+  const [showElevateModal, setShowElevateModal] = useState(false);
+  const [elevateSource, setElevateSource] = useState<'laps' | 'custom_admin' | 'end_user_uac'>('laps');
+  const [elevateTargetAction, setElevateTargetAction] = useState<'elevate_temp_session' | 'promote_permanent_service'>('elevate_temp_session');
+  const [customAdminUsername, setCustomAdminUsername] = useState('.\\Administrator');
+  const [customAdminPassword, setCustomAdminPassword] = useState('');
+  const [elevating, setElevating] = useState(false);
+  const [elevateSuccessMsg, setElevateSuccessMsg] = useState<string | null>(null);
+  const [elevateMfaOpen, setElevateMfaOpen] = useState(false);
+  const [statusBanner, setStatusBanner] = useState<string | null>(null);
+  const [agentPrivilegeLevel, setAgentPrivilegeLevel] = useState<string>(device.agent_privilege_mode || 'SYSTEM');
+
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  const showTransientBanner = (msg: string) => {
+    setStatusBanner(msg);
+    setTimeout(() => setStatusBanner(null), 4000);
+  };
 
   // Negotiate OS-specific display pipeline & Ghost Session isolation with backend
   useEffect(() => {
@@ -52,17 +78,29 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
       .then((desc) => {
         if (desc?.success) setSessionDescriptor(desc);
       })
-      .catch(console.error);
+      .catch(() => {});
   }, [device.id, sessionMode, selectedMonitor]);
 
-  // Load stealth settings
+  // Load stealth settings & policy consent configuration
   useEffect(() => {
     fetchSettings()
       .then((s) => {
         setStealthForTechs(Boolean(s.session_recording_stealth_for_techs));
       })
-      .catch(console.error);
-  }, []);
+      .catch(() => {});
+    fetchDeviceConsentStatus(device.id)
+      .then((cs) => {
+        if (cs) {
+          setAutoLockOnDisconnect(Boolean(cs.autoLockOnDisconnect));
+          if (!cs.requireConsent || cs.bypassedDueToLockScreen) {
+            setConsentGranted(true);
+          } else if (cs.timeoutSec) {
+            setConsentCountdown(cs.timeoutSec);
+          }
+        }
+      })
+      .catch(() => {});
+  }, [device.id]);
 
   // Timer for active server-side recording
   useEffect(() => {
@@ -289,7 +327,7 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
           ctx.fillText(`PS C:\\Windows\\System32> qwinsta`, termX + 12, termY + 24);
           ctx.fillStyle = '#cbd5e1';
           ctx.fillText(` SESSIONNAME       USERNAME                 ID  STATE   TYPE`, termX + 12, termY + 44);
-          ctx.fillText(` console           Tyler.Hats                1  Active  wdcon (Physical User)`, termX + 12, termY + 62);
+          ctx.fillText(` console           local-user                1  Active  wdcon (Physical User)`, termX + 12, termY + 62);
           if (sessionMode === 'ghost') {
             ctx.fillStyle = '#c084fc';
             ctx.fillText(`>vitrine-ghost#99  NT AUTHORITY\\SYSTEM       2  Active  idd-virtual (Ghost GUI)`, termX + 12, termY + 80);
@@ -374,12 +412,45 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
   }, [consentGranted, sessionMode, selectedMonitor, sessionDescriptor, useLiveMeshIframe, device]);
 
   const handleSendCtrlAltDel = () => {
-    alert(`Ctrl+Alt+Del injected successfully to ${device.hostname} via MeshCentral SAS API.`);
+    showTransientBanner(`Ctrl+Alt+Del Secure Attention Sequence dispatched to ${device.hostname}.`);
   };
 
-  const handleSyncClipboard = () => {
+  const handleSyncClipboard = async () => {
+    try {
+      await navigator.clipboard.readText();
+    } catch {
+      // Clipboard permission optional
+    }
     setClipboardSynced(true);
+    showTransientBanner(`Clipboard synchronized with ${device.hostname}.`);
     setTimeout(() => setClipboardSynced(false), 2000);
+  };
+
+  const handleTriggerElevation = async () => {
+    setElevating(true);
+    setElevateSuccessMsg(null);
+    try {
+      const res = await elevateRemoteAgent(device.id, {
+        credentialSource: elevateSource,
+        adminUsername: elevateSource === 'custom_admin' ? customAdminUsername : undefined,
+        adminPassword: elevateSource === 'custom_admin' ? customAdminPassword : undefined,
+        elevationAction: elevateTargetAction
+      });
+      if (res.mfaRequired) {
+        setElevateMfaOpen(true);
+        return;
+      }
+      if (res.success) {
+        setAgentPrivilegeLevel(res.newPrivilegeLevel || 'elevated_admin');
+        setElevateSuccessMsg(res.message);
+      } else {
+        setElevateSuccessMsg(res.error || 'Remote elevation failed');
+      }
+    } catch (e: any) {
+      setElevateSuccessMsg(e?.message || 'Remote elevation failed');
+    } finally {
+      setElevating(false);
+    }
   };
 
   return (
@@ -491,12 +562,26 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
                 <button
                   className="btn-glass btn-danger"
                   style={{ padding: '0.25rem 0.65rem', fontSize: '0.72rem', display: 'flex', alignItems: 'center', gap: '0.35rem' }}
-                  onClick={() => {
+                  onClick={async () => {
+                    const dur = Math.max(1, manualSeconds);
                     setManualRecording(false);
-                    alert(`Manual Session Recording saved! 1080p WebM clip (${Math.floor(manualSeconds / 60)}m ${manualSeconds % 60}s) downloaded directly to technician workstation.`);
                     setManualSeconds(0);
+                    try {
+                      const rec = await saveRecording({
+                        device_id: device.id,
+                        is_ghost_session: sessionMode === 'ghost' ? 1 : 0,
+                        duration_sec: dur,
+                        file_size_mb: parseFloat(((dur * 48000) / (1024 * 1024)).toFixed(2))
+                      });
+                      if (rec.id) {
+                        window.open(getRecordingDownloadUrl(rec.id), '_blank');
+                      }
+                      showTransientBanner(`Session clip (${dur}s) saved to audit vault.`);
+                    } catch {
+                      showTransientBanner('Clip capture stopped.');
+                    }
                   }}
-                  title="Click to stop manual recording and download video"
+                  title="Click to stop manual recording and download audit clip"
                 >
                   <CircleDot size={12} color="#fff" />
                   <span>Stop Clip ({Math.floor(manualSeconds / 60)}:{(manualSeconds % 60).toString().padStart(2, '0')})</span>
@@ -547,6 +632,22 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
               </button>
             )}
 
+            <button
+              className="btn-glass"
+              style={{
+                padding: '0.35rem 0.65rem',
+                fontSize: '0.75rem',
+                background: showElevateModal ? 'rgba(245, 158, 11, 0.22)' : 'rgba(245, 158, 11, 0.1)',
+                borderColor: 'rgba(245, 158, 11, 0.45)',
+                color: '#fbbf24'
+              }}
+              onClick={() => setShowElevateModal(!showElevateModal)}
+              title="Remotely self-elevate standard-user QuickSupport agent or promote to permanent service using LAPS or Tech credentials"
+            >
+              <KeyRound size={13} />
+              <span>Elevate Agent ({agentPrivilegeLevel})</span>
+            </button>
+
             <button className="btn-glass" style={{ padding: '0.35rem 0.65rem', fontSize: '0.75rem' }} onClick={handleSendCtrlAltDel} title="Inject Ctrl+Alt+Del">
               <Lock size={13} />
               <span>Ctrl+Alt+Del</span>
@@ -581,10 +682,8 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
                 if (recordSeconds > 5) {
                   saveRecording({
                     device_id: device.id,
-                    technician: 'Lead Admin (Authentik)',
                     is_ghost_session: sessionMode === 'ghost' ? 1 : 0,
                     duration_sec: recordSeconds,
-                    file_path: `/var/vitrine/recordings/${device.id}_${Date.now()}.webm`,
                     file_size_mb: parseFloat(((recordSeconds * 48000) / (1024 * 1024)).toFixed(2))
                   }).catch(() => {});
                 }
@@ -596,6 +695,12 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
             </button>
           </div>
         </div>
+
+        {statusBanner && (
+          <div style={{ padding: '0.5rem 1.5rem', background: 'rgba(16, 185, 129, 0.14)', borderBottom: '1px solid rgba(16, 185, 129, 0.35)', color: '#34d399', fontSize: '0.8rem' }}>
+            ✓ {statusBanner}
+          </div>
+        )}
 
         {/* Consent Warning Banner (Feature 9) */}
         {!consentGranted && (
@@ -629,10 +734,14 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
 
         {/* Viewport Canvas or Live MeshCentral WebRTC Iframe */}
         <div style={{ flex: 1, position: 'relative', background: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}>
-          {useLiveMeshIframe && sessionDescriptor?.meshRelayUrl ? (
+          {useLiveMeshIframe &&
+          sessionDescriptor?.meshRelayUrl &&
+          /^https?:\/\//i.test(sessionDescriptor.meshRelayUrl) ? (
             <iframe
               src={sessionDescriptor.meshRelayUrl}
               title={`MeshCentral Live WebRTC — ${device.hostname}`}
+              sandbox="allow-scripts allow-same-origin allow-forms"
+              referrerPolicy="no-referrer"
               style={{ width: '100%', height: '100%', border: 'none' }}
             />
           ) : (
@@ -647,6 +756,109 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
                 cursor: consentGranted ? 'default' : 'wait'
               }}
             />
+          )}
+
+          {/* Tech-Side Remote Self-Elevation Popover */}
+          {showElevateModal && (
+            <div
+              style={{
+                position: 'absolute',
+                top: '16px',
+                right: '16px',
+                width: '410px',
+                background: 'rgba(15, 23, 42, 0.97)',
+                border: '1px solid rgba(245, 158, 11, 0.45)',
+                borderRadius: '12px',
+                padding: '1.15rem',
+                zIndex: 50,
+                boxShadow: '0 20px 45px rgba(0, 0, 0, 0.7)'
+              }}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.65rem' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', color: '#fbbf24', fontWeight: 700, fontSize: '0.9rem' }}>
+                  <KeyRound size={16} />
+                  <span>Tech-Side Remote Self-Elevation</span>
+                </div>
+                <button className="btn-glass btn-icon" style={{ padding: '0.2rem' }} onClick={() => setShowElevateModal(false)}>
+                  <X size={14} />
+                </button>
+              </div>
+              <p style={{ fontSize: '0.76rem', color: 'var(--text-muted)', marginBottom: '0.75rem', lineHeight: 1.45 }}>
+                Elevate a non-admin QuickSupport / standard-user session to full <code>SYSTEM / Administrator</code> privileges (including UAC prompt capture) or promote it into a permanent signed service.
+              </p>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
+                <div>
+                  <label className="form-label" style={{ fontSize: '0.73rem' }}>Credential Source</label>
+                  <select
+                    className="form-select"
+                    style={{ fontSize: '0.78rem', padding: '0.4rem' }}
+                    value={elevateSource}
+                    onChange={(e) => setElevateSource(e.target.value as any)}
+                  >
+                    <option value="laps">1-Click Vaulted LAPS Local Admin ({device.laps_account || 'VitrineLocalAdmin'})</option>
+                    <option value="custom_admin">Custom Admin / Domain Credentials (Tech Input)</option>
+                    <option value="end_user_uac">Trigger End-User UAC Consent Prompt on Screen</option>
+                  </select>
+                </div>
+
+                {elevateSource === 'custom_admin' && (
+                  <div className="grid-2" style={{ gap: '0.5rem' }}>
+                    <div>
+                      <label className="form-label" style={{ fontSize: '0.72rem' }}>Admin Username</label>
+                      <input
+                        className="form-input"
+                        style={{ fontSize: '0.78rem', padding: '0.35rem 0.5rem' }}
+                        value={customAdminUsername}
+                        onChange={(e) => setCustomAdminUsername(e.target.value)}
+                        placeholder=".\Administrator or DOMAIN\Admin"
+                      />
+                    </div>
+                    <div>
+                      <label className="form-label" style={{ fontSize: '0.72rem' }}>Admin Password</label>
+                      <input
+                        type="password"
+                        className="form-input"
+                        style={{ fontSize: '0.78rem', padding: '0.35rem 0.5rem' }}
+                        value={customAdminPassword}
+                        onChange={(e) => setCustomAdminPassword(e.target.value)}
+                        placeholder="••••••••••••"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                <div>
+                  <label className="form-label" style={{ fontSize: '0.73rem' }}>Target Elevation Mode</label>
+                  <select
+                    className="form-select"
+                    style={{ fontSize: '0.78rem', padding: '0.4rem' }}
+                    value={elevateTargetAction}
+                    onChange={(e) => setElevateTargetAction(e.target.value as any)}
+                  >
+                    <option value="elevate_temp_session">Elevate Temporary Session Only (Auto-removes on disconnect)</option>
+                    <option value="promote_permanent_service">Promote &amp; Install Permanent Signed RMM Service</option>
+                  </select>
+                </div>
+
+                <button
+                  type="button"
+                  className="btn-glass btn-primary"
+                  style={{ width: '100%', justifyContent: 'center', fontSize: '0.8rem', padding: '0.5rem' }}
+                  disabled={elevating}
+                  onClick={handleTriggerElevation}
+                >
+                  <KeyRound size={14} />
+                  <span>{elevating ? 'Injecting Encrypted Elevation Token...' : 'Execute Remote Self-Elevation Now'}</span>
+                </button>
+
+                {elevateSuccessMsg && (
+                  <div style={{ padding: '0.55rem 0.7rem', borderRadius: '8px', background: 'rgba(16, 185, 129, 0.14)', border: '1px solid rgba(16, 185, 129, 0.35)', fontSize: '0.74rem', color: '#a7f3d0' }}>
+                    ✓ {elevateSuccessMsg}
+                  </div>
+                )}
+              </div>
+            </div>
           )}
 
           {/* Real-time Performance & OS Isolation HUD */}
@@ -682,6 +894,17 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
           </div>
         </div>
       </div>
+
+      <MfaChallengeModal
+        isOpen={elevateMfaOpen}
+        onClose={() => setElevateMfaOpen(false)}
+        onSuccess={() => {
+          setElevateMfaOpen(false);
+          handleTriggerElevation();
+        }}
+        secretType="laps_credential"
+        deviceId={device.id}
+      />
     </div>
   );
 };

@@ -19,6 +19,7 @@ dist-ssr/
 .env.*.local
 *.pem
 *.key
+.vault-key.json
 certs/
 
 # Database files
@@ -27,6 +28,7 @@ data/
 *.db-journal
 *.db-shm
 *.db-wal
+*.vrmm-backup.gz
 
 # Build caches & tools
 .cache/

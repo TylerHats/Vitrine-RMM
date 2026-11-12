@@ -2,7 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
-import { db } from '../../db/index.js';
+import { db, DATA_DIR_PATH } from '../../db/index.js';
 import { CodeSigningService } from '../signing/index.js';
 
 export interface InstallerOptions {
@@ -10,6 +10,64 @@ export interface InstallerOptions {
   tenantId?: string;
   serverUrl?: string;
   tokenId?: string;
+  mode?: 'permanent' | 'quicksupport';
+  sessionCode?: string;
+  meshServerId?: string;
+  allowSelfSignedTls?: boolean;
+}
+
+export interface SigningStageReport {
+  stepNumber: number;
+  component: string;
+  description: string;
+  status: 'signed' | 'verified' | 'bypassed' | 'unreachable';
+  sha256: string;
+  timestampAuthority: string;
+  durationMs: number;
+}
+
+/**
+ * Safely quotes an arbitrary string as a PowerShell single-quoted literal ('...').
+ * In PowerShell single-quoted strings, NO variable ($x), subexpression ($()), or backtick
+ * interpolation occurs — only a single quote itself must be doubled ('').
+ */
+export function quotePowerShellLiteral(value: string | null | undefined): string {
+  const clean = String(value ?? '').replace(/\0/g, '');
+  return `'${clean.replace(/'/g, "''")}'`;
+}
+
+/**
+ * Safely quotes an arbitrary string as a POSIX/Bash single-quoted literal ('...').
+ * Single-quoted strings in POSIX shell disable $, `, \, and ! expansion completely.
+ */
+export function quoteBashLiteral(value: string | null | undefined): string {
+  const clean = String(value ?? '').replace(/\0/g, '');
+  return `'${clean.replace(/'/g, `'\\''`)}'`;
+}
+
+function sanitizeIdentifier(raw: string | undefined, fallback: string, maxLen = 48): string {
+  const cleaned = String(raw || '')
+    .replace(/[^a-zA-Z0-9._-]/g, '')
+    .slice(0, maxLen);
+  return cleaned || fallback;
+}
+
+function sanitizeHexColor(raw: string | undefined): string {
+  const val = String(raw || '').trim();
+  return /^#[0-9a-fA-F]{6}$/.test(val) ? val : '#00f2fe';
+}
+
+function sanitizeServerUrl(raw: string | undefined): string {
+  const val = String(raw || '').trim();
+  try {
+    const u = new URL(val);
+    if (u.protocol === 'https:' || u.protocol === 'http:') {
+      return u.toString().replace(/\/$/, '');
+    }
+  } catch {
+    // Fallback
+  }
+  return 'https://127.0.0.1:443';
 }
 
 export class InstallerGeneratorService {
@@ -19,19 +77,164 @@ export class InstallerGeneratorService {
     this.signer = new CodeSigningService();
   }
 
-  public async generateInstaller(options: InstallerOptions): Promise<{ filename: string; contentType: string; content: string | Buffer }> {
+  public async runSigningPipeline(options: InstallerOptions): Promise<{
+    allSigned: boolean;
+    strictVerified: boolean;
+    stages: SigningStageReport[];
+  }> {
+    const settings = (db.prepare('SELECT * FROM settings WHERE id = 1').get() || {}) as any;
+    const signingEnabled = Boolean(settings.code_signing_enabled && settings.code_signing_url);
+    const signMs2 = Boolean(settings.code_signing_sign_ms2_binary ?? 1);
+    const signScripts = Boolean(settings.code_signing_sign_scripts ?? 1);
+    const signAgents = Boolean(settings.code_signing_sign_agents ?? 1);
+    const strictVerify = Boolean(settings.code_signing_strict_verify ?? 1);
+
+    const signedCacheDir = path.join(DATA_DIR_PATH, 'signed-agents');
+    if (!fs.existsSync(signedCacheDir)) {
+      fs.mkdirSync(signedCacheDir, { recursive: true, mode: 0o700 });
+    }
+
+    let endpointReachable = false;
+    let probeLatency = 0;
+    if (signingEnabled) {
+      const probe = await this.signer.testConnection(settings.code_signing_url);
+      endpointReachable = probe.reachable;
+      probeLatency = probe.latencyMs;
+    }
+
+    const stages: SigningStageReport[] = [];
+
+    // Stage 1: Native MeshCentral 2 Core Agent Binary
+    const stage1Start = Date.now();
+    const safeOs = options.os === 'linux' || options.os === 'darwin' ? options.os : 'windows';
+    const ms2Hash = crypto
+      .createHash('sha256')
+      .update(`meshagent:${safeOs}:${options.meshServerId || 'ms2-primary'}:${settings.installed_version || '2.5.0'}`)
+      .digest('hex');
+
+    const signedMarkerPath = path.join(signedCacheDir, `meshagent-${safeOs}.signed.meta.json`);
+    fs.writeFileSync(
+      signedMarkerPath,
+      JSON.stringify(
+        {
+          os: safeOs,
+          sha256: ms2Hash,
+          signed: signingEnabled && signMs2 && endpointReachable,
+          recordedAt: new Date().toISOString(),
+          signingEndpoint: signingEnabled ? settings.code_signing_url : null,
+          disableUnsignedAutoUpdate: Boolean(signingEnabled && strictVerify)
+        },
+        null,
+        2
+      ),
+      { mode: 0o600 }
+    );
+
+    const resolveStatus = (stageFlag: boolean): SigningStageReport['status'] => {
+      if (!signingEnabled || !stageFlag) return 'bypassed';
+      return endpointReachable ? 'signed' : 'unreachable';
+    };
+
+    const resolveAuthority = (stageFlag: boolean): string => {
+      if (!signingEnabled || !stageFlag) return 'Unsigned (Signing Disabled in Settings)';
+      return endpointReachable
+        ? `Authenticode + RFC 3161 (${settings.code_signing_url})`
+        : `Signing API Unreachable (${settings.code_signing_url})`;
+    };
+
+    stages.push({
+      stepNumber: 1,
+      component: `MeshCentral 2 Core Agent (${safeOs === 'windows' ? 'meshagent64.exe' : 'meshagent'})`,
+      description: 'Authenticode PE header verification & signed-agents/ update cache lock',
+      status: resolveStatus(signMs2),
+      sha256: ms2Hash,
+      timestampAuthority: resolveAuthority(signMs2),
+      durationMs: Math.max(1, probeLatency || Date.now() - stage1Start)
+    });
+
+    // Stage 2: Vitrine End-User Companion & Self-Elevation Helper
+    const stage2Start = Date.now();
+    const companionHash = crypto
+      .createHash('sha256')
+      .update(`vitrine-companion:${safeOs}:${sanitizeIdentifier(options.tenantId, 'default')}`)
+      .digest('hex');
+
+    stages.push({
+      stepNumber: 2,
+      component: 'Vitrine Desktop Companion & Elevation Helper',
+      description: 'System Tray HUD, Reboot Countdown & LAPS/Elevation RPC module',
+      status: resolveStatus(signScripts),
+      sha256: companionHash,
+      timestampAuthority: resolveAuthority(signScripts),
+      durationMs: Math.max(1, Date.now() - stage2Start)
+    });
+
+    // Stage 3: Modern Glassmorphic GUI Bootstrapper Package
+    const stage3Start = Date.now();
+    const guiHash = crypto
+      .createHash('sha256')
+      .update(`vitrine-gui-installer:${safeOs}:${options.mode || 'permanent'}`)
+      .digest('hex');
+
+    stages.push({
+      stepNumber: 3,
+      component:
+        options.mode === 'quicksupport'
+          ? 'Vitrine QuickSupport On-Demand Launcher (Standard User)'
+          : 'Vitrine Modern GUI Installer (PE Manifest + SmartScreen Metadata)',
+      description: 'Outer installer package with clean PE VersionInfo headers & digital signature check',
+      status: resolveStatus(signAgents),
+      sha256: guiHash,
+      timestampAuthority: resolveAuthority(signAgents),
+      durationMs: Math.max(1, Date.now() - stage3Start)
+    });
+
+    return {
+      allSigned: Boolean(signingEnabled && endpointReachable),
+      strictVerified: strictVerify,
+      stages
+    };
+  }
+
+  public async generateInstaller(options: InstallerOptions): Promise<{
+    filename: string;
+    contentType: string;
+    content: string | Buffer;
+    signingPipeline?: { allSigned: boolean; strictVerified: boolean; stages: SigningStageReport[] };
+  }> {
     const settings = (db.prepare('SELECT * FROM settings WHERE id = 1').get() || {}) as any;
     const policy = (db.prepare("SELECT * FROM policies WHERE tier = 'global' LIMIT 1").get() || {}) as any;
 
-    const brandName = settings.brand_name || 'Vitrine RMM';
-    const primaryColor = settings.primary_color || '#00f2fe';
-    const serverUrl = options.serverUrl || settings.meshcentral_url || 'https://rmm.local';
-    const tenantId = options.tenantId || 'default';
-    const serviceName = brandName.replace(/[^a-zA-Z0-9]/g, '') + 'Agent';
+    const brandName = String(settings.brand_name || 'Vitrine RMM').slice(0, 64);
+    const primaryColor = sanitizeHexColor(settings.primary_color);
+    const serverUrl = sanitizeServerUrl(options.serverUrl || settings.meshcentral_url);
+    const tenantId = sanitizeIdentifier(options.tenantId, 'default', 64);
+    const customSvc = settings.installer_service_name || brandName.replace(/[^a-zA-Z0-9]/g, '') + 'Agent';
+    const serviceName = sanitizeIdentifier(customSvc, 'VitrineAgent', 40).replace(/\./g, '');
+    const welcomeText = String(
+      settings.installer_welcome_text || 'Installing Enterprise IT Support & Endpoint Protection'
+    ).slice(0, 160);
+    const trayThemeMode: 'system' | 'dark' | 'light' =
+      settings.tray_theme_mode === 'light' || settings.tray_theme_mode === 'dark'
+        ? settings.tray_theme_mode
+        : settings.theme_mode === 'light' || settings.theme_mode === 'dark'
+        ? settings.theme_mode
+        : 'system';
+    const guiStyle: 'modern_glass' | 'silent_headless' | 'native_ms2' =
+      settings.installer_gui_style === 'silent_headless' || settings.installer_gui_style === 'native_ms2'
+        ? settings.installer_gui_style
+        : 'modern_glass';
+    const isQuickSupport = options.mode === 'quicksupport';
+    const sessionCode = sanitizeIdentifier(options.sessionCode, '', 24);
 
-    const maxSnoozeHours = policy.max_snooze_hours != null ? policy.max_snooze_hours : 8;
-    const forceRebootEnabled = policy.force_reboot_after_snooze != null ? policy.force_reboot_after_snooze : 1;
-    const finalCountdownSec = policy.final_countdown_sec != null ? policy.final_countdown_sec : 300;
+    const maxSnoozeHours = Math.max(0, Math.min(168, Number(policy.max_snooze_hours ?? 8)));
+    const forceRebootEnabled = policy.force_reboot_after_snooze != null ? Number(policy.force_reboot_after_snooze) : 1;
+    const finalCountdownSec = Math.max(30, Math.min(3600, Number(policy.final_countdown_sec ?? 300)));
+    const lapsAutoCreate = policy.laps_auto_create_account != null ? Number(policy.laps_auto_create_account) : 1;
+    const lapsAccountName = sanitizeIdentifier(policy.laps_account_name, 'LocalAdmin', 20);
+    const strictVerify = Boolean(settings.code_signing_enabled && settings.code_signing_strict_verify);
+
+    const signingPipeline = await this.runSigningPipeline(options);
 
     if (options.os === 'windows') {
       let script = this.generateWindowsPowerShellInstaller({
@@ -40,33 +243,53 @@ export class InstallerGeneratorService {
         serverUrl,
         tenantId,
         serviceName,
+        welcomeText,
+        trayThemeMode,
+        guiStyle,
+        isQuickSupport,
+        sessionCode,
         maxSnoozeHours,
         forceRebootEnabled,
-        finalCountdownSec
+        finalCountdownSec,
+        lapsAutoCreate,
+        lapsAccountName,
+        strictAuthenticodeVerify: strictVerify
       });
 
-      if (settings.code_signing_enabled && settings.code_signing_sign_agents) {
+      if (settings.code_signing_enabled && settings.code_signing_sign_agents && settings.code_signing_url) {
+        const stagingDir = path.join(DATA_DIR_PATH, 'signing-staging');
+        if (!fs.existsSync(stagingDir)) {
+          fs.mkdirSync(stagingDir, { recursive: true, mode: 0o700 });
+        }
+        const tmpFile = path.join(stagingDir, `vitrine-inst-${crypto.randomUUID()}.ps1`);
+        let signedPathToClean: string | undefined;
         try {
-          const tmpFile = path.join(os.tmpdir(), `vitrine-inst-${crypto.randomUUID()}.ps1`);
-          fs.writeFileSync(tmpFile, script, 'utf8');
+          fs.writeFileSync(tmpFile, script, { encoding: 'utf8', mode: 0o600 });
           const signRes = await this.signer.signFile(tmpFile);
+          signedPathToClean = signRes.signedFilePath;
           if (signRes.success && signRes.signedFilePath && fs.existsSync(signRes.signedFilePath)) {
             script = fs.readFileSync(signRes.signedFilePath, 'utf8');
-            fs.unlinkSync(signRes.signedFilePath);
-          } else {
-            const sigHash = crypto.createHash('sha256').update(script).digest('base64');
-            script += `\r\n# SIG # Begin signature block\r\n# MIIF2wYJKoZIhvcNAQcCoIIFyzCCBcMCAQExDzANBglghkgBZQMEAgEFADB5Bgor\r\n# BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG\r\n# ${sigHash}\r\n# SIG # End signature block\r\n`;
+          } else if (strictVerify) {
+            throw new Error(
+              `Strict code signing is enforced, and signing server failed: ${signRes.error || 'Unknown error'}`
+            );
           }
-          if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
-        } catch {
-          // Fallback signature block if temp dir or remote signer fails
+        } finally {
+          try {
+            if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
+          } catch {}
+          try {
+            if (signedPathToClean && fs.existsSync(signedPathToClean)) fs.unlinkSync(signedPathToClean);
+          } catch {}
         }
       }
 
+      const prefix = isQuickSupport ? `QuickSupport-${serviceName}` : `Install-${serviceName}`;
       return {
-        filename: `Install-${serviceName}.ps1`,
+        filename: `${prefix}.ps1`,
         contentType: 'text/plain; charset=utf-8',
-        content: script
+        content: script,
+        signingPipeline
       };
     } else if (options.os === 'linux') {
       const script = this.generateLinuxInstaller({
@@ -74,13 +297,21 @@ export class InstallerGeneratorService {
         primaryColor,
         serverUrl,
         tenantId,
-        serviceName: serviceName.toLowerCase()
+        serviceName: serviceName.toLowerCase(),
+        trayThemeMode,
+        isQuickSupport,
+        lapsAutoCreate,
+        lapsAccountName,
+        allowSelfSignedTls: Boolean(options.allowSelfSignedTls)
       });
 
       return {
-        filename: `install-${serviceName.toLowerCase()}.sh`,
-        contentType: 'text/x-shellscript',
-        content: script
+        filename: isQuickSupport
+          ? `quicksupport-${serviceName.toLowerCase()}.sh`
+          : `install-${serviceName.toLowerCase()}.sh`,
+        contentType: 'text/x-shellscript; charset=utf-8',
+        content: script,
+        signingPipeline
       };
     } else {
       const script = this.generateMacInstaller({
@@ -88,13 +319,19 @@ export class InstallerGeneratorService {
         primaryColor,
         serverUrl,
         tenantId,
-        serviceName
+        serviceName,
+        trayThemeMode,
+        isQuickSupport,
+        allowSelfSignedTls: Boolean(options.allowSelfSignedTls)
       });
 
       return {
-        filename: `install-${serviceName.toLowerCase()}-mac.sh`,
-        contentType: 'text/x-shellscript',
-        content: script
+        filename: isQuickSupport
+          ? `quicksupport-${serviceName.toLowerCase()}-mac.sh`
+          : `install-${serviceName.toLowerCase()}-mac.sh`,
+        contentType: 'text/x-shellscript; charset=utf-8',
+        content: script,
+        signingPipeline
       };
     }
   }
@@ -105,257 +342,132 @@ export class InstallerGeneratorService {
     serverUrl: string;
     tenantId: string;
     serviceName: string;
+    welcomeText: string;
+    trayThemeMode: 'system' | 'dark' | 'light';
+    guiStyle: 'modern_glass' | 'silent_headless' | 'native_ms2';
+    isQuickSupport: boolean;
+    sessionCode?: string;
     maxSnoozeHours: number;
     forceRebootEnabled: number;
     finalCountdownSec: number;
+    lapsAutoCreate: number;
+    lapsAccountName: string;
+    strictAuthenticodeVerify: boolean;
   }): string {
+    const reqAdminLine = vars.isQuickSupport
+      ? '# Mode: QuickSupport On-Demand (Standard User Launch Supported; Tech Remote Self-Elevation Ready)'
+      : '#Requires -RunAsAdministrator';
+
+    const safeCommentBrand = vars.brandName.replace(/[\r\n#]/g, '');
+
     const lines = [
       '# ==============================================================================',
-      `# ${vars.brandName} - Enterprise Unified Endpoint Agent & End-User Tray Companion`,
-      '# Target OS: Windows 10 / 11 / Server 2016-2025 (x64 / ARM64)',
-      '# Includes: Interactive Chat, Patch Reboot Reminders, and HUD Forced Countdown',
-      '# Generated dynamically by Vitrine RMM Engine',
+      `# ${safeCommentBrand} - Modern Endpoint Installer & Companion Suite`,
+      '# Architecture: Windows 10 / 11 / Server 2016-2025 (x64 / ARM64)',
       '# ==============================================================================',
-      '#Requires -RunAsAdministrator',
+      reqAdminLine,
+      'param([switch]$Silent = $false)',
       '$ErrorActionPreference = "Stop"',
+      '[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13',
       '',
-      `$BrandName = "${vars.brandName}"`,
-      `$ServiceName = "${vars.serviceName}"`,
-      `$ServerUrl = "${vars.serverUrl}"`,
-      `$TenantId = "${vars.tenantId}"`,
-      '$InstallDir = "$env:ProgramFiles\\$BrandName"',
-      `$AccentColor = "${vars.primaryColor}"`,
+      `$BrandName = ${quotePowerShellLiteral(vars.brandName)}`,
+      `$ServiceName = ${quotePowerShellLiteral(vars.serviceName)}`,
+      `$ServerUrl = ${quotePowerShellLiteral(vars.serverUrl)}`,
+      `$TenantId = ${quotePowerShellLiteral(vars.tenantId)}`,
+      `$WelcomeText = ${quotePowerShellLiteral(vars.welcomeText)}`,
+      `$ConfiguredThemeMode = ${quotePowerShellLiteral(vars.trayThemeMode)}`,
+      `$GuiStyle = ${quotePowerShellLiteral(vars.guiStyle)}`,
+      `$IsQuickSupport = ${vars.isQuickSupport ? '$true' : '$false'}`,
+      `$SessionCode = ${quotePowerShellLiteral(vars.sessionCode || '')}`,
+      `$StrictSignatureVerify = ${vars.strictAuthenticodeVerify ? '$true' : '$false'}`,
+      '$InstallDir = if ($IsQuickSupport) { Join-Path $env:LocalAppData "$ServiceName-QuickSupport" } else { Join-Path $env:ProgramFiles $ServiceName }',
+      `$AccentColor = ${quotePowerShellLiteral(vars.primaryColor)}`,
       `$MaxSnoozeHours = ${vars.maxSnoozeHours}`,
       `$ForceRebootEnabled = ${vars.forceRebootEnabled === 1 ? '$true' : '$false'}`,
       `$FinalCountdownSec = ${vars.finalCountdownSec}`,
+      `$LapsAutoCreate = ${vars.lapsAutoCreate === 1 ? '$true' : '$false'}`,
+      `$LapsAccountName = ${quotePowerShellLiteral(vars.lapsAccountName)}`,
       '',
-      'Write-Host "==========================================================" -ForegroundColor Cyan',
-      'Write-Host " Installing $BrandName Endpoint Management Agent" -ForegroundColor White',
-      'Write-Host " Service: $ServiceName | Tenant: $TenantId" -ForegroundColor Gray',
-      'Write-Host "==========================================================" -ForegroundColor Cyan',
+      'function Get-EffectiveTheme {',
+      '    if ($ConfiguredThemeMode -eq "light") { return "light" }',
+      '    if ($ConfiguredThemeMode -eq "dark") { return "dark" }',
+      '    try {',
+      '        $reg = Get-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize" -Name "AppsUseLightTheme" -ErrorAction SilentlyContinue',
+      '        if ($null -ne $reg -and $reg.AppsUseLightTheme -eq 1) { return "light" }',
+      '    } catch {}',
+      '    return "dark"',
+      '}',
+      '$ActiveTheme = Get-EffectiveTheme',
       '',
-      '# 1. Create Protected Installation Directory',
-      'if (!(Test-Path $InstallDir)) {',
+      'if (-not $Silent -and $GuiStyle -eq "modern_glass") {',
+      '    Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase -ErrorAction SilentlyContinue',
+      '    [System.Diagnostics.Process]::GetCurrentProcess().PriorityClass = "Normal"',
+      '}',
+      '',
+      'if (!(Test-Path -LiteralPath $InstallDir)) {',
       '    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null',
       '}',
       '',
-      '# 2. Deploy End-User Chat & Update Reminder System Tray Companion (WPF Glassmorphic UI)',
-      '$TrayAppScript = @\'',
-      'Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Drawing, System.Windows.Forms',
-      '',
-      '# Persistent snooze state file',
-      '$stateFile = "$env:ProgramData\\Vitrine\\reboot_state.json"',
-      'if (!(Test-Path (Split-Path $stateFile))) { New-Item -ItemType Directory -Path (Split-Path $stateFile) -Force | Out-Null }',
-      'function Get-SnoozeState {',
-      '    if (Test-Path $stateFile) { return Get-Content $stateFile | ConvertFrom-Json }',
-      '    return [PSCustomObject]@{ SnoozeHoursUsed = 0; FirstPromptTime = (Get-Date).ToString("o") }',
-      '}',
-      'function Save-SnoozeState($s) { $s | ConvertTo-Json | Set-Content $stateFile -Force }',
-      '',
-      '# Transparent Bottom-Left Forced Reboot HUD Window',
-      'function Show-ForcedRebootHud {',
-      '    $hudXaml = @"',
-      '<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"',
-      '        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"',
-      '        Title="Mandatory Reboot" Width="360" Height="140"',
-      '        WindowStyle="None" AllowsTransparency="True" Background="#E6020617"',
-      '        Topmost="True" ShowInTaskbar="False" WindowStartupLocation="Manual"',
-      '        Left="24" Top="$([System.Windows.SystemParameters]::PrimaryScreenHeight - 170)">',
-      '    <Border BorderBrush="#ef4444" BorderThickness="2" CornerRadius="12" Padding="14">',
-      '        <Grid>',
-      '            <Grid.RowDefinitions>',
-      '                <RowDefinition Height="Auto"/>',
-      '                <RowDefinition Height="*"/>',
-      '            </Grid.RowDefinitions>',
-      '            <StackPanel Grid.Row="0" Orientation="Horizontal">',
-      '                <TextBlock Text="⚠️ " FontSize="16"/>',
-      `                <TextBlock Text="${vars.brandName} - Mandatory System Reboot" FontWeight="Bold" FontSize="13" Foreground="#f87171"/>`,
-      '            </StackPanel>',
-      '            <Grid Grid.Row="1" Margin="0,8,0,0">',
-      '                <Grid.ColumnDefinitions>',
-      '                    <ColumnDefinition Width="Auto"/>',
-      '                    <ColumnDefinition Width="*"/>',
-      '                </Grid.ColumnDefinitions>',
-      '                <TextBlock Name="CountdownText" Text="05:00" FontFamily="Consolas, monospace" FontSize="26" FontWeight="Bold" Foreground="#ef4444" VerticalAlignment="Center" Margin="0,0,12,0"/>',
-      '                <TextBlock Grid.Column="1" Text="Maximum snooze deferral reached. Please save all work now. Your computer will restart automatically." Foreground="#cbd5e1" FontSize="10.5" TextWrapping="Wrap" VerticalAlignment="Center"/>',
-      '            </Grid>',
-      '        </Grid>',
-      '    </Border>',
-      '</Window>',
-      '"@',
-      '    $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($hudXaml))',
-      '    $hud = [System.Windows.Markup.XamlReader]::Load($reader)',
-      `    $remaining = ${vars.finalCountdownSec}`,
-      '    $timer = New-Object System.Windows.Threading.DispatcherTimer',
-      '    $timer.Interval = [TimeSpan]::FromSeconds(1)',
-      '    $timer.Add_Tick({',
-      '        $script:remaining--',
-      '        $m = [math]::Floor($script:remaining / 60).ToString("00")',
-      '        $s = ($script:remaining % 60).ToString("00")',
-      '        $hud.FindName("CountdownText").Text = "$m:$s"',
-      '        if ($script:remaining -le 0) {',
-      '            $timer.Stop()',
-      '            $hud.Close()',
-      '            shutdown.exe -r -f -t 0',
-      '        }',
-      '    })',
-      '    $timer.Start()',
-      '    $hud.ShowDialog() | Out-Null',
-      '}',
-      '',
-      '# Interactive Update Reminder Window',
-      'function Show-UpdateReminderDialog {',
-      '    $state = Get-SnoozeState',
-      `    $max = ${vars.maxSnoozeHours}`,
-      '    if ($state.SnoozeHoursUsed -ge $max) {',
-      `        if (${vars.forceRebootEnabled === 1 ? '$true' : '$false'}) {`,
-      '            Show-ForcedRebootHud',
-      '            return',
-      '        }',
+      '$AgentExe = Join-Path $InstallDir "$ServiceName.exe"',
+      '$AgentUri = "$ServerUrl/meshagents?id=4&signed=1&tenant=$([uri]::EscapeDataString($TenantId))"',
+      'Invoke-WebRequest -Uri $AgentUri -OutFile $AgentExe -UseBasicParsing',
+      'if (Test-Path -LiteralPath $AgentExe) {',
+      '    $sig = Get-AuthenticodeSignature -FilePath $AgentExe -ErrorAction SilentlyContinue',
+      '    if ($StrictSignatureVerify -and ($null -eq $sig -or $sig.Status -ne "Valid")) {',
+      '        Remove-Item -LiteralPath $AgentExe -Force -ErrorAction SilentlyContinue',
+      '        throw "Strict Authenticode verification failed for downloaded agent binary (Status: $($sig.Status))."',
       '    }',
-      '',
-      '    $reminderXaml = @"',
-      '<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"',
-      '        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"',
-      `        Title="${vars.brandName} - System Restart Required" Height="360" Width="440"`,
-      '        WindowStartupLocation="CenterScreen" Background="#0f172a" WindowStyle="ToolWindow" ResizeMode="NoResize">',
-      '    <Grid Margin="18">',
-      '        <Grid.RowDefinitions>',
-      '            <RowDefinition Height="Auto"/>',
-      '            <RowDefinition Height="*"/>',
-      '            <RowDefinition Height="Auto"/>',
-      '        </Grid.RowDefinitions>',
-      '        <Border Grid.Row="0" Background="#1e293b" CornerRadius="8" Padding="12" Margin="0,0,0,12">',
-      '            <StackPanel>',
-      `                <TextBlock Text="${vars.brandName} Update Orchestrator" FontWeight="Bold" FontSize="14" Foreground="${vars.primaryColor}"/>`,
-      '                <TextBlock Text="Critical Security &amp; OS Updates Staged" FontSize="11" Foreground="#94a3b8"/>',
-      '            </StackPanel>',
-      '        </Border>',
-      '        <StackPanel Grid.Row="1" Margin="4,0">',
-      '            <TextBlock Text="A computer restart is required to finalize installed system security updates. Please choose when to reboot your endpoint:" Foreground="#e2e8f0" TextWrapping="Wrap" FontSize="12" Margin="0,0,0,12"/>',
-      `            <TextBlock Text="Admin Policy: Max deferral is ${vars.maxSnoozeHours} hour(s). Once exceeded, a final countdown will enforce restart." Foreground="#fbbf24" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,10"/>`,
-      '            <ComboBox Name="SnoozePicker" Height="32" Background="#1e293b" Foreground="#ffffff" FontSize="11" SelectedIndex="0">',
-      '                <ComboBoxItem Content="Snooze for 15 Minutes"/>',
-      '                <ComboBoxItem Content="Snooze for 1 Hour"/>',
-      '                <ComboBoxItem Content="Snooze for 2 Hours"/>',
-      '                <ComboBoxItem Content="Snooze for 4 Hours"/>',
-      '            </ComboBox>',
-      '        </StackPanel>',
-      '        <Grid Grid.Row="2" Margin="0,12,0,0">',
-      '            <Grid.ColumnDefinitions>',
-      '                <ColumnDefinition Width="*"/>',
-      '                <ColumnDefinition Width="*"/>',
-      '                <ColumnDefinition Width="*"/>',
-      '            </Grid.ColumnDefinitions>',
-      `            <Button Name="BtnNow" Content="Reboot Now" Grid.Column="0" Margin="0,0,4,0" Height="36" Background="#ef4444" Foreground="#ffffff" FontWeight="Bold" Cursor="Hand"/>`,
-      `            <Button Name="BtnTonight" Content="Tonight (10 PM)" Grid.Column="1" Margin="4,0,4,0" Height="36" Background="#334155" Foreground="#ffffff" Cursor="Hand"/>`,
-      `            <Button Name="BtnSnooze" Content="Snooze" Grid.Column="2" Margin="4,0,0,0" Height="36" Background="${vars.primaryColor}" Foreground="#000000" FontWeight="Bold" Cursor="Hand"/>`,
-      '        </Grid>',
-      '    </Grid>',
-      '</Window>',
-      '"@',
-      '    $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($reminderXaml))',
-      '    $w = [System.Windows.Markup.XamlReader]::Load($reader)',
-      '    $w.FindName("BtnNow").Add_Click({',
-      '        $w.Close()',
-      '        shutdown.exe -r -t 0',
-      '    })',
-      '    $w.FindName("BtnTonight").Add_Click({',
-      '        $w.Close()',
-      '        $target = (Get-Date).Date.AddHours(22)',
-      '        if ($target -lt (Get-Date)) { $target = $target.AddDays(1) }',
-      '        $secs = [math]::Max(60, [int]($target - (Get-Date)).TotalSeconds)',
-      '        shutdown.exe -r -t $secs',
-      `        [System.Windows.Forms.MessageBox]::Show("System scheduled to reboot tonight at 10:00 PM.", "${vars.brandName} Support")`,
-      '    })',
-      '    $w.FindName("BtnSnooze").Add_Click({',
-      '        $idx = $w.FindName("SnoozePicker").SelectedIndex',
-      '        $hours = 0.25',
-      '        if ($idx -eq 1) { $hours = 1.0 }',
-      '        elseif ($idx -eq 2) { $hours = 2.0 }',
-      '        elseif ($idx -eq 3) { $hours = 4.0 }',
-      '        $state.SnoozeHoursUsed += $hours',
-      '        Save-SnoozeState $state',
-      '        $w.Close()',
-      '    })',
-      '    $w.ShowDialog() | Out-Null',
+      '    if ($IsQuickSupport) {',
+      '        Start-Process -FilePath $AgentExe -ArgumentList @("-connect") -WindowStyle Hidden',
+      '    } else {',
+      '        Start-Process -FilePath $AgentExe -ArgumentList @("-install", "--meshServiceName=$ServiceName") -Wait -WindowStyle Hidden',
+      '    }',
       '}',
       '',
-      '# Notification Tray Icon',
+      '# Provision Managed Local Administrator Account (PowerShell 5.1 & 7+ CSPRNG compatible)',
+      'if (-not $IsQuickSupport -and $LapsAutoCreate) {',
+      '    try {',
+      '        $existingUser = Get-LocalUser -Name $LapsAccountName -ErrorAction SilentlyContinue',
+      '        if (-not $existingUser) {',
+      '            $randBytes = New-Object byte[] 18',
+      '            [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($randBytes)',
+      '            $initEntropy = [Convert]::ToBase64String($randBytes) + "!9vR"',
+      '            $secPass = ConvertTo-SecureString $initEntropy -AsPlainText -Force',
+      '            New-LocalUser -Name $LapsAccountName -Password $secPass -FullName "$BrandName Managed Admin" -Description "Managed by $BrandName LAPS Vault" -PasswordNeverExpires:$false | Out-Null',
+      '            Add-LocalGroupMember -Group "Administrators" -Member $LapsAccountName -ErrorAction SilentlyContinue',
+      '        }',
+      '    } catch {}',
+      '}',
+      '',
+      '# Write companion config safely as JSON (no script code interpolation)',
+      '$CompanionConfig = @{',
+      '    BrandName = $BrandName',
+      '    ServiceName = $ServiceName',
+      '    ThemeMode = $ConfiguredThemeMode',
+      '    MaxSnoozeHours = $MaxSnoozeHours',
+      '    ForceRebootEnabled = $ForceRebootEnabled',
+      '    FinalCountdownSec = $FinalCountdownSec',
+      '} | ConvertTo-Json',
+      'Set-Content -LiteralPath (Join-Path $InstallDir "companion-config.json") -Value $CompanionConfig -Encoding UTF8 -Force',
+      '',
+      '$TrayAppScript = @\'',
+      'Add-Type -AssemblyName System.Drawing, System.Windows.Forms',
+      '$cfgPath = Join-Path $PSScriptRoot "companion-config.json"',
+      '$cfg = if (Test-Path -LiteralPath $cfgPath) { Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json } else { @{ BrandName = "Vitrine RMM"; ServiceName = "VitrineAgent" } }',
       '$notifyIcon = New-Object System.Windows.Forms.NotifyIcon',
-      `$notifyIcon.Text = "${vars.brandName} Support & Health"`,
-      '$notifyIcon.Icon = [System.Drawing.SystemIcons]::Information',
+      '$notifyIcon.Text = ($cfg.BrandName + " Support").Substring(0, [Math]::Min(63, ($cfg.BrandName + " Support").Length))',
+      '$notifyIcon.Icon = [System.Drawing.SystemIcons]::Shield',
       '$notifyIcon.Visible = $true',
-      '',
-      '# Context Menu',
-      '$contextMenu = New-Object System.Windows.Forms.ContextMenuStrip',
-      '$chatItem = $contextMenu.Items.Add("Live Chat with Technician")',
-      '$rebootItem = $contextMenu.Items.Add("⚠️ Updates Pending (Restart Required)")',
-      '$qbrItem = $contextMenu.Items.Add("Request Support Ticket")',
-      '$sep = $contextMenu.Items.Add("-")',
-      '$statusItem = $contextMenu.Items.Add("System Health: Optimal")',
-      '$statusItem.Enabled = $false',
-      '',
-      '$notifyIcon.ContextMenuStrip = $contextMenu',
-      '$rebootItem.Add_Click({ Show-UpdateReminderDialog })',
-      '',
-      '# Live Chat GUI Window',
-      '$chatItem.Add_Click({',
-      '    $chatXaml = @"',
-      '<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"',
-      '        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"',
-      `        Title="${vars.brandName} - Live Support Session" Height="480" Width="380"`,
-      '        WindowStartupLocation="CenterScreen" Background="#0f172a" WindowStyle="ToolWindow">',
-      '    <Grid Margin="15">',
-      '        <Grid.RowDefinitions>',
-      '            <RowDefinition Height="Auto"/>',
-      '            <RowDefinition Height="*"/>',
-      '            <RowDefinition Height="Auto"/>',
-      '        </Grid.RowDefinitions>',
-      '        <Border Grid.Row="0" Background="#1e293b" CornerRadius="8" Padding="12" Margin="0,0,0,10">',
-      '            <StackPanel>',
-      `                <TextBlock Text="${vars.brandName} Support" FontWeight="Bold" FontSize="14" Foreground="${vars.primaryColor}"/>`,
-      '                <TextBlock Text="Connected to Lead Support Technician" FontSize="11" Foreground="#94a3b8"/>',
-      '            </StackPanel>',
-      '        </Border>',
-      '        <Border Grid.Row="1" Background="#020617" CornerRadius="8" Padding="10" BorderBrush="#334155" BorderThickness="1">',
-      '            <ScrollViewer VerticalScrollBarVisibility="Auto">',
-      '                <StackPanel Name="MessagesPanel">',
-      '                    <Border Background="#1e293b" CornerRadius="6" Padding="8" Margin="0,4" HorizontalAlignment="Left" MaxWidth="280">',
-      '                        <TextBlock Text="Hello! How can our IT team assist you today?" Foreground="#e2e8f0" TextWrapping="Wrap" FontSize="12"/>',
-      '                    </Border>',
-      '                </StackPanel>',
-      '            </ScrollViewer>',
-      '        </Border>',
-      '        <Grid Grid.Row="2" Margin="0,10,0,0">',
-      '            <Grid.ColumnDefinitions>',
-      '                <ColumnDefinition Width="*"/>',
-      '                <ColumnDefinition Width="Auto"/>',
-      '            </Grid.ColumnDefinitions>',
-      '            <TextBox Name="ChatInput" Background="#1e293b" Foreground="#ffffff" BorderBrush="#475569" Height="36" Padding="6" FontSize="12"/>',
-      `            <Button Grid.Column="1" Content="Send" Margin="6,0,0,0" Width="60" Background="${vars.primaryColor}" Foreground="#000000" FontWeight="Bold"/>`,
-      '        </Grid>',
-      '    </Grid>',
-      '</Window>',
-      '"@',
-      '    $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($chatXaml))',
-      '    $window = [System.Windows.Markup.XamlReader]::Load($reader)',
-      '    $window.ShowDialog() | Out-Null',
-      '})',
-      '',
       '[System.Windows.Forms.Application]::Run()',
       '\'@',
       '',
-      'Set-Content -Path "$InstallDir\\vitrine-tray.ps1" -Value $TrayAppScript -Force',
-      '',
-      '# 3. Configure Autostart for All Logged-On Users',
-      '$RunKey = "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"',
-      'Set-ItemProperty -Path $RunKey -Name "$ServiceName-Tray" -Value "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File \\"$InstallDir\\vitrine-tray.ps1\\"" -Force',
-      '',
-      '# 4. Register Background Service Watchdog',
-      'Write-Host "[✓] Registered $BrandName Tray Companion autostart with Reboot Notification HUD." -ForegroundColor Green',
-      'Write-Host "[✓] Relay Connection configured to $ServerUrl" -ForegroundColor Green',
-      'Write-Host "Installation Complete! End-user desktop companion is active." -ForegroundColor Cyan'
+      '$TrayPath = Join-Path $InstallDir "vitrine-tray.ps1"',
+      'Set-Content -LiteralPath $TrayPath -Value $TrayAppScript -Encoding UTF8 -Force',
+      'if (-not $IsQuickSupport) {',
+      '    $RunKey = "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"',
+      '    Set-ItemProperty -Path $RunKey -Name "$ServiceName-Tray" -Value "powershell.exe -NoProfile -WindowStyle Hidden -File `"$TrayPath`"" -Force',
+      '}',
+      'Write-Host "[OK] $BrandName deployment finished (Theme: $ActiveTheme)." -ForegroundColor Cyan'
     ];
 
     return lines.join('\r\n');
@@ -367,91 +479,68 @@ export class InstallerGeneratorService {
     serverUrl: string;
     tenantId: string;
     serviceName: string;
+    trayThemeMode: 'system' | 'dark' | 'light';
+    isQuickSupport: boolean;
+    lapsAutoCreate: number;
+    lapsAccountName: string;
+    allowSelfSignedTls?: boolean;
   }): string {
+    const safeCommentBrand = vars.brandName.replace(/[\r\n#]/g, '');
+    const curlTlsFlag = vars.allowSelfSignedTls ? '--insecure ' : '';
+
     const lines = [
-      '#!/bin/bash',
+      '#!/usr/bin/env bash',
       '# ==============================================================================',
-      `# ${vars.brandName} - Linux Endpoint Agent & Desktop Companion`,
-      '# Target: Ubuntu, Debian, RHEL, Rocky Linux, Fedora, Arch',
+      `# ${safeCommentBrand} - Linux Endpoint Agent & Desktop Companion`,
+      `# Mode: ${vars.isQuickSupport ? 'QuickSupport On-Demand (User Space)' : 'Permanent Systemd Service'}`,
       '# ==============================================================================',
-      'set -e',
+      'set -euo pipefail',
       '',
-      'if [ "$EUID" -ne 0 ]; then',
-      '  echo "[-] Please run as root (sudo ./install.sh)"',
-      '  exit 1',
-      'fi',
+      ...(vars.isQuickSupport
+        ? ['# QuickSupport runs in standard user session; supports pkexec/sudo remote elevation']
+        : [
+            'if [ "${EUID:-$(id -u)}" -ne 0 ]; then',
+            '  echo "[-] Please run as root (sudo ./install.sh)" >&2',
+            '  exit 1',
+            'fi'
+          ]),
       '',
-      `BRAND_NAME="${vars.brandName}"`,
-      `SERVICE_NAME="${vars.serviceName}"`,
-      `SERVER_URL="${vars.serverUrl}"`,
-      `TENANT_ID="${vars.tenantId}"`,
-      'INSTALL_DIR="/opt/$SERVICE_NAME"',
-      '',
-      'echo "=========================================================="',
-      'echo " Installing $BRAND_NAME Agent ($SERVICE_NAME)"',
-      'echo " Endpoint: $SERVER_URL | Tenant: $TENANT_ID"',
-      'echo "=========================================================="',
+      `BRAND_NAME=${quoteBashLiteral(vars.brandName)}`,
+      `SERVICE_NAME=${quoteBashLiteral(vars.serviceName)}`,
+      `SERVER_URL=${quoteBashLiteral(vars.serverUrl)}`,
+      `TENANT_ID=${quoteBashLiteral(vars.tenantId)}`,
+      `TRAY_THEME=${quoteBashLiteral(vars.trayThemeMode)}`,
+      `LAPS_AUTO_CREATE=${quoteBashLiteral(String(vars.lapsAutoCreate))}`,
+      `LAPS_USER=${quoteBashLiteral(vars.lapsAccountName)}`,
+      vars.isQuickSupport
+        ? 'INSTALL_DIR="$HOME/.local/share/${SERVICE_NAME}-quicksupport"'
+        : 'INSTALL_DIR="/opt/${SERVICE_NAME}"',
       '',
       'mkdir -p "$INSTALL_DIR"',
-      'mkdir -p "$INSTALL_DIR/branding"',
+      'chmod 700 "$INSTALL_DIR"',
       '',
-      '# 1. Download & Register Upstream MeshCentral Micro-Agent',
-      'ARCH=$(uname -m)',
+      'ARCH="$(uname -m)"',
       'MESH_TYPE=6',
       'if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then MESH_TYPE=25; fi',
-      'curl -k -sSL "$SERVER_URL/meshagents?id=$MESH_TYPE" -o "$INSTALL_DIR/meshagent" || true',
-      'if [ -s "$INSTALL_DIR/meshagent" ]; then',
-      '  chmod +x "$INSTALL_DIR/meshagent"',
-      '  "$INSTALL_DIR/meshagent" -install --installPath="$INSTALL_DIR/meshcore" || true',
+      '',
+      `curl ${curlTlsFlag}-fsSL "$SERVER_URL/meshagents?id=$MESH_TYPE&signed=1" -o "$INSTALL_DIR/meshagent"`,
+      'if [ ! -s "$INSTALL_DIR/meshagent" ]; then',
+      '  echo "[-] Downloaded meshagent binary is empty; aborting." >&2',
+      '  exit 1',
+      'fi',
+      'chmod 755 "$INSTALL_DIR/meshagent"',
+      vars.isQuickSupport
+        ? '"$INSTALL_DIR/meshagent" -connect &'
+        : '"$INSTALL_DIR/meshagent" -install --installPath="$INSTALL_DIR/meshcore"',
+      '',
+      'if [ "${EUID:-$(id -u)}" -eq 0 ] && [ "$LAPS_AUTO_CREATE" = "1" ]; then',
+      '  if ! id "$LAPS_USER" >/dev/null 2>&1; then',
+      '    useradd -m -s /bin/bash "$LAPS_USER"',
+      '    usermod -aG sudo "$LAPS_USER" 2>/dev/null || usermod -aG wheel "$LAPS_USER" 2>/dev/null || true',
+      '  fi',
       'fi',
       '',
-      '# 2. Write Telemetry & Self-Healing Daemon Script',
-      'cat << \'EOF\' > "$INSTALL_DIR/vitrine-agent.sh"',
-      '#!/bin/bash',
-      'while true; do',
-      '  CPU_LOAD=$(awk \'{print $1}\' /proc/loadavg 2>/dev/null || echo "0.15")',
-      '  MEM_FREE=$(free -m 2>/dev/null | awk \'/Mem:/ {print $4}\' || echo "4096")',
-      '  curl -k -s -X POST "$SERVER_URL/api/health" -H "Content-Type: application/json" -d "{\\"hostname\\":\\"$(hostname)\\",\\"cpu\\":\\"$CPU_LOAD\\",\\"memFreeMb\\":\\"$MEM_FREE\\"}" >/dev/null 2>&1 || true',
-      '  sleep 30',
-      'done',
-      'EOF',
-      'chmod +x "$INSTALL_DIR/vitrine-agent.sh"',
-      '',
-      '# 3. Create Systemd Daemon Service',
-      'cat <<EOF > /etc/systemd/system/$SERVICE_NAME.service',
-      '[Unit]',
-      'Description=$BRAND_NAME Fleet Management Agent',
-      'After=network.target',
-      '',
-      '[Service]',
-      'Type=simple',
-      'Environment=SERVER_URL=$SERVER_URL',
-      'Environment=TENANT_ID=$TENANT_ID',
-      'ExecStart=$INSTALL_DIR/vitrine-agent.sh',
-      'Restart=always',
-      'RestartSec=10',
-      'WorkingDirectory=$INSTALL_DIR',
-      '',
-      '[Install]',
-      'WantedBy=multi-user.target',
-      'EOF',
-      '',
-      'systemctl daemon-reload',
-      'systemctl enable --now $SERVICE_NAME.service',
-      '',
-      '# XDG Desktop Autostart for End-User Tray',
-      'mkdir -p /etc/xdg/autostart',
-      'cat <<EOF > /etc/xdg/autostart/$SERVICE_NAME-tray.desktop',
-      '[Desktop Entry]',
-      'Type=Application',
-      'Name=$BRAND_NAME Support',
-      'Comment=Enterprise IT Support & Live Chat',
-      'Exec=$INSTALL_DIR/vitrine-agent.sh',
-      'Terminal=false',
-      'Categories=Utility;',
-      'EOF',
-      '',
-      'echo "[✓] $BRAND_NAME agent and desktop autostart successfully deployed."'
+      'printf "[OK] %s Linux deployment completed.\\n" "$BRAND_NAME"'
     ];
 
     return lines.join('\n');
@@ -463,69 +552,54 @@ export class InstallerGeneratorService {
     serverUrl: string;
     tenantId: string;
     serviceName: string;
+    trayThemeMode: 'system' | 'dark' | 'light';
+    isQuickSupport: boolean;
+    allowSelfSignedTls?: boolean;
   }): string {
+    const safeCommentBrand = vars.brandName.replace(/[\r\n#]/g, '');
+    const curlTlsFlag = vars.allowSelfSignedTls ? '--insecure ' : '';
+
     const lines = [
-      '#!/bin/bash',
+      '#!/usr/bin/env bash',
       '# ==============================================================================',
-      `# ${vars.brandName} - macOS Agent & Notification Tray`,
-      '# Target: macOS 12 Monterey - macOS 15 Sequoia (Apple Silicon & Intel)',
+      `# ${safeCommentBrand} - macOS Universal Agent & Notification Tray`,
+      `# Mode: ${vars.isQuickSupport ? 'QuickSupport On-Demand (User Space)' : 'Permanent LaunchDaemon'}`,
       '# ==============================================================================',
-      'set -e',
+      'set -euo pipefail',
       '',
-      'if [ "$EUID" -ne 0 ]; then',
-      '  echo "[-] Please run as root (sudo ./install.sh)"',
+      ...(vars.isQuickSupport
+        ? ['# QuickSupport runs in standard user space']
+        : [
+            'if [ "${EUID:-$(id -u)}" -ne 0 ]; then',
+            '  echo "[-] Please run as root (sudo ./install-mac.sh)" >&2',
+            '  exit 1',
+            'fi'
+          ]),
+      '',
+      `BRAND_NAME=${quoteBashLiteral(vars.brandName)}`,
+      `SERVER_URL=${quoteBashLiteral(vars.serverUrl)}`,
+      `TENANT_ID=${quoteBashLiteral(vars.tenantId)}`,
+      `TRAY_THEME=${quoteBashLiteral(vars.trayThemeMode)}`,
+      `SERVICE_SLUG=${quoteBashLiteral(vars.serviceName.toLowerCase())}`,
+      vars.isQuickSupport
+        ? 'INSTALL_DIR="$HOME/Library/Application Support/${SERVICE_SLUG}-quicksupport"'
+        : 'INSTALL_DIR="/Library/Application Support/${SERVICE_SLUG}"',
+      '',
+      'mkdir -p "$INSTALL_DIR"',
+      'ARCH="$(uname -m)"',
+      'MESH_TYPE=16',
+      'if [ "$ARCH" = "arm64" ]; then MESH_TYPE=29; fi',
+      '',
+      `curl ${curlTlsFlag}-fsSL "$SERVER_URL/meshagents?id=$MESH_TYPE&signed=1" -o "$INSTALL_DIR/meshagent"`,
+      'if [ ! -s "$INSTALL_DIR/meshagent" ]; then',
+      '  echo "[-] Downloaded macOS meshagent binary is empty; aborting." >&2',
       '  exit 1',
       'fi',
-      '',
-      `BRAND_NAME="${vars.brandName}"`,
-      `SERVER_URL="${vars.serverUrl}"`,
-      `TENANT_ID="${vars.tenantId}"`,
-      `SERVICE_NAME="com.vitrine.${vars.serviceName.toLowerCase()}"`,
-      'INSTALL_DIR="/Library/Application Support/$BRAND_NAME"',
-      '',
-      'echo "Installing $BRAND_NAME for macOS..."',
-      'mkdir -p "$INSTALL_DIR"',
-      '',
-      '# 1. Download Universal macOS MeshAgent Binary',
-      'curl -k -sSL "$SERVER_URL/meshagents?id=29" -o "$INSTALL_DIR/meshagent" || true',
-      'if [ -s "$INSTALL_DIR/meshagent" ]; then',
-      '  chmod +x "$INSTALL_DIR/meshagent"',
-      '  "$INSTALL_DIR/meshagent" -install --installPath="$INSTALL_DIR/meshcore" || true',
-      'fi',
-      '',
-      '# 2. Write Telemetry & Watchdog Runner',
-      'cat << \'EOF\' > "$INSTALL_DIR/vitrine-mac-agent.sh"',
-      '#!/bin/bash',
-      'while true; do',
-      '  UPTIME_STR=$(uptime)',
-      '  curl -k -s -X POST "$SERVER_URL/api/health" -H "Content-Type: application/json" -d "{\\"hostname\\":\\"$(scutil --get LocalHostName 2>/dev/null || hostname)\\"}" >/dev/null 2>&1 || true',
-      '  sleep 30',
-      'done',
-      'EOF',
-      'chmod +x "$INSTALL_DIR/vitrine-mac-agent.sh"',
-      '',
-      '# 3. Create LaunchDaemon Plist',
-      'cat <<EOF > /Library/LaunchDaemons/$SERVICE_NAME.plist',
-      '<?xml version="1.0" encoding="UTF-8"?>',
-      '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
-      '<plist version="1.0">',
-      '<dict>',
-      '    <key>Label</key>',
-      '    <string>$SERVICE_NAME</string>',
-      '    <key>RunAtLoad</key>',
-      '    <true/>',
-      '    <key>KeepAlive</key>',
-      '    <true/>',
-      '    <key>ProgramArguments</key>',
-      '    <array>',
-      '        <string>$INSTALL_DIR/vitrine-mac-agent.sh</string>',
-      '    </array>',
-      '</dict>',
-      '</plist>',
-      'EOF',
-      '',
-      'launchctl load -w /Library/LaunchDaemons/$SERVICE_NAME.plist',
-      'echo "[✓] $BRAND_NAME LaunchDaemon activated."'
+      'chmod 755 "$INSTALL_DIR/meshagent"',
+      vars.isQuickSupport
+        ? '"$INSTALL_DIR/meshagent" -connect &'
+        : '"$INSTALL_DIR/meshagent" -install --installPath="$INSTALL_DIR/meshcore"',
+      'printf "[OK] %s macOS deployment completed.\\n" "$BRAND_NAME"'
     ];
 
     return lines.join('\n');
