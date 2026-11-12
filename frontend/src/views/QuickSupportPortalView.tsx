@@ -105,8 +105,9 @@ export const QuickSupportPortalView: React.FC<QuickSupportPortalViewProps> = ({ 
 
   const isLight = effectiveTheme === 'light';
   const brandName = portalConfig?.brand_name || 'Vitrine RMM';
-  const brandLogo = portalConfig?.brand_logo_url || '/logo.png';
+  const brandLogo = portalConfig?.brand_logo_url || '/branding/logo.png';
   const accent = portalConfig?.primary_color || '#00f2fe';
+  const isPortalDisabled = portalConfig !== null && portalConfig.quicksupport_enabled === false;
 
   return (
     <div
@@ -194,9 +195,25 @@ export const QuickSupportPortalView: React.FC<QuickSupportPortalViewProps> = ({ 
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginBottom: '0.5rem' }}>
           <Sparkles size={20} color={accent} />
           <h1 style={{ fontSize: '1.4rem', fontWeight: 700, margin: 0 }}>
-            Start a Temporary Support Session
+            {isPortalDisabled ? 'QuickSupport Portal Currently Disabled' : 'Start a Temporary Support Session'}
           </h1>
         </div>
+        {isPortalDisabled ? (
+          <div
+            style={{
+              marginTop: '1rem',
+              padding: '1.25rem',
+              borderRadius: '12px',
+              background: 'rgba(245, 158, 11, 0.12)',
+              border: '1px solid rgba(245, 158, 11, 0.35)',
+              fontSize: '0.88rem',
+              lineHeight: 1.55
+            }}
+          >
+            Public on-demand QuickSupport launcher downloads have been disabled by your organization&apos;s administrator. Please contact your support technician directly for an authorized session invite link.
+          </div>
+        ) : (
+        <>
         <p style={{ fontSize: '0.85rem', opacity: 0.78, marginBottom: '1.5rem', lineHeight: 1.5 }}>
           Connect with an authorized support technician in seconds. This launcher runs in temporary user mode
           without requiring local administrator permissions, and every component is cryptographically code-signed
@@ -387,6 +404,8 @@ export const QuickSupportPortalView: React.FC<QuickSupportPortalViewProps> = ({ 
             </div>
           )}
         </form>
+        </>
+        )}
 
         {/* Security & Elevation Footnote */}
         <div

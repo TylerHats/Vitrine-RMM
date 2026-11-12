@@ -3,7 +3,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { db } from '../../db/index.js';
-import { decryptVaultSecret } from '../vault/index.js';
+import { decryptVaultSecret, validateOutboundHostSafety } from '../vault/index.js';
 import { quotePowerShellLiteral, quoteBashLiteral } from '../agent/installerGenerator.js';
 
 export interface ProcessItem {
@@ -1335,6 +1335,20 @@ export class MeshCentralBridge {
     }
 
     const normalizedUrl = urlCheck.normalized;
+    const dnsSafety = await validateOutboundHostSafety(normalizedUrl, { allowLoopback: true });
+    if (!dnsSafety.safe) {
+      return {
+        reachable: false,
+        authenticated: false,
+        source: 'unreachable',
+        serverUrl: normalizedUrl,
+        latencyMs: Date.now() - startMs,
+        error: dnsSafety.reason || 'MeshCentral URL blocked by SSRF policy.',
+        groups: [],
+        agents: []
+      };
+    }
+
     const cleanToken = params.apiToken ? decryptVaultSecret(params.apiToken) || params.apiToken : '';
 
     // 1. Try live WebSocket control.ashx probe (standard MeshCentral 2 protocol)

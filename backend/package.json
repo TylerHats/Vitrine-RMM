@@ -1,6 +1,6 @@
 {
   "name": "vitrine-rmm-backend",
-  "version": "2.5.0",
+  "version": "2.5.1",
   "type": "module",
   "description": "Backend API and MeshCentral 2 bridge for Vitrine RMM",
   "main": "dist/server.js",

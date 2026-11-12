@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { execSync } from 'child_process';
+import { execSync, execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import {
   db,
@@ -458,14 +458,84 @@ export class SystemUpdaterService {
       };
     }
 
-    // 3. Bare-Metal Execution with Real Automatic Rollback on Any Error
+    // 3. Bare-Metal Execution with Real Git Fetch + Build + Automatic Rollback on Any Error
+    const repoCandidates = [path.resolve(__dirname, '../../..'), path.resolve(__dirname, '../../../..')];
+    const repoRoot = repoCandidates.find((r) => fs.existsSync(path.join(r, '.git'))) || null;
+    let preHeadSha: string | null = null;
+    let gitUpdated = false;
+
     try {
-      if (process.env.VITRINE_ENABLE_GIT_SELF_PULL === 'true') {
-        const repoRoot = path.resolve(__dirname, '../../..');
-        if (fs.existsSync(path.join(repoRoot, '.git'))) {
-          const ref = status.channel === 'stable' ? status.latestStable.tag : 'origin/main';
-          execSync('git fetch --tags origin', { cwd: repoRoot, stdio: 'pipe', timeout: 30000 });
-          execSync(`git merge --ff-only ${ref}`, { cwd: repoRoot, stdio: 'pipe', timeout: 30000 });
+      const gitSelfPullDisabled = process.env.VITRINE_DISABLE_GIT_SELF_PULL === 'true';
+      const explicitGitSelfPull = process.env.VITRINE_ENABLE_GIT_SELF_PULL === 'true';
+
+      if (repoRoot && !gitSelfPullDisabled && (explicitGitSelfPull || status.updateAvailable)) {
+        const dirtyStatus = execFileSync('git', ['status', '--porcelain'], {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: 15000
+        }).trim();
+
+        if (dirtyStatus && !explicitGitSelfPull) {
+          throw new Error(
+            'Local repository has uncommitted modifications (`git status --porcelain` is non-empty). Commit or stash local changes before running bare-metal self-update.'
+          );
+        }
+
+        preHeadSha = execFileSync('git', ['rev-parse', 'HEAD'], {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: 10000
+        }).trim();
+
+        const rawRef = status.channel === 'stable' ? status.latestStable.tag : 'origin/main';
+        if (!/^[a-zA-Z0-9._/-]+$/.test(rawRef)) {
+          throw new Error(`Invalid target git reference '${rawRef}'.`);
+        }
+
+        execFileSync('git', ['fetch', '--tags', 'origin'], {
+          cwd: repoRoot,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: 60000
+        });
+
+        if (status.channel === 'stable') {
+          execFileSync('git', ['checkout', rawRef], {
+            cwd: repoRoot,
+            stdio: ['ignore', 'pipe', 'pipe'],
+            timeout: 30000
+          });
+        } else {
+          execFileSync('git', ['merge', '--ff-only', rawRef], {
+            cwd: repoRoot,
+            stdio: ['ignore', 'pipe', 'pipe'],
+            timeout: 30000
+          });
+        }
+
+        const postHeadSha = execFileSync('git', ['rev-parse', 'HEAD'], {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: 10000
+        }).trim();
+
+        if (postHeadSha !== preHeadSha || explicitGitSelfPull) {
+          gitUpdated = postHeadSha !== preHeadSha;
+          const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+          for (const pkgDir of ['frontend', 'backend']) {
+            execFileSync(npmBin, ['install', '--no-audit', '--no-fund', '--prefix', pkgDir], {
+              cwd: repoRoot,
+              stdio: ['ignore', 'pipe', 'pipe'],
+              timeout: 180000
+            });
+            execFileSync(npmBin, ['run', 'build', '--prefix', pkgDir], {
+              cwd: repoRoot,
+              stdio: ['ignore', 'pipe', 'pipe'],
+              timeout: 180000
+            });
+          }
         }
       }
 
@@ -510,9 +580,19 @@ export class SystemUpdaterService {
         `Updated on ${status.channel.toUpperCase()} channel: ${fromVersion} (${fromCommit}) -> ${targetVersion} (${targetCommit}). Pre-update backup: ${preUpdateBackupId || 'none'}.`
       );
 
+      // If running under systemd and git compiled new server artifacts, schedule clean service restart after HTTP reply flushes
+      const restartScheduled = Boolean(gitUpdated && (process.env.INVOCATION_ID || explicitGitSelfPull));
+      if (restartScheduled) {
+        setTimeout(() => {
+          process.exit(0);
+        }, 1500).unref();
+      }
+
       return {
         success: true,
         rolledBack: false,
+        gitUpdated,
+        restartScheduled,
         fromVersion,
         toVersion: targetVersion,
         fromCommit,
@@ -522,15 +602,43 @@ export class SystemUpdaterService {
         status: this.getStatus()
       };
     } catch (err: any) {
-      const errorTrace = err?.message || 'Unexpected error during bare-metal update pipeline';
+      const errorTrace = err?.stderr?.toString?.()?.slice(0, 400) || err?.message || 'Unexpected error during bare-metal update pipeline';
       let rolledBack = false;
 
-      if (settings.update_auto_rollback && preUpdateBackupId) {
-        try {
-          backupService.restoreFromBackup(preUpdateBackupId, 'auto_migrate');
-          rolledBack = true;
-        } catch {
-          rolledBack = false;
+      if (settings.update_auto_rollback) {
+        // 1. Revert git working tree & recompile previous working build if git HEAD changed
+        if (repoRoot && preHeadSha) {
+          try {
+            const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+            execFileSync('git', ['reset', '--hard', preHeadSha], {
+              cwd: repoRoot,
+              stdio: ['ignore', 'pipe', 'pipe'],
+              timeout: 30000
+            });
+            execFileSync(npmBin, ['run', 'build', '--prefix', 'frontend'], {
+              cwd: repoRoot,
+              stdio: ['ignore', 'pipe', 'pipe'],
+              timeout: 180000
+            });
+            execFileSync(npmBin, ['run', 'build', '--prefix', 'backend'], {
+              cwd: repoRoot,
+              stdio: ['ignore', 'pipe', 'pipe'],
+              timeout: 180000
+            });
+            rolledBack = true;
+          } catch {
+            // Continue to DB snapshot restore
+          }
+        }
+
+        // 2. Restore pre-update atomic SQLite + Vault snapshot
+        if (preUpdateBackupId) {
+          try {
+            backupService.restoreFromBackup(preUpdateBackupId, 'auto_migrate');
+            rolledBack = true;
+          } catch {
+            rolledBack = false;
+          }
         }
       }
 

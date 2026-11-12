@@ -86,7 +86,7 @@ export const QbrReportModal: React.FC<QbrReportModalProps> = ({
             <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--glass-border)', paddingBottom: '1.5rem' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-                  <img src={brandLogoUrl || '/logo.png'} alt="Logo" style={{ width: '56px', height: '56px', objectFit: 'contain' }} />
+                  <img src={brandLogoUrl || '/branding/logo.png'} alt="Logo" style={{ width: '56px', height: '56px', objectFit: 'contain' }} />
                   <div>
                     <h2 style={{ fontFamily: 'var(--font-heading)', fontSize: '1.5rem' }}>
                       Quarterly Executive Business Review

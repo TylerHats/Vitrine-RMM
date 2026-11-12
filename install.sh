@@ -6,7 +6,7 @@ set -euo pipefail
 echo "=========================================================="
 echo "             Vitrine RMM Installation Script              "
 echo "=========================================================="
-echo "Modern, Glassmorphic Self-Hosted RMM (v2.5.0)"
+echo "Modern, Glassmorphic Self-Hosted RMM (v2.5.1)"
 echo "Powered by MeshCentral 2 Remote Engine (Co-Existence Safe)"
 echo "=========================================================="
 
@@ -115,6 +115,7 @@ Environment=NODE_ENV=production
 Environment=PORT=$DEFAULT_PORT
 Environment=DATA_DIR=$PROJ_ROOT/data
 Environment=BRANDING_DIR=$PROJ_ROOT/branding
+Environment=VITRINE_ENABLE_GIT_SELF_PULL=true
 ExecStart=$NODE_PATH $SERVER_PATH
 Restart=always
 RestartSec=5
@@ -139,7 +140,7 @@ fi
 
 echo ""
 echo "=========================================================="
-echo "Vitrine RMM v2.5.0 setup completed successfully!"
+echo "Vitrine RMM v2.5.1 setup completed successfully!"
 echo "Neighboring MeshCentral 2 installations were left untouched."
 echo ""
 echo "Open http://localhost:${DEFAULT_PORT}/ in your browser to create"

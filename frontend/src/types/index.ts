@@ -321,6 +321,7 @@ export interface Settings {
   backup_include_mesh_config?: number | boolean;
   backup_encryption_enabled?: number | boolean;
   backup_encryption_passphrase?: string;
+  backup_key_acknowledged?: number | boolean;
   backup_offsite_enabled?: number | boolean;
   backup_offsite_provider?: 's3' | 'backblaze_b2' | 'b2' | 'minio' | 'sftp' | 'smb' | string;
   backup_offsite_endpoint?: string;
@@ -351,6 +352,8 @@ export interface CustomFieldDefinition {
   description?: string | null;
   current_value?: string | null;
   value_updated_at?: string | null;
+  has_secret?: boolean;
+  revealed?: boolean;
 }
 
 export interface MaintenanceWindow {

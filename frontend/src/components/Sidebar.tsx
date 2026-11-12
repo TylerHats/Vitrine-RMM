@@ -83,7 +83,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
       />
       <aside className={`sidebar ${isMobileOpen ? 'mobile-open' : ''}`} id="app-sidebar">
         <div className="sidebar-header">
-          <img src={brandLogoUrl || '/logo.png'} alt="Vitrine Logo" className="brand-logo-img" />
+          <img src={brandLogoUrl || '/branding/logo.png'} alt="Vitrine Logo" className="brand-logo-img" />
           <span className="brand-title">{brandName || 'Vitrine RMM'}</span>
           <span className="brand-badge">v{appVersion}</span>
         </div>

@@ -36,12 +36,23 @@ import {
 import {
   encryptVaultSecret,
   decryptVaultSecret,
+  isEncryptedVaultSecret,
   maskSecretValue,
   isMaskedSecret,
   hashPasswordScrypt,
   verifyPasswordScrypt,
-  generateRandomBase32
+  generateRandomBase32,
+  validateOutboundHostSafety
 } from '../services/vault/index.js';
+import {
+  createOidcAuthorizationRedirect,
+  completeOidcCallback,
+  testOidcDiscoveryConfig
+} from '../services/auth/oidc.js';
+import {
+  syncVirtualizationHost,
+  dispatchLiveHypervisorVmAction
+} from '../services/virtualization/index.js';
 import {
   checkRateLimit,
   isSuperAdminRole,
@@ -117,6 +128,7 @@ function sanitizeSettingsRowForResponse(row: any): any {
     copy[col] = maskSecretValue(copy[col]);
   }
   copy.meshcentral_connected = meshBridge.getStatus().connected ? 1 : 0;
+  copy.backup_key_acknowledged = Boolean(copy.backup_key_acknowledged);
   if (copy.mesh_external_delete_prompt === 1 || copy.mesh_external_delete_prompt === '1') {
     copy.mesh_external_delete_prompt = 'prompt';
   } else if (copy.mesh_external_delete_prompt === 0 || copy.mesh_external_delete_prompt === '0') {
@@ -200,13 +212,17 @@ async function probeNetworkEndpoint(params: {
   const rawHost = String(params.ipOrHost || '').trim();
   const cleanHost = rawHost.includes('://') ? new URL(rawHost).hostname : rawHost.split(':')[0];
 
-  if (
-    !cleanHost ||
-    cleanHost === '169.254.169.254' ||
-    cleanHost.startsWith('169.254.') ||
-    cleanHost === 'metadata.google.internal'
-  ) {
-    return { reachable: false, latencyMs: 0, detail: 'Blocked invalid or link-local metadata address' };
+  if (!cleanHost) {
+    return { reachable: false, latencyMs: 0, detail: 'Target hostname or IP is empty' };
+  }
+
+  const hostSafety = await validateOutboundHostSafety(cleanHost, { allowLoopback: false });
+  if (!hostSafety.safe) {
+    return {
+      reachable: false,
+      latencyMs: 0,
+      detail: hostSafety.reason || 'Blocked invalid or restricted address'
+    };
   }
 
   // 1. If HTTP/HTTPS vendor API endpoint is provided (or WAN SSL probe), inspect TLS/HTTP
@@ -218,6 +234,14 @@ async function probeNetworkEndpoint(params: {
         : null;
 
   if (targetUrl) {
+    const urlSafety = await validateOutboundHostSafety(targetUrl, { allowLoopback: false });
+    if (!urlSafety.safe) {
+      return {
+        reachable: false,
+        latencyMs: 0,
+        detail: urlSafety.reason || 'Blocked restricted API endpoint URL'
+      };
+    }
     try {
       const parsed = new URL(targetUrl);
       let tlsDaysRemaining: number | undefined;
@@ -343,6 +367,8 @@ export async function registerApiRoutes(server: FastifyInstance) {
       pathname === '/api/auth/setup-initial-admin' ||
       pathname === '/api/auth/login' ||
       pathname === '/api/auth/logout' ||
+      pathname === '/api/auth/oidc/login' ||
+      pathname === '/api/auth/oidc/callback' ||
       pathname === '/api/agent/deploy' ||
       pathname === '/api/agent/download' ||
       pathname === '/api/psa/webhook' ||
@@ -369,6 +395,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
       pathname === '/api/demo/seed' ||
       pathname.startsWith('/api/users') ||
       pathname.startsWith('/api/backups') ||
+      pathname === '/api/auth/oidc/test' ||
       (pathname.startsWith('/api/updater') && request.method !== 'GET') ||
       pathname === '/api/laps/break-glass-export' ||
       pathname === '/api/smtp/test' ||
@@ -386,14 +413,19 @@ export async function registerApiRoutes(server: FastifyInstance) {
       });
     }
 
-    // Client Admins have tenant-scoped read-only visibility (cannot mutate fleet state or run system tools)
+    // Client Admins have strictly tenant-scoped read-only visibility on safe inventory routes only
+    // (never remote files, registry, processes, services, eventlogs, scheduled tasks, or LAPS/BitLocker vaults)
     const isReadMethod = request.method === 'GET' || request.method === 'HEAD';
+    const isSafeClientAdminDeviceSubroute =
+      /^\/api\/devices\/[^/]+$/.test(pathname) ||
+      /^\/api\/devices\/[^/]+\/(software|warranty|hardware-history|network-history|custom-fields)$/.test(pathname);
     const isAllowedForClientAdmin =
       pathname.startsWith('/api/auth/') ||
+      (request.method === 'POST' && /^\/api\/notifications\/[^/]+\/read$/.test(pathname)) ||
       (isReadMethod &&
         (pathname === '/api/tenants' ||
           pathname === '/api/devices' ||
-          pathname.startsWith('/api/devices/') ||
+          isSafeClientAdminDeviceSubroute ||
           pathname === '/api/patches' ||
           pathname === '/api/reports/qbr' ||
           pathname === '/api/notifications'));
@@ -620,8 +652,14 @@ export async function registerApiRoutes(server: FastifyInstance) {
   // Authentication, Initial Admin Bootstrap & Step-Up MFA
   // ============================================================================
   server.get('/api/auth/status', async (request) => {
-    const settings = (db.prepare('SELECT is_onboarded, oobe_completed, oidc_enabled, brand_name, brand_logo_url, primary_color, theme_mode FROM settings WHERE id = 1').get() ||
-      {}) as any;
+    const settings = (db
+      .prepare(
+        'SELECT is_onboarded, oobe_completed, oidc_enabled, oidc_issuer_url, oidc_client_id, brand_name, brand_logo_url, primary_color, theme_mode FROM settings WHERE id = 1'
+      )
+      .get() || {}) as any;
+    const hasOidcConfig = Boolean(
+      String(settings.oidc_issuer_url || '').trim() && String(settings.oidc_client_id || '').trim()
+    );
     return {
       initialized: hasConfiguredAdminUser(),
       authenticated: Boolean(request.auth),
@@ -629,7 +667,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
       mfaVerified: Boolean(request.auth?.mfaVerified),
       mfaVerifiedUntil: request.auth?.mfaVerifiedUntil || null,
       isOnboarded: Boolean(settings.is_onboarded || settings.oobe_completed),
-      oidcEnabled: Boolean(settings.oidc_enabled),
+      oidcEnabled: Boolean(hasOidcConfig && (settings.oidc_enabled ?? 1)),
       branding: {
         brand_name: settings.brand_name || 'Vitrine RMM',
         brand_logo_url: settings.brand_logo_url || '/branding/logo.png',
@@ -637,6 +675,53 @@ export async function registerApiRoutes(server: FastifyInstance) {
         theme_mode: settings.theme_mode || 'system'
       }
     };
+  });
+
+  server.get('/api/auth/oidc/login', async (request, reply) => {
+    const rate = checkRateLimit(`oidc-login:${request.ip}`, 15, 5 * 60_000);
+    if (!rate.allowed) {
+      return reply.redirect(`/?sso_error=${encodeURIComponent('Too many SSO attempts. Please wait and try again.')}`);
+    }
+    try {
+      const redirectUrl = await createOidcAuthorizationRedirect(request);
+      return reply.redirect(redirectUrl);
+    } catch (err: any) {
+      return reply.redirect(
+        `/?sso_error=${encodeURIComponent(err?.message || 'Unable to initiate Enterprise SSO login.')}`
+      );
+    }
+  });
+
+  server.get('/api/auth/oidc/callback', async (request, reply) => {
+    const query = (request.query || {}) as {
+      code?: string;
+      state?: string;
+      error?: string;
+      error_description?: string;
+    };
+    if (query.error) {
+      return reply.redirect(
+        `/?sso_error=${encodeURIComponent(query.error_description || query.error || 'SSO authentication cancelled.')}`
+      );
+    }
+    if (!query.code || !query.state) {
+      return reply.redirect(`/?sso_error=${encodeURIComponent('Missing authorization code or state parameter.')}`);
+    }
+    try {
+      const user = await completeOidcCallback({ code: query.code, state: query.state });
+      const session = createUserSession(user.id, request.ip, request.headers['user-agent']);
+      setSessionCookie(reply, request, session.rawToken);
+      return reply.redirect('/');
+    } catch (err: any) {
+      return reply.redirect(
+        `/?sso_error=${encodeURIComponent(err?.message || 'Enterprise SSO authentication failed.')}`
+      );
+    }
+  });
+
+  server.post('/api/auth/oidc/test', async (request) => {
+    const body = (request.body || {}) as { issuerUrl?: string; clientId?: string };
+    return await testOidcDiscoveryConfig(body);
   });
 
   server.post('/api/auth/setup-initial-admin', async (request, reply) => {
@@ -856,6 +941,32 @@ export async function registerApiRoutes(server: FastifyInstance) {
             : current.is_onboarded
           : null;
 
+    const resolvedOidcEnabled =
+      body.oidc_enabled != null
+        ? body.oidc_enabled
+          ? 1
+          : 0
+        : body.oidc_issuer_url !== undefined || body.oidc_client_id !== undefined
+          ? String(body.oidc_issuer_url ?? current.oidc_issuer_url ?? '').trim() &&
+            String(body.oidc_client_id ?? current.oidc_client_id ?? '').trim()
+            ? 1
+            : 0
+          : null;
+
+    const customBackupPassSet = Boolean(
+      body.backup_encryption_passphrase &&
+        !isMaskedSecret(String(body.backup_encryption_passphrase)) &&
+        String(body.backup_encryption_passphrase).trim().length > 0
+    );
+    const resolvedBackupAck =
+      body.backup_key_acknowledged != null
+        ? body.backup_key_acknowledged
+          ? 1
+          : 0
+        : customBackupPassSet
+          ? 1
+          : null;
+
     db.prepare(`
       UPDATE settings SET
         brand_name = COALESCE(?, brand_name),
@@ -925,6 +1036,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
         backup_include_mesh_config = COALESCE(?, backup_include_mesh_config),
         backup_encryption_enabled = COALESCE(?, backup_encryption_enabled),
         backup_encryption_passphrase = COALESCE(?, backup_encryption_passphrase),
+        backup_key_acknowledged = COALESCE(?, backup_key_acknowledged),
         backup_offsite_enabled = COALESCE(?, backup_offsite_enabled),
         backup_offsite_provider = COALESCE(?, backup_offsite_provider),
         backup_offsite_endpoint = COALESCE(?, backup_offsite_endpoint),
@@ -951,7 +1063,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
       body.smtp_tls != null ? (body.smtp_tls ? 1 : 0) : null,
       body.itflow_url ?? null,
       resolveSecretUpdate('itflow_api_key'),
-      body.oidc_enabled != null ? (body.oidc_enabled ? 1 : 0) : null,
+      resolvedOidcEnabled,
       body.oidc_issuer_url ?? null,
       body.oidc_client_id ?? null,
       resolveSecretUpdate('oidc_client_secret'),
@@ -1003,6 +1115,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
       body.backup_include_mesh_config != null ? (body.backup_include_mesh_config ? 1 : 0) : null,
       body.backup_encryption_enabled != null ? (body.backup_encryption_enabled ? 1 : 0) : null,
       resolveSecretUpdate('backup_encryption_passphrase'),
+      resolvedBackupAck,
       body.backup_offsite_enabled != null ? (body.backup_offsite_enabled ? 1 : 0) : null,
       body.backup_offsite_provider ?? null,
       body.backup_offsite_endpoint ?? null,
@@ -1165,6 +1278,32 @@ export async function registerApiRoutes(server: FastifyInstance) {
     const existing = db.prepare('SELECT * FROM users WHERE id = ?').get(id) as any;
     if (!existing) return reply.status(404).send({ error: 'User not found' });
 
+    if (body.password !== undefined && body.password !== '' && body.password.length < 10) {
+      return reply.status(400).send({ error: 'User password must be at least 10 characters.' });
+    }
+
+    const nextRole = body.role ?? existing.role;
+    if (isSuperAdminRole(existing.role) && !isSuperAdminRole(nextRole)) {
+      const adminCount = (
+        db
+          .prepare("SELECT COUNT(*) as c FROM users WHERE role IN ('msp_super_admin', 'super_admin', 'admin')")
+          .get() as { c: number }
+      ).c;
+      if (adminCount <= 1) {
+        return reply.status(400).send({ error: 'Cannot demote the last MSP Super Admin account.' });
+      }
+    }
+
+    const nextTenantId =
+      nextRole === 'client_admin'
+        ? body.tenant_id !== undefined
+          ? body.tenant_id
+          : existing.tenant_id
+        : null;
+    if (nextRole === 'client_admin' && !nextTenantId) {
+      return reply.status(400).send({ error: 'Client Admin accounts must be scoped to a specific Client tenant.' });
+    }
+
     const nextPassHash =
       body.password && body.password.length >= 10 ? hashPasswordScrypt(body.password) : null;
 
@@ -1177,14 +1316,14 @@ export async function registerApiRoutes(server: FastifyInstance) {
       WHERE id = ?
     `).run(
       body.role ?? null,
-      body.email ?? null,
-      body.tenant_id !== undefined ? body.tenant_id : existing.tenant_id,
+      body.email ? body.email.trim().toLowerCase() : null,
+      nextTenantId,
       nextPassHash,
       id
     );
 
-    // If password was rotated, revoke active sessions for that user
-    if (nextPassHash) {
+    // If password was rotated or role/tenant scope changed, revoke active sessions for that user immediately
+    if (nextPassHash || nextRole !== existing.role || nextTenantId !== existing.tenant_id) {
       db.prepare('DELETE FROM auth_sessions WHERE user_id = ?').run(id);
     }
 
@@ -1361,7 +1500,9 @@ export async function registerApiRoutes(server: FastifyInstance) {
     const safeDevice = sanitizeDeviceRowForResponse(device);
     safeDevice.enrolled_at = safeDevice.enrolled_at || safeDevice.created_at || new Date().toISOString();
     safeDevice.policy = sanitizeEffectivePolicyForResponse(resolveEffectiveDevicePolicy(id));
-    safeDevice.laps = getLapsCredential(id, false, { actorUsername: getActorUsername(request) });
+    safeDevice.laps = isTechnicianOrAbove(request.auth?.user.role)
+      ? getLapsCredential(id, false, { actorUsername: getActorUsername(request) })
+      : null;
     safeDevice.warranty = db.prepare('SELECT * FROM oem_warranties WHERE device_id = ?').get(id) || null;
 
     const nowIso = new Date().toISOString();
@@ -2884,6 +3025,29 @@ export async function registerApiRoutes(server: FastifyInstance) {
       return reply.status(400).send({ error: 'Appliance name and IP/hostname are required.' });
     }
 
+    const rawTarget = body.ip_address.trim();
+    let parsedTargetHost = rawTarget;
+    try {
+      parsedTargetHost = rawTarget.includes('://') ? new URL(rawTarget).hostname : rawTarget.split(':')[0];
+    } catch {
+      return reply.status(400).send({ error: 'Invalid IP address or hostname format.' });
+    }
+    const hostCheck = await validateOutboundHostSafety(parsedTargetHost, { allowLoopback: false });
+    if (!hostCheck.safe) {
+      return reply.status(400).send({ error: hostCheck.reason || 'Blocked unsafe or restricted appliance target.' });
+    }
+    if (body.vendor_api_endpoint && body.vendor_api_endpoint.includes('://')) {
+      try {
+        const epHost = new URL(body.vendor_api_endpoint).hostname;
+        const epCheck = await validateOutboundHostSafety(epHost, { allowLoopback: false });
+        if (!epCheck.safe) {
+          return reply.status(400).send({ error: epCheck.reason || 'Blocked unsafe vendor API endpoint.' });
+        }
+      } catch {
+        return reply.status(400).send({ error: 'Invalid vendor API endpoint URL.' });
+      }
+    }
+
     const id = `app-${crypto.randomUUID().slice(0, 8)}`;
     const firstTenant = db.prepare('SELECT id FROM tenants ORDER BY created_at ASC LIMIT 1').get() as
       | { id: string }
@@ -3125,7 +3289,32 @@ export async function registerApiRoutes(server: FastifyInstance) {
       storageTotal,
       storageTotal
     );
-    return { success: true, id, reachable: probe.reachable };
+
+    const syncReport = await syncVirtualizationHost(id);
+    return {
+      success: true,
+      id,
+      reachable: syncReport.synced || probe.reachable,
+      sync: syncReport
+    };
+  });
+
+  server.post('/api/virtualization/hosts/:id/sync', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const existing = db.prepare('SELECT id, name FROM virtualization_hosts WHERE id = ?').get(id) as any;
+    if (!existing) {
+      return reply.status(404).send({ success: false, error: 'Virtualization host not found.' });
+    }
+    const syncReport = await syncVirtualizationHost(id);
+    db.prepare(`
+      INSERT INTO audit_logs (id, username, device_id, action, details)
+      VALUES (?, ?, NULL, 'Hypervisor Host Synchronized', ?)
+    `).run(
+      `aud-vsync-${crypto.randomUUID()}`,
+      getActorUsername(request),
+      `Polled hypervisor '${existing.name}': ${syncReport.message}`
+    );
+    return { success: true, ...syncReport };
   });
 
   server.delete('/api/virtualization/hosts/:id', async (request) => {
@@ -3135,21 +3324,35 @@ export async function registerApiRoutes(server: FastifyInstance) {
     return { success: true };
   });
 
-  server.post('/api/virtualization/hosts/:hostId/vms/:vmid/action', async (request) => {
+  server.post('/api/virtualization/hosts/:hostId/vms/:vmid/action', async (request, reply) => {
     const { hostId, vmid } = request.params as { hostId: string; vmid: string };
     const body = (request.body || {}) as { action?: 'start' | 'stop' | 'reboot' | 'snapshot' };
     const vmIdNum = parseInt(vmid, 10);
+    const act = body.action || 'start';
 
-    if (body.action === 'start' || body.action === 'reboot') {
+    let liveResult: { dispatchedLive: boolean; detail: string } = {
+      dispatchedLive: false,
+      detail: 'Local VM state updated.'
+    };
+    try {
+      liveResult = await dispatchLiveHypervisorVmAction(hostId, vmIdNum, act);
+    } catch (err: any) {
+      return reply.status(502).send({
+        success: false,
+        error: err?.message || 'Hypervisor API rejected the VM action.'
+      });
+    }
+
+    if (act === 'start' || act === 'reboot') {
       db.prepare(
         "UPDATE virtualization_vms SET status = 'Running', cpu = CASE WHEN cpu = 0 THEN 4 ELSE cpu END WHERE host_id = ? AND vmid = ?"
       ).run(hostId, vmIdNum);
-    } else if (body.action === 'stop') {
+    } else if (act === 'stop') {
       db.prepare("UPDATE virtualization_vms SET status = 'Stopped', cpu = 0 WHERE host_id = ? AND vmid = ?").run(
         hostId,
         vmIdNum
       );
-    } else if (body.action === 'snapshot') {
+    } else if (act === 'snapshot') {
       const snapStr = new Date().toLocaleString('en-US', {
         month: 'short',
         day: '2-digit',
@@ -3169,10 +3372,14 @@ export async function registerApiRoutes(server: FastifyInstance) {
     `).run(
       `aud-vm-${crypto.randomUUID()}`,
       getActorUsername(request),
-      `Executed '${body.action}' on VM #${vmIdNum} (Host: ${hostId})`
+      `Executed '${act}' on VM #${vmIdNum} (Host: ${hostId}) — ${liveResult.detail}`
     );
 
-    return { success: true };
+    return {
+      success: true,
+      dispatchedLive: liveResult.dispatchedLive,
+      detail: liveResult.detail
+    };
   });
 
   // ============================================================================
@@ -3354,8 +3561,29 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.get('/api/devices/:id/custom-fields', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
-    return db
+    const access = ensureDeviceTenantAccess(request, reply, id);
+    if (!access.allowed || !access.device) return;
+
+    const isTech = isTechnicianOrAbove(request.auth?.user.role);
+    const query = (request.query || {}) as { reveal?: string; fieldId?: string };
+    const revealSecrets = isTech && query.reveal === 'true';
+
+    if (revealSecrets) {
+      if (!requireStepUpMfaIfEnforced(request, reply, id)) {
+        return;
+      }
+      db.prepare(`
+        INSERT INTO audit_logs (id, username, device_id, action, details)
+        VALUES (?, ?, ?, 'Secret Custom Field Revealed', ?)
+      `).run(
+        `aud-cfs-${crypto.randomUUID()}`,
+        getActorUsername(request),
+        id,
+        `Revealed encrypted custom asset secret field(s) on ${access.device.hostname}`
+      );
+    }
+
+    const rows = db
       .prepare(`
         SELECT d.id as field_id, d.key, d.label, d.category, d.field_type, d.scope, d.options, d.description,
                COALESCE(v.value, '') as value, v.updated_at
@@ -3364,7 +3592,23 @@ export async function registerApiRoutes(server: FastifyInstance) {
         WHERE d.scope = 'device' OR d.scope = 'all'
         ORDER BY d.category ASC, d.label ASC
       `)
-      .all(id);
+      .all(id) as any[];
+
+    return rows
+      .filter((r) => isTech || r.field_type !== 'secret')
+      .map((r) => {
+        if (r.field_type !== 'secret') return r;
+        const hasVal = Boolean(r.value && String(r.value).trim() !== '');
+        if (!hasVal) {
+          return { ...r, value: '', has_secret: false };
+        }
+        const shouldRevealThis = revealSecrets && (!query.fieldId || query.fieldId === r.field_id);
+        if (shouldRevealThis) {
+          const plain = isEncryptedVaultSecret(r.value) ? decryptVaultSecret(r.value) : String(r.value);
+          return { ...r, value: plain, has_secret: true, revealed: true };
+        }
+        return { ...r, value: '••••••••••••', has_secret: true, revealed: false };
+      });
   });
 
   server.post('/api/devices/:id/custom-fields', async (request, reply) => {
@@ -3385,16 +3629,35 @@ export async function registerApiRoutes(server: FastifyInstance) {
         updated_at = CURRENT_TIMESTAMP
     `);
 
+    const saveSingleFieldValue = (fId: string, rawVal: unknown) => {
+      const def = db
+        .prepare('SELECT field_type FROM custom_field_definitions WHERE id = ?')
+        .get(fId) as { field_type?: string } | undefined;
+      const strVal = String(rawVal ?? '');
+
+      if (def?.field_type === 'secret') {
+        if (isMaskedSecret(strVal)) {
+          // Preserve existing ciphertext when client saves masked placeholder
+          return;
+        }
+        const toStore = strVal ? encryptVaultSecret(strVal) : '';
+        upsertStmt.run(`cfv-${crypto.randomUUID().slice(0, 8)}`, fId, id, toStore);
+        return;
+      }
+
+      upsertStmt.run(`cfv-${crypto.randomUUID().slice(0, 8)}`, fId, id, strVal);
+    };
+
     if (body.values && typeof body.values === 'object') {
       for (const [fId, val] of Object.entries(body.values)) {
-        upsertStmt.run(`cfv-${crypto.randomUUID().slice(0, 8)}`, fId, id, String(val ?? ''));
+        saveSingleFieldValue(fId, val);
       }
     } else {
       const targetFieldId = body.fieldId || body.field_id;
       if (!targetFieldId) {
         return reply.status(400).send({ error: 'fieldId is required.' });
       }
-      upsertStmt.run(`cfv-${crypto.randomUUID().slice(0, 8)}`, targetFieldId, id, String(body.value ?? ''));
+      saveSingleFieldValue(targetFieldId, body.value);
     }
 
     return { success: true };
@@ -3703,10 +3966,16 @@ export async function registerApiRoutes(server: FastifyInstance) {
   // ============================================================================
   // Notifications, MeshCentral Sync, Tenant Delete, History, Smart Groups & Software
   // ============================================================================
-  server.get('/api/notifications', async () => {
-    const rows = db
-      .prepare('SELECT * FROM notifications ORDER BY is_read ASC, created_at DESC LIMIT 100')
-      .all() as any[];
+  server.get('/api/notifications', async (request) => {
+    const user = request.auth?.user;
+    const isClientScoped = Boolean(user && !isTechnicianOrAbove(user.role));
+    const rows = (isClientScoped
+      ? db
+          .prepare('SELECT * FROM notifications WHERE tenant_id = ? ORDER BY is_read ASC, created_at DESC LIMIT 100')
+          .all(user?.tenant_id || '__none__')
+      : db
+          .prepare('SELECT * FROM notifications ORDER BY is_read ASC, created_at DESC LIMIT 100')
+          .all()) as any[];
     return rows.map((r) => ({
       ...r,
       is_read: Boolean(r.is_read),
@@ -3716,6 +3985,17 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.post('/api/notifications/:id/read', async (request) => {
     const { id } = request.params as { id: string };
+    const user = request.auth?.user;
+    const isClientScoped = Boolean(user && !isTechnicianOrAbove(user.role));
+    if (isClientScoped) {
+      const tid = user?.tenant_id || '__none__';
+      if (id === 'all') {
+        db.prepare('UPDATE notifications SET is_read = 1 WHERE tenant_id = ?').run(tid);
+      } else {
+        db.prepare('UPDATE notifications SET is_read = 1 WHERE id = ? AND tenant_id = ?').run(id, tid);
+      }
+      return { success: true };
+    }
     if (id === 'all') {
       db.prepare('UPDATE notifications SET is_read = 1').run();
     } else {
@@ -4347,7 +4627,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
         SELECT d.id as field_id, d.key, d.label, d.category, COALESCE(v.value, '') as value
         FROM custom_field_definitions d
         LEFT JOIN custom_field_values v ON d.id = v.field_id AND v.entity_id = ?
-        WHERE d.scope = 'device' OR d.scope = 'all'
+        WHERE (d.scope = 'device' OR d.scope = 'all') AND d.field_type != 'secret'
         ORDER BY d.category ASC, d.label ASC
       `)
       .all(deviceId);
@@ -5165,6 +5445,32 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.post('/api/backups/sync-offsite', async () => {
     return await backupService.syncAllToOffsiteVault();
+  });
+
+  server.post('/api/backups/recovery-key', async (request, reply) => {
+    if (!requireStepUpMfaIfEnforced(request, reply, null)) {
+      return;
+    }
+    const info = backupService.getOrGenerateRecoveryPassphrase(true);
+    db.prepare(`
+      INSERT INTO audit_logs (id, username, device_id, action, details)
+      VALUES (?, ?, NULL, 'Backup Encryption Key Revealed', 'MSP Super Admin viewed/exported the Disaster Recovery Backup Encryption Passphrase')
+    `).run(`aud-bkkey-${crypto.randomUUID()}`, getActorUsername(request));
+    return {
+      success: true,
+      passphrase: info.passphrase,
+      encryptionEnabled: info.encryptionEnabled,
+      acknowledged: true
+    };
+  });
+
+  server.post('/api/backups/acknowledge-key', async (request) => {
+    db.prepare('UPDATE settings SET backup_key_acknowledged = 1 WHERE id = 1').run();
+    db.prepare(`
+      INSERT INTO audit_logs (id, username, device_id, action, details)
+      VALUES (?, ?, NULL, 'Backup Recovery Key Acknowledged', 'Administrator confirmed external escrow of Backup Encryption Passphrase')
+    `).run(`aud-bkack-${crypto.randomUUID()}`, getActorUsername(request));
+    return { success: true, acknowledged: true };
   });
 
   server.post('/api/laps/break-glass-export', async (request, reply) => {

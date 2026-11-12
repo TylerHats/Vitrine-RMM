@@ -1,30 +1,69 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, lazy, Suspense } from 'react';
 import { Sparkles, X, ShieldCheck, RefreshCw } from 'lucide-react';
 import { Sidebar } from './components/Sidebar.js';
 import { TopNavbar } from './components/TopNavbar.js';
 import { LoginView } from './components/LoginView.js';
 import { FleetDashboard } from './views/FleetDashboard.js';
-import { DeviceDetailView } from './views/DeviceDetailView.js';
-import { PoliciesView } from './views/PoliciesView.js';
-import { PatchManagementView } from './views/PatchManagementView.js';
-import { ScriptLibraryView } from './views/ScriptLibraryView.js';
-import { SelfHealingView } from './views/SelfHealingView.js';
-import { NetworkTopologyView } from './views/NetworkTopologyView.js';
-import { VirtualizationView } from './views/VirtualizationView.js';
-import { PsaSyncView } from './views/PsaSyncView.js';
-import { SettingsView } from './views/SettingsView.js';
-
-import { RemoteScreenModal } from './components/RemoteScreenModal.js';
-import { BackgroundToolsModal } from './components/BackgroundToolsModal.js';
-import { LapsModal } from './components/LapsModal.js';
-import { CyberIsolationModal } from './components/CyberIsolationModal.js';
-import { OnboardingWizardModal } from './components/OnboardingWizardModal.js';
-import { QbrReportModal } from './components/QbrReportModal.js';
-import { AgentInstallerModal } from './components/AgentInstallerModal.js';
-import { GuestAccessModal } from './components/GuestAccessModal.js';
 import { MfaChallengeModal } from './components/MfaChallengeModal.js';
-import { GuestPortalView } from './views/GuestPortalView.js';
-import { QuickSupportPortalView } from './views/QuickSupportPortalView.js';
+
+const DeviceDetailView = lazy(() =>
+  import('./views/DeviceDetailView.js').then((m) => ({ default: m.DeviceDetailView }))
+);
+const PoliciesView = lazy(() =>
+  import('./views/PoliciesView.js').then((m) => ({ default: m.PoliciesView }))
+);
+const PatchManagementView = lazy(() =>
+  import('./views/PatchManagementView.js').then((m) => ({ default: m.PatchManagementView }))
+);
+const ScriptLibraryView = lazy(() =>
+  import('./views/ScriptLibraryView.js').then((m) => ({ default: m.ScriptLibraryView }))
+);
+const SelfHealingView = lazy(() =>
+  import('./views/SelfHealingView.js').then((m) => ({ default: m.SelfHealingView }))
+);
+const NetworkTopologyView = lazy(() =>
+  import('./views/NetworkTopologyView.js').then((m) => ({ default: m.NetworkTopologyView }))
+);
+const VirtualizationView = lazy(() =>
+  import('./views/VirtualizationView.js').then((m) => ({ default: m.VirtualizationView }))
+);
+const PsaSyncView = lazy(() =>
+  import('./views/PsaSyncView.js').then((m) => ({ default: m.PsaSyncView }))
+);
+const SettingsView = lazy(() =>
+  import('./views/SettingsView.js').then((m) => ({ default: m.SettingsView }))
+);
+const GuestPortalView = lazy(() =>
+  import('./views/GuestPortalView.js').then((m) => ({ default: m.GuestPortalView }))
+);
+const QuickSupportPortalView = lazy(() =>
+  import('./views/QuickSupportPortalView.js').then((m) => ({ default: m.QuickSupportPortalView }))
+);
+
+const RemoteScreenModal = lazy(() =>
+  import('./components/RemoteScreenModal.js').then((m) => ({ default: m.RemoteScreenModal }))
+);
+const BackgroundToolsModal = lazy(() =>
+  import('./components/BackgroundToolsModal.js').then((m) => ({ default: m.BackgroundToolsModal }))
+);
+const LapsModal = lazy(() =>
+  import('./components/LapsModal.js').then((m) => ({ default: m.LapsModal }))
+);
+const CyberIsolationModal = lazy(() =>
+  import('./components/CyberIsolationModal.js').then((m) => ({ default: m.CyberIsolationModal }))
+);
+const OnboardingWizardModal = lazy(() =>
+  import('./components/OnboardingWizardModal.js').then((m) => ({ default: m.OnboardingWizardModal }))
+);
+const QbrReportModal = lazy(() =>
+  import('./components/QbrReportModal.js').then((m) => ({ default: m.QbrReportModal }))
+);
+const AgentInstallerModal = lazy(() =>
+  import('./components/AgentInstallerModal.js').then((m) => ({ default: m.AgentInstallerModal }))
+);
+const GuestAccessModal = lazy(() =>
+  import('./components/GuestAccessModal.js').then((m) => ({ default: m.GuestAccessModal }))
+);
 
 import {
   fetchAuthStatus,
@@ -73,6 +112,7 @@ function applyVisualSettings(
 export function App() {
   const [authChecked, setAuthChecked] = useState(false);
   const [authInitialized, setAuthInitialized] = useState(true);
+  const [oidcEnabled, setOidcEnabled] = useState(false);
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
   const [publicConfig, setPublicConfig] = useState<PublicPortalConfig | null>(null);
 
@@ -162,13 +202,14 @@ export function App() {
     try {
       const [pub, auth] = await Promise.all([
         fetchPublicPortalConfig().catch(() => null),
-        fetchAuthStatus().catch(() => ({ initialized: true, authenticated: false, user: null }))
+        fetchAuthStatus().catch(() => ({ initialized: true, authenticated: false, user: null, oidcEnabled: false }))
       ]);
       if (pub) {
         setPublicConfig(pub);
         applyVisualSettings(pub);
       }
       setAuthInitialized(auth.initialized);
+      setOidcEnabled(Boolean((auth as any).oidcEnabled));
       setCurrentUser(auth.authenticated && auth.user ? auth.user : null);
     } finally {
       setAuthChecked(true);
@@ -277,11 +318,31 @@ export function App() {
   };
 
   if (guestGrantId) {
-    return <GuestPortalView grantId={guestGrantId} />;
+    return (
+      <Suspense
+        fallback={
+          <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#090d16', color: '#f8fafc' }}>
+            Loading Guest Portal...
+          </div>
+        }
+      >
+        <GuestPortalView grantId={guestGrantId} />
+      </Suspense>
+    );
   }
 
   if (isQuickSupportRoute) {
-    return <QuickSupportPortalView onBackToAdmin={() => navigatePath('/')} />;
+    return (
+      <Suspense
+        fallback={
+          <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#090d16', color: '#f8fafc' }}>
+            Loading QuickSupport Portal...
+          </div>
+        }
+      >
+        <QuickSupportPortalView onBackToAdmin={() => navigatePath('/')} />
+      </Suspense>
+    );
   }
 
   if (!authChecked) {
@@ -305,10 +366,10 @@ export function App() {
           mfaVerified: false,
           mfaVerifiedUntil: null,
           isOnboarded: Boolean(settings?.is_onboarded),
-          oidcEnabled: false,
+          oidcEnabled,
           branding: {
             brand_name: publicConfig?.brand_name || 'Vitrine RMM',
-            brand_logo_url: publicConfig?.brand_logo_url || '/logo.png',
+            brand_logo_url: publicConfig?.brand_logo_url || '/branding/logo.png',
             primary_color: publicConfig?.primary_color || '#00f2fe',
             theme_mode: publicConfig?.theme_mode || 'system'
           }
@@ -386,7 +447,7 @@ export function App() {
         onCloseMobile={() => setIsMobileSidebarOpen(false)}
         currentUser={currentUser}
         meshConnected={Boolean(settings?.meshcentral_connected)}
-        appVersion={updaterStatus?.installedVersion || '2.5.0'}
+        appVersion={updaterStatus?.installedVersion || '2.5.1'}
       />
 
       <div className="main-wrapper">
@@ -490,108 +551,118 @@ export function App() {
             />
           )}
 
-          {currentView === 'device-detail' && activeDeviceForDetail && (
-            <DeviceDetailView
-              device={activeDeviceForDetail}
-              onBack={() => setCurrentView('dashboard')}
-              onOpenRemote={(device, isGhost) => setRemoteModal({ open: true, device, isGhost })}
-              onOpenBgTools={(device, initialTab) =>
-                setBgToolsModal({ open: true, device, initialTab: initialTab || 'terminal' })
-              }
-              onOpenLaps={(device) => setLapsModal({ open: true, device })}
-              onOpenQuarantine={(device) => setQuarantineModal({ open: true, device })}
-              currentUser={currentUser}
-              onRefreshFleet={loadData}
-            />
-          )}
+          <Suspense
+            fallback={
+              <div className="glass-card" style={{ padding: '2.5rem', textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.88rem' }}>
+                Loading module...
+              </div>
+            }
+          >
+            {currentView === 'device-detail' && activeDeviceForDetail && (
+              <DeviceDetailView
+                device={activeDeviceForDetail}
+                onBack={() => setCurrentView('dashboard')}
+                onOpenRemote={(device, isGhost) => setRemoteModal({ open: true, device, isGhost })}
+                onOpenBgTools={(device, initialTab) =>
+                  setBgToolsModal({ open: true, device, initialTab: initialTab || 'terminal' })
+                }
+                onOpenLaps={(device) => setLapsModal({ open: true, device })}
+                onOpenQuarantine={(device) => setQuarantineModal({ open: true, device })}
+                currentUser={currentUser}
+                onRefreshFleet={loadData}
+              />
+            )}
 
-          {currentView === 'policies' && currentUser.role !== 'client_admin' && (
-            <PoliciesView devices={devices} tenants={tenants} />
-          )}
-          {currentView === 'patching' && <PatchManagementView settings={settings} onSettingsUpdated={handleSettingsUpdated} />}
-          {currentView === 'scripts' && currentUser.role !== 'client_admin' && <ScriptLibraryView devices={devices} />}
-          {currentView === 'self-healing' && currentUser.role !== 'client_admin' && <SelfHealingView />}
-          {currentView === 'topology' && currentUser.role !== 'client_admin' && <NetworkTopologyView />}
-          {currentView === 'virtualization' && currentUser.role !== 'client_admin' && <VirtualizationView />}
-          {currentView === 'psa' && currentUser.role !== 'client_admin' && (
-            <PsaSyncView tenants={tenants} devices={devices} />
-          )}
-          {currentView === 'settings' && currentUser.role === 'super_admin' && (
-            <SettingsView
-              settings={settings || ({} as Settings)}
-              onUpdated={handleSettingsUpdated}
-              onOpenWizard={() => setOnboardingOpen(true)}
-              tenants={tenants}
-            />
-          )}
+            {currentView === 'policies' && currentUser.role !== 'client_admin' && (
+              <PoliciesView devices={devices} tenants={tenants} />
+            )}
+            {currentView === 'patching' && <PatchManagementView settings={settings} onSettingsUpdated={handleSettingsUpdated} />}
+            {currentView === 'scripts' && currentUser.role !== 'client_admin' && <ScriptLibraryView devices={devices} />}
+            {currentView === 'self-healing' && currentUser.role !== 'client_admin' && <SelfHealingView />}
+            {currentView === 'topology' && currentUser.role !== 'client_admin' && <NetworkTopologyView />}
+            {currentView === 'virtualization' && currentUser.role !== 'client_admin' && <VirtualizationView />}
+            {currentView === 'psa' && currentUser.role !== 'client_admin' && (
+              <PsaSyncView tenants={tenants} devices={devices} />
+            )}
+            {currentView === 'settings' && currentUser.role === 'super_admin' && (
+              <SettingsView
+                settings={settings || ({} as Settings)}
+                onUpdated={handleSettingsUpdated}
+                onOpenWizard={() => setOnboardingOpen(true)}
+                tenants={tenants}
+              />
+            )}
+          </Suspense>
         </main>
       </div>
 
-      {remoteModal.open && remoteModal.device && (
-        <RemoteScreenModal
-          device={remoteModal.device}
-          isGhostSession={remoteModal.isGhost}
-          onClose={() => setRemoteModal({ open: false, device: null, isGhost: false })}
-        />
-      )}
+      <Suspense fallback={null}>
+        {remoteModal.open && remoteModal.device && (
+          <RemoteScreenModal
+            device={remoteModal.device}
+            isGhostSession={remoteModal.isGhost}
+            onClose={() => setRemoteModal({ open: false, device: null, isGhost: false })}
+          />
+        )}
 
-      {bgToolsModal.open && bgToolsModal.device && (
-        <BackgroundToolsModal
-          device={bgToolsModal.device}
-          initialTab={bgToolsModal.initialTab}
-          onClose={() => setBgToolsModal({ open: false, device: null, initialTab: 'terminal' })}
-        />
-      )}
+        {bgToolsModal.open && bgToolsModal.device && (
+          <BackgroundToolsModal
+            device={bgToolsModal.device}
+            initialTab={bgToolsModal.initialTab}
+            onClose={() => setBgToolsModal({ open: false, device: null, initialTab: 'terminal' })}
+          />
+        )}
 
-      {lapsModal.open && lapsModal.device && (
-        <LapsModal
-          device={lapsModal.device}
-          onClose={() => setLapsModal({ open: false, device: null })}
-        />
-      )}
+        {lapsModal.open && lapsModal.device && (
+          <LapsModal
+            device={lapsModal.device}
+            onClose={() => setLapsModal({ open: false, device: null })}
+          />
+        )}
 
-      {quarantineModal.open && quarantineModal.device && (
-        <CyberIsolationModal
-          device={quarantineModal.device}
-          onClose={() => setQuarantineModal({ open: false, device: null })}
-          onUpdated={handleDeviceQuarantineUpdated}
-        />
-      )}
+        {quarantineModal.open && quarantineModal.device && (
+          <CyberIsolationModal
+            device={quarantineModal.device}
+            onClose={() => setQuarantineModal({ open: false, device: null })}
+            onUpdated={handleDeviceQuarantineUpdated}
+          />
+        )}
 
-      {onboardingOpen && (
-        <OnboardingWizardModal
-          settings={settings || ({} as Settings)}
-          onClose={() => setOnboardingOpen(false)}
-          onSaved={handleSettingsUpdated}
-        />
-      )}
+        {onboardingOpen && (
+          <OnboardingWizardModal
+            settings={settings || ({} as Settings)}
+            onClose={() => setOnboardingOpen(false)}
+            onSaved={handleSettingsUpdated}
+          />
+        )}
 
-      {qbrOpen && (
-        <QbrReportModal
-          brandLogoUrl={settings?.brand_logo_url}
-          tenants={tenants}
-          initialTenantId={selectedTenantId}
-          onClose={() => setQbrOpen(false)}
-        />
-      )}
+        {qbrOpen && (
+          <QbrReportModal
+            brandLogoUrl={settings?.brand_logo_url}
+            tenants={tenants}
+            initialTenantId={selectedTenantId}
+            onClose={() => setQbrOpen(false)}
+          />
+        )}
 
-      {installerModalOpen && (
-        <AgentInstallerModal
-          tenants={tenants}
-          selectedTenantId={selectedTenantId}
-          settings={settings}
-          currentUser={currentUser}
-          onOpenQuickSupportPortal={() => navigatePath(configuredQsPath || '/remote')}
-          onClose={() => setInstallerModalOpen(false)}
-        />
-      )}
+        {installerModalOpen && (
+          <AgentInstallerModal
+            tenants={tenants}
+            selectedTenantId={selectedTenantId}
+            settings={settings}
+            currentUser={currentUser}
+            onOpenQuickSupportPortal={() => navigatePath(configuredQsPath || '/remote')}
+            onClose={() => setInstallerModalOpen(false)}
+          />
+        )}
 
-      {guestAccessModalOpen && (
-        <GuestAccessModal
-          devices={devices}
-          onClose={() => setGuestAccessModalOpen(false)}
-        />
-      )}
+        {guestAccessModalOpen && (
+          <GuestAccessModal
+            devices={devices}
+            onClose={() => setGuestAccessModalOpen(false)}
+          />
+        )}
+      </Suspense>
 
       {quickSupportQueueOpen && (
         <div className="modal-backdrop" style={{ zIndex: 1050 }}>

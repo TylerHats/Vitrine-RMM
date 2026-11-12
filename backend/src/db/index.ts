@@ -88,8 +88,8 @@ const DB_PATH = path.join(DATA_DIR, 'vitrine.db');
 export const DATA_DIR_PATH = DATA_DIR;
 export const BRANDING_DIR_PATH = BRANDING_DIR;
 export const DB_FILE_PATH = DB_PATH;
-export const APP_VERSION = '2.5.0';
-export const APP_SCHEMA_VERSION = 15;
+export const APP_VERSION = '2.5.1';
+export const APP_SCHEMA_VERSION = 16;
 
 function detectInstalledCommit(): string {
   if (process.env.VITRINE_GIT_COMMIT && process.env.VITRINE_GIT_COMMIT.trim()) {
@@ -471,6 +471,7 @@ export function initDatabase() {
 
     CREATE TABLE IF NOT EXISTS notifications (
       id TEXT PRIMARY KEY,
+      tenant_id TEXT,
       type TEXT NOT NULL,
       title TEXT NOT NULL,
       message TEXT NOT NULL,
@@ -985,6 +986,8 @@ export function runDatabaseMigrations() {
   safeAddColumn('settings', 'agent_enrollment_secret TEXT NOT NULL DEFAULT ""');
   safeAddColumn('settings', 'patch_auto_approve_third_party INTEGER NOT NULL DEFAULT 1');
   safeAddColumn('settings', 'patch_canary_delay_days INTEGER NOT NULL DEFAULT 3');
+  safeAddColumn('settings', 'backup_key_acknowledged INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('notifications', 'tenant_id TEXT');
 
   // Installer, Guest, Backup, LAPS, Appliances & Virtualization extended columns
   safeAddColumn('installer_audit_log', 'platform TEXT NOT NULL DEFAULT "windows"');
@@ -1066,6 +1069,9 @@ function migrateSecretsAndRuntimeMetadata() {
         if (col === 'agent_enrollment_secret' && !rawVal) {
           rawVal = crypto.randomBytes(24).toString('hex');
         }
+        if (col === 'backup_encryption_passphrase' && !rawVal) {
+          rawVal = crypto.randomBytes(24).toString('base64url');
+        }
         if (col === 'backup_offsite_access_key' && rawVal === 'AKIAVITRINERMMVAULT') {
           rawVal = '';
         }
@@ -1083,7 +1089,7 @@ function migrateSecretsAndRuntimeMetadata() {
     }
 
     // Encrypt plaintext BitLocker keys at rest
-    const devices = db.prepare('SELECT id, bitlocker_key FROM devices WHERE bitlocker_key IS NOT NULL AND bitlocker_key != ""').all() as Array<{ id: string; bitlocker_key: string }>;
+    const devices = db.prepare("SELECT id, bitlocker_key FROM devices WHERE bitlocker_key IS NOT NULL AND bitlocker_key != ''").all() as Array<{ id: string; bitlocker_key: string }>;
     for (const dev of devices) {
       if (!isEncryptedVaultSecret(dev.bitlocker_key)) {
         db.prepare('UPDATE devices SET bitlocker_key = ? WHERE id = ?').run(encryptVaultSecret(dev.bitlocker_key), dev.id);
@@ -1091,7 +1097,7 @@ function migrateSecretsAndRuntimeMetadata() {
     }
 
     // Encrypt plaintext static LAPS passwords in policies
-    const policies = db.prepare('SELECT id, laps_static_password FROM policies WHERE laps_static_password IS NOT NULL AND laps_static_password != ""').all() as Array<{ id: string; laps_static_password: string }>;
+    const policies = db.prepare("SELECT id, laps_static_password FROM policies WHERE laps_static_password IS NOT NULL AND laps_static_password != ''").all() as Array<{ id: string; laps_static_password: string }>;
     for (const pol of policies) {
       if (!isEncryptedVaultSecret(pol.laps_static_password)) {
         db.prepare('UPDATE policies SET laps_static_password = ? WHERE id = ?').run(encryptVaultSecret(pol.laps_static_password), pol.id);
@@ -1099,10 +1105,23 @@ function migrateSecretsAndRuntimeMetadata() {
     }
 
     // Encrypt plaintext MeshCentral server tokens
-    const meshServers = db.prepare('SELECT id, api_token FROM mesh_servers WHERE api_token IS NOT NULL AND api_token != ""').all() as Array<{ id: string; api_token: string }>;
+    const meshServers = db.prepare("SELECT id, api_token FROM mesh_servers WHERE api_token IS NOT NULL AND api_token != ''").all() as Array<{ id: string; api_token: string }>;
     for (const ms of meshServers) {
       if (!isEncryptedVaultSecret(ms.api_token)) {
         db.prepare('UPDATE mesh_servers SET api_token = ? WHERE id = ?').run(encryptVaultSecret(ms.api_token), ms.id);
+      }
+    }
+
+    // Encrypt plaintext 'secret'-type custom field values at rest
+    const secretFieldVals = db.prepare(`
+      SELECT v.id, v.value
+      FROM custom_field_values v
+      JOIN custom_field_definitions d ON v.field_id = d.id
+      WHERE d.field_type = 'secret' AND v.value IS NOT NULL AND v.value != ''
+    `).all() as Array<{ id: string; value: string }>;
+    for (const sv of secretFieldVals) {
+      if (!isEncryptedVaultSecret(sv.value)) {
+        db.prepare('UPDATE custom_field_values SET value = ? WHERE id = ?').run(encryptVaultSecret(sv.value), sv.id);
       }
     }
 

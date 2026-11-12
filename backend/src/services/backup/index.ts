@@ -16,10 +16,13 @@ import {
   runDatabaseMigrations
 } from '../../db/index.js';
 import {
+  encryptVaultSecret,
   decryptVaultSecret,
   encryptBufferAesGcm,
   decryptBufferAesGcm,
-  isEncryptedArchiveBuffer
+  isEncryptedArchiveBuffer,
+  reloadVaultMasterKey,
+  validateOutboundHostSafety
 } from '../vault/index.js';
 
 const MAX_GUNZIP_BYTES = 256 * 1024 * 1024; // 256 MiB anti-gzip-bomb limit
@@ -89,6 +92,10 @@ async function uploadBufferToS3Compatible(params: {
     const endpoint = new URL(params.endpointUrl.trim());
     if (endpoint.protocol !== 'https:' && endpoint.protocol !== 'http:') {
       return { ok: false, error: 'Offsite endpoint must use http or https.' };
+    }
+    const safety = await validateOutboundHostSafety(params.endpointUrl, { allowLoopback: true });
+    if (!safety.safe) {
+      return { ok: false, error: safety.reason || 'Offsite endpoint blocked by SSRF policy.' };
     }
     const region = params.region || 'us-east-1';
     const service = 's3';
@@ -191,6 +198,34 @@ export class BackupService {
   private getBackupEncryptionPassphrase(): string {
     const settings = (db.prepare('SELECT backup_encryption_passphrase FROM settings WHERE id = 1').get() || {}) as any;
     return decryptVaultSecret(settings.backup_encryption_passphrase) || '';
+  }
+
+  public getOrGenerateRecoveryPassphrase(markAcknowledged = true): {
+    passphrase: string;
+    encryptionEnabled: boolean;
+    acknowledged: boolean;
+  } {
+    const settings = (
+      db
+        .prepare(
+          'SELECT backup_encryption_passphrase, backup_encryption_enabled, backup_key_acknowledged FROM settings WHERE id = 1'
+        )
+        .get() || {}
+    ) as any;
+
+    let pass = decryptVaultSecret(settings.backup_encryption_passphrase) || '';
+    if (!pass) {
+      pass = crypto.randomBytes(24).toString('base64url');
+      db.prepare('UPDATE settings SET backup_encryption_passphrase = ? WHERE id = 1').run(encryptVaultSecret(pass));
+    }
+    if (markAcknowledged) {
+      db.prepare('UPDATE settings SET backup_key_acknowledged = 1 WHERE id = 1').run();
+    }
+    return {
+      passphrase: pass,
+      encryptionEnabled: Boolean(settings.backup_encryption_enabled ?? 1),
+      acknowledged: markAcknowledged ? true : Boolean(settings.backup_key_acknowledged)
+    };
   }
 
   private unpackArchiveBuffer(rawBuf: Buffer, explicitPassphrase?: string): any {
@@ -738,11 +773,12 @@ export class BackupService {
         };
       }
 
-      // Restore .vault-key.json if present so LAPS/BitLocker ciphertexts match
+      // Restore .vault-key.json if present so LAPS/BitLocker ciphertexts match, and reload in-memory master key cache!
       if (parsed.vaultKeyJson && typeof parsed.vaultKeyJson === 'string') {
         try {
           const vkPath = path.join(DATA_DIR_PATH, '.vault-key.json');
           fs.writeFileSync(vkPath, parsed.vaultKeyJson, { encoding: 'utf8', mode: 0o600 });
+          reloadVaultMasterKey();
         } catch {}
       }
 

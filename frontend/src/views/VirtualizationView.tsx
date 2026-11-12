@@ -1,6 +1,12 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Server, Play, Square, RotateCcw, Camera, Plus, Trash2, X } from 'lucide-react';
-import { fetchVirtualization, manageVmPower, addVirtualizationHost, deleteVirtualizationHost } from '../services/api.js';
+import { Server, Play, Square, RotateCcw, Camera, Plus, Trash2, X, RefreshCw } from 'lucide-react';
+import {
+  fetchVirtualization,
+  manageVmPower,
+  addVirtualizationHost,
+  deleteVirtualizationHost,
+  syncVirtualizationHost
+} from '../services/api.js';
 
 interface GuestVm {
   vmid: number | string;
@@ -32,6 +38,7 @@ interface HypervisorHost {
 export const VirtualizationView: React.FC = () => {
   const [hosts, setHosts] = useState<HypervisorHost[]>([]);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
+  const [syncingHostId, setSyncingHostId] = useState<string | null>(null);
 
   const [showAddHost, setShowAddHost] = useState(false);
   const [newHostName, setNewHostName] = useState('');
@@ -55,6 +62,24 @@ export const VirtualizationView: React.FC = () => {
       setActionMsg(`Dispatched ${action.toUpperCase()} command to VM #${vmid} on ${hostId}.`);
       loadHosts();
       setTimeout(() => setActionMsg(null), 4000);
+    } else {
+      setActionMsg(`Hypervisor error: ${(res as any).error || 'Command rejected'}`);
+    }
+  };
+
+  const handleSyncHost = async (host: HypervisorHost) => {
+    setSyncingHostId(host.id);
+    try {
+      const res = await syncVirtualizationHost(host.id);
+      setActionMsg(
+        res.message ||
+          (res.success
+            ? `Synchronized ${host.name} (${res.vmCount ?? 0} guest VMs indexed).`
+            : `Sync issue on ${host.name}: ${res.error || 'Unreachable'}`)
+      );
+      loadHosts();
+    } finally {
+      setSyncingHostId(null);
     }
   };
 
@@ -139,6 +164,17 @@ export const VirtualizationView: React.FC = () => {
                 <span className={`status-pill ${isOnline ? 'status-online' : 'status-offline'}`}>
                   {h.status || 'Connected'}
                 </span>
+                <button
+                  type="button"
+                  className="btn-glass"
+                  style={{ fontSize: '0.75rem', padding: '0.3rem 0.65rem' }}
+                  disabled={syncingHostId === h.id}
+                  title="Poll Live Hypervisor API (Proxmox VE / vSphere / TCP Probe)"
+                  onClick={() => handleSyncHost(h)}
+                >
+                  <RefreshCw size={13} className={syncingHostId === h.id ? 'spin' : ''} />
+                  <span>{syncingHostId === h.id ? 'Syncing...' : 'Sync Host'}</span>
+                </button>
                 <button
                   className="btn-glass btn-icon"
                   title="Remove Hypervisor Host"

@@ -111,10 +111,12 @@ export async function runMaintenanceAndLifecycleTick(): Promise<{
             : 23 * 3600 * 1000;
 
       const now = new Date();
+      const todayTarget = new Date(now);
+      todayTarget.setHours(targetH, targetM, 0, 0);
       const timeWindowReached =
         freq === 'hourly' ||
         lastMs === 0 ||
-        (now.getHours() === targetH && now.getMinutes() >= targetM);
+        now.getTime() >= todayTarget.getTime();
 
       if (elapsedMs >= minIntervalMs && timeWindowReached) {
         backupService.createBackup({

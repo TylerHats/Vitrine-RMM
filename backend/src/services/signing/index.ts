@@ -3,6 +3,7 @@ import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { db, DATA_DIR_PATH } from '../../db/index.js';
+import { validateOutboundHostSafety } from '../vault/index.js';
 
 export interface SigningResult {
   success: boolean;
@@ -96,6 +97,16 @@ export class CodeSigningService {
       };
     }
 
+    const dnsSafety = await validateOutboundHostSafety(check.normalizedUrl, { allowLoopback: true });
+    if (!dnsSafety.safe) {
+      return {
+        reachable: false,
+        endpoint: check.normalizedUrl,
+        latencyMs: Date.now() - start,
+        error: dnsSafety.reason || 'Code signing URL blocked by SSRF policy.'
+      };
+    }
+
     try {
       const res = await fetch(`${check.normalizedUrl}/health`, {
         method: 'GET',
@@ -141,6 +152,15 @@ export class CodeSigningService {
         return {
           success: false,
           error: urlCheck.error || 'Code signing endpoint URL is invalid.',
+          durationMs: Date.now() - start
+        };
+      }
+
+      const dnsSafety = await validateOutboundHostSafety(urlCheck.normalizedUrl, { allowLoopback: true });
+      if (!dnsSafety.safe) {
+        return {
+          success: false,
+          error: dnsSafety.reason || 'Code signing endpoint blocked by SSRF policy.',
           durationMs: Date.now() - start
         };
       }

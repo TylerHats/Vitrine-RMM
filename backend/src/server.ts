@@ -11,6 +11,7 @@ import { initDatabase, closeDatabase, db, BRANDING_DIR_PATH } from './db/index.j
 import { registerApiRoutes } from './routes/api.js';
 import {
   extractAuthContext,
+  isSessionTokenActive,
   isTechnicianOrAbove,
   canUserAccessTenant
 } from './services/auth/index.js';
@@ -145,6 +146,40 @@ function isAllowedCorsOrigin(origin: string | undefined): boolean {
   }
 }
 
+function buildContentSecurityPolicy(): string {
+  const frameOrigins = new Set<string>(["'self'"]);
+  try {
+    const s = db.prepare('SELECT meshcentral_url FROM settings WHERE id = 1').get() as { meshcentral_url?: string } | undefined;
+    const msRows = db.prepare('SELECT url FROM mesh_servers').all() as Array<{ url?: string }>;
+    for (const raw of [s?.meshcentral_url, ...msRows.map((r) => r.url)]) {
+      if (!raw) continue;
+      try {
+        const parsed = new URL(String(raw).trim());
+        if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+          frameOrigins.add(parsed.origin);
+        }
+      } catch {
+        // Ignore malformed URL
+      }
+    }
+  } catch {
+    // DB initializing
+  }
+
+  return [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com data:",
+    "img-src 'self' data: blob: https:",
+    "connect-src 'self' ws: wss: https: http://localhost:* http://127.0.0.1:*",
+    `frame-src ${Array.from(frameOrigins).join(' ')}`,
+    "object-src 'none'",
+    "base-uri 'self'",
+    "frame-ancestors 'self'"
+  ].join('; ');
+}
+
 async function startServer() {
   initDatabase();
   meshBridge.checkConfig();
@@ -157,12 +192,13 @@ async function startServer() {
     }
   });
 
-  // Defensive HTTP security headers on every response
+  // Defensive HTTP security headers & strict Content-Security-Policy on every response
   server.addHook('onSend', async (_req, reply) => {
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('X-Frame-Options', 'SAMEORIGIN');
     reply.header('Referrer-Policy', 'strict-origin-when-cross-origin');
     reply.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    reply.header('Content-Security-Policy', buildContentSecurityPolicy());
   });
 
   await server.register(cors, {
@@ -195,6 +231,13 @@ async function startServer() {
   // ============================================================================
   server.get('/ws/terminal', { websocket: true }, (rawSocket, req) => {
     const socket = (rawSocket as any).socket || rawSocket;
+    if (!isAllowedCorsOrigin(req.headers.origin as string | undefined)) {
+      try {
+        socket.close(1008, 'Cross-origin WebSocket rejected');
+      } catch {}
+      return;
+    }
+
     const auth = extractAuthContext(req);
 
     if (!auth || !isTechnicianOrAbove(auth.user.role)) {
@@ -283,6 +326,19 @@ async function startServer() {
 
     socket.on('message', async (message: Buffer) => {
       try {
+        const liveUser = isSessionTokenActive(auth.tokenHash);
+        if (!liveUser || !isTechnicianOrAbove(liveUser.role)) {
+          socket.send(
+            JSON.stringify({
+              type: 'output',
+              data: '\r\n\x1b[31m[Session Terminated] Your session expired or privileges were revoked.\x1b[0m\r\n'
+            })
+          );
+          socket.close(1008, 'Session expired or revoked');
+          return;
+        }
+        auth.user = liveUser;
+
         const parsed = JSON.parse(message.toString());
 
         if (parsed.type === 'switch_context') {
@@ -358,6 +414,13 @@ async function startServer() {
   // ============================================================================
   server.get('/ws/telemetry', { websocket: true }, (rawSocket, req) => {
     const socket = (rawSocket as any).socket || rawSocket;
+    if (!isAllowedCorsOrigin(req.headers.origin as string | undefined)) {
+      try {
+        socket.close(1008, 'Cross-origin WebSocket rejected');
+      } catch {}
+      return;
+    }
+
     const query = (req.query || {}) as Record<string, string>;
     const auth = extractAuthContext(req);
 
@@ -400,6 +463,28 @@ async function startServer() {
 
     const emitSample = () => {
       if (socket.readyState !== 1) return; // 1 = WebSocket.OPEN
+
+      if (auth) {
+        const liveUser = isSessionTokenActive(auth.tokenHash);
+        if (!liveUser) {
+          socket.close(1008, 'Session expired or revoked');
+          return;
+        }
+        auth.user = liveUser;
+      } else if (authorizedGuestDeviceId && query.guestGrantId) {
+        const grantCheck = db
+          .prepare('SELECT status, expires_at FROM guest_access_grants WHERE id = ?')
+          .get(query.guestGrantId) as { status?: string; expires_at?: string } | undefined;
+        if (
+          !grantCheck ||
+          grantCheck.status === 'revoked' ||
+          !grantCheck.expires_at ||
+          new Date(grantCheck.expires_at).getTime() <= Date.now()
+        ) {
+          socket.close(1008, 'Guest grant expired or revoked');
+          return;
+        }
+      }
 
       if (targetDeviceId) {
         const dev = db
@@ -550,7 +635,7 @@ async function startServer() {
 
   try {
     await server.listen({ port: PORT, host: HOST });
-    console.log(`\n🔮 Vitrine RMM v2.5.0 control plane listening on http://${HOST}:${PORT}`);
+    console.log(`\n🔮 Vitrine RMM v2.5.1 control plane listening on http://${HOST}:${PORT}`);
   } catch (err) {
     server.log.error(err);
     process.exit(1);

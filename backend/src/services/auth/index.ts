@@ -351,6 +351,32 @@ export function extractAuthContext(req: FastifyRequest): AuthContext | null {
   };
 }
 
+export function isSessionTokenActive(tokenHash?: string | null): AuthenticatedUser | null {
+  if (!tokenHash) return null;
+  const row = db
+    .prepare(`
+      SELECT s.expires_at, u.id, u.username, u.email, u.role, u.tenant_id, u.totp_enabled
+      FROM auth_sessions s
+      JOIN users u ON s.user_id = u.id
+      WHERE s.token_hash = ?
+    `)
+    .get(tokenHash) as any;
+
+  if (!row) return null;
+  if (!row.expires_at || new Date(row.expires_at).getTime() <= Date.now()) {
+    db.prepare('DELETE FROM auth_sessions WHERE token_hash = ?').run(tokenHash);
+    return null;
+  }
+  return {
+    id: row.id,
+    username: row.username,
+    email: row.email,
+    role: row.role,
+    tenant_id: row.tenant_id || null,
+    totp_enabled: Boolean(row.totp_enabled)
+  };
+}
+
 export function authenticateUserPassword(
   identifier: string,
   password: string
@@ -404,8 +430,7 @@ export function verifySessionStepUpMfa(
     return { success: false, error: 'User account not found.' };
   }
 
-  const settingsRow = db.prepare('SELECT totp_secret FROM settings WHERE id = 1').get() as any;
-  const userSecret = decryptVaultSecret(userRow.totp_secret) || decryptVaultSecret(settingsRow?.totp_secret);
+  const userSecret = decryptVaultSecret(userRow.totp_secret);
 
   // 1. Check 6-digit RFC 6238 TOTP with replay guard
   const numericOnly = cleaned.replace(/\s|-/g, '');
@@ -481,10 +506,10 @@ export function getOrEnrollUserMfaDetails(userId: string): {
     .get(userId) as any;
   if (!userRow) throw new Error('User not found');
 
-  const settings = (db.prepare('SELECT brand_name, totp_secret FROM settings WHERE id = 1').get() || {}) as any;
+  const settings = (db.prepare('SELECT brand_name FROM settings WHERE id = 1').get() || {}) as any;
   let secret = decryptVaultSecret(userRow.totp_secret);
   if (!secret) {
-    secret = decryptVaultSecret(settings.totp_secret) || generateRandomBase32(20);
+    secret = generateRandomBase32(20);
     db.prepare('UPDATE users SET totp_secret = ?, totp_enabled = 1 WHERE id = ?').run(
       encryptVaultSecret(secret),
       userId

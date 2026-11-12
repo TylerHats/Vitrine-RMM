@@ -38,6 +38,7 @@ import {
 import { AuthUser, Device, CustomFieldDefinition, OemWarranty, ChatMessage, HardwareHistoryItem, NetworkHistoryItem, SoftwareItem, DeviceNote, SessionRecording, WakeOnLanResult } from '../types/index.js';
 import {
   fetchDeviceCustomFields,
+  revealDeviceSecretCustomFields,
   saveDeviceCustomFields,
   fetchWarranty,
   triggerWarrantyLookup,
@@ -124,6 +125,9 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
   // Custom Fields state
   const [customFields, setCustomFields] = useState<CustomFieldDefinition[]>([]);
   const [fieldValues, setFieldValues] = useState<Record<string, string>>({});
+  const [revealedSecretFields, setRevealedSecretFields] = useState<Record<string, boolean>>({});
+  const [pendingSecretFieldId, setPendingSecretFieldId] = useState<string | null>(null);
+  const [showSecretFieldMfa, setShowSecretFieldMfa] = useState(false);
   const [savingFields, setSavingFields] = useState(false);
   const [fieldsSavedNotice, setFieldsSavedNotice] = useState(false);
 
@@ -167,6 +171,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
     setOffboardNotice(null);
     setIsBitlockerRevealed(false);
     setRevealedBitlockerKey(null);
+    setRevealedSecretFields({});
   }, [
     device.id,
     device.maintenance_active,
@@ -244,6 +249,27 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
     if (res.success) {
       setRevealedBitlockerKey(res.bitlocker_key || null);
       setIsBitlockerRevealed(true);
+    }
+  };
+
+  const handleToggleRevealSecretField = async (fieldId: string) => {
+    if (revealedSecretFields[fieldId]) {
+      setRevealedSecretFields((prev) => ({ ...prev, [fieldId]: false }));
+      setFieldValues((prev) => ({ ...prev, [fieldId]: '••••••••••••' }));
+      return;
+    }
+    const res = await revealDeviceSecretCustomFields(device.id, fieldId);
+    if (res.mfaRequired) {
+      setPendingSecretFieldId(fieldId);
+      setShowSecretFieldMfa(true);
+      return;
+    }
+    if (res.success && res.fields) {
+      const target = res.fields.find((item) => item.id === fieldId);
+      if (target) {
+        setFieldValues((prev) => ({ ...prev, [fieldId]: target.current_value || '' }));
+        setRevealedSecretFields((prev) => ({ ...prev, [fieldId]: true }));
+      }
     }
   };
 
@@ -1741,9 +1767,16 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                     <label className="form-label" style={{ margin: 0 }}>
                       {f.label}
                     </label>
-                    <span className="status-pill status-reboot" style={{ fontSize: '0.65rem' }}>
-                      {f.category}
-                    </span>
+                    <div style={{ display: 'flex', gap: '0.35rem', alignItems: 'center' }}>
+                      {f.field_type === 'secret' && (
+                        <span className="status-pill status-online" style={{ fontSize: '0.62rem' }}>
+                          Encrypted Vault
+                        </span>
+                      )}
+                      <span className="status-pill status-reboot" style={{ fontSize: '0.65rem' }}>
+                        {f.category}
+                      </span>
+                    </div>
                   </div>
 
                   {f.field_type === 'dropdown' ? (
@@ -1768,6 +1801,27 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                       />
                       <span>Enabled</span>
                     </label>
+                  ) : f.field_type === 'secret' ? (
+                    <div style={{ display: 'flex', gap: '0.45rem' }}>
+                      <input
+                        type={revealedSecretFields[f.id] ? 'text' : 'password'}
+                        className="glass-input"
+                        placeholder="Enter secret value (AES-256-GCM encrypted at rest)"
+                        value={currentVal}
+                        onChange={(e) => setFieldValues({ ...fieldValues, [f.id]: e.target.value })}
+                      />
+                      {currentUser?.role !== 'client_admin' && (f.has_secret || Boolean(currentVal)) && (
+                        <button
+                          type="button"
+                          className="btn-glass"
+                          style={{ whiteSpace: 'nowrap', fontSize: '0.75rem', padding: '0 0.7rem' }}
+                          onClick={() => handleToggleRevealSecretField(f.id)}
+                        >
+                          {revealedSecretFields[f.id] ? <EyeOff size={14} /> : <Eye size={14} />}
+                          <span>{revealedSecretFields[f.id] ? 'Hide' : 'Reveal (MFA)'}</span>
+                        </button>
+                      )}
+                    </div>
                   ) : (
                     <input
                       type="text"
@@ -1879,6 +1933,27 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
         title="Step-Up MFA: Remote LAPS Self-Elevation"
         description={`Verify your TOTP authenticator or recovery code to inject vaulted LAPS credentials into ${device.hostname}.`}
         secretType="laps_password"
+        deviceId={device.id}
+      />
+
+      {/* MFA Challenge for Encrypted Secret Custom Field Reveal */}
+      <MfaChallengeModal
+        isOpen={showSecretFieldMfa}
+        onClose={() => {
+          setShowSecretFieldMfa(false);
+          setPendingSecretFieldId(null);
+        }}
+        onSuccess={() => {
+          const targetField = pendingSecretFieldId;
+          setShowSecretFieldMfa(false);
+          setPendingSecretFieldId(null);
+          if (targetField) {
+            handleToggleRevealSecretField(targetField);
+          }
+        }}
+        title="Step-Up MFA: Reveal Encrypted Custom Attribute"
+        description={`Verify your 6-digit authenticator or recovery code to decrypt this vaulted custom field on ${device.hostname}.`}
+        secretType="custom_field_secret"
         deviceId={device.id}
       />
     </div>

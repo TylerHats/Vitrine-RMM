@@ -1,5 +1,7 @@
 import crypto from 'crypto';
+import dns from 'dns';
 import fs from 'fs';
+import net from 'net';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -71,14 +73,134 @@ export function getVaultMasterKey(): Buffer {
     }
   }
 
-  const rawSecret =
-    process.env.LAPS_MASTER_SECRET && process.env.LAPS_MASTER_SECRET.trim().length >= 16
-      ? process.env.LAPS_MASTER_SECRET.trim()
-      : material.masterSecretHex;
+  const envMaster =
+    (process.env.VITRINE_MASTER_KEY && process.env.VITRINE_MASTER_KEY.trim()) ||
+    (process.env.LAPS_MASTER_SECRET && process.env.LAPS_MASTER_SECRET.trim()) ||
+    '';
+
+  const rawSecret = envMaster.length >= 16 ? envMaster : material.masterSecretHex;
 
   const saltBuf = Buffer.from(material.kdfSaltHex, 'hex');
   cachedMasterKey = crypto.scryptSync(rawSecret, saltBuf, 32);
   return cachedMasterKey;
+}
+
+export function reloadVaultMasterKey(): Buffer {
+  cachedMasterKey = null;
+  return getVaultMasterKey();
+}
+
+export function isBlockedOutboundIp(ipRaw: string, allowLoopback = false): boolean {
+  let ip = (ipRaw || '').trim().toLowerCase();
+  if (!ip) return true;
+  if (ip.startsWith('::ffff:')) {
+    ip = ip.slice(7);
+  }
+
+  const version = net.isIP(ip);
+  if (version === 4) {
+    const parts = ip.split('.').map((p) => parseInt(p, 10));
+    if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return true;
+    // Unspecified 0.0.0.0/8
+    if (parts[0] === 0) return true;
+    // Loopback 127.0.0.0/8
+    if (parts[0] === 127) return !allowLoopback;
+    // Link-local / AWS & Azure & GCP cloud metadata 169.254.0.0/16
+    if (parts[0] === 169 && parts[1] === 254) return true;
+    // Alibaba Cloud metadata 100.100.100.200
+    if (parts[0] === 100 && parts[1] === 100 && parts[2] === 100 && parts[3] === 200) return true;
+    // Multicast / broadcast 224.0.0.0+
+    if (parts[0] >= 224) return true;
+    return false;
+  }
+
+  if (version === 6) {
+    if (ip === '::' || ip === '0:0:0:0:0:0:0:0') return true;
+    if (ip === '::1' || ip === '0:0:0:0:0:0:0:1') return !allowLoopback;
+    // IPv6 Link-local fe80::/10 or multicast ff00::/8
+    if (/^fe[89ab]/i.test(ip) || ip.startsWith('ff')) return true;
+    // AWS EC2 IPv6 IMDS fd00:ec2::254
+    if (ip.startsWith('fd00:ec2:')) return true;
+    return false;
+  }
+
+  return true;
+}
+
+export async function validateOutboundHostSafety(
+  rawUrlOrHost: string,
+  options?: { allowLoopback?: boolean }
+): Promise<{ safe: boolean; reason?: string; resolvedAddresses?: string[] }> {
+  const allowLoopback = Boolean(options?.allowLoopback);
+  const trimmed = (rawUrlOrHost || '').trim();
+  if (!trimmed) {
+    return { safe: false, reason: 'Target host or URL is empty.' };
+  }
+
+  let hostname = trimmed;
+  if (trimmed.includes('://')) {
+    try {
+      const parsed = new URL(trimmed);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:' && parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
+        return { safe: false, reason: `Unsupported outbound protocol '${parsed.protocol}'.` };
+      }
+      hostname = parsed.hostname;
+    } catch {
+      return { safe: false, reason: 'Invalid URL format.' };
+    }
+  } else {
+    hostname = trimmed.replace(/^\[|\]$/g, '').split('/')[0];
+    if (hostname.includes(':') && net.isIP(hostname) === 0) {
+      hostname = hostname.split(':')[0];
+    }
+  }
+
+  hostname = hostname.replace(/^\[|\]$/g, '').trim().toLowerCase();
+  if (!hostname) {
+    return { safe: false, reason: 'Target hostname is empty.' };
+  }
+
+  if (hostname === 'metadata.google.internal' || hostname === 'metadata' || hostname.endsWith('.metadata.google.internal')) {
+    return { safe: false, reason: 'Cloud metadata hostnames are blocked for SSRF protection.' };
+  }
+
+  if (hostname === 'localhost' || hostname.endsWith('.localhost')) {
+    return allowLoopback
+      ? { safe: true, resolvedAddresses: ['127.0.0.1'] }
+      : { safe: false, reason: 'Loopback targets are disallowed for this endpoint.' };
+  }
+
+  if (net.isIP(hostname) !== 0) {
+    if (isBlockedOutboundIp(hostname, allowLoopback)) {
+      return {
+        safe: false,
+        reason: `Target IP '${hostname}' is blocked by outbound SSRF security policy.`
+      };
+    }
+    return { safe: true, resolvedAddresses: [hostname] };
+  }
+
+  try {
+    const records = await dns.promises.lookup(hostname, { all: true, verbatim: true });
+    if (!records || records.length === 0) {
+      return { safe: false, reason: `Hostname '${hostname}' did not resolve to any IP address.` };
+    }
+    const addrs = records.map((r) => r.address);
+    for (const addr of addrs) {
+      if (isBlockedOutboundIp(addr, allowLoopback)) {
+        return {
+          safe: false,
+          reason: `Hostname '${hostname}' resolved to restricted IP '${addr}' (DNS-rebinding / SSRF guard).`
+        };
+      }
+    }
+    return { safe: true, resolvedAddresses: addrs };
+  } catch (err: any) {
+    return {
+      safe: false,
+      reason: `DNS lookup failed for '${hostname}': ${err?.code || err?.message || 'ENOTFOUND'}`
+    };
+  }
 }
 
 export function isEncryptedVaultSecret(val?: string | null): boolean {

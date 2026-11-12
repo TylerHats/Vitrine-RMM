@@ -1,4 +1,4 @@
-# Multi-stage Docker build for Vitrine RMM v2.5.0
+# Multi-stage Docker build for Vitrine RMM v2.5.1 (linux/amd64 & linux/arm64)
 # Stage 1: Build Frontend and Backend (with native better-sqlite3 toolchain)
 FROM node:22-slim AS builder
 

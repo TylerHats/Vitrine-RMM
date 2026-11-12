@@ -14,7 +14,9 @@ import {
   HardDrive,
   Lock,
   Copy,
-  Check
+  Check,
+  Download,
+  AlertTriangle
 } from 'lucide-react';
 import { Settings, MeshDiscoveryResult } from '../types/index.js';
 import {
@@ -23,8 +25,12 @@ import {
   importFromMeshServer,
   testCodeSigningPipeline,
   testProxyTlsSetup,
-  createSystemBackup
+  createSystemBackup,
+  revealBackupRecoveryKey,
+  acknowledgeBackupRecoveryKey,
+  testOidcDiscovery
 } from '../services/api.js';
+import { MfaChallengeModal } from './MfaChallengeModal.js';
 
 interface OnboardingWizardModalProps {
   settings: Settings;
@@ -164,8 +170,45 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
   const [testingProxy, setTestingProxy] = useState(false);
   const [proxyTestChecks, setProxyTestChecks] = useState<Array<{ name: string; status: string; detail: string }> | null>(null);
 
-  // Step 6: Initial Baseline Backup Option
+  // Step 6: Initial Baseline Backup Option + OIDC Test + Backup Encryption Key Escrow
   const [createInitialBackup, setCreateInitialBackup] = useState(true);
+  const [testingOidc, setTestingOidc] = useState(false);
+  const [oidcTestMsg, setOidcTestMsg] = useState<string | null>(null);
+  const [revealedWizardBackupKey, setRevealedWizardBackupKey] = useState<string | null>(null);
+  const [showWizardBackupKeyMfa, setShowWizardBackupKeyMfa] = useState(false);
+  const [copiedWizardBackupKey, setCopiedWizardBackupKey] = useState(false);
+
+  const handleRevealWizardBackupKey = async () => {
+    const res = await revealBackupRecoveryKey();
+    if (res.mfaRequired) {
+      setShowWizardBackupKeyMfa(true);
+      return;
+    }
+    if (res.success && res.passphrase) {
+      setRevealedWizardBackupKey(res.passphrase);
+      setFormData((prev) => ({ ...prev, backup_key_acknowledged: 1 }));
+    }
+  };
+
+  const handleDownloadWizardBackupKit = (passphrase: string) => {
+    const content = [
+      `${formData.brand_name || 'Vitrine RMM'} — Disaster Recovery Backup Encryption Key`,
+      `Generated: ${new Date().toISOString()}`,
+      '',
+      'IMPORTANT: Store this passphrase in an external password manager (1Password, Bitwarden, Keeper).',
+      'You will need this passphrase to decrypt .vrmm-backup.gz archives during bare-metal or cross-host disaster recovery.',
+      '',
+      `AES-256-GCM Backup Passphrase:`,
+      passphrase
+    ].join('\n');
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'vitrine-rmm-backup-encryption-key.txt';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
 
   const handleTestDiscoverMesh = async () => {
     setDiscoveringMesh(true);
@@ -927,7 +970,43 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
           {/* STEP 6: OIDC SSO & UNIFIED SELF-BACKUP SCHEDULE */}
           {step === 6 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1.15rem' }}>
-              <div style={{ display: 'grid', gridTemplateColumns: '1.5fr 1fr', gap: '1rem' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.84rem', fontWeight: 600, cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(formData.oidc_enabled)}
+                    onChange={(e) => setFormData({ ...formData, oidc_enabled: e.target.checked ? 1 : 0 })}
+                  />
+                  <span>Enable Enterprise OpenID Connect (OIDC + PKCE) Single Sign-On</span>
+                </label>
+                <button
+                  type="button"
+                  className="btn-glass"
+                  style={{ fontSize: '0.76rem', padding: '0.3rem 0.7rem' }}
+                  disabled={testingOidc || !formData.oidc_issuer_url}
+                  onClick={async () => {
+                    setTestingOidc(true);
+                    setOidcTestMsg(null);
+                    try {
+                      const res = await testOidcDiscovery({
+                        issuerUrl: formData.oidc_issuer_url,
+                        clientId: formData.oidc_client_id
+                      });
+                      setOidcTestMsg(
+                        res.success
+                          ? `✓ OIDC Discovery verified (${res.issuer}) — Auth endpoint ready.`
+                          : `OIDC check failed: ${res.error || 'Unable to fetch .well-known/openid-configuration'}`
+                      );
+                    } finally {
+                      setTestingOidc(false);
+                    }
+                  }}
+                >
+                  <Globe size={13} /> {testingOidc ? 'Testing OIDC...' : 'Test OIDC Discovery'}
+                </button>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr 1fr', gap: '1rem' }}>
                 <div className="form-group">
                   <label className="form-label">OpenID Connect / Authentik Issuer URL</label>
                   <input
@@ -946,6 +1025,121 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                     value={formData.oidc_client_id || ''}
                     onChange={(e) => setFormData({ ...formData, oidc_client_id: e.target.value })}
                   />
+                </div>
+                <div className="form-group">
+                  <label className="form-label">OIDC Client Secret (Vaulted)</label>
+                  <input
+                    type="password"
+                    className="glass-input"
+                    placeholder="Optional for public PKCE"
+                    value={formData.oidc_client_secret || ''}
+                    onChange={(e) => setFormData({ ...formData, oidc_client_secret: e.target.value })}
+                  />
+                </div>
+              </div>
+
+              {oidcTestMsg && (
+                <div style={{ padding: '0.6rem 0.9rem', borderRadius: '8px', background: 'rgba(0, 242, 254, 0.1)', border: '1px solid rgba(0, 242, 254, 0.35)', fontSize: '0.78rem' }}>
+                  {oidcTestMsg}
+                </div>
+              )}
+
+              {/* Disaster Recovery Backup Encryption Key Reminder & Escrow */}
+              <div
+                style={{
+                  background: 'rgba(245, 158, 11, 0.1)',
+                  border: '1px solid rgba(245, 158, 11, 0.42)',
+                  borderRadius: '8px',
+                  padding: '0.95rem 1.05rem',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '0.65rem'
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.82rem', fontWeight: 700, color: '#fbbf24' }}>
+                    <AlertTriangle size={16} />
+                    <span>IMPORTANT: Escrow Your Backup Encryption Passphrase Offline</span>
+                  </div>
+                  <div style={{ display: 'flex', gap: '0.45rem' }}>
+                    <button
+                      type="button"
+                      className="btn-glass"
+                      style={{ fontSize: '0.74rem', padding: '0.28rem 0.65rem', borderColor: 'rgba(245, 158, 11, 0.45)', color: '#fbbf24' }}
+                      onClick={handleRevealWizardBackupKey}
+                    >
+                      <KeyRound size={13} /> Reveal Auto-Generated Recovery Key (MFA)
+                    </button>
+                  </div>
+                </div>
+                <div style={{ fontSize: '0.77rem', color: 'var(--text-muted)', lineHeight: 1.45 }}>
+                  All <code>.vrmm-backup.gz</code> archives are encrypted with AES-256-GCM. Save your recovery passphrase in 1Password/Bitwarden now—or set a custom passphrase below—so you can restore backups on a replacement server if this host is ever lost.
+                </div>
+
+                {revealedWizardBackupKey && (
+                  <div style={{ display: 'flex', gap: '0.45rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                    <input
+                      type="text"
+                      readOnly
+                      className="glass-input"
+                      style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: '0.78rem', fontWeight: 700, color: 'var(--primary)' }}
+                      value={revealedWizardBackupKey}
+                    />
+                    <button
+                      type="button"
+                      className="btn-glass"
+                      style={{ fontSize: '0.74rem', padding: '0.35rem 0.65rem' }}
+                      onClick={() => {
+                        navigator.clipboard.writeText(revealedWizardBackupKey);
+                        setCopiedWizardBackupKey(true);
+                        setTimeout(() => setCopiedWizardBackupKey(false), 2000);
+                      }}
+                    >
+                      {copiedWizardBackupKey ? <Check size={13} color="#10b981" /> : <Copy size={13} />}
+                      <span>{copiedWizardBackupKey ? 'Copied' : 'Copy'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-glass btn-primary"
+                      style={{ fontSize: '0.74rem', padding: '0.35rem 0.7rem' }}
+                      onClick={() => handleDownloadWizardBackupKit(revealedWizardBackupKey)}
+                    >
+                      <Download size={13} /> Download .txt Kit
+                    </button>
+                  </div>
+                )}
+
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '0.65rem', alignItems: 'end' }}>
+                  <div className="form-group" style={{ margin: 0 }}>
+                    <label className="form-label" style={{ fontSize: '0.72rem' }}>
+                      Or Customize Backup Archive Passphrase (Optional)
+                    </label>
+                    <input
+                      type="password"
+                      className="glass-input"
+                      style={{ fontSize: '0.78rem' }}
+                      placeholder="Leave unchanged to keep auto-generated high-entropy passphrase"
+                      value={formData.backup_encryption_passphrase || ''}
+                      onChange={(e) =>
+                        setFormData({
+                          ...formData,
+                          backup_encryption_passphrase: e.target.value,
+                          backup_key_acknowledged: 1
+                        })
+                      }
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    className="btn-glass"
+                    style={{ fontSize: '0.74rem', padding: '0.45rem 0.75rem' }}
+                    onClick={async () => {
+                      await acknowledgeBackupRecoveryKey();
+                      setFormData((prev) => ({ ...prev, backup_key_acknowledged: 1 }));
+                    }}
+                  >
+                    <CheckCircle2 size={13} /> Mark Key Escrowed
+                  </button>
                 </div>
               </div>
 
@@ -1099,6 +1293,18 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
           </div>
         </div>
       )}
+
+      <MfaChallengeModal
+        isOpen={showWizardBackupKeyMfa}
+        onClose={() => setShowWizardBackupKeyMfa(false)}
+        onSuccess={() => {
+          setShowWizardBackupKeyMfa(false);
+          handleRevealWizardBackupKey();
+        }}
+        title="Step-Up MFA: Reveal Backup Recovery Key"
+        description="Enter your 6-digit TOTP authenticator code or recovery code to view and download the AES-256-GCM Backup Encryption Passphrase."
+        secretType="backup_recovery_key"
+      />
     </div>
   );
 };

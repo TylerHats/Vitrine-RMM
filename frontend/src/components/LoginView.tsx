@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   ShieldCheck,
   Lock,
@@ -10,7 +10,8 @@ import {
   CheckCircle,
   AlertCircle,
   ArrowRight,
-  LifeBuoy
+  LifeBuoy,
+  Globe
 } from 'lucide-react';
 import { setupInitialSuperAdmin, loginWithPassword } from '../services/api.js';
 import { AuthStatusResponse, AuthUser } from '../types/index.js';
@@ -28,7 +29,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
 }) => {
   const isFirstSetup = !authStatus.initialized;
   const brandName = authStatus.branding?.brand_name || 'Vitrine RMM';
-  const brandLogoUrl = authStatus.branding?.brand_logo_url || '/logo.png';
+  const brandLogoUrl = authStatus.branding?.brand_logo_url || '/branding/logo.png';
 
   const [username, setUsername] = useState(isFirstSetup ? 'admin' : '');
   const [email, setEmail] = useState('');
@@ -36,6 +37,18 @@ export const LoginView: React.FC<LoginViewProps> = ({
   const [confirmPassword, setConfirmPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const ssoErr = params.get('sso_error');
+    if (ssoErr) {
+      setError(ssoErr);
+      params.delete('sso_error');
+      const cleanQuery = params.toString();
+      const nextUrl = `${window.location.pathname}${cleanQuery ? `?${cleanQuery}` : ''}${window.location.hash}`;
+      window.history.replaceState({}, '', nextUrl);
+    }
+  }, []);
 
   // Post-bootstrap MFA Enrollment & Recovery Codes screen
   const [provisionedMfa, setProvisionedMfa] = useState<{
@@ -424,6 +437,29 @@ export const LoginView: React.FC<LoginViewProps> = ({
                 ? 'Initialize Super Admin & Vault'
                 : 'Sign In to Control Plane'}
           </button>
+
+          {!isFirstSetup && authStatus.oidcEnabled && (
+            <button
+              type="button"
+              className="btn-glass"
+              style={{
+                width: '100%',
+                padding: '0.7rem',
+                marginTop: '0.65rem',
+                justifyContent: 'center',
+                borderColor: 'rgba(0, 242, 254, 0.38)',
+                color: 'var(--primary)',
+                fontWeight: 600
+              }}
+              onClick={() => {
+                window.location.href = '/api/auth/oidc/login';
+              }}
+              id="oidc-sso-login-btn"
+            >
+              <Globe size={15} />
+              <span>Sign In with Enterprise SSO (OpenID Connect)</span>
+            </button>
+          )}
         </form>
 
         {onOpenQuickSupport && (

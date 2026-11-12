@@ -271,6 +271,24 @@ export async function verifyMfa(
   });
 }
 
+export async function testOidcDiscovery(data?: {
+  issuerUrl?: string;
+  clientId?: string;
+}): Promise<{
+  success: boolean;
+  issuer?: string;
+  authorizationEndpoint?: string;
+  tokenEndpoint?: string;
+  userinfoEndpoint?: string;
+  error?: string;
+}> {
+  return requestJson('/auth/oidc/test', {
+    method: 'POST',
+    body: JSON.stringify(data || {}),
+    returnErrorPayload: true
+  });
+}
+
 export async function fetchPublicPortalConfig(): Promise<PublicPortalConfig> {
   return requestJson<PublicPortalConfig>('/public/portal-config', { suppressAuthEvent: true });
 }
@@ -889,8 +907,50 @@ export async function fetchDeviceCustomFields(deviceId: string): Promise<CustomF
     options: r.options,
     description: r.description,
     current_value: r.value ?? r.current_value ?? '',
-    value_updated_at: r.updated_at ?? r.value_updated_at ?? null
+    value_updated_at: r.updated_at ?? r.value_updated_at ?? null,
+    has_secret: Boolean(r.has_secret),
+    revealed: Boolean(r.revealed)
   }));
+}
+
+export async function revealDeviceSecretCustomFields(
+  deviceId: string,
+  fieldId?: string
+): Promise<{
+  success: boolean;
+  fields?: CustomFieldDefinition[];
+  mfaRequired?: boolean;
+  error?: string;
+}> {
+  const qs = fieldId ? `?reveal=true&fieldId=${encodeURIComponent(fieldId)}` : '?reveal=true';
+  const res = await requestJson<any>(
+    `/devices/${encodeURIComponent(deviceId)}/custom-fields${qs}`,
+    { returnErrorPayload: true }
+  );
+  if (!Array.isArray(res)) {
+    return {
+      success: false,
+      mfaRequired: Boolean(res?.mfaRequired),
+      error: res?.error || 'Step-Up MFA verification required.'
+    };
+  }
+  return {
+    success: true,
+    fields: res.map((r) => ({
+      id: r.field_id || r.id,
+      key: r.key,
+      label: r.label,
+      category: r.category,
+      field_type: r.field_type,
+      scope: r.scope,
+      options: r.options,
+      description: r.description,
+      current_value: r.value ?? r.current_value ?? '',
+      value_updated_at: r.updated_at ?? r.value_updated_at ?? null,
+      has_secret: Boolean(r.has_secret),
+      revealed: Boolean(r.revealed)
+    }))
+  };
 }
 
 export async function saveDeviceCustomFields(
@@ -1195,10 +1255,25 @@ export async function addVirtualizationHost(data: {
   apiToken?: string;
   ramTotalGb?: number;
   storageTotalTb?: number;
-}): Promise<{ success: boolean; id: string; reachable?: boolean; error?: string }> {
+}): Promise<{ success: boolean; id: string; reachable?: boolean; sync?: any; error?: string }> {
   return requestJson('/virtualization/hosts', {
     method: 'POST',
     body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
+export async function syncVirtualizationHost(id: string): Promise<{
+  success: boolean;
+  reachable?: boolean;
+  source?: string;
+  vmCount?: number;
+  message?: string;
+  error?: string;
+}> {
+  return requestJson(`/virtualization/hosts/${encodeURIComponent(id)}/sync`, {
+    method: 'POST',
+    body: JSON.stringify({}),
     returnErrorPayload: true
   });
 }
@@ -1955,6 +2030,33 @@ export async function syncOffsiteBackups(): Promise<{
   error?: string;
 }> {
   return requestJson('/backups/sync-offsite', { method: 'POST', returnErrorPayload: true });
+}
+
+export async function revealBackupRecoveryKey(): Promise<{
+  success: boolean;
+  passphrase?: string;
+  encryptionEnabled?: boolean;
+  acknowledged?: boolean;
+  mfaRequired?: boolean;
+  error?: string;
+}> {
+  return requestJson('/backups/recovery-key', {
+    method: 'POST',
+    body: JSON.stringify({}),
+    returnErrorPayload: true
+  });
+}
+
+export async function acknowledgeBackupRecoveryKey(): Promise<{
+  success: boolean;
+  acknowledged?: boolean;
+  error?: string;
+}> {
+  return requestJson('/backups/acknowledge-key', {
+    method: 'POST',
+    body: JSON.stringify({}),
+    returnErrorPayload: true
+  });
 }
 
 export async function exportBreakGlassSheet(data?: {

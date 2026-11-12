@@ -25,7 +25,10 @@ import {
   Lock,
   ListChecks,
   CalendarClock,
-  Webhook
+  Webhook,
+  Copy,
+  Check,
+  Globe
 } from 'lucide-react';
 import {
   Settings,
@@ -73,8 +76,12 @@ import {
   deleteCustomField,
   fetchMaintenanceWindows,
   createMaintenanceWindow,
-  deleteMaintenanceWindow
+  deleteMaintenanceWindow,
+  testOidcDiscovery,
+  revealBackupRecoveryKey,
+  acknowledgeBackupRecoveryKey
 } from '../services/api.js';
+import { MfaChallengeModal } from '../components/MfaChallengeModal.js';
 
 interface SettingsViewProps {
   settings: Settings;
@@ -137,7 +144,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [customFieldDefs, setCustomFieldDefs] = useState<CustomFieldDefinition[]>([]);
   const [newFieldLabel, setNewFieldLabel] = useState('');
   const [newFieldCategory, setNewFieldCategory] = useState('Operations');
-  const [newFieldType, setNewFieldType] = useState<'text' | 'dropdown' | 'checkbox'>('text');
+  const [newFieldType, setNewFieldType] = useState<'text' | 'dropdown' | 'checkbox' | 'secret'>('text');
   const [newFieldOptions, setNewFieldOptions] = useState('');
 
   const [maintenanceWindows, setMaintenanceWindows] = useState<MaintenanceWindow[]>([]);
@@ -165,10 +172,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     usedBytes: 0,
     quotaMb: 5120,
     retentionCount: 14,
-    currentAppSchemaVersion: 15
+    currentAppSchemaVersion: 16
   });
   const [creatingBackup, setCreatingBackup] = useState(false);
   const [backupNotice, setBackupNotice] = useState<string | null>(null);
+  const [revealedBackupKey, setRevealedBackupKey] = useState<string | null>(null);
+  const [showBackupKeyMfa, setShowBackupKeyMfa] = useState(false);
+  const [copiedBackupKey, setCopiedBackupKey] = useState(false);
+  const [testingOidc, setTestingOidc] = useState(false);
+  const [oidcTestResult, setOidcTestResult] = useState<string | null>(null);
   const [schemaMismatchModal, setSchemaMismatchModal] = useState<{
     backup: SystemBackupItem;
     backupSchemaVersion: number;
@@ -348,6 +360,70 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setSmtpTestResult(res.message);
     } finally {
       setTestingSmtp(false);
+    }
+  };
+
+  const handleRevealBackupKey = async () => {
+    const res = await revealBackupRecoveryKey();
+    if (res.mfaRequired) {
+      setShowBackupKeyMfa(true);
+      return;
+    }
+    if (res.success && res.passphrase) {
+      setRevealedBackupKey(res.passphrase);
+      const next = { ...formData, backup_key_acknowledged: 1 };
+      setFormData(next);
+      onUpdated(next);
+    } else if (res.error) {
+      setBackupNotice(`Unable to reveal recovery key: ${res.error}`);
+    }
+  };
+
+  const handleAcknowledgeBackupKey = async () => {
+    const res = await acknowledgeBackupRecoveryKey();
+    if (res.success) {
+      const next = { ...formData, backup_key_acknowledged: 1 };
+      setFormData(next);
+      onUpdated(next);
+      setBackupNotice('✓ Backup Encryption Passphrase marked as escrowed offline.');
+    }
+  };
+
+  const handleDownloadBackupKeyKit = (passphrase: string) => {
+    const content = [
+      `${formData.brand_name || 'Vitrine RMM'} — Disaster Recovery Backup Encryption Key`,
+      `Generated: ${new Date().toISOString()}`,
+      '',
+      'IMPORTANT: Store this passphrase in an external vault (1Password, Bitwarden, Keeper).',
+      'Required to decrypt .vrmm-backup.gz archives during bare-metal or cross-machine restoration.',
+      '',
+      'AES-256-GCM Backup Encryption Passphrase:',
+      passphrase
+    ].join('\n');
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'vitrine-rmm-backup-encryption-key.txt';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleTestOidc = async () => {
+    setTestingOidc(true);
+    setOidcTestResult(null);
+    try {
+      const res = await testOidcDiscovery({
+        issuerUrl: formData.oidc_issuer_url,
+        clientId: formData.oidc_client_id
+      });
+      setOidcTestResult(
+        res.success
+          ? `✓ OIDC Discovery verified (${res.issuer}) — Authorization & Token endpoints active.`
+          : `OIDC Discovery failed: ${res.error || 'Verify Issuer URL and network connectivity.'}`
+      );
+    } finally {
+      setTestingOidc(false);
     }
   };
 
@@ -718,6 +794,53 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         </div>
       )}
 
+      {(formData.backup_encryption_enabled ?? 1) !== 0 && !formData.backup_key_acknowledged && (
+        <div
+          className="glass-card"
+          style={{
+            padding: '1rem 1.25rem',
+            background: 'rgba(245, 158, 11, 0.12)',
+            borderColor: 'rgba(245, 158, 11, 0.45)',
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            flexWrap: 'wrap',
+            gap: '0.85rem'
+          }}
+          id="backup-key-reminder-banner"
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flex: 1, minWidth: '280px' }}>
+            <AlertTriangle size={22} color="#fbbf24" style={{ flexShrink: 0 }} />
+            <div>
+              <div style={{ fontWeight: 700, fontSize: '0.88rem', color: '#fbbf24' }}>
+                Action Recommended: Escrow Your Disaster Recovery Backup Encryption Key
+              </div>
+              <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginTop: '0.15rem' }}>
+                Encrypted <code>.vrmm-backup.gz</code> archives require your Backup Encryption Passphrase if you ever restore onto a new server. Reveal &amp; download the recovery kit (Step-Up MFA) or set a custom passphrase in Backups below.
+              </div>
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+            <button
+              type="button"
+              className="btn-glass btn-primary"
+              style={{ fontSize: '0.76rem', padding: '0.4rem 0.8rem' }}
+              onClick={handleRevealBackupKey}
+            >
+              <KeyRound size={14} /> Reveal / Export Recovery Key (MFA)
+            </button>
+            <button
+              type="button"
+              className="btn-glass"
+              style={{ fontSize: '0.76rem', padding: '0.4rem 0.75rem' }}
+              onClick={handleAcknowledgeBackupKey}
+            >
+              <CheckCircle2 size={14} /> I Have Escrowed My Key
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* RBAC Technician Management & Client Tenants */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem' }}>
         {/* RBAC Technicians */}
@@ -1070,9 +1193,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               className="glass-select"
               style={{ width: 'auto', fontSize: '0.76rem' }}
               value={newFieldType}
-              onChange={(e) => setNewFieldType(e.target.value as 'text' | 'dropdown' | 'checkbox')}
+              onChange={(e) => setNewFieldType(e.target.value as 'text' | 'dropdown' | 'checkbox' | 'secret')}
             >
               <option value="text">Text</option>
+              <option value="secret">Encrypted Secret (Vaulted + MFA)</option>
               <option value="dropdown">Dropdown</option>
               <option value="checkbox">Checkbox</option>
             </select>
@@ -1707,7 +1831,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   Self-Update Engine (Stable Releases vs. Alpha Commits) &amp; Watchdog Auto-Rollback
                 </h3>
                 <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', margin: '0.2rem 0 0 0' }}>
-                  Installed Version: <strong>v{updaterStatus?.installedVersion || formData.installed_version || '2.5.0'}</strong> • Installed Commit:{' '}
+                  Installed Version: <strong>v{updaterStatus?.installedVersion || formData.installed_version || '2.5.1'}</strong> • Installed Commit:{' '}
                   <code>{updaterStatus?.installedCommit || formData.installed_commit || 'HEAD'}</code> • DB Schema:{' '}
                   <code>v{backupStorage.currentAppSchemaVersion}</code> • Mode:{' '}
                   <strong>{updaterStatus?.deploymentMode === 'docker' ? 'Docker Container' : 'Bare-Metal Systemd'}</strong>
@@ -1960,17 +2084,83 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </label>
               </div>
 
-              <button
-                type="button"
-                className="btn-glass"
-                style={{ fontSize: '0.76rem', padding: '0.35rem 0.75rem', borderColor: 'rgba(56, 189, 248, 0.45)', color: '#38bdf8' }}
-                disabled={syncingOffsite}
-                onClick={handleSyncOffsiteVault}
-              >
-                <CloudUpload size={13} />
-                <span>{syncingOffsite ? 'Replicating to Offsite Vault...' : 'Test & Sync Offsite Vault Now'}</span>
-              </button>
+              <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  className="btn-glass"
+                  style={{ fontSize: '0.76rem', padding: '0.35rem 0.75rem', borderColor: 'rgba(245, 158, 11, 0.45)', color: '#fbbf24' }}
+                  onClick={handleRevealBackupKey}
+                >
+                  <KeyRound size={13} />
+                  <span>Reveal / Export Recovery Key (MFA)</span>
+                </button>
+                <button
+                  type="button"
+                  className="btn-glass"
+                  style={{ fontSize: '0.76rem', padding: '0.35rem 0.75rem', borderColor: 'rgba(56, 189, 248, 0.45)', color: '#38bdf8' }}
+                  disabled={syncingOffsite}
+                  onClick={handleSyncOffsiteVault}
+                >
+                  <CloudUpload size={13} />
+                  <span>{syncingOffsite ? 'Replicating to Offsite Vault...' : 'Test & Sync Offsite Vault Now'}</span>
+                </button>
+              </div>
             </div>
+
+            {revealedBackupKey && (
+              <div
+                style={{
+                  padding: '0.75rem 0.95rem',
+                  borderRadius: '8px',
+                  background: 'rgba(245, 158, 11, 0.1)',
+                  border: '1px solid rgba(245, 158, 11, 0.4)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.5rem',
+                  flexWrap: 'wrap'
+                }}
+              >
+                <span style={{ fontSize: '0.75rem', fontWeight: 700, color: '#fbbf24' }}>
+                  Recovery Passphrase:
+                </span>
+                <input
+                  type="text"
+                  readOnly
+                  className="glass-input"
+                  style={{ flex: 1, minWidth: '220px', fontFamily: 'var(--font-mono)', fontSize: '0.78rem', fontWeight: 700, color: 'var(--primary)' }}
+                  value={revealedBackupKey}
+                />
+                <button
+                  type="button"
+                  className="btn-glass"
+                  style={{ fontSize: '0.74rem', padding: '0.3rem 0.65rem' }}
+                  onClick={() => {
+                    navigator.clipboard.writeText(revealedBackupKey);
+                    setCopiedBackupKey(true);
+                    setTimeout(() => setCopiedBackupKey(false), 2000);
+                  }}
+                >
+                  {copiedBackupKey ? <Check size={13} color="#10b981" /> : <Copy size={13} />}
+                  <span>{copiedBackupKey ? 'Copied' : 'Copy'}</span>
+                </button>
+                <button
+                  type="button"
+                  className="btn-glass btn-primary"
+                  style={{ fontSize: '0.74rem', padding: '0.3rem 0.7rem' }}
+                  onClick={() => handleDownloadBackupKeyKit(revealedBackupKey)}
+                >
+                  <Download size={13} /> Download .txt Kit
+                </button>
+                <button
+                  type="button"
+                  className="btn-glass"
+                  style={{ fontSize: '0.74rem', padding: '0.3rem 0.6rem' }}
+                  onClick={() => setRevealedBackupKey(null)}
+                >
+                  Hide
+                </button>
+              </div>
+            )}
 
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1.2fr 1fr', gap: '0.75rem' }}>
               <div>
@@ -2205,6 +2395,26 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           </div>
 
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', fontSize: '0.84rem', fontWeight: 600 }}>
+              <input
+                type="checkbox"
+                checked={Boolean(formData.oidc_enabled)}
+                onChange={(e) => setFormData({ ...formData, oidc_enabled: e.target.checked ? 1 : 0 })}
+              />
+              <span>Enable OpenID Connect (OIDC + S256 PKCE) Single Sign-On on Login Screen</span>
+            </label>
+            <button
+              type="button"
+              className="btn-glass"
+              style={{ fontSize: '0.76rem', padding: '0.32rem 0.75rem' }}
+              disabled={testingOidc || !formData.oidc_issuer_url}
+              onClick={handleTestOidc}
+            >
+              <Globe size={13} /> {testingOidc ? 'Testing Discovery...' : 'Test OIDC Discovery'}
+            </button>
+          </div>
+
           <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr 1fr', gap: '1.25rem' }}>
             <div className="form-group">
               <label className="form-label">OIDC Issuer URL (Authentik / Entra ID)</label>
@@ -2236,6 +2446,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               />
             </div>
           </div>
+
+          {oidcTestResult && (
+            <div style={{ marginTop: '0.85rem', padding: '0.7rem 0.95rem', borderRadius: '8px', background: 'rgba(0, 242, 254, 0.1)', border: '1px solid rgba(0, 242, 254, 0.35)', fontSize: '0.78rem', color: 'var(--text-main)' }}>
+              {oidcTestResult}
+            </div>
+          )}
         </div>
 
         {/* Outbound SMTP Notifications Card */}
@@ -2346,7 +2562,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <div style={{ padding: '0.75rem', borderRadius: '8px', background: 'var(--glass-bg)', border: '1px solid var(--glass-border)' }}>
                   <div style={{ fontSize: '0.73rem', color: 'var(--text-muted)' }}>Installed Software Target</div>
                   <div style={{ fontSize: '1.05rem', fontWeight: 700, color: '#38bdf8' }}>
-                    Schema v{schemaMismatchModal.appSchemaVersion} (App v{updaterStatus?.installedVersion || '2.5.0'})
+                    Schema v{schemaMismatchModal.appSchemaVersion} (App v{updaterStatus?.installedVersion || '2.5.1'})
                   </div>
                 </div>
               </div>
@@ -2399,6 +2615,18 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
         </div>
       )}
+
+      <MfaChallengeModal
+        isOpen={showBackupKeyMfa}
+        onClose={() => setShowBackupKeyMfa(false)}
+        onSuccess={() => {
+          setShowBackupKeyMfa(false);
+          handleRevealBackupKey();
+        }}
+        title="Step-Up MFA: Reveal Backup Encryption Key"
+        description="Verify your 6-digit TOTP authenticator or single-use recovery code to view and export the Disaster Recovery Backup Encryption Passphrase."
+        secretType="backup_recovery_key"
+      />
     </div>
   );
 };

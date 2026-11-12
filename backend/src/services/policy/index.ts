@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import { db } from '../../db/index.js';
-import { maskSecretValue, decryptVaultSecret } from '../vault/index.js';
+import { maskSecretValue, decryptVaultSecret, validateOutboundHostSafety } from '../vault/index.js';
 import { sendAlertEmailUsingStoredSettings } from '../smtp/index.js';
 
 export interface ConditionAlertRule {
@@ -570,6 +570,8 @@ async function syncTicketWithItflowIfConfigured(ticket: {
     const settings = db.prepare('SELECT itflow_url, itflow_api_key FROM settings WHERE id = 1').get() as any;
     const apiKey = decryptVaultSecret(settings?.itflow_api_key);
     if (!settings?.itflow_url || !apiKey || settings.itflow_url.includes('itflow.internal')) return;
+    const hostCheck = await validateOutboundHostSafety(settings.itflow_url, { allowLoopback: true });
+    if (!hostCheck.safe) return;
     await fetch(`${settings.itflow_url.replace(/\/$/, '')}/tickets/create.php`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -649,9 +651,22 @@ export async function evaluateFleetAlertConditions(): Promise<{
     clientName: string,
     rule: ConditionAlertRule,
     detail: string,
-    flapGraceMinutes = 15
+    flapGraceMinutes = 15,
+    tenantId?: string | null
   ) => {
     if (!rule.enabled) return;
+
+    const resolvedTenantId =
+      tenantId !== undefined
+        ? tenantId
+        : ((db.prepare('SELECT tenant_id FROM devices WHERE id = ?').get(entityId) as { tenant_id?: string } | undefined)
+            ?.tenant_id ??
+          (
+            db.prepare('SELECT tenant_id FROM network_appliances WHERE id = ?').get(entityId) as
+              | { tenant_id?: string }
+              | undefined
+          )?.tenant_id ??
+          null);
 
     // Deduplicate recent notifications within flapGraceMinutes so repeated runs don't spam duplicates
     const graceCutoffIso = new Date(Date.now() - Math.max(1, flapGraceMinutes) * 60 * 1000).toISOString();
@@ -666,10 +681,11 @@ export async function evaluateFleetAlertConditions(): Promise<{
       channels.push('Web UI Notification');
       webUiNotificationsCreated++;
       db.prepare(`
-        INSERT INTO notifications (id, type, title, message, severity)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO notifications (id, tenant_id, type, title, message, severity)
+        VALUES (?, ?, ?, ?, ?, ?)
       `).run(
         `notif-cond-${crypto.randomUUID()}`,
+        resolvedTenantId,
         rule.conditionId,
         expectedTitlePrefix,
         `${detail} (${clientName || 'Global MSP'})`,
