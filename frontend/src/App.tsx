@@ -5,9 +5,19 @@ import { TopNavbar } from './components/TopNavbar.js';
 import { LoginView } from './components/LoginView.js';
 import { FleetDashboard } from './views/FleetDashboard.js';
 import { MfaChallengeModal } from './components/MfaChallengeModal.js';
+import { isSuperAdmin as checkIsSuperAdmin, canMutateFleet } from './utils/permissions.js';
 
 const DeviceDetailView = lazy(() =>
   import('./views/DeviceDetailView.js').then((m) => ({ default: m.DeviceDetailView }))
+);
+const AlertsCenterView = lazy(() =>
+  import('./views/AlertsCenterView.js').then((m) => ({ default: m.AlertsCenterView }))
+);
+const DocumentationView = lazy(() =>
+  import('./views/DocumentationView.js').then((m) => ({ default: m.DocumentationView }))
+);
+const AuditExplorerView = lazy(() =>
+  import('./views/AuditExplorerView.js').then((m) => ({ default: m.AuditExplorerView }))
 );
 const PoliciesView = lazy(() =>
   import('./views/PoliciesView.js').then((m) => ({ default: m.PoliciesView }))
@@ -111,10 +121,21 @@ function applyVisualSettings(
 
 export function App() {
   const [authChecked, setAuthChecked] = useState(false);
-  const [authInitialized, setAuthInitialized] = useState(true);
-  const [oidcEnabled, setOidcEnabled] = useState(false);
+  const [authMeta, setAuthMeta] = useState<{
+    initialized: boolean;
+    oidcEnabled: boolean;
+    isOnboarded: boolean;
+  }>({
+    initialized: true,
+    oidcEnabled: false,
+    isOnboarded: true
+  });
   const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
   const [publicConfig, setPublicConfig] = useState<PublicPortalConfig | null>(null);
+  const [globalMfaModal, setGlobalMfaModal] = useState<{ open: boolean; secretType: string }>({
+    open: false,
+    secretType: 'step_up_action'
+  });
 
   const [currentView, setCurrentView] = useState('dashboard');
   const [themeOverride, setThemeOverride] = useState<'dark' | 'light' | null>(() => {
@@ -161,9 +182,15 @@ export function App() {
   const [guestAccessModalOpen, setGuestAccessModalOpen] = useState(false);
   const [quickSupportQueueOpen, setQuickSupportQueueOpen] = useState(false);
   const [qsSessions, setQsSessions] = useState<QuickSupportSession[]>([]);
+  const [qsSelectedSession, setQsSelectedSession] = useState<QuickSupportSession | null>(null);
+  const [qsElevationAction, setQsElevationAction] = useState<'elevate_temp_session' | 'promote_permanent_service'>('elevate_temp_session');
+  const [qsCredentialSource, setQsCredentialSource] = useState<'laps' | 'custom_admin' | 'end_user_uac'>('end_user_uac');
+  const [qsAdminUsername, setQsAdminUsername] = useState('');
+  const [qsAdminPassword, setQsAdminPassword] = useState('');
   const [qsElevatingDeviceId, setQsElevatingDeviceId] = useState<string | null>(null);
   const [qsElevationMfaOpen, setQsElevationMfaOpen] = useState(false);
   const [qsMessage, setQsMessage] = useState<string | null>(null);
+  const [qsMessageIsError, setQsMessageIsError] = useState(false);
 
   const [updaterStatus, setUpdaterStatus] = useState<UpdaterStatus | null>(null);
   const [dismissedUpdateBanner, setDismissedUpdateBanner] = useState(false);
@@ -202,14 +229,23 @@ export function App() {
     try {
       const [pub, auth] = await Promise.all([
         fetchPublicPortalConfig().catch(() => null),
-        fetchAuthStatus().catch(() => ({ initialized: true, authenticated: false, user: null, oidcEnabled: false }))
+        fetchAuthStatus().catch(() => ({
+          initialized: true,
+          authenticated: false,
+          user: null,
+          oidcEnabled: false,
+          isOnboarded: true
+        }))
       ]);
       if (pub) {
         setPublicConfig(pub);
         applyVisualSettings(pub);
       }
-      setAuthInitialized(auth.initialized);
-      setOidcEnabled(Boolean((auth as any).oidcEnabled));
+      setAuthMeta({
+        initialized: auth.initialized,
+        oidcEnabled: Boolean((auth as any).oidcEnabled),
+        isOnboarded: (auth as any).isOnboarded !== undefined ? Boolean((auth as any).isOnboarded) : true
+      });
       setCurrentUser(auth.authenticated && auth.user ? auth.user : null);
     } finally {
       setAuthChecked(true);
@@ -221,8 +257,23 @@ export function App() {
     const onAuthExpired = () => {
       setCurrentUser(null);
     };
+    const onMfaRequired = (e: Event) => {
+      const detail = (e as CustomEvent)?.detail;
+      setTimeout(() => {
+        if (!document.getElementById('mfa-challenge-modal')) {
+          setGlobalMfaModal({
+            open: true,
+            secretType: detail?.action || detail?.secretType || 'step_up_action'
+          });
+        }
+      }, 45);
+    };
     window.addEventListener('vitrine:auth-expired', onAuthExpired);
-    return () => window.removeEventListener('vitrine:auth-expired', onAuthExpired);
+    window.addEventListener('vitrine:mfa-required', onMfaRequired);
+    return () => {
+      window.removeEventListener('vitrine:auth-expired', onAuthExpired);
+      window.removeEventListener('vitrine:mfa-required', onMfaRequired);
+    };
   }, [refreshAuthAndPublic]);
 
   useEffect(() => {
@@ -246,7 +297,7 @@ export function App() {
         fetchDevices(),
         fetchTenants(),
         fetchSettings().catch(() => null),
-        currentUser.role !== 'client_admin' ? fetchUpdaterStatus().catch(() => null) : Promise.resolve(null)
+        checkIsSuperAdmin(currentUser) ? fetchUpdaterStatus().catch(() => null) : Promise.resolve(null)
       ]);
       setDevices(devs);
       setTenants(tens);
@@ -255,7 +306,7 @@ export function App() {
         applyVisualSettings(sets);
         if (
           !hasAutoCheckedOobe &&
-          currentUser.role === 'super_admin' &&
+          checkIsSuperAdmin(currentUser) &&
           sets.oobe_completed === 0 &&
           sets.is_onboarded === 0
         ) {
@@ -286,32 +337,63 @@ export function App() {
 
   const handleOpenQuickSupportQueue = () => {
     setQsMessage(null);
+    setQsMessageIsError(false);
+    setQsSelectedSession(null);
     setQuickSupportQueueOpen(true);
     loadQuickSupportQueue();
   };
 
-  const handleElevateQuickSupport = async (
-    deviceId: string,
+  const openQuickSupportElevation = (
+    session: QuickSupportSession,
     action: 'elevate_temp_session' | 'promote_permanent_service'
   ) => {
-    setQsElevatingDeviceId(deviceId);
+    setQsSelectedSession(session);
+    setQsElevationAction(action);
+    setQsCredentialSource(session.device_id ? 'laps' : 'end_user_uac');
+    setQsAdminUsername('');
+    setQsAdminPassword('');
     setQsMessage(null);
+    setQsMessageIsError(false);
+  };
+
+  const handleElevateQuickSupport = async (
+    overrideSession?: QuickSupportSession,
+    overrideAction?: 'elevate_temp_session' | 'promote_permanent_service'
+  ) => {
+    const activeQs = overrideSession || qsSelectedSession;
+    if (!activeQs) return;
+    const targetId = activeQs.device_id || activeQs.id;
+    const action = overrideAction || qsElevationAction;
+    const effectiveCredentialSource =
+      !activeQs.device_id && qsCredentialSource === 'laps' ? 'end_user_uac' : qsCredentialSource;
+
+    setQsElevatingDeviceId(targetId);
+    setQsMessage(null);
+    setQsMessageIsError(false);
     try {
-      const res = await elevateRemoteAgent(deviceId, {
-        credentialSource: 'laps',
-        elevationAction: action
+      const res = await elevateRemoteAgent(targetId, {
+        credentialSource: effectiveCredentialSource,
+        elevationAction: action,
+        adminUsername: effectiveCredentialSource === 'custom_admin' ? qsAdminUsername.trim() : undefined,
+        adminPassword: effectiveCredentialSource === 'custom_admin' ? qsAdminPassword : undefined
       });
       if (res.mfaRequired) {
         setQsElevationMfaOpen(true);
         return;
       }
       if (res.success) {
+        setQsMessageIsError(false);
         setQsMessage(res.message || 'Remote elevation command dispatched.');
+        setQsSelectedSession(null);
         loadQuickSupportQueue();
         loadData();
       } else {
+        setQsMessageIsError(true);
         setQsMessage(res.error || 'Elevation failed.');
       }
+    } catch (err: any) {
+      setQsMessageIsError(true);
+      setQsMessage(err?.message || 'Elevation failed.');
     } finally {
       setQsElevatingDeviceId(null);
     }
@@ -360,13 +442,13 @@ export function App() {
     return (
       <LoginView
         authStatus={{
-          initialized: authInitialized,
+          initialized: authMeta.initialized,
           authenticated: false,
           user: null,
           mfaVerified: false,
           mfaVerifiedUntil: null,
-          isOnboarded: Boolean(settings?.is_onboarded),
-          oidcEnabled,
+          isOnboarded: authMeta.isOnboarded || Boolean(settings?.is_onboarded),
+          oidcEnabled: authMeta.oidcEnabled,
           branding: {
             brand_name: publicConfig?.brand_name || 'Vitrine RMM',
             brand_logo_url: publicConfig?.brand_logo_url || '/branding/logo.png',
@@ -375,9 +457,9 @@ export function App() {
           }
         }}
         onAuthenticated={(user, triggerOobe) => {
-          setAuthInitialized(true);
+          setAuthMeta((prev) => ({ ...prev, initialized: true }));
           setCurrentUser(user);
-          if (triggerOobe) setOnboardingOpen(true);
+          if (triggerOobe && checkIsSuperAdmin(user)) setOnboardingOpen(true);
         }}
         onOpenQuickSupport={() => navigatePath(configuredQsPath || '/remote')}
       />
@@ -412,14 +494,19 @@ export function App() {
 
   const handleDeviceQuarantineUpdated = (quarantined: boolean) => {
     if (quarantineModal.device) {
-      setDevices(
-        devices.map((d) =>
+      setDevices((prev) =>
+        prev.map((d) =>
           d.id === quarantineModal.device!.id
-            ? { ...d, quarantined: quarantined ? 1 : 0, status: quarantined ? 'isolated' : 'online' }
+            ? {
+                ...d,
+                quarantined: quarantined ? 1 : 0,
+                status: quarantined ? 'isolated' : d.status === 'isolated' ? 'online' : d.status
+              }
             : d
         )
       );
     }
+    loadData();
   };
 
   const handleSettingsUpdated = (s: Settings) => {
@@ -447,7 +534,7 @@ export function App() {
         onCloseMobile={() => setIsMobileSidebarOpen(false)}
         currentUser={currentUser}
         meshConnected={Boolean(settings?.meshcentral_connected)}
-        appVersion={updaterStatus?.installedVersion || '2.5.1'}
+        appVersion={updaterStatus?.installedVersion || '2.6.0'}
       />
 
       <div className="main-wrapper">
@@ -474,7 +561,7 @@ export function App() {
 
         <main className="content-container">
           {updaterStatus?.updateAvailable &&
-            currentUser.role !== 'client_admin' &&
+            checkIsSuperAdmin(currentUser) &&
             !dismissedUpdateBanner &&
             (settings?.update_notify_webui ?? 1) !== 0 && (
               <div
@@ -507,19 +594,17 @@ export function App() {
                   </span>
                 </div>
                 <div style={{ display: 'flex', gap: '0.5rem' }}>
-                  {currentUser.role === 'super_admin' && (
-                    <button
-                      type="button"
-                      className="btn-glass btn-primary"
-                      style={{ padding: '0.3rem 0.75rem', fontSize: '0.76rem' }}
-                      onClick={() => {
-                        setCurrentView('settings');
-                        setSelectedDeviceId(null);
-                      }}
-                    >
-                      Review Release Notes &amp; Update
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    className="btn-glass btn-primary"
+                    style={{ padding: '0.3rem 0.75rem', fontSize: '0.76rem' }}
+                    onClick={() => {
+                      setCurrentView('settings');
+                      setSelectedDeviceId(null);
+                    }}
+                  >
+                    Review Release Notes &amp; Update
+                  </button>
                   <button
                     type="button"
                     className="btn-glass"
@@ -573,18 +658,48 @@ export function App() {
               />
             )}
 
+            {currentView === 'alerts' && (
+              <AlertsCenterView
+                tenants={tenants}
+                selectedTenantId={selectedTenantId}
+                currentUser={currentUser}
+              />
+            )}
+            {currentView === 'documentation' && (
+              <DocumentationView
+                tenants={tenants}
+                devices={devices}
+                selectedTenantId={selectedTenantId}
+                currentUser={currentUser}
+              />
+            )}
+            {currentView === 'audit' && currentUser.role !== 'client_admin' && <AuditExplorerView />}
             {currentView === 'policies' && currentUser.role !== 'client_admin' && (
-              <PoliciesView devices={devices} tenants={tenants} />
+              <PoliciesView devices={devices} tenants={tenants} currentUser={currentUser} />
             )}
-            {currentView === 'patching' && <PatchManagementView settings={settings} onSettingsUpdated={handleSettingsUpdated} />}
-            {currentView === 'scripts' && currentUser.role !== 'client_admin' && <ScriptLibraryView devices={devices} />}
-            {currentView === 'self-healing' && currentUser.role !== 'client_admin' && <SelfHealingView />}
-            {currentView === 'topology' && currentUser.role !== 'client_admin' && <NetworkTopologyView />}
-            {currentView === 'virtualization' && currentUser.role !== 'client_admin' && <VirtualizationView />}
+            {currentView === 'patching' && (
+              <PatchManagementView
+                settings={settings}
+                onSettingsUpdated={handleSettingsUpdated}
+                currentUser={currentUser}
+              />
+            )}
+            {currentView === 'scripts' && currentUser.role !== 'client_admin' && (
+              <ScriptLibraryView devices={devices} currentUser={currentUser} />
+            )}
+            {currentView === 'self-healing' && currentUser.role !== 'client_admin' && (
+              <SelfHealingView currentUser={currentUser} />
+            )}
+            {currentView === 'topology' && currentUser.role !== 'client_admin' && (
+              <NetworkTopologyView currentUser={currentUser} />
+            )}
+            {currentView === 'virtualization' && currentUser.role !== 'client_admin' && (
+              <VirtualizationView currentUser={currentUser} />
+            )}
             {currentView === 'psa' && currentUser.role !== 'client_admin' && (
-              <PsaSyncView tenants={tenants} devices={devices} />
+              <PsaSyncView tenants={tenants} devices={devices} currentUser={currentUser} />
             )}
-            {currentView === 'settings' && currentUser.role === 'super_admin' && (
+            {currentView === 'settings' && checkIsSuperAdmin(currentUser) && (
               <SettingsView
                 settings={settings || ({} as Settings)}
                 onUpdated={handleSettingsUpdated}
@@ -599,7 +714,7 @@ export function App() {
       <Suspense fallback={null}>
         {remoteModal.open && remoteModal.device && (
           <RemoteScreenModal
-            device={remoteModal.device}
+            device={devices.find((d) => d.id === remoteModal.device!.id) || remoteModal.device}
             isGhostSession={remoteModal.isGhost}
             onClose={() => setRemoteModal({ open: false, device: null, isGhost: false })}
           />
@@ -607,7 +722,7 @@ export function App() {
 
         {bgToolsModal.open && bgToolsModal.device && (
           <BackgroundToolsModal
-            device={bgToolsModal.device}
+            device={devices.find((d) => d.id === bgToolsModal.device!.id) || bgToolsModal.device}
             initialTab={bgToolsModal.initialTab}
             onClose={() => setBgToolsModal({ open: false, device: null, initialTab: 'terminal' })}
           />
@@ -615,24 +730,27 @@ export function App() {
 
         {lapsModal.open && lapsModal.device && (
           <LapsModal
-            device={lapsModal.device}
+            device={devices.find((d) => d.id === lapsModal.device!.id) || lapsModal.device}
             onClose={() => setLapsModal({ open: false, device: null })}
           />
         )}
 
         {quarantineModal.open && quarantineModal.device && (
           <CyberIsolationModal
-            device={quarantineModal.device}
+            device={devices.find((d) => d.id === quarantineModal.device!.id) || quarantineModal.device}
             onClose={() => setQuarantineModal({ open: false, device: null })}
             onUpdated={handleDeviceQuarantineUpdated}
           />
         )}
 
-        {onboardingOpen && (
+        {onboardingOpen && checkIsSuperAdmin(currentUser) && (
           <OnboardingWizardModal
             settings={settings || ({} as Settings)}
             onClose={() => setOnboardingOpen(false)}
-            onSaved={handleSettingsUpdated}
+            onSaved={(updated) => {
+              setAuthMeta((prev) => ({ ...prev, isOnboarded: true }));
+              handleSettingsUpdated(updated);
+            }}
           />
         )}
 
@@ -686,10 +804,107 @@ export function App() {
             </div>
             <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '0.9rem' }}>
               {qsMessage && (
-                <div style={{ padding: '0.7rem 0.9rem', borderRadius: '8px', background: 'rgba(16, 185, 129, 0.14)', border: '1px solid rgba(16, 185, 129, 0.35)', fontSize: '0.8rem' }}>
+                <div
+                  style={{
+                    padding: '0.7rem 0.9rem',
+                    borderRadius: '8px',
+                    background: qsMessageIsError ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.14)',
+                    border: `1px solid ${qsMessageIsError ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`,
+                    color: qsMessageIsError ? '#f87171' : '#34d399',
+                    fontSize: '0.8rem'
+                  }}
+                >
                   {qsMessage}
                 </div>
               )}
+
+              {qsSelectedSession && canMutateFleet(currentUser) && (
+                <div
+                  className="glass-card"
+                  style={{
+                    padding: '1rem',
+                    border: '1px solid rgba(0, 242, 254, 0.35)',
+                    background: 'rgba(0, 242, 254, 0.06)',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '0.75rem'
+                  }}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div style={{ fontWeight: 700, fontSize: '0.88rem', color: 'var(--primary)' }}>
+                      {qsElevationAction === 'promote_permanent_service'
+                        ? `Promote QuickSupport Session ${qsSelectedSession.session_code} to Permanent Service`
+                        : `Self-Elevate QuickSupport Session ${qsSelectedSession.session_code}`}
+                    </div>
+                    <button
+                      type="button"
+                      className="btn-glass btn-icon"
+                      onClick={() => setQsSelectedSession(null)}
+                    >
+                      <X size={15} />
+                    </button>
+                  </div>
+
+                  <div className="form-group" style={{ margin: 0 }}>
+                    <label className="form-label" style={{ fontSize: '0.75rem' }}>
+                      Elevation Credential Source
+                    </label>
+                    <select
+                      className="glass-select"
+                      value={!qsSelectedSession.device_id && qsCredentialSource === 'laps' ? 'end_user_uac' : qsCredentialSource}
+                      onChange={(e) =>
+                        setQsCredentialSource(e.target.value as 'laps' | 'custom_admin' | 'end_user_uac')
+                      }
+                    >
+                      {Boolean(qsSelectedSession.device_id) && (
+                        <option value="laps">Use Escrowed Vitrine LAPS Vault Credential</option>
+                      )}
+                      <option value="end_user_uac">Trigger Interactive End-User UAC / Polkit Consent Prompt</option>
+                      <option value="custom_admin">Supply One-Time Local / Domain Admin Credentials</option>
+                    </select>
+                  </div>
+
+                  {qsCredentialSource === 'custom_admin' && (
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.65rem' }}>
+                      <input
+                        type="text"
+                        className="glass-input"
+                        placeholder="Administrator or DOMAIN\Admin"
+                        value={qsAdminUsername}
+                        onChange={(e) => setQsAdminUsername(e.target.value)}
+                      />
+                      <input
+                        type="password"
+                        className="glass-input"
+                        placeholder="Admin Password"
+                        value={qsAdminPassword}
+                        onChange={(e) => setQsAdminPassword(e.target.value)}
+                      />
+                    </div>
+                  )}
+
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem' }}>
+                    <button type="button" className="btn-glass" onClick={() => setQsSelectedSession(null)}>
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-glass btn-primary"
+                      disabled={
+                        qsElevatingDeviceId === (qsSelectedSession.device_id || qsSelectedSession.id) ||
+                        (qsCredentialSource === 'custom_admin' && (!qsAdminUsername.trim() || !qsAdminPassword))
+                      }
+                      onClick={() => handleElevateQuickSupport()}
+                    >
+                      <ShieldCheck size={14} />{' '}
+                      {qsElevationAction === 'promote_permanent_service'
+                        ? 'Dispatch Service Promotion'
+                        : 'Dispatch Self-Elevation'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {qsSessions.length === 0 ? (
                 <div style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-muted)', fontSize: '0.85rem' }}>
                   No active QuickSupport sessions waiting in queue. Direct clients to{' '}
@@ -708,7 +923,7 @@ export function App() {
                         OS: {qs.platform.toUpperCase()} • Privilege: <strong>{qs.privilege_level}</strong> • Expires {new Date(qs.expires_at).toLocaleTimeString()}
                       </div>
                     </div>
-                    {(() => {
+                    {canMutateFleet(currentUser) && (() => {
                       const targetId = qs.device_id || qs.id;
                       return (
                         <div style={{ display: 'flex', gap: '0.45rem' }}>
@@ -716,15 +931,15 @@ export function App() {
                             className="btn-glass"
                             style={{ fontSize: '0.75rem' }}
                             disabled={qsElevatingDeviceId === targetId}
-                            onClick={() => handleElevateQuickSupport(targetId, 'elevate_temp_session')}
+                            onClick={() => openQuickSupportElevation(qs, 'elevate_temp_session')}
                           >
-                            <ShieldCheck size={13} /> Self-Elevate (LAPS)
+                            <ShieldCheck size={13} /> Self-Elevate
                           </button>
                           <button
                             className="btn-glass btn-primary"
                             style={{ fontSize: '0.75rem' }}
                             disabled={qsElevatingDeviceId === targetId}
-                            onClick={() => handleElevateQuickSupport(targetId, 'promote_permanent_service')}
+                            onClick={() => openQuickSupportElevation(qs, 'promote_permanent_service')}
                           >
                             Promote to Service
                           </button>
@@ -744,9 +959,18 @@ export function App() {
         onClose={() => setQsElevationMfaOpen(false)}
         onSuccess={() => {
           setQsElevationMfaOpen(false);
-          setQsMessage('Step-Up MFA verified. Click Self-Elevate again to dispatch elevated token.');
+          handleElevateQuickSupport();
         }}
         secretType="LAPS Remote Self-Elevation"
+      />
+
+      <MfaChallengeModal
+        isOpen={globalMfaModal.open}
+        onClose={() => setGlobalMfaModal({ open: false, secretType: 'step_up_action' })}
+        onSuccess={() => setGlobalMfaModal({ open: false, secretType: 'step_up_action' })}
+        title="Step-Up MFA Verification Required"
+        description="This administrative or vault action requires a fresh 6-digit TOTP authenticator code or recovery code. Once verified, you can retry your action immediately."
+        secretType={globalMfaModal.secretType}
       />
     </div>
   );

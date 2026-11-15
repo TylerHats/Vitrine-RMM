@@ -83,13 +83,26 @@ function resolveBrandingDir(): string {
 
 const DATA_DIR = resolveDataDir();
 const BRANDING_DIR = resolveBrandingDir();
+const RECORDINGS_DIR = path.join(DATA_DIR, 'recordings');
+const PACKAGES_DIR = path.join(DATA_DIR, 'packages');
+for (const subDir of [RECORDINGS_DIR, PACKAGES_DIR]) {
+  if (!fs.existsSync(subDir)) {
+    try {
+      fs.mkdirSync(subDir, { recursive: true, mode: 0o700 });
+    } catch {
+      // Non-fatal on read-only test mount
+    }
+  }
+}
 const DB_PATH = path.join(DATA_DIR, 'vitrine.db');
 
 export const DATA_DIR_PATH = DATA_DIR;
 export const BRANDING_DIR_PATH = BRANDING_DIR;
+export const RECORDINGS_DIR_PATH = RECORDINGS_DIR;
+export const PACKAGES_DIR_PATH = PACKAGES_DIR;
 export const DB_FILE_PATH = DB_PATH;
-export const APP_VERSION = '2.5.1';
-export const APP_SCHEMA_VERSION = 16;
+export const APP_VERSION = '2.6.0';
+export const APP_SCHEMA_VERSION = 18;
 
 function detectInstalledCommit(): string {
   if (process.env.VITRINE_GIT_COMMIT && process.env.VITRINE_GIT_COMMIT.trim()) {
@@ -133,7 +146,13 @@ function detectInstalledCommit(): string {
 export const APP_INSTALLED_COMMIT = detectInstalledCommit();
 
 export function isRunningInDocker(): boolean {
-  if (process.env.CONTAINER === 'true' || process.env.VITRINE_DOCKER === '1') return true;
+  if (
+    process.env.CONTAINER === 'true' ||
+    process.env.VITRINE_DOCKER === '1' ||
+    process.env.VITRINE_DOCKER === 'true'
+  ) {
+    return true;
+  }
   try {
     if (fs.existsSync('/.dockerenv') || fs.existsSync('/run/.containerenv')) return true;
   } catch {
@@ -272,15 +291,15 @@ export function initDatabase() {
       site_id TEXT,
       hostname TEXT NOT NULL,
       os_type TEXT NOT NULL DEFAULT 'windows',
-      os_version TEXT NOT NULL,
-      os_build TEXT NOT NULL,
-      ip_address TEXT NOT NULL,
-      mac_address TEXT NOT NULL,
+      os_version TEXT NOT NULL DEFAULT 'Unknown OS',
+      os_build TEXT NOT NULL DEFAULT '',
+      ip_address TEXT NOT NULL DEFAULT '0.0.0.0',
+      mac_address TEXT NOT NULL DEFAULT '00:00:00:00:00:00',
       status TEXT NOT NULL DEFAULT 'online',
       device_role TEXT NOT NULL DEFAULT 'Workstation',
       manufacturer TEXT NOT NULL DEFAULT '',
       model TEXT NOT NULL DEFAULT '',
-      cpu_model TEXT NOT NULL,
+      cpu_model TEXT NOT NULL DEFAULT 'Generic CPU',
       cpu_cores INTEGER NOT NULL DEFAULT 8,
       cpu_usage REAL NOT NULL DEFAULT 0.0,
       ram_total_gb REAL NOT NULL DEFAULT 16.0,
@@ -741,7 +760,235 @@ export function initDatabase() {
       tenant_id TEXT NOT NULL,
       tenant_name TEXT NOT NULL,
       laps_action TEXT NOT NULL DEFAULT 'remove_account',
+      laps_account_name TEXT NOT NULL DEFAULT 'LocalAdmin',
+      os_type TEXT NOT NULL DEFAULT 'windows',
       quiet_offboarded_at TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS agent_tasks (
+      id TEXT PRIMARY KEY,
+      device_id TEXT NOT NULL,
+      task_type TEXT NOT NULL,
+      payload_json TEXT NOT NULL DEFAULT '{}',
+      status TEXT NOT NULL DEFAULT 'queued',
+      exit_code INTEGER,
+      stdout TEXT NOT NULL DEFAULT '',
+      stderr TEXT NOT NULL DEFAULT '',
+      result_json TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      completed_at TEXT,
+      FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS scheduled_automations (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      script_id TEXT NOT NULL,
+      trigger_type TEXT NOT NULL DEFAULT 'cron',
+      cron_expression TEXT NOT NULL DEFAULT '0 2 * * *',
+      target_type TEXT NOT NULL DEFAULT 'global',
+      target_id TEXT,
+      run_as TEXT NOT NULL DEFAULT 'system',
+      params_json TEXT NOT NULL DEFAULT '{}',
+      enabled INTEGER NOT NULL DEFAULT 1,
+      last_run_at TEXT,
+      next_run_at TEXT,
+      last_status TEXT,
+      created_by TEXT NOT NULL DEFAULT 'admin',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS software_packages (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      vendor TEXT NOT NULL DEFAULT '',
+      version TEXT NOT NULL DEFAULT 'latest',
+      platform TEXT NOT NULL DEFAULT 'windows',
+      package_type TEXT NOT NULL DEFAULT 'winget',
+      package_identifier TEXT NOT NULL,
+      download_url TEXT NOT NULL DEFAULT '',
+      local_file_path TEXT NOT NULL DEFAULT '',
+      sha256_hash TEXT NOT NULL DEFAULT '',
+      install_args TEXT NOT NULL DEFAULT '',
+      uninstall_args TEXT NOT NULL DEFAULT '',
+      detection_rule TEXT NOT NULL DEFAULT '',
+      category TEXT NOT NULL DEFAULT 'Productivity',
+      is_required_baseline INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS software_deployments (
+      id TEXT PRIMARY KEY,
+      package_id TEXT NOT NULL,
+      package_name TEXT NOT NULL,
+      device_id TEXT NOT NULL,
+      hostname TEXT NOT NULL,
+      action TEXT NOT NULL DEFAULT 'install',
+      status TEXT NOT NULL DEFAULT 'queued',
+      output TEXT NOT NULL DEFAULT '',
+      triggered_by TEXT NOT NULL DEFAULT 'admin',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      completed_at TEXT,
+      FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS kb_blacklist (
+      id TEXT PRIMARY KEY,
+      kb_or_pkg_id TEXT NOT NULL,
+      platform TEXT NOT NULL DEFAULT 'all',
+      reason TEXT NOT NULL DEFAULT '',
+      tenant_id TEXT,
+      created_by TEXT NOT NULL DEFAULT 'admin',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS alert_incidents (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT,
+      device_id TEXT,
+      appliance_id TEXT,
+      entity_name TEXT NOT NULL,
+      condition_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      detail TEXT NOT NULL,
+      severity TEXT NOT NULL DEFAULT 'warning',
+      status TEXT NOT NULL DEFAULT 'open',
+      assigned_to TEXT,
+      snoozed_until TEXT,
+      psa_ticket_id TEXT,
+      metric_snapshot_json TEXT NOT NULL DEFAULT '{}',
+      triggered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      acknowledged_at TEXT,
+      resolved_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS notification_channels (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      channel_type TEXT NOT NULL DEFAULT 'slack',
+      webhook_url_encrypted TEXT NOT NULL DEFAULT '',
+      signing_secret_encrypted TEXT NOT NULL DEFAULT '',
+      min_severity TEXT NOT NULL DEFAULT 'warning',
+      tenant_id TEXT,
+      events_json TEXT NOT NULL DEFAULT '["alert","self_healing","offboard","security"]',
+      enabled INTEGER NOT NULL DEFAULT 1,
+      last_triggered_at TEXT,
+      last_status TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS documentation_articles (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT,
+      site_id TEXT,
+      device_id TEXT,
+      title TEXT NOT NULL,
+      category TEXT NOT NULL DEFAULT 'runbook',
+      content_markdown TEXT NOT NULL DEFAULT '',
+      checklist_json TEXT NOT NULL DEFAULT '[]',
+      tags_json TEXT NOT NULL DEFAULT '[]',
+      expires_at TEXT,
+      is_pinned INTEGER NOT NULL DEFAULT 0,
+      author TEXT NOT NULL DEFAULT 'admin',
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS custom_roles (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE,
+      description TEXT NOT NULL DEFAULT '',
+      base_tier TEXT NOT NULL DEFAULT 'technician',
+      permissions_json TEXT NOT NULL DEFAULT '[]',
+      allowed_tenant_ids_json TEXT NOT NULL DEFAULT '[]',
+      is_system INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS api_keys (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      key_prefix TEXT NOT NULL,
+      key_hash TEXT NOT NULL UNIQUE,
+      scopes_json TEXT NOT NULL DEFAULT '["read:devices","read:alerts"]',
+      tenant_id TEXT,
+      created_by TEXT NOT NULL DEFAULT 'admin',
+      expires_at TEXT,
+      last_used_at TEXT,
+      revoked_at TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS psa_integrations (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      provider TEXT NOT NULL DEFAULT 'itflow',
+      base_url TEXT NOT NULL,
+      client_id TEXT NOT NULL DEFAULT '',
+      api_secret_encrypted TEXT NOT NULL DEFAULT '',
+      default_board TEXT NOT NULL DEFAULT 'Service Desk',
+      two_way_sync INTEGER NOT NULL DEFAULT 1,
+      auto_time_entry INTEGER NOT NULL DEFAULT 1,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      last_synced_at TEXT,
+      last_status TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS psa_time_entries (
+      id TEXT PRIMARY KEY,
+      ticket_id TEXT NOT NULL,
+      technician TEXT NOT NULL,
+      minutes INTEGER NOT NULL DEFAULT 15,
+      work_type TEXT NOT NULL DEFAULT 'Remote Support',
+      notes TEXT NOT NULL DEFAULT '',
+      billable INTEGER NOT NULL DEFAULT 1,
+      synced_external INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (ticket_id) REFERENCES psa_tickets(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS backup_policies (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      engine TEXT NOT NULL DEFAULT 'restic',
+      target_repo TEXT NOT NULL DEFAULT '',
+      schedule_cron TEXT NOT NULL DEFAULT '0 1 * * *',
+      include_paths_json TEXT NOT NULL DEFAULT '["/etc","/home","C:\\\\Users"]',
+      exclude_paths_json TEXT NOT NULL DEFAULT '["*.tmp","node_modules"]',
+      retention_days INTEGER NOT NULL DEFAULT 30,
+      encryption_enabled INTEGER NOT NULL DEFAULT 1,
+      tenant_id TEXT,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS device_backup_jobs (
+      id TEXT PRIMARY KEY,
+      device_id TEXT NOT NULL,
+      policy_id TEXT,
+      engine TEXT NOT NULL DEFAULT 'restic',
+      status TEXT NOT NULL DEFAULT 'Completed',
+      size_gb REAL NOT NULL DEFAULT 0.0,
+      duration_sec INTEGER NOT NULL DEFAULT 0,
+      snapshot_id TEXT NOT NULL DEFAULT '',
+      details TEXT NOT NULL DEFAULT '',
+      executed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS mdm_profiles (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      provider TEXT NOT NULL DEFAULT 'intune',
+      platform TEXT NOT NULL DEFAULT 'windows',
+      config_json TEXT NOT NULL DEFAULT '{}',
+      compliance_rules_json TEXT NOT NULL DEFAULT '{}',
+      tenant_id TEXT,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      last_synced_at TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
   `);
@@ -798,73 +1045,58 @@ export function runDatabaseMigrations() {
   const safeAddColumn = (table: string, columnDef: string) => {
     try {
       db.exec(`ALTER TABLE ${table} ADD COLUMN ${columnDef}`);
-    } catch {
-      // Column already exists
+    } catch (err: any) {
+      const msg = String(err?.message || '');
+      if (!/duplicate column name/i.test(msg)) {
+        throw err;
+      }
     }
   };
 
-  // Core table creation for upgraded older DBs
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS auth_sessions (
-      token_hash TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      mfa_verified_until TEXT,
-      ip_address TEXT,
-      user_agent TEXT,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS script_executions (
-      id TEXT PRIMARY KEY,
-      script_id TEXT NOT NULL,
-      script_name TEXT NOT NULL,
-      device_id TEXT NOT NULL,
-      hostname TEXT NOT NULL,
-      run_as TEXT NOT NULL DEFAULT 'system',
-      params_json TEXT,
-      status TEXT NOT NULL DEFAULT 'Completed',
-      exit_code INTEGER NOT NULL DEFAULT 0,
-      output TEXT NOT NULL,
-      triggered_by TEXT NOT NULL,
-      executed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS deleted_tenant_device_tombstones (
-      device_id TEXT PRIMARY KEY,
-      mesh_node_id TEXT,
-      hostname TEXT NOT NULL,
-      tenant_id TEXT NOT NULL,
-      tenant_name TEXT NOT NULL,
-      laps_action TEXT NOT NULL DEFAULT 'remove_account',
-      quiet_offboarded_at TEXT,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
-
-  // User authentication & MFA columns
+  // User authentication, MFA, OIDC & RBAC columns
   safeAddColumn('users', 'password_hash TEXT');
   safeAddColumn('users', 'totp_secret TEXT');
   safeAddColumn('users', 'totp_enabled INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('users', 'totp_confirmed_at TEXT');
   safeAddColumn('users', 'last_totp_step INTEGER');
   safeAddColumn('users', 'recovery_codes_json TEXT');
   safeAddColumn('users', 'last_login_at TEXT');
+  safeAddColumn('users', 'oidc_issuer TEXT');
+  safeAddColumn('users', 'oidc_sub TEXT');
+  safeAddColumn('users', 'custom_role_id TEXT');
+  safeAddColumn('users', 'password_changed_at TEXT');
 
-  // Device extended columns
+  // Backfill totp_confirmed_at for legacy users who already completed at least one TOTP step
+  try {
+    db.exec('UPDATE users SET totp_confirmed_at = COALESCE(totp_confirmed_at, last_login_at, created_at) WHERE last_totp_step IS NOT NULL AND totp_confirmed_at IS NULL');
+  } catch {
+    // Ignore if empty
+  }
+
+  // Device extended columns (strict SQLite single-quoted constant defaults)
   safeAddColumn('devices', 'maintenance_until TEXT');
   safeAddColumn('devices', 'warranty_expiration TEXT');
-  safeAddColumn('devices', 'enrolled_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP');
+  safeAddColumn('devices', 'enrolled_at TEXT');
+  try {
+    db.exec('UPDATE devices SET enrolled_at = COALESCE(enrolled_at, created_at, CURRENT_TIMESTAMP) WHERE enrolled_at IS NULL');
+  } catch {
+    // Ignore if empty
+  }
   safeAddColumn('devices', 'intel_amt_reachable INTEGER NOT NULL DEFAULT 0');
-  safeAddColumn('devices', 'mesh_server_id TEXT NOT NULL DEFAULT "ms2-primary"');
-  safeAddColumn('devices', 'agent_privilege_mode TEXT NOT NULL DEFAULT "system_service"');
+  safeAddColumn('devices', 'wol_supported INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('devices', "wol_status TEXT NOT NULL DEFAULT 'Enabled'");
+  safeAddColumn('devices', 'amt_supported INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('devices', 'amt_provisioned INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('devices', "amt_version TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('devices', "mesh_server_id TEXT NOT NULL DEFAULT 'ms2-primary'");
+  safeAddColumn('devices', "agent_privilege_mode TEXT NOT NULL DEFAULT 'system_service'");
   safeAddColumn('devices', 'companion_installed INTEGER NOT NULL DEFAULT 1');
   safeAddColumn('devices', 'agent_code_signed INTEGER NOT NULL DEFAULT 1');
-  safeAddColumn('devices', 'manufacturer TEXT NOT NULL DEFAULT ""');
-  safeAddColumn('devices', 'model TEXT NOT NULL DEFAULT ""');
+  safeAddColumn('devices', "manufacturer TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('devices', "model TEXT NOT NULL DEFAULT ''");
   safeAddColumn('devices', 'pending_reboot_since TEXT');
   safeAddColumn('devices', 'agent_auth_token TEXT');
-  safeAddColumn('devices', 'lifecycle_state TEXT NOT NULL DEFAULT "active"');
+  safeAddColumn('devices', "lifecycle_state TEXT NOT NULL DEFAULT 'active'");
   safeAddColumn('devices', 'offboard_queued_at TEXT');
   safeAddColumn('devices', 'offboarded_at TEXT');
   safeAddColumn('devices', 'offboard_reason TEXT');
@@ -872,25 +1104,44 @@ export function runDatabaseMigrations() {
   safeAddColumn('devices', 'offboard_laps_action_taken TEXT');
   safeAddColumn('devices', 'resurrected_at TEXT');
   safeAddColumn('devices', 'resurrect_count INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('devices', 'last_patch_scan TEXT');
+  safeAddColumn('devices', "patch_ring TEXT NOT NULL DEFAULT 'production'");
+  safeAddColumn('devices', "edr_policy_json TEXT NOT NULL DEFAULT '{}'");
+  safeAddColumn('devices', 'av_last_scan TEXT');
+  safeAddColumn('devices', "tags_json TEXT NOT NULL DEFAULT '[]'");
+  safeAddColumn('devices', "mdm_compliance_status TEXT NOT NULL DEFAULT 'Unmanaged'");
+  safeAddColumn('devices', "last_backup_status TEXT NOT NULL DEFAULT 'Unconfigured'");
+  safeAddColumn('devices', 'last_backup_at TEXT');
+  safeAddColumn('devices', "companion_version TEXT NOT NULL DEFAULT '2.6.0'");
+  safeAddColumn('devices', 'logged_in_user TEXT');
+  safeAddColumn('devices', 'reboot_required INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('devices', 'uptime_seconds INTEGER NOT NULL DEFAULT 0');
 
   // Patches, Hardware & Network History
   safeAddColumn('patches', 'cve_id TEXT');
   safeAddColumn('patches', 'cvss_score REAL');
+  safeAddColumn('patches', 'is_blacklisted INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('patches', "ring TEXT NOT NULL DEFAULT 'production'");
+  safeAddColumn('patches', "source_type TEXT NOT NULL DEFAULT 'os'");
   safeAddColumn('hardware_history', 'acknowledged INTEGER NOT NULL DEFAULT 0');
   safeAddColumn('network_history', 'local_ip TEXT');
+  safeAddColumn('network_history', 'public_ip TEXT');
 
   // Tenants & Scripts
   safeAddColumn('tenants', 'mesh_group_id TEXT');
-  safeAddColumn('tenants', 'mesh_server_id TEXT NOT NULL DEFAULT "ms2-primary"');
-  safeAddColumn('tenants', 'lifecycle_state TEXT NOT NULL DEFAULT "active"');
+  safeAddColumn('tenants', "mesh_server_id TEXT NOT NULL DEFAULT 'ms2-primary'");
+  safeAddColumn('tenants', "lifecycle_state TEXT NOT NULL DEFAULT 'active'");
   safeAddColumn('tenants', 'archived_at TEXT');
   safeAddColumn('tenants', 'offboard_reason TEXT');
   safeAddColumn('tenants', 'offline_auto_archive_days INTEGER NOT NULL DEFAULT 14');
 
   safeAddColumn('scripts', 'enabled INTEGER NOT NULL DEFAULT 1');
-  safeAddColumn('scripts', 'required_role TEXT NOT NULL DEFAULT "technician"');
+  safeAddColumn('scripts', "required_role TEXT NOT NULL DEFAULT 'technician'");
   safeAddColumn('scripts', 'is_builtin INTEGER NOT NULL DEFAULT 0');
   safeAddColumn('scripts', 'tenant_id TEXT DEFAULT NULL');
+  safeAddColumn('scripts', "os_type TEXT NOT NULL DEFAULT 'all'");
+  safeAddColumn('scripts', "parameters_schema_json TEXT NOT NULL DEFAULT '[]'");
+  safeAddColumn('scripts', 'timeout_sec INTEGER NOT NULL DEFAULT 300');
 
   // Policy & LAPS extended columns + explicit override tracking
   safeAddColumn('policies', 'overrides_json TEXT');
@@ -899,13 +1150,13 @@ export function runDatabaseMigrations() {
   safeAddColumn('policies', 'final_countdown_sec INTEGER NOT NULL DEFAULT 300');
   safeAddColumn('policies', 'laps_enabled INTEGER NOT NULL DEFAULT 1');
   safeAddColumn('policies', 'laps_auto_create_account INTEGER NOT NULL DEFAULT 1');
-  safeAddColumn('policies', 'laps_account_name TEXT NOT NULL DEFAULT "LocalAdmin"');
-  safeAddColumn('policies', 'laps_password_mode TEXT NOT NULL DEFAULT "random"');
+  safeAddColumn('policies', "laps_account_name TEXT NOT NULL DEFAULT 'LocalAdmin'");
+  safeAddColumn('policies', "laps_password_mode TEXT NOT NULL DEFAULT 'random'");
   safeAddColumn('policies', 'laps_password_length INTEGER NOT NULL DEFAULT 20');
-  safeAddColumn('policies', 'laps_complexity TEXT NOT NULL DEFAULT "alphanumeric_symbols"');
+  safeAddColumn('policies', "laps_complexity TEXT NOT NULL DEFAULT 'alphanumeric_symbols'");
   safeAddColumn('policies', 'laps_passphrase_words INTEGER NOT NULL DEFAULT 5');
-  safeAddColumn('policies', 'laps_passphrase_separator TEXT NOT NULL DEFAULT "-"');
-  safeAddColumn('policies', 'laps_static_password TEXT NOT NULL DEFAULT ""');
+  safeAddColumn('policies', "laps_passphrase_separator TEXT NOT NULL DEFAULT '-'");
+  safeAddColumn('policies', "laps_static_password TEXT NOT NULL DEFAULT ''");
   safeAddColumn('policies', 'laps_rotation_days INTEGER NOT NULL DEFAULT 30');
   safeAddColumn('policies', 'laps_rotate_on_access INTEGER NOT NULL DEFAULT 1');
   safeAddColumn('policies', 'laps_post_access_grace_hours INTEGER NOT NULL DEFAULT 2');
@@ -917,22 +1168,34 @@ export function runDatabaseMigrations() {
   safeAddColumn('policies', 'self_healing_alert_psa INTEGER NOT NULL DEFAULT 1');
   safeAddColumn('policies', 'psa_flap_grace_minutes INTEGER NOT NULL DEFAULT 15');
   safeAddColumn('policies', 'auto_patch_cve_min_cvss REAL NOT NULL DEFAULT 8.0');
-  safeAddColumn('policies', 'laps_cleanup_old_account_on_rename TEXT NOT NULL DEFAULT "disable"');
+  safeAddColumn('policies', "laps_cleanup_old_account_on_rename TEXT NOT NULL DEFAULT 'disable'");
   safeAddColumn('policies', 'laps_disable_builtin_sid500_admin INTEGER NOT NULL DEFAULT 1');
-  safeAddColumn('policies', 'laps_offboard_explicit_device_action TEXT NOT NULL DEFAULT "remove_account"');
-  safeAddColumn('policies', 'laps_offboard_client_archived_action TEXT NOT NULL DEFAULT "keep_account_rotate_final"');
-  safeAddColumn('policies', 'laps_offboard_client_deleted_action TEXT NOT NULL DEFAULT "remove_account"');
+  safeAddColumn('policies', "laps_offboard_explicit_device_action TEXT NOT NULL DEFAULT 'remove_account'");
+  safeAddColumn('policies', "laps_offboard_client_archived_action TEXT NOT NULL DEFAULT 'keep_account_rotate_final'");
+  safeAddColumn('policies', "laps_offboard_client_deleted_action TEXT NOT NULL DEFAULT 'remove_account'");
   safeAddColumn('policies', 'offboard_offline_auto_archive_days INTEGER NOT NULL DEFAULT 14');
   safeAddColumn('policies', 'alert_rules_json TEXT');
+  safeAddColumn('policies', 'os_patch_approval_json TEXT');
+  safeAddColumn('policies', 'third_party_patch_approval_json TEXT');
+  safeAddColumn('policies', 'required_software_json TEXT');
+  safeAddColumn('policies', 'defender_policy_json TEXT');
+  safeAddColumn('policies', "patch_ring TEXT NOT NULL DEFAULT 'production'");
+  safeAddColumn('policies', 'patch_delay_days INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('policies', 'defender_managed INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('policies', 'bitlocker_enforced INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('policies', 'backup_policy_id TEXT');
+  safeAddColumn('policies', 'mdm_profile_id TEXT');
+  safeAddColumn('kb_blacklist', "kb_id TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('kb_blacklist', "title TEXT NOT NULL DEFAULT ''");
 
   // Settings extended columns
-  safeAddColumn('settings', 'code_signing_url TEXT NOT NULL DEFAULT ""');
+  safeAddColumn('settings', "code_signing_url TEXT NOT NULL DEFAULT ''");
   safeAddColumn('settings', 'session_recording_enabled INTEGER NOT NULL DEFAULT 1');
   safeAddColumn('settings', 'session_recording_retention_days INTEGER NOT NULL DEFAULT 90');
-  safeAddColumn('settings', 'session_recording_quality TEXT NOT NULL DEFAULT "high"');
+  safeAddColumn('settings', "session_recording_quality TEXT NOT NULL DEFAULT 'high'");
   safeAddColumn('settings', 'session_recording_visual_indicator INTEGER NOT NULL DEFAULT 1');
   safeAddColumn('settings', 'mesh_sync_enabled INTEGER NOT NULL DEFAULT 1');
-  safeAddColumn('settings', 'mesh_client_delete_action TEXT NOT NULL DEFAULT "move_to_unassigned"');
+  safeAddColumn('settings', "mesh_client_delete_action TEXT NOT NULL DEFAULT 'move_to_unassigned'");
   safeAddColumn('settings', 'mesh_external_delete_prompt INTEGER NOT NULL DEFAULT 1');
   safeAddColumn('settings', 'code_signing_enabled INTEGER NOT NULL DEFAULT 0');
   safeAddColumn('settings', 'code_signing_sign_scripts INTEGER NOT NULL DEFAULT 1');
@@ -940,62 +1203,69 @@ export function runDatabaseMigrations() {
   safeAddColumn('settings', 'code_signing_sign_assemblies INTEGER NOT NULL DEFAULT 1');
   safeAddColumn('settings', 'code_signing_sign_ms2_binary INTEGER NOT NULL DEFAULT 1');
   safeAddColumn('settings', 'code_signing_strict_verify INTEGER NOT NULL DEFAULT 1');
-  safeAddColumn('settings', 'installer_download_role TEXT NOT NULL DEFAULT "technician"');
+  safeAddColumn('settings', "installer_download_role TEXT NOT NULL DEFAULT 'technician'");
   safeAddColumn('settings', 'installer_require_ticket INTEGER NOT NULL DEFAULT 0');
-  safeAddColumn('settings', 'installer_gui_style TEXT NOT NULL DEFAULT "modern_glass"');
-  safeAddColumn('settings', 'installer_service_name TEXT NOT NULL DEFAULT "VitrineAgent"');
-  safeAddColumn('settings', 'installer_welcome_text TEXT NOT NULL DEFAULT "Installing Enterprise IT Support & Endpoint Protection"');
+  safeAddColumn('settings', "installer_gui_style TEXT NOT NULL DEFAULT 'modern_glass'");
+  safeAddColumn('settings', "installer_service_name TEXT NOT NULL DEFAULT 'VitrineAgent'");
+  safeAddColumn('settings', "installer_welcome_text TEXT NOT NULL DEFAULT 'Installing Enterprise IT Support & Endpoint Protection'");
   safeAddColumn('settings', 'session_recording_stealth_for_techs INTEGER NOT NULL DEFAULT 0');
   safeAddColumn('settings', 'maintenance_auto_clear_hours INTEGER NOT NULL DEFAULT 24');
-  safeAddColumn('settings', 'totp_secret TEXT NOT NULL DEFAULT ""');
+  safeAddColumn('settings', "totp_secret TEXT NOT NULL DEFAULT ''");
   safeAddColumn('settings', 'oobe_completed INTEGER NOT NULL DEFAULT 0');
-  safeAddColumn('settings', 'theme_mode TEXT NOT NULL DEFAULT "system"');
-  safeAddColumn('settings', 'tray_theme_mode TEXT NOT NULL DEFAULT "system"');
+  safeAddColumn('settings', "theme_mode TEXT NOT NULL DEFAULT 'system'");
+  safeAddColumn('settings', "tray_theme_mode TEXT NOT NULL DEFAULT 'system'");
   safeAddColumn('settings', 'quicksupport_enabled INTEGER NOT NULL DEFAULT 1');
-  safeAddColumn('settings', 'quicksupport_custom_domain TEXT NOT NULL DEFAULT ""');
-  safeAddColumn('settings', 'quicksupport_url_path TEXT NOT NULL DEFAULT "/remote"');
-  safeAddColumn('settings', 'tls_mode TEXT NOT NULL DEFAULT "reverse_proxy"');
-  safeAddColumn('settings', 'reverse_proxy_type TEXT NOT NULL DEFAULT "nginx"');
-  safeAddColumn('settings', 'letsencrypt_email TEXT NOT NULL DEFAULT ""');
-  safeAddColumn('settings', 'update_channel TEXT NOT NULL DEFAULT "stable"');
-  safeAddColumn('settings', 'installed_version TEXT NOT NULL DEFAULT "2.5.0"');
-  safeAddColumn('settings', 'installed_commit TEXT NOT NULL DEFAULT "v2.5.0"');
-  safeAddColumn('settings', 'db_schema_version INTEGER NOT NULL DEFAULT 15');
+  safeAddColumn('settings', "quicksupport_custom_domain TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('settings', "quicksupport_url_path TEXT NOT NULL DEFAULT '/remote'");
+  safeAddColumn('settings', "tls_mode TEXT NOT NULL DEFAULT 'reverse_proxy'");
+  safeAddColumn('settings', "reverse_proxy_type TEXT NOT NULL DEFAULT 'nginx'");
+  safeAddColumn('settings', "letsencrypt_email TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('settings', "update_channel TEXT NOT NULL DEFAULT 'stable'");
+  safeAddColumn('settings', "installed_version TEXT NOT NULL DEFAULT '2.6.0'");
+  safeAddColumn('settings', "installed_commit TEXT NOT NULL DEFAULT 'v2.6.0'");
+  safeAddColumn('settings', 'db_schema_version INTEGER NOT NULL DEFAULT 18');
   safeAddColumn('settings', 'update_auto_backup INTEGER NOT NULL DEFAULT 1');
   safeAddColumn('settings', 'update_auto_rollback INTEGER NOT NULL DEFAULT 1');
   safeAddColumn('settings', 'update_notify_webui INTEGER NOT NULL DEFAULT 1');
   safeAddColumn('settings', 'update_notify_email INTEGER NOT NULL DEFAULT 0');
   safeAddColumn('settings', 'update_create_psa_ticket INTEGER NOT NULL DEFAULT 0');
   safeAddColumn('settings', 'backup_schedule_enabled INTEGER NOT NULL DEFAULT 1');
-  safeAddColumn('settings', 'backup_schedule_frequency TEXT NOT NULL DEFAULT "daily"');
-  safeAddColumn('settings', 'backup_schedule_time TEXT NOT NULL DEFAULT "03:00"');
+  safeAddColumn('settings', "backup_schedule_frequency TEXT NOT NULL DEFAULT 'daily'");
+  safeAddColumn('settings', "backup_schedule_time TEXT NOT NULL DEFAULT '03:00'");
   safeAddColumn('settings', 'backup_retention_count INTEGER NOT NULL DEFAULT 14');
   safeAddColumn('settings', 'backup_max_storage_mb INTEGER NOT NULL DEFAULT 2048');
   safeAddColumn('settings', 'backup_include_branding INTEGER NOT NULL DEFAULT 1');
   safeAddColumn('settings', 'backup_include_mesh_config INTEGER NOT NULL DEFAULT 1');
   safeAddColumn('settings', 'backup_encryption_enabled INTEGER NOT NULL DEFAULT 1');
-  safeAddColumn('settings', 'backup_encryption_passphrase TEXT NOT NULL DEFAULT ""');
+  safeAddColumn('settings', "backup_encryption_passphrase TEXT NOT NULL DEFAULT ''");
   safeAddColumn('settings', 'backup_offsite_enabled INTEGER NOT NULL DEFAULT 0');
-  safeAddColumn('settings', 'backup_offsite_provider TEXT NOT NULL DEFAULT "s3"');
-  safeAddColumn('settings', 'backup_offsite_endpoint TEXT NOT NULL DEFAULT ""');
-  safeAddColumn('settings', 'backup_offsite_bucket TEXT NOT NULL DEFAULT ""');
-  safeAddColumn('settings', 'backup_offsite_access_key TEXT NOT NULL DEFAULT ""');
-  safeAddColumn('settings', 'backup_offsite_secret_key TEXT NOT NULL DEFAULT ""');
-  safeAddColumn('settings', 'oidc_client_secret TEXT NOT NULL DEFAULT ""');
-  safeAddColumn('settings', 'psa_webhook_secret TEXT NOT NULL DEFAULT ""');
-  safeAddColumn('settings', 'agent_enrollment_secret TEXT NOT NULL DEFAULT ""');
+  safeAddColumn('settings', "backup_offsite_provider TEXT NOT NULL DEFAULT 's3'");
+  safeAddColumn('settings', "backup_offsite_endpoint TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('settings', "backup_offsite_bucket TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('settings', "backup_offsite_access_key TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('settings', "backup_offsite_secret_key TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('settings', "oidc_client_secret TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('settings', "psa_webhook_secret TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('settings', "agent_enrollment_secret TEXT NOT NULL DEFAULT ''");
   safeAddColumn('settings', 'patch_auto_approve_third_party INTEGER NOT NULL DEFAULT 1');
   safeAddColumn('settings', 'patch_canary_delay_days INTEGER NOT NULL DEFAULT 3');
   safeAddColumn('settings', 'backup_key_acknowledged INTEGER NOT NULL DEFAULT 0');
   safeAddColumn('notifications', 'tenant_id TEXT');
 
-  // Installer, Guest, Backup, LAPS, Appliances & Virtualization extended columns
-  safeAddColumn('installer_audit_log', 'platform TEXT NOT NULL DEFAULT "windows"');
+  // Installer, Guest, Backup, Recordings, Tombstones, LAPS, Appliances & Virtualization extended columns
+  safeAddColumn('installer_audit_log', "platform TEXT NOT NULL DEFAULT 'windows'");
   safeAddColumn('installer_audit_log', 'expires_at TEXT');
+  safeAddColumn('installer_audit_log', 'max_uses INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('installer_audit_log', 'use_count INTEGER NOT NULL DEFAULT 0');
   safeAddColumn('guest_access_grants', 'password_hash TEXT');
   safeAddColumn('system_backups', 'encrypted INTEGER NOT NULL DEFAULT 0');
   safeAddColumn('system_backups', 'offsite_synced INTEGER NOT NULL DEFAULT 0');
-  safeAddColumn('system_backups', 'offsite_location TEXT NOT NULL DEFAULT "local-only"');
+  safeAddColumn('system_backups', "offsite_location TEXT NOT NULL DEFAULT 'local-only'");
+  safeAddColumn('session_recordings', 'video_path TEXT');
+  safeAddColumn('session_recordings', "mime_type TEXT NOT NULL DEFAULT 'video/webm'");
+  safeAddColumn('session_recordings', 'file_size_bytes INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('deleted_tenant_device_tombstones', "laps_account_name TEXT NOT NULL DEFAULT 'LocalAdmin'");
+  safeAddColumn('deleted_tenant_device_tombstones', "os_type TEXT NOT NULL DEFAULT 'windows'");
 
   safeAddColumn('laps_vault', 'previous_account_name TEXT');
   safeAddColumn('laps_vault', 'previous_encrypted_password TEXT');
@@ -1005,14 +1275,102 @@ export function runDatabaseMigrations() {
   safeAddColumn('laps_vault', 'pending_rotation_reason TEXT');
   safeAddColumn('laps_vault', 'pending_account_name TEXT');
 
-  safeAddColumn('network_appliances', 'integration_protocol TEXT NOT NULL DEFAULT "generic_snmp_v3"');
+  safeAddColumn('network_appliances', "integration_protocol TEXT NOT NULL DEFAULT 'generic_snmp_v3'");
   safeAddColumn('network_appliances', 'vendor_api_endpoint TEXT');
   safeAddColumn('network_appliances', 'vendor_api_token_masked TEXT');
   safeAddColumn('network_appliances', 'vendor_api_token_encrypted TEXT');
+  safeAddColumn('network_appliances', 'snmp_community_encrypted TEXT');
+  safeAddColumn('network_appliances', 'snmp_v3_user TEXT');
+  safeAddColumn('network_appliances', "snmp_v3_auth_proto TEXT DEFAULT 'SHA'");
+  safeAddColumn('network_appliances', 'snmp_v3_auth_key_encrypted TEXT');
+  safeAddColumn('network_appliances', "snmp_v3_priv_proto TEXT DEFAULT 'AES'");
+  safeAddColumn('network_appliances', 'snmp_v3_priv_key_encrypted TEXT');
+  safeAddColumn('network_appliances', 'snmp_port INTEGER NOT NULL DEFAULT 161');
 
   safeAddColumn('virtualization_hosts', 'api_port INTEGER NOT NULL DEFAULT 8006');
   safeAddColumn('virtualization_hosts', 'api_username TEXT');
   safeAddColumn('virtualization_hosts', 'api_token_encrypted TEXT');
+  safeAddColumn('virtualization_hosts', 'allow_self_signed INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('virtualization_hosts', 'tls_fingerprint_sha256 TEXT');
+  safeAddColumn('virtualization_hosts', 'linked_device_id TEXT');
+  safeAddColumn('virtualization_vms', 'node_name TEXT');
+  safeAddColumn('virtualization_vms', 'moref_id TEXT');
+
+  // Extended parity & telemetry columns across new and existing tables
+  safeAddColumn('script_executions', "triggered_by TEXT NOT NULL DEFAULT 'admin'");
+  safeAddColumn('script_executions', "stdout TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('script_executions', "stderr TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('script_executions', 'duration_ms INTEGER NOT NULL DEFAULT 0');
+
+  safeAddColumn('agent_tasks', 'tenant_id TEXT');
+  safeAddColumn('agent_tasks', 'dispatched_at TEXT');
+
+  safeAddColumn('scheduled_automations', "cron_expr TEXT NOT NULL DEFAULT '0 3 * * *'");
+  safeAddColumn('scheduled_automations', "parameters_json TEXT NOT NULL DEFAULT '{}'");
+  safeAddColumn('scheduled_automations', 'missed_run_catchup INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('scheduled_automations', 'tenant_id TEXT');
+  safeAddColumn('scheduled_automations', 'run_count INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('scheduled_automations', "schedule_type TEXT NOT NULL DEFAULT 'cron'");
+
+  safeAddColumn('software_packages', "os_type TEXT NOT NULL DEFAULT 'windows'");
+  safeAddColumn('software_packages', "package_manager TEXT NOT NULL DEFAULT 'winget'");
+  safeAddColumn('software_packages', 'installer_url TEXT');
+  safeAddColumn('software_deployments', 'exit_code INTEGER');
+
+  safeAddColumn('alert_incidents', "first_seen_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'");
+  safeAddColumn('alert_incidents', "last_seen_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'");
+  safeAddColumn('alert_incidents', 'acknowledged_by TEXT');
+  safeAddColumn('alert_incidents', 'psa_ticket_number TEXT');
+  safeAddColumn('alert_incidents', 'occurrence_count INTEGER NOT NULL DEFAULT 1');
+
+  safeAddColumn('notification_channels', 'routing_key_encrypted TEXT');
+  safeAddColumn('notification_channels', 'secret_encrypted TEXT');
+
+  safeAddColumn('documentation_articles', 'encrypted_secrets_json TEXT');
+  safeAddColumn('documentation_articles', 'linked_script_id TEXT');
+  safeAddColumn('documentation_articles', 'version INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('documentation_articles', 'last_edited_by TEXT');
+
+  safeAddColumn('psa_integrations', 'api_key_encrypted TEXT');
+  safeAddColumn('psa_integrations', 'client_secret_encrypted TEXT');
+  safeAddColumn('psa_integrations', 'auto_sync_tickets INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('psa_integrations', 'auto_sync_assets INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('psa_time_entries', 'minutes_spent INTEGER NOT NULL DEFAULT 15');
+
+  safeAddColumn('backup_policies', "repository_url TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('backup_policies', 'repository_password_encrypted TEXT');
+  safeAddColumn('device_backup_jobs', "hostname TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('device_backup_jobs', 'bytes_processed INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('device_backup_jobs', "output TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('device_backup_jobs', "started_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'");
+  safeAddColumn('device_backup_jobs', 'completed_at TEXT');
+
+  safeAddColumn('mdm_profiles', "profile_type TEXT NOT NULL DEFAULT 'security_baseline'");
+  safeAddColumn('mdm_profiles', "payload_xml TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('mdm_profiles', "settings_json TEXT NOT NULL DEFAULT '{}'");
+
+  safeAddColumn('network_appliances', 'firmware_version TEXT');
+  safeAddColumn('network_appliances', 'uptime_hours REAL NOT NULL DEFAULT 0.0');
+  safeAddColumn('network_appliances', 'cpu_usage REAL NOT NULL DEFAULT 0.0');
+  safeAddColumn('network_appliances', 'temperature_c REAL NOT NULL DEFAULT 0.0');
+  safeAddColumn('network_appliances', 'snmp_v3_username TEXT');
+  safeAddColumn('network_appliances', "snmp_v3_auth_protocol TEXT DEFAULT 'SHA'");
+  safeAddColumn('network_appliances', 'api_token_encrypted TEXT');
+  safeAddColumn('network_appliances', "vendor TEXT NOT NULL DEFAULT ''");
+
+  safeAddColumn('api_keys', "role TEXT NOT NULL DEFAULT 'technician'");
+
+  // Additional parity, TLS, S3 region, code-signing auth, retention & tombstone columns
+  safeAddColumn('settings', 'meshcentral_allow_self_signed INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('settings', "backup_offsite_region TEXT NOT NULL DEFAULT 'us-east-1'");
+  safeAddColumn('settings', "code_signing_api_key TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('policies', 'session_recording_retention_days INTEGER NOT NULL DEFAULT 90');
+  safeAddColumn('psa_integrations', 'last_error TEXT');
+  safeAddColumn('notification_channels', 'last_error TEXT');
+  safeAddColumn('backup_policies', 'last_run_at TEXT');
+  safeAddColumn('deleted_tenant_device_tombstones', 'agent_token_hash TEXT');
+  safeAddColumn('agent_tasks', "stdout TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('agent_tasks', "stderr TEXT NOT NULL DEFAULT ''");
 
   // Deduplicate custom_field_values before enforcing UNIQUE(field_id, entity_id)
   try {
@@ -1055,7 +1413,8 @@ function migrateSecretsAndRuntimeMetadata() {
         'backup_offsite_secret_key',
         'oidc_client_secret',
         'psa_webhook_secret',
-        'agent_enrollment_secret'
+        'agent_enrollment_secret',
+        'code_signing_api_key'
       ];
 
       for (const col of secretColumns) {
@@ -1201,12 +1560,13 @@ $keys | ConvertTo-Json -Compress`,
     {
       id: 'scr-4',
       name: 'Cyber Isolation: Emergency Network Quarantine',
-      description: 'Applies strict Windows Defender Firewall rules dropping inbound/outbound traffic except the RMM control plane.',
+      description: 'Applies strict Windows Defender Firewall default-deny policy while preserving explicit Allow rules for RMM & MeshAgent.',
       language: 'powershell',
-      code: `New-NetFirewallRule -DisplayName "VITRINE_QUARANTINE_IN" -Direction Inbound -Action Block -Profile Any -ErrorAction SilentlyContinue
-New-NetFirewallRule -DisplayName "VITRINE_QUARANTINE_OUT" -Direction Outbound -Action Block -Profile Any -ErrorAction SilentlyContinue
-New-NetFirewallRule -DisplayName "VITRINE_QUARANTINE_ALLOW_RMM" -Direction Outbound -Action Allow -Protocol TCP -RemotePort 443, 4430, 8080 -ErrorAction SilentlyContinue
-Write-Output "Endpoint isolated from lateral network traffic; RMM control channel preserved."`,
+      code: `New-NetFirewallRule -DisplayName "VITRINE_QUARANTINE_ALLOW_AGENT" -Direction Outbound -Action Allow -Program "$env:ProgramFiles\\Mesh Agent\\MeshAgent.exe" -Profile Any -ErrorAction SilentlyContinue
+New-NetFirewallRule -DisplayName "VITRINE_QUARANTINE_ALLOW_DNS" -Direction Outbound -Action Allow -Protocol UDP -RemotePort 53 -Profile Any -ErrorAction SilentlyContinue
+New-NetFirewallRule -DisplayName "VITRINE_QUARANTINE_ALLOW_RMM" -Direction Outbound -Action Allow -Protocol TCP -RemotePort 443, 4430, 8080 -Profile Any -ErrorAction SilentlyContinue
+Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultInboundAction Block -DefaultOutboundAction Block
+Write-Output "Endpoint isolated via DefaultOutboundAction=Block; RMM control channel preserved."`,
       category: 'Security',
       required_role: 'msp_super_admin'
     },
@@ -1351,6 +1711,79 @@ df -h /`,
     insCf.run('cf-4', 'bdr_tier', 'BDR Backup Strategy', 'Security', 'dropdown', 'device', JSON.stringify(['Tier 1 - Hourly VSS + Cloud Immutable', 'Tier 2 - Daily Image', 'Tier 3 - File-Level Restic', 'Unmanaged / Excluded']), 'Backup & Disaster Recovery policy assignment');
     insCf.run('cf-5', 'gl_billing_code', 'GL Billing Cost Code', 'Billing', 'text', 'tenant', null, 'ERP sync accounting reference');
     insCf.run('cf-6', 'vip_escalation', 'VIP Support SLA Escalation', 'Custom', 'checkbox', 'device', null, 'Enables immediate P1 response paging for executive endpoints');
+  }
+
+  // 5. System Custom RBAC Role Templates (NinjaOne-style Granular Permission Matrix)
+  const roleCount = (db.prepare('SELECT COUNT(*) as c FROM custom_roles').get() as { c: number }).c;
+  if (roleCount === 0) {
+    const insRole = db.prepare(`
+      INSERT OR IGNORE INTO custom_roles (id, name, description, base_tier, permissions_json, allowed_tenant_ids_json, is_system)
+      VALUES (?, ?, ?, ?, ?, '[]', 1)
+    `);
+    insRole.run(
+      'role-msp-super-admin',
+      'MSP Super Administrator',
+      'Unrestricted global platform, security policy, vault, user, and backup administration.',
+      'super_admin',
+      JSON.stringify([
+        'devices:read', 'devices:manage', 'remote:connect', 'remote:unattended', 'remote:elevate',
+        'scripts:run', 'scripts:write', 'automations:manage', 'patches:approve', 'software:deploy',
+        'laps:reveal', 'laps:rotate', 'policies:write', 'alerts:triage', 'docs:write',
+        'psa:manage', 'users:manage', 'backups:manage', 'settings:write', 'audit:export'
+      ])
+    );
+    insRole.run(
+      'role-senior-tech',
+      'Senior Systems Engineer (Tier 3)',
+      'Full remote control, scripting, patch approval, software deployment, and LAPS access across assigned clients.',
+      'technician',
+      JSON.stringify([
+        'devices:read', 'devices:manage', 'remote:connect', 'remote:unattended', 'remote:elevate',
+        'scripts:run', 'scripts:write', 'automations:manage', 'patches:approve', 'software:deploy',
+        'laps:reveal', 'laps:rotate', 'alerts:triage', 'docs:write', 'psa:manage'
+      ])
+    );
+    insRole.run(
+      'role-helpdesk-t1',
+      'Helpdesk Technician (Tier 1)',
+      'Consent-gated remote desktop, safe diagnostic scripts, alert triage, and documentation read/write.',
+      'technician',
+      JSON.stringify([
+        'devices:read', 'remote:connect', 'scripts:run', 'alerts:triage', 'docs:write', 'psa:manage'
+      ])
+    );
+    insRole.run(
+      'role-security-auditor',
+      'Compliance & Security Auditor',
+      'Read-only access to fleet inventory, patch posture, policies, and compliance audit logs.',
+      'auditor',
+      JSON.stringify(['devices:read', 'audit:export'])
+    );
+    insRole.run(
+      'role-client-it',
+      'Client Co-Managed IT Admin',
+      'Scoped single-tenant inventory, patch visibility, and co-managed workstation support.',
+      'client_admin',
+      JSON.stringify(['devices:read', 'remote:connect', 'alerts:triage'])
+    );
+  }
+
+  // 6. Baseline Cross-Platform Software Package Catalog
+  const pkgCount = (db.prepare('SELECT COUNT(*) as c FROM software_packages').get() as { c: number }).c;
+  if (pkgCount === 0) {
+    const insPkg = db.prepare(`
+      INSERT OR IGNORE INTO software_packages (
+        id, name, vendor, version, platform, package_type, package_identifier,
+        install_args, uninstall_args, detection_rule, category, is_required_baseline
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insPkg.run('pkg-7zip-win', '7-Zip Archiver', 'Igor Pavlov', 'latest', 'windows', 'winget', '7zip.7zip', '--silent --accept-package-agreements --accept-source-agreements', 'uninstall --id 7zip.7zip --silent', 'C:\\Program Files\\7-Zip\\7z.exe', 'Utilities', 1);
+    insPkg.run('pkg-chrome-win', 'Google Chrome Enterprise', 'Google', 'latest', 'windows', 'winget', 'Google.Chrome.EXE', '--silent --accept-package-agreements --accept-source-agreements', 'uninstall --id Google.Chrome.EXE --silent', 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', 'Browsers', 1);
+    insPkg.run('pkg-pwsh-win', 'PowerShell 7 LTS', 'Microsoft', 'latest', 'windows', 'winget', 'Microsoft.PowerShell', '--silent --accept-package-agreements --accept-source-agreements', 'uninstall --id Microsoft.PowerShell --silent', 'C:\\Program Files\\PowerShell\\7\\pwsh.exe', 'Management', 0);
+    insPkg.run('pkg-tailscale-linux', 'htop Process Viewer', 'htop-dev', 'latest', 'linux', 'apt', 'htop', '-y', 'remove -y htop', '/usr/bin/htop', 'Utilities', 0);
+    insPkg.run('pkg-jq-linux', 'jq JSON Processor', 'stedolan', 'latest', 'linux', 'apt', 'jq', '-y', 'remove -y jq', '/usr/bin/jq', 'Utilities', 1);
+    insPkg.run('pkg-restic-linux', 'Restic Encrypted Backup', 'Restic', 'latest', 'linux', 'apt', 'restic', '-y', 'remove -y restic', '/usr/bin/restic', 'Backup & BDR', 0);
+    insPkg.run('pkg-iterm-mac', 'Rectangle Window Manager', 'Ryan Hanson', 'latest', 'macos', 'brew', 'rectangle', '--cask', 'uninstall --cask rectangle', '/Applications/Rectangle.app', 'Productivity', 0);
   }
 }
 

@@ -20,7 +20,7 @@ import {
   BookOpen,
   CheckCircle2
 } from 'lucide-react';
-import { NetworkAppliance } from '../types/index.js';
+import { NetworkAppliance, AuthUser } from '../types/index.js';
 import {
   fetchTopology,
   triggerTopologyScan,
@@ -30,6 +30,7 @@ import {
   pollNetworkAppliance,
   deleteNetworkAppliance
 } from '../services/api.js';
+import { canMutateFleet } from '../utils/permissions.js';
 
 interface SwitchPort {
   port: string;
@@ -57,7 +58,12 @@ interface TopologyData {
   discoveredSubnets: DiscoveredSubnet[];
 }
 
-export const NetworkTopologyView: React.FC = () => {
+interface NetworkTopologyViewProps {
+  currentUser?: AuthUser | null;
+}
+
+export const NetworkTopologyView: React.FC<NetworkTopologyViewProps> = ({ currentUser }) => {
+  const canMutate = canMutateFleet(currentUser);
   const [data, setData] = useState<TopologyData | null>(null);
   const [appliances, setAppliances] = useState<NetworkAppliance[]>([]);
   const [pollingId, setPollingId] = useState<string | null>(null);
@@ -281,15 +287,19 @@ export const NetworkTopologyView: React.FC = () => {
           >
             <BookOpen size={15} /> Vendor API &amp; Probe Setup Guide
           </button>
-          <button className="btn-glass" onClick={() => setShowAddAppliance(true)}>
-            <Plus size={15} /> Add Specialty / Network Appliance
-          </button>
-          <button className="btn-glass" onClick={() => setShowAddPort(true)}>
-            <Plus size={15} /> Map Switch Port
-          </button>
-          <button className="btn-glass btn-primary" onClick={handleTriggerSweep} disabled={scanning}>
-            <RefreshCw size={15} /> {scanning ? 'Sweeping Subnets...' : 'Trigger Subnet Sweep'}
-          </button>
+          {canMutate && (
+            <>
+              <button className="btn-glass" onClick={() => setShowAddAppliance(true)}>
+                <Plus size={15} /> Add Specialty / Network Appliance
+              </button>
+              <button className="btn-glass" onClick={() => setShowAddPort(true)}>
+                <Plus size={15} /> Map Switch Port
+              </button>
+              <button className="btn-glass btn-primary" onClick={handleTriggerSweep} disabled={scanning}>
+                <RefreshCw size={15} /> {scanning ? 'Sweeping Subnets...' : 'Trigger Subnet Sweep'}
+              </button>
+            </>
+          )}
         </div>
       </div>
 
@@ -454,23 +464,25 @@ export const NetworkTopologyView: React.FC = () => {
                   <span>
                     Probe Relay: <strong style={{ color: '#38bdf8' }}>{app.probe_hostname}</strong> ({app.snmp_version.split(' ')[0]})
                   </span>
-                  <div style={{ display: 'flex', gap: '0.4rem' }}>
-                    <button
-                      className="btn-glass"
-                      style={{ padding: '0.2rem 0.55rem', fontSize: '0.7rem' }}
-                      onClick={() => handlePollAppliance(app.id)}
-                      disabled={pollingId === app.id}
-                    >
-                      <Activity size={11} /> {pollingId === app.id ? 'Polling...' : 'Poll Probe'}
-                    </button>
-                    <button
-                      className="btn-glass btn-danger"
-                      style={{ padding: '0.2rem 0.45rem', fontSize: '0.7rem' }}
-                      onClick={() => handleDeleteAppliance(app.id, app.name)}
-                    >
-                      <Trash2 size={11} />
-                    </button>
-                  </div>
+                  {canMutate && (
+                    <div style={{ display: 'flex', gap: '0.4rem' }}>
+                      <button
+                        className="btn-glass"
+                        style={{ padding: '0.2rem 0.55rem', fontSize: '0.7rem' }}
+                        onClick={() => handlePollAppliance(app.id)}
+                        disabled={pollingId === app.id}
+                      >
+                        <Activity size={11} /> {pollingId === app.id ? 'Polling...' : 'Poll Probe'}
+                      </button>
+                      <button
+                        className="btn-glass btn-danger"
+                        style={{ padding: '0.2rem 0.45rem', fontSize: '0.7rem' }}
+                        onClick={() => handleDeleteAppliance(app.id, app.name)}
+                      >
+                        <Trash2 size={11} />
+                      </button>
+                    </div>
+                  )}
                 </div>
               </div>
             );

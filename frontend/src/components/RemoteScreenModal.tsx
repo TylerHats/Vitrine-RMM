@@ -21,28 +21,45 @@ import {
   fetchSettings,
   fetchDeviceConsentStatus,
   negotiateRemoteSession,
-  elevateRemoteAgent
+  elevateRemoteAgent,
+  startGuestPortalRemoteSession
 } from '../services/api.js';
 import { MfaChallengeModal } from './MfaChallengeModal.js';
 
 interface RemoteScreenModalProps {
   device: Device;
   isGhostSession?: boolean;
+  guestGrantId?: string;
+  guestPermissions?: {
+    canRemoteScreen?: boolean;
+    canGhostSession?: boolean;
+  };
   onClose: () => void;
 }
 
 export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
   device,
   isGhostSession = false,
+  guestGrantId,
+  guestPermissions,
   onClose
 }) => {
-  const [sessionMode, setSessionMode] = useState<'kvm' | 'ghost' | 'amt_kvm'>(isGhostSession ? 'ghost' : 'kvm');
+  const isGuestPortal = Boolean(guestGrantId);
+  const canUseKvm = !isGuestPortal || !guestPermissions || guestPermissions.canRemoteScreen !== false;
+  const canUseGhost = !isGuestPortal || !guestPermissions || Boolean(guestPermissions.canGhostSession);
+  const [sessionMode, setSessionMode] = useState<'kvm' | 'ghost' | 'amt_kvm'>(
+    isGhostSession && canUseGhost ? 'ghost' : canUseKvm ? 'kvm' : 'ghost'
+  );
   const [selectedMonitor, setSelectedMonitor] = useState(1);
   const [sessionDescriptor, setSessionDescriptor] = useState<RemoteSessionDescriptor | null>(null);
   const [useLiveMeshIframe, setUseLiveMeshIframe] = useState(false);
   const [audioEnabled, setAudioEnabled] = useState(false);
   const [consentGranted, setConsentGranted] = useState(false);
   const [consentCountdown, setConsentCountdown] = useState(15);
+  const [consentTimeoutAction, setConsentTimeoutAction] = useState<string>('deny');
+  const [consentTimedOut, setConsentTimedOut] = useState(false);
+  const [consentConfigLoaded, setConsentConfigLoaded] = useState(false);
+  const [consentRetrySeq, setConsentRetrySeq] = useState(0);
   const [autoLockOnDisconnect, setAutoLockOnDisconnect] = useState(true);
   const [clipboardSynced, setClipboardSynced] = useState(false);
   const [isRecording, setIsRecording] = useState(true);
@@ -61,11 +78,74 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
   const [customAdminPassword, setCustomAdminPassword] = useState('');
   const [elevating, setElevating] = useState(false);
   const [elevateSuccessMsg, setElevateSuccessMsg] = useState<string | null>(null);
+  const [elevateIsError, setElevateIsError] = useState(false);
   const [elevateMfaOpen, setElevateMfaOpen] = useState(false);
   const [statusBanner, setStatusBanner] = useState<string | null>(null);
   const [agentPrivilegeLevel, setAgentPrivilegeLevel] = useState<string>(device.agent_privilege_mode || 'SYSTEM');
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+
+  const startCanvasWebmCapture = () => {
+    recordedChunksRef.current = [];
+    const canvas = canvasRef.current;
+    if (!canvas || typeof (canvas as any).captureStream !== 'function' || typeof MediaRecorder === 'undefined') {
+      return;
+    }
+    try {
+      const stream = (canvas as any).captureStream(15) as MediaStream;
+      const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp8')
+        ? 'video/webm;codecs=vp8'
+        : 'video/webm';
+      const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 600_000 });
+      recorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) {
+          recordedChunksRef.current.push(ev.data);
+        }
+      };
+      recorder.start(500);
+      mediaRecorderRef.current = recorder;
+    } catch {
+      mediaRecorderRef.current = null;
+    }
+  };
+
+  const stopCanvasWebmCaptureBase64 = (): Promise<{ base64?: string; sizeMb?: number }> => {
+    return new Promise((resolve) => {
+      const recorder = mediaRecorderRef.current;
+      mediaRecorderRef.current = null;
+      const finalize = () => {
+        if (recordedChunksRef.current.length === 0) {
+          resolve({});
+          return;
+        }
+        const blob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
+        recordedChunksRef.current = [];
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const dataUrl = String(reader.result || '');
+          const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+          resolve({
+            base64,
+            sizeMb: Number((blob.size / (1024 * 1024)).toFixed(3))
+          });
+        };
+        reader.onerror = () => resolve({});
+        reader.readAsDataURL(blob);
+      };
+      if (!recorder || recorder.state === 'inactive') {
+        finalize();
+        return;
+      }
+      recorder.onstop = finalize;
+      try {
+        recorder.stop();
+      } catch {
+        finalize();
+      }
+    });
+  };
 
   const showTransientBanner = (msg: string) => {
     setStatusBanner(msg);
@@ -74,15 +154,61 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
 
   // Negotiate OS-specific display pipeline & Ghost Session isolation with backend
   useEffect(() => {
+    if (guestGrantId) {
+      startGuestPortalRemoteSession(
+        guestGrantId,
+        device.id,
+        sessionMode === 'ghost' ? 'ghost' : 'interactive'
+      )
+        .then((res) => {
+          if (res?.success) {
+            const relayUrl = (res as any).session?.meshRelayUrl || res.meshRelayUrl || null;
+            setSessionDescriptor({
+              success: true,
+              sessionId: res.sessionId || `guest-${Date.now()}`,
+              deviceId: device.id,
+              hostname: device.hostname,
+              osType: device.os_type,
+              mode: sessionMode,
+              monitor: selectedMonitor,
+              displayDriver: relayUrl ? 'MeshCentral Live Relay' : 'Scoped Vendor KVM Relay',
+              sessionIsolation:
+                sessionMode === 'ghost'
+                  ? 'Scoped Vendor Ghost Session'
+                  : 'Scoped Vendor Interactive Session',
+              audioPipeline: 'WebAudio Opus',
+              resolution: '1920x1080',
+              meshRelayUrl: relayUrl,
+              meshBridgeConnected: Boolean(relayUrl),
+              userInterference: sessionMode === 'ghost' ? 'None (Background Isolated)' : 'Shared Console'
+            });
+            if (relayUrl) setUseLiveMeshIframe(true);
+            setConsentGranted(true);
+          }
+        })
+        .catch(() => {});
+      return;
+    }
+
     negotiateRemoteSession(device.id, sessionMode, selectedMonitor)
       .then((desc) => {
-        if (desc?.success) setSessionDescriptor(desc);
+        if (desc?.success) {
+          setSessionDescriptor(desc);
+          if (desc.meshBridgeConnected && desc.meshRelayUrl) {
+            setUseLiveMeshIframe(true);
+          }
+        }
       })
       .catch(() => {});
-  }, [device.id, sessionMode, selectedMonitor]);
+  }, [device.id, device.hostname, device.os_type, guestGrantId, sessionMode, selectedMonitor]);
 
   // Load stealth settings & policy consent configuration
   useEffect(() => {
+    if (guestGrantId) {
+      setConsentGranted(true);
+      setConsentConfigLoaded(true);
+      return;
+    }
     fetchSettings()
       .then((s) => {
         setStealthForTechs(Boolean(s.session_recording_stealth_for_techs));
@@ -92,6 +218,8 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
       .then((cs) => {
         if (cs) {
           setAutoLockOnDisconnect(Boolean(cs.autoLockOnDisconnect));
+          const resolvedAction = String((cs as any).consent_timeout_action || cs.timeoutAction || 'deny').toLowerCase();
+          setConsentTimeoutAction(resolvedAction);
           if (!cs.requireConsent || cs.bypassedDueToLockScreen) {
             setConsentGranted(true);
           } else if (cs.timeoutSec) {
@@ -99,8 +227,9 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
           }
         }
       })
-      .catch(() => {});
-  }, [device.id]);
+      .catch(() => {})
+      .finally(() => setConsentConfigLoaded(true));
+  }, [device.id, guestGrantId]);
 
   // Timer for active server-side recording
   useEffect(() => {
@@ -129,21 +258,27 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
 
   useEffect(() => {
     if (bypassesUserPrompt) {
+      setConsentTimedOut(false);
       setConsentGranted(true);
-    } else {
-      const timer = setInterval(() => {
-        setConsentCountdown((prev) => {
-          if (prev <= 1) {
-            clearInterval(timer);
-            setConsentGranted(true);
-            return 0;
-          }
-          return prev - 1;
-        });
-      }, 1000);
-      return () => clearInterval(timer);
+      return;
     }
-  }, [bypassesUserPrompt]);
+    if (!consentConfigLoaded || consentGranted || consentTimedOut) return;
+    const timer = setInterval(() => {
+      setConsentCountdown((prev) => {
+        if (prev <= 1) {
+          clearInterval(timer);
+          if (consentTimeoutAction === 'allow') {
+            setConsentGranted(true);
+          } else {
+            setConsentTimedOut(true);
+          }
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [bypassesUserPrompt, consentConfigLoaded, consentGranted, consentTimedOut, consentTimeoutAction, consentRetrySeq]);
 
   // OS-aware & Mode-aware Canvas rendering of interactive screen viewport
   useEffect(() => {
@@ -442,16 +577,24 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
       }
       if (res.success) {
         setAgentPrivilegeLevel(res.newPrivilegeLevel || 'elevated_admin');
+        setElevateIsError(false);
         setElevateSuccessMsg(res.message);
       } else {
+        setElevateIsError(true);
         setElevateSuccessMsg(res.error || 'Remote elevation failed');
       }
     } catch (e: any) {
+      setElevateIsError(true);
       setElevateSuccessMsg(e?.message || 'Remote elevation failed');
     } finally {
       setElevating(false);
     }
   };
+
+  const liveStreamActive =
+    Boolean(useLiveMeshIframe) &&
+    Boolean(sessionDescriptor?.meshRelayUrl) &&
+    /^https?:\/\//i.test(sessionDescriptor?.meshRelayUrl || '');
 
   return (
     <div className="modal-backdrop" id="remote-screen-modal">
@@ -483,40 +626,60 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
               </>
             )}
 
+            {!liveStreamActive && (
+              <span
+                className="status-pill status-reboot"
+                style={{
+                  background: 'rgba(245, 158, 11, 0.18)',
+                  color: '#fbbf24',
+                  border: '1px solid rgba(245, 158, 11, 0.45)',
+                  fontWeight: 700
+                }}
+              >
+                PREVIEW SIMULATION
+              </span>
+            )}
+
             {/* 3-Mode Session Type Switcher */}
             <div style={{ display: 'flex', background: 'rgba(0, 0, 0, 0.35)', borderRadius: '6px', padding: '2px', marginLeft: '0.5rem' }}>
-              <button
-                type="button"
-                className={`btn-glass ${sessionMode === 'kvm' ? 'btn-primary' : ''}`}
-                style={{ padding: '0.2rem 0.55rem', fontSize: '0.72rem' }}
-                onClick={() => setSessionMode('kvm')}
-              >
-                Standard KVM
-              </button>
-              <button
-                type="button"
-                className={`btn-glass ${sessionMode === 'ghost' ? 'btn-primary' : ''}`}
-                style={{ padding: '0.2rem 0.55rem', fontSize: '0.72rem' }}
-                onClick={() => setSessionMode('ghost')}
-                title="Spawn a full headless graphical desktop without interfering with the logged-in user"
-              >
-                Ghost Session (Headless GUI)
-              </button>
-              <button
-                type="button"
-                className={`btn-glass ${sessionMode === 'amt_kvm' ? 'btn-primary' : ''}`}
-                style={{ padding: '0.2rem 0.55rem', fontSize: '0.72rem' }}
-                onClick={() => setSessionMode('amt_kvm')}
-                title="Out-of-Band Intel AMT / vPro Hardware KVM (BIOS / Pre-Boot)"
-              >
-                Intel AMT KVM
-              </button>
+              {canUseKvm && (
+                <button
+                  type="button"
+                  className={`btn-glass ${sessionMode === 'kvm' ? 'btn-primary' : ''}`}
+                  style={{ padding: '0.2rem 0.55rem', fontSize: '0.72rem' }}
+                  onClick={() => setSessionMode('kvm')}
+                >
+                  Standard KVM
+                </button>
+              )}
+              {canUseGhost && (
+                <button
+                  type="button"
+                  className={`btn-glass ${sessionMode === 'ghost' ? 'btn-primary' : ''}`}
+                  style={{ padding: '0.2rem 0.55rem', fontSize: '0.72rem' }}
+                  onClick={() => setSessionMode('ghost')}
+                  title="Spawn a full headless graphical desktop without interfering with the logged-in user"
+                >
+                  Ghost Session (Headless GUI)
+                </button>
+              )}
+              {!isGuestPortal && (
+                <button
+                  type="button"
+                  className={`btn-glass ${sessionMode === 'amt_kvm' ? 'btn-primary' : ''}`}
+                  style={{ padding: '0.2rem 0.55rem', fontSize: '0.72rem' }}
+                  onClick={() => setSessionMode('amt_kvm')}
+                  title="Out-of-Band Intel AMT / vPro Hardware KVM (BIOS / Pre-Boot)"
+                >
+                  Intel AMT KVM
+                </button>
+              )}
             </div>
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
-            {/* Server-Side Session Recording Indicator (Shown only if NOT in Admin Stealth Mode) */}
-            {!stealthForTechs && (
+            {/* Server-Side Session Recording Indicator (Shown only if NOT in Admin Stealth Mode or Guest Portal) */}
+            {!stealthForTechs && !isGuestPortal && (
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
                 {isRecording ? (
                   <button
@@ -556,50 +719,60 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
               </div>
             )}
 
-            {/* Manual Technician Clip Recording (Provides direct video download on stop) */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
-              {manualRecording ? (
-                <button
-                  className="btn-glass btn-danger"
-                  style={{ padding: '0.25rem 0.65rem', fontSize: '0.72rem', display: 'flex', alignItems: 'center', gap: '0.35rem' }}
-                  onClick={async () => {
-                    const dur = Math.max(1, manualSeconds);
-                    setManualRecording(false);
-                    setManualSeconds(0);
-                    try {
-                      const rec = await saveRecording({
-                        device_id: device.id,
-                        is_ghost_session: sessionMode === 'ghost' ? 1 : 0,
-                        duration_sec: dur,
-                        file_size_mb: parseFloat(((dur * 48000) / (1024 * 1024)).toFixed(2))
-                      });
-                      if (rec.id) {
-                        window.open(getRecordingDownloadUrl(rec.id), '_blank');
+            {/* Manual Technician Clip Recording (Captures real WebM video clip to Audit Vault) */}
+            {!isGuestPortal && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                {manualRecording ? (
+                  <button
+                    className="btn-glass btn-danger"
+                    style={{ padding: '0.25rem 0.65rem', fontSize: '0.72rem', display: 'flex', alignItems: 'center', gap: '0.35rem' }}
+                    onClick={async () => {
+                      const dur = Math.max(1, manualSeconds);
+                      setManualRecording(false);
+                      setManualSeconds(0);
+                      try {
+                        const captured = await stopCanvasWebmCaptureBase64();
+                        if (!captured.base64) {
+                          showTransientBanner('Clip capture stopped (no media frames recorded).');
+                          return;
+                        }
+                        const rec = await saveRecording({
+                          device_id: device.id,
+                          is_ghost_session: sessionMode === 'ghost' ? 1 : 0,
+                          duration_sec: dur,
+                          file_size_mb: captured.sizeMb || 0.01,
+                          video_base64: captured.base64,
+                          mime_type: 'video/webm'
+                        });
+                        if (rec.id) {
+                          window.open(getRecordingDownloadUrl(rec.id), '_blank');
+                        }
+                        showTransientBanner(`Session WebM clip (${dur}s) saved to audit vault.`);
+                      } catch {
+                        showTransientBanner('Clip capture stopped.');
                       }
-                      showTransientBanner(`Session clip (${dur}s) saved to audit vault.`);
-                    } catch {
-                      showTransientBanner('Clip capture stopped.');
-                    }
-                  }}
-                  title="Click to stop manual recording and download audit clip"
-                >
-                  <CircleDot size={12} color="#fff" />
-                  <span>Stop Clip ({Math.floor(manualSeconds / 60)}:{(manualSeconds % 60).toString().padStart(2, '0')})</span>
-                </button>
-              ) : (
-                <button
-                  className="btn-glass"
-                  style={{ padding: '0.25rem 0.55rem', fontSize: '0.72rem' }}
-                  onClick={() => {
-                    setManualRecording(true);
-                    setManualSeconds(0);
-                  }}
-                  title="Record direct high-quality video clip to your workstation"
-                >
-                  ● Record Clip
-                </button>
-              )}
-            </div>
+                    }}
+                    title="Click to stop manual recording and download WebM audit clip"
+                  >
+                    <CircleDot size={12} color="#fff" />
+                    <span>Stop Clip ({Math.floor(manualSeconds / 60)}:{(manualSeconds % 60).toString().padStart(2, '0')})</span>
+                  </button>
+                ) : (
+                  <button
+                    className="btn-glass"
+                    style={{ padding: '0.25rem 0.55rem', fontSize: '0.72rem' }}
+                    onClick={() => {
+                      startCanvasWebmCapture();
+                      setManualRecording(true);
+                      setManualSeconds(0);
+                    }}
+                    title="Record real WebM video clip to Audit Vault & download"
+                  >
+                    ● Record Clip
+                  </button>
+                )}
+              </div>
+            )}
 
             {/* Monitor Switcher */}
             <div style={{ display: 'flex', background: 'rgba(0, 0, 0, 0.3)', borderRadius: '6px', padding: '2px' }}>
@@ -632,60 +805,93 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
               </button>
             )}
 
+            {!isGuestPortal && (
+              <button
+                className="btn-glass"
+                style={{
+                  padding: '0.35rem 0.65rem',
+                  fontSize: '0.75rem',
+                  background: showElevateModal ? 'rgba(245, 158, 11, 0.22)' : 'rgba(245, 158, 11, 0.1)',
+                  borderColor: 'rgba(245, 158, 11, 0.45)',
+                  color: '#fbbf24'
+                }}
+                onClick={() => setShowElevateModal(!showElevateModal)}
+                title="Remotely self-elevate standard-user QuickSupport agent or promote to permanent service using LAPS or Tech credentials"
+              >
+                <KeyRound size={13} />
+                <span>Elevate Agent ({agentPrivilegeLevel})</span>
+              </button>
+            )}
+
             <button
               className="btn-glass"
-              style={{
-                padding: '0.35rem 0.65rem',
-                fontSize: '0.75rem',
-                background: showElevateModal ? 'rgba(245, 158, 11, 0.22)' : 'rgba(245, 158, 11, 0.1)',
-                borderColor: 'rgba(245, 158, 11, 0.45)',
-                color: '#fbbf24'
-              }}
-              onClick={() => setShowElevateModal(!showElevateModal)}
-              title="Remotely self-elevate standard-user QuickSupport agent or promote to permanent service using LAPS or Tech credentials"
+              style={{ padding: '0.35rem 0.65rem', fontSize: '0.75rem', opacity: liveStreamActive ? 1 : 0.45 }}
+              disabled={!liveStreamActive}
+              onClick={handleSendCtrlAltDel}
+              title={liveStreamActive ? 'Inject Ctrl+Alt+Del' : 'Requires live MeshCentral KVM relay'}
             >
-              <KeyRound size={13} />
-              <span>Elevate Agent ({agentPrivilegeLevel})</span>
-            </button>
-
-            <button className="btn-glass" style={{ padding: '0.35rem 0.65rem', fontSize: '0.75rem' }} onClick={handleSendCtrlAltDel} title="Inject Ctrl+Alt+Del">
               <Lock size={13} />
               <span>Ctrl+Alt+Del</span>
             </button>
 
-            <button className="btn-glass" style={{ padding: '0.35rem 0.65rem', fontSize: '0.75rem' }} onClick={handleSyncClipboard} title="Sync Clipboard">
+            <button
+              className="btn-glass"
+              style={{ padding: '0.35rem 0.65rem', fontSize: '0.75rem', opacity: liveStreamActive ? 1 : 0.45 }}
+              disabled={!liveStreamActive}
+              onClick={handleSyncClipboard}
+              title={liveStreamActive ? 'Sync Clipboard' : 'Requires live MeshCentral KVM relay'}
+            >
               {clipboardSynced ? <CheckCircle2 size={13} color="#10b981" /> : <Clipboard size={13} />}
               <span>{clipboardSynced ? 'Synced!' : 'Clipboard'}</span>
             </button>
 
             <button
               className="btn-glass btn-icon"
-              style={{ padding: '0.35rem' }}
+              style={{ padding: '0.35rem', opacity: liveStreamActive ? 1 : 0.45 }}
+              disabled={!liveStreamActive}
               onClick={() => setAudioEnabled(!audioEnabled)}
-              title={audioEnabled ? 'Remote Audio Enabled' : 'Remote Audio Muted'}
+              title={
+                !liveStreamActive
+                  ? 'Remote Audio requires live MeshCentral KVM relay'
+                  : audioEnabled
+                    ? 'Remote Audio Enabled'
+                    : 'Remote Audio Muted'
+              }
             >
               {audioEnabled ? <Volume2 size={15} color="#00f2fe" /> : <VolumeX size={15} />}
             </button>
 
             <button
               className="btn-glass btn-icon"
-              style={{ padding: '0.35rem' }}
+              style={{ padding: '0.35rem', opacity: liveStreamActive ? 1 : 0.45 }}
+              disabled={!liveStreamActive}
               onClick={() => setAutoLockOnDisconnect(!autoLockOnDisconnect)}
-              title={autoLockOnDisconnect ? 'Auto-lock target endpoint upon disconnect (Active)' : 'Auto-lock disabled'}
+              title={
+                !liveStreamActive
+                  ? 'Auto-lock on disconnect requires live MeshCentral KVM relay'
+                  : autoLockOnDisconnect
+                    ? 'Auto-lock target endpoint upon disconnect (Active)'
+                    : 'Auto-lock disabled'
+              }
             >
               <Lock size={15} color={autoLockOnDisconnect ? '#10b981' : '#94a3b8'} />
             </button>
 
             <button
               className="btn-glass btn-icon"
-              onClick={() => {
-                if (recordSeconds > 5) {
-                  saveRecording({
-                    device_id: device.id,
-                    is_ghost_session: sessionMode === 'ghost' ? 1 : 0,
-                    duration_sec: recordSeconds,
-                    file_size_mb: parseFloat(((recordSeconds * 48000) / (1024 * 1024)).toFixed(2))
-                  }).catch(() => {});
+              onClick={async () => {
+                if (!isGuestPortal && recordSeconds > 5 && mediaRecorderRef.current) {
+                  const captured = await stopCanvasWebmCaptureBase64().catch(() => ({ base64: undefined, sizeMb: undefined }));
+                  if (captured.base64) {
+                    saveRecording({
+                      device_id: device.id,
+                      is_ghost_session: sessionMode === 'ghost' ? 1 : 0,
+                      duration_sec: recordSeconds,
+                      file_size_mb: captured.sizeMb || 0.01,
+                      video_base64: captured.base64,
+                      mime_type: 'video/webm'
+                    }).catch(() => {});
+                  }
                 }
                 onClose();
               }}
@@ -696,8 +902,29 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
           </div>
         </div>
 
+        {!liveStreamActive && (
+          <div
+            style={{
+              padding: '0.5rem 1.5rem',
+              background: 'rgba(245, 158, 11, 0.14)',
+              borderBottom: '1px solid rgba(245, 158, 11, 0.4)',
+              color: '#fbbf24',
+              fontSize: '0.78rem',
+              fontWeight: 600,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: '0.75rem'
+            }}
+          >
+            <span>
+              PREVIEW SIMULATION — Connect MeshCentral 2 Server for Live Endpoint KVM (Canvas compositor preview active; live input, audio &amp; clipboard controls disabled)
+            </span>
+          </div>
+        )}
+
         {statusBanner && (
-          <div style={{ padding: '0.5rem 1.5rem', background: 'rgba(16, 185, 129, 0.14)', borderBottom: '1px solid rgba(16, 185, 129, 0.35)', color: '#34d399', fontSize: '0.8rem' }}>
+          <div style={{ padding: '0.5rem 1.5rem', background: 'rgba(16, 185, 119, 0.14)', borderBottom: '1px solid rgba(16, 185, 129, 0.35)', color: '#34d399', fontSize: '0.8rem' }}>
             ✓ {statusBanner}
           </div>
         )}
@@ -707,28 +934,65 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
           <div
             style={{
               padding: '0.75rem 1.5rem',
-              background: 'rgba(245, 158, 11, 0.15)',
-              borderBottom: '1px solid rgba(245, 158, 11, 0.3)',
+              background: consentTimedOut ? 'rgba(239, 68, 68, 0.16)' : 'rgba(245, 158, 11, 0.15)',
+              borderBottom: `1px solid ${consentTimedOut ? 'rgba(239, 68, 68, 0.4)' : 'rgba(245, 158, 11, 0.3)'}`,
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'space-between',
-              color: '#fbbf24',
+              gap: '0.75rem',
+              color: consentTimedOut ? '#f87171' : '#fbbf24',
               fontSize: '0.85rem'
             }}
           >
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
               <Shield size={18} />
-              <span>
-                <strong>User Privacy Policy Enforced:</strong> Prompting end-user on target endpoint. Auto-connecting in <strong>{consentCountdown}s</strong> if unattended.
-              </span>
+              {consentTimedOut ? (
+                <span>
+                  <strong>End-user consent timed out (Denied by policy):</strong> The remote user did not approve interactive screen sharing within the policy window.
+                </span>
+              ) : (
+                <span>
+                  <strong>User Privacy Policy Enforced:</strong> Prompting end-user on target endpoint ({consentCountdown}s remaining — timeout action:{' '}
+                  <strong>{consentTimeoutAction === 'allow' ? 'Auto-Allow' : 'Deny Session'}</strong>).
+                </span>
+              )}
             </div>
-            <button
-              className="btn-glass"
-              style={{ padding: '0.25rem 0.75rem', fontSize: '0.75rem', background: '#f59e0b', color: '#000', fontWeight: 600 }}
-              onClick={() => setConsentGranted(true)}
-            >
-              Bypass Consent (Admin Elevation)
-            </button>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              {consentTimedOut && (
+                <>
+                  <button
+                    type="button"
+                    className="btn-glass"
+                    style={{ padding: '0.25rem 0.75rem', fontSize: '0.75rem' }}
+                    onClick={() => {
+                      setConsentTimedOut(false);
+                      setConsentCountdown(15);
+                      setConsentRetrySeq((s) => s + 1);
+                    }}
+                  >
+                    Retry Prompt
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-glass btn-danger"
+                    style={{ padding: '0.25rem 0.75rem', fontSize: '0.75rem' }}
+                    onClick={onClose}
+                  >
+                    Close
+                  </button>
+                </>
+              )}
+              {!isGuestPortal && !consentTimedOut && (
+                <button
+                  type="button"
+                  className="btn-glass"
+                  style={{ padding: '0.25rem 0.75rem', fontSize: '0.75rem', background: '#f59e0b', color: '#000', fontWeight: 600 }}
+                  onClick={() => setConsentGranted(true)}
+                >
+                  Bypass Consent (Admin Elevation)
+                </button>
+              )}
+            </div>
           </div>
         )}
 
@@ -853,8 +1117,18 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
                 </button>
 
                 {elevateSuccessMsg && (
-                  <div style={{ padding: '0.55rem 0.7rem', borderRadius: '8px', background: 'rgba(16, 185, 129, 0.14)', border: '1px solid rgba(16, 185, 129, 0.35)', fontSize: '0.74rem', color: '#a7f3d0' }}>
-                    ✓ {elevateSuccessMsg}
+                  <div
+                    style={{
+                      padding: '0.55rem 0.7rem',
+                      borderRadius: '8px',
+                      background: elevateIsError ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.14)',
+                      border: `1px solid ${elevateIsError ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`,
+                      fontSize: '0.74rem',
+                      color: elevateIsError ? '#f87171' : '#a7f3d0'
+                    }}
+                  >
+                    {elevateIsError ? '⚠ ' : '✓ '}
+                    {elevateSuccessMsg}
                   </div>
                 )}
               </div>

@@ -25,8 +25,23 @@ if [ -f /etc/systemd/system/vitrine-rmm.service ]; then
     echo "--> vitrine-rmm systemd service removed."
 fi
 
-if systemctl list-unit-files 2>/dev/null | grep -q "meshcentral.service"; then
-    echo "--> Verified: Neighboring meshcentral.service remains intact and untouched."
+# Ensure no standalone Vitrine Node.js backend process is still writing to data/vitrine.db
+if command -v pgrep &> /dev/null; then
+    RUNNING_PIDS="$(pgrep -f "$PROJ_ROOT/backend/(dist/server\.js|src/server\.ts)" 2>/dev/null || true)"
+    if [ -n "$RUNNING_PIDS" ]; then
+        echo "--> Stopping active Vitrine RMM Node.js server process(es) ($RUNNING_PIDS) before touching data/..."
+        for pid in $RUNNING_PIDS; do
+            kill -TERM "$pid" 2>/dev/null || sudo kill -TERM "$pid" 2>/dev/null || true
+        done
+        sleep 2
+    fi
+fi
+
+if command -v systemctl &> /dev/null; then
+    UNIT_FILES="$(systemctl list-unit-files --no-pager 2>/dev/null || true)"
+    if [[ "$UNIT_FILES" == *"meshcentral.service"* ]]; then
+        echo "--> Verified: Neighboring meshcentral.service remains intact and untouched."
+    fi
 fi
 
 # 2. Clean Vitrine build artifacts and dist bundles
@@ -46,10 +61,28 @@ if [ -d "$PROJ_ROOT/data" ]; then
     fi
 
     if [[ "$EXPORT_BAK" =~ ^[Yy]$ ]]; then
-        TARGET_HOME=$(eval echo "~${SUDO_USER:-$(whoami)}")
+        TARGET_USER="${SUDO_USER:-$(id -un)}"
+        TARGET_HOME="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6 || true)"
+        if [ -z "$TARGET_HOME" ] || [ ! -d "$TARGET_HOME" ]; then
+            TARGET_HOME="${HOME:-/tmp}"
+        fi
+        if [ "$(id -u)" -ne 0 ] && [ ! -w "$TARGET_HOME" ]; then
+            TARGET_HOME="${HOME:-/tmp}"
+        fi
+        if [ ! -d "$TARGET_HOME" ] || ( [ "$(id -u)" -ne 0 ] && [ ! -w "$TARGET_HOME" ] ); then
+            TARGET_HOME="/tmp"
+        fi
         FINAL_BAK="${TARGET_HOME}/vitrine-rmm-final-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-        tar -czf "$FINAL_BAK" -C "$PROJ_ROOT" data branding 2>/dev/null || true
-        echo "--> Saved final backup archive to: $FINAL_BAK"
+        ARCHIVE_ITEMS=("data")
+        if [ -d "$PROJ_ROOT/branding" ]; then
+            ARCHIVE_ITEMS+=("branding")
+        fi
+        (umask 077 && tar -czf "$FINAL_BAK" -C "$PROJ_ROOT" "${ARCHIVE_ITEMS[@]}")
+        chmod 600 "$FINAL_BAK"
+        if [ "$(id -u)" -eq 0 ] && [ "$TARGET_USER" != "root" ]; then
+            chown "$TARGET_USER" "$FINAL_BAK" || true
+        fi
+        echo "--> Saved restricted (0600) final backup archive to: $FINAL_BAK"
     fi
 
     if [ -t 0 ]; then
@@ -59,9 +92,11 @@ if [ -d "$PROJ_ROOT/data" ]; then
     fi
 
     if [[ "$DELETE_DATA" =~ ^[Yy]$ ]]; then
-        echo "--> Removing Vitrine data/ directory..."
-        rm -rf "$PROJ_ROOT/data" || true
-        echo "--> Vitrine database and local vaults deleted."
+        if [[ -n "$PROJ_ROOT" && "$PROJ_ROOT" != "/" && -f "$PROJ_ROOT/uninstall.sh" ]]; then
+            echo "--> Removing Vitrine data/ directory..."
+            rm -rf "$PROJ_ROOT/data"
+            echo "--> Vitrine database and local vaults deleted."
+        fi
     else
         echo "--> Keeping data/ directory for future upgrades or restores."
     fi

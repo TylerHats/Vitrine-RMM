@@ -1,9 +1,10 @@
 import fs from 'fs';
+import net from 'net';
 import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { db, DATA_DIR_PATH } from '../../db/index.js';
-import { validateOutboundHostSafety } from '../vault/index.js';
+import { decryptVaultSecret, isBlockedOutboundIp, safeOutboundFetch } from '../vault/index.js';
 
 export interface SigningResult {
   success: boolean;
@@ -11,6 +12,24 @@ export interface SigningResult {
   error?: string;
   filename?: string;
   durationMs?: number;
+}
+
+function isLoopbackSigningHost(rawHost: string): boolean {
+  const clean = rawHost.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  return (
+    clean === 'localhost' ||
+    clean === '::1' ||
+    clean === '127.0.0.1' ||
+    clean.startsWith('127.')
+  );
+}
+
+function normalizePs1ScriptContent(raw: string): string {
+  return raw
+    .replace(/^\uFEFF/, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/\n+$/, '');
 }
 
 export function validateSigningEndpointUrl(rawUrl: string): { valid: boolean; normalizedUrl?: string; error?: string } {
@@ -28,13 +47,22 @@ export function validateSigningEndpointUrl(rawUrl: string): { valid: boolean; no
     return { valid: false, error: 'Code signing URL must use http:// or https://.' };
   }
   const host = parsed.hostname.toLowerCase();
+  const cleanHost = host.replace(/^\[|\]$/g, '');
   if (
-    host === '169.254.169.254' ||
-    host.startsWith('169.254.') ||
-    host === 'metadata.google.internal' ||
-    host === '100.100.100.200'
+    cleanHost === '169.254.169.254' ||
+    cleanHost.startsWith('169.254.') ||
+    cleanHost === 'metadata.google.internal' ||
+    cleanHost === '100.100.100.200' ||
+    (net.isIP(cleanHost) !== 0 &&
+      isBlockedOutboundIp(cleanHost, { allowLoopback: true, allowPrivateLan: true }))
   ) {
     return { valid: false, error: 'Cloud metadata / link-local endpoints are blocked.' };
+  }
+  if (process.env.NODE_ENV === 'production' && parsed.protocol !== 'https:' && !isLoopbackSigningHost(cleanHost)) {
+    return {
+      valid: false,
+      error: 'Code signing URL must use https:// in production for non-loopback endpoints.'
+    };
   }
   return { valid: true, normalizedUrl: parsed.toString().replace(/\/$/, '') };
 }
@@ -72,10 +100,19 @@ export class CodeSigningService {
     try {
       const settings = db.prepare('SELECT code_signing_url FROM settings WHERE id = 1').get() as any;
       if (settings?.code_signing_url) return settings.code_signing_url;
-    } catch {
-      // DB not ready
-    }
+    } catch {}
     return this.endpointUrl;
+  }
+
+  public getApiKey(): string {
+    try {
+      const settings = db.prepare('SELECT code_signing_api_key FROM settings WHERE id = 1').get() as any;
+      const decrypted = decryptVaultSecret(settings?.code_signing_api_key);
+      if (decrypted) {
+        return decrypted.replace(/[\r\n]+/g, '').trim();
+      }
+    } catch {}
+    return (process.env.CODE_SIGNING_API_KEY || '').replace(/[\r\n]+/g, '').trim();
   }
 
   public async testConnection(urlOverride?: string): Promise<{
@@ -97,24 +134,21 @@ export class CodeSigningService {
       };
     }
 
-    const dnsSafety = await validateOutboundHostSafety(check.normalizedUrl, { allowLoopback: true });
-    if (!dnsSafety.safe) {
-      return {
-        reachable: false,
-        endpoint: check.normalizedUrl,
-        latencyMs: Date.now() - start,
-        error: dnsSafety.reason || 'Code signing URL blocked by SSRF policy.'
-      };
-    }
+    const apiKey = this.getApiKey();
+    const authHeaders: Record<string, string> = apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
 
     try {
-      const res = await fetch(`${check.normalizedUrl}/health`, {
+      const res = await safeOutboundFetch(`${check.normalizedUrl}/health`, {
         method: 'GET',
-        signal: AbortSignal.timeout(5000)
+        headers: authHeaders,
+        timeoutMs: 5000,
+        safety: { allowLoopback: true, allowPrivateLan: true }
       }).catch(async () => {
-        return fetch(check.normalizedUrl!, {
+        return safeOutboundFetch(check.normalizedUrl!, {
           method: 'HEAD',
-          signal: AbortSignal.timeout(5000)
+          headers: authHeaders,
+          timeoutMs: 5000,
+          safety: { allowLoopback: true, allowPrivateLan: true }
         });
       });
 
@@ -156,15 +190,6 @@ export class CodeSigningService {
         };
       }
 
-      const dnsSafety = await validateOutboundHostSafety(urlCheck.normalizedUrl, { allowLoopback: true });
-      if (!dnsSafety.safe) {
-        return {
-          success: false,
-          error: dnsSafety.reason || 'Code signing endpoint blocked by SSRF policy.',
-          durationMs: Date.now() - start
-        };
-      }
-
       const safeFilename = path.basename(filePath).replace(/[^a-zA-Z0-9._-]/g, '_');
       const fileData = fs.readFileSync(filePath);
       const boundary = '----VitrineSignBoundary' + crypto.randomBytes(16).toString('hex');
@@ -175,17 +200,25 @@ export class CodeSigningService {
       const post = Buffer.from(`\r\n--${boundary}--\r\n`);
       const body = Buffer.concat([pre, fileData, post]);
 
-      const res = await fetch(`${urlCheck.normalizedUrl}/sign`, {
+      const apiKey = this.getApiKey();
+      const reqHeaders: Record<string, string> = {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`
+      };
+      if (apiKey) {
+        reqHeaders.Authorization = `Bearer ${apiKey}`;
+      }
+
+      const res = await safeOutboundFetch(`${urlCheck.normalizedUrl}/sign`, {
         method: 'POST',
-        headers: {
-          'Content-Type': `multipart/form-data; boundary=${boundary}`
-        },
+        headers: reqHeaders,
         body,
-        signal: AbortSignal.timeout(8000)
+        timeoutMs: 10000,
+        maxBytes: 64 * 1024 * 1024,
+        safety: { allowLoopback: true, allowPrivateLan: true }
       });
 
-      if (!res.ok) {
-        const errorText = (await res.text()).slice(0, 300);
+      if (res.status < 200 || res.status >= 300) {
+        const errorText = res.body.toString('utf8').slice(0, 300);
         return {
           success: false,
           error: `Signer returned HTTP ${res.status}: ${errorText}`,
@@ -194,9 +227,7 @@ export class CodeSigningService {
         };
       }
 
-      const arrayBuffer = await res.arrayBuffer();
-      const signedBuffer = Buffer.from(arrayBuffer);
-
+      const signedBuffer = res.body;
       const textPreview = signedBuffer.subarray(0, 100).toString('utf8');
       if (textPreview.startsWith('{"status":"Failed"')) {
         try {
@@ -218,6 +249,33 @@ export class CodeSigningService {
       }
 
       const parsedPath = path.parse(filePath);
+      if (parsedPath.ext.toLowerCase() === '.ps1') {
+        const signedText = signedBuffer.toString('utf8');
+        const sigBeginMarker = '# SIG # Begin signature block';
+        const sigEndMarker = '# SIG # End signature block';
+        const sigIdx = signedText.indexOf(sigBeginMarker);
+        const sigEndIdx = signedText.indexOf(sigEndMarker);
+        if (sigIdx < 0 || sigEndIdx <= sigIdx) {
+          return {
+            success: false,
+            error: 'Signed PowerShell script is missing a valid # SIG # Authenticode signature block.',
+            filename: safeFilename,
+            durationMs: Date.now() - start
+          };
+        }
+        const trailingAfterSig = signedText.slice(sigEndIdx + sigEndMarker.length).trim();
+        const originalNormalized = normalizePs1ScriptContent(fileData.toString('utf8'));
+        const signedBodyNormalized = normalizePs1ScriptContent(signedText.slice(0, sigIdx));
+        if (trailingAfterSig.length > 0 || signedBodyNormalized !== originalNormalized) {
+          return {
+            success: false,
+            error: 'Signed PowerShell script content failed integrity verification against unsigned original.',
+            filename: safeFilename,
+            durationMs: Date.now() - start
+          };
+        }
+      }
+
       const signedFilePath = path.join(parsedPath.dir, `${parsedPath.name}.signed${parsedPath.ext}`);
       fs.writeFileSync(signedFilePath, signedBuffer, { mode: 0o600 });
 

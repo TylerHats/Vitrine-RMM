@@ -141,6 +141,14 @@ export interface Policy {
   network_drift_detection_enabled?: number | boolean;
   self_healing_max_hourly_runs?: number;
   self_healing_alert_psa?: number | boolean;
+  patch_ring?: 'canary' | 'pilot' | 'production' | string;
+  patch_delay_days?: number;
+  defender_managed?: number | boolean;
+  managed_defender_enabled?: number | boolean;
+  bitlocker_enforced?: number | boolean;
+  bitlocker_enforcement?: number | boolean;
+  backup_policy_id?: string | null;
+  mdm_profile_id?: string | null;
   alert_rules?: ConditionAlertRule[];
   alert_rules_json?: string | null;
 }
@@ -159,6 +167,17 @@ export interface Patch {
   cvss_score?: number;
 }
 
+export interface ScriptParameterDef {
+  name: string;
+  label?: string;
+  type?: 'string' | 'number' | 'boolean' | 'choice' | 'select' | 'secret';
+  required?: boolean;
+  defaultValue?: string | number | boolean;
+  default?: string;
+  choices?: string[];
+  options?: string[];
+}
+
 export interface ScriptItem {
   id: string;
   name: string;
@@ -167,11 +186,14 @@ export interface ScriptItem {
   code: string;
   category: string;
   enabled?: number | boolean;
-  required_role?: 'admin' | 'super_admin' | 'technician' | 'readonly';
-  os_type?: 'windows' | 'linux' | 'macos' | 'any';
+  required_role?: 'admin' | 'super_admin' | 'msp_super_admin' | 'technician' | 'readonly';
+  os_type?: 'windows' | 'linux' | 'macos' | 'any' | 'all';
   default_run_as?: 'system' | 'user';
   parameters_json?: string | null;
-  parameters?: Array<{ name: string; label?: string; default?: string }>;
+  parameters_schema_json?: string | null;
+  parameters_schema?: ScriptParameterDef[];
+  parameters?: ScriptParameterDef[];
+  timeout_sec?: number;
   is_builtin?: number | boolean;
   tenant_id?: string | null;
 }
@@ -213,6 +235,9 @@ export interface HardwareHistoryItem {
   description: string;
   vendor_id?: string;
   device_id_pci?: string;
+  acknowledged?: number | boolean;
+  acknowledged_by?: string | null;
+  acknowledged_at?: string | null;
   timestamp: string;
 }
 
@@ -384,9 +409,14 @@ export interface SessionRecording {
   technician: string;
   duration_sec: number;
   file_path: string;
+  video_path?: string | null;
+  mime_type?: string;
+  file_size_bytes?: number;
   file_size_mb: number;
   sha256_hash?: string | null;
-  is_ghost_session: number;
+  is_ghost_session: number | boolean;
+  has_video?: boolean;
+  video_base64?: string;
   created_at: string;
 }
 
@@ -411,6 +441,13 @@ export interface EventLogItem {
   message: string;
 }
 
+export interface SmartGroupRule {
+  field: string;
+  op?: '=' | '!=' | '>' | '<' | '>=' | '<=' | 'contains' | 'not_contains' | string;
+  operator?: 'eq' | 'neq' | 'contains' | 'gt' | 'lt' | 'in' | string;
+  value: string | number | boolean;
+}
+
 export interface SmartGroup {
   id: string;
   name: string;
@@ -418,6 +455,8 @@ export interface SmartGroup {
   tenant_id?: string | null;
   criteria_json: string;
   criteria?: Record<string, unknown>;
+  matchedCount?: number;
+  matchedDeviceIds?: string[];
   created_at: string;
 }
 
@@ -460,6 +499,12 @@ export interface RbacUser {
   role: 'super_admin' | 'technician' | 'client_admin' | 'msp_super_admin' | 'senior_tech' | 'support_tech' | 'auditor' | string;
   tenant_id?: string | null;
   tenant_name?: string | null;
+  custom_role_id?: string | null;
+  custom_role_name?: string | null;
+  totp_enabled?: number | boolean;
+  totp_confirmed?: boolean;
+  oidc_issuer?: string | null;
+  last_login_at?: string | null;
   created_at: string;
 }
 
@@ -547,6 +592,7 @@ export interface WakeOnLanResult {
   tenantName?: string;
   siteName?: string;
   newStatus?: string;
+  verifiedOnline?: boolean;
   bootTarget?: string;
   tieredStrategy: {
     tier1_current_subnet_relays: number;
@@ -572,6 +618,7 @@ export interface RemoteSessionDescriptor {
   audioPipeline: string;
   resolution: string;
   meshRelayUrl?: string | null;
+  meshBridgeConnected?: boolean;
   userInterference: string;
 }
 
@@ -602,6 +649,7 @@ export interface MeshDiscoveryResult {
   coexistenceSafe: boolean;
   tlsVerified: boolean;
   summary: string;
+  error?: string;
   discoveredGroups: Array<{
     meshGroupId: string;
     name: string;
@@ -791,6 +839,10 @@ export interface AuthUser {
   role: 'msp_super_admin' | 'super_admin' | 'admin' | 'technician' | 'senior_tech' | 'support_tech' | 'client_admin' | 'auditor' | string;
   tenant_id: string | null;
   totp_enabled: boolean;
+  totp_confirmed?: boolean;
+  custom_role_id?: string | null;
+  custom_role_name?: string | null;
+  permissions?: string[];
 }
 
 export interface AuthStatusResponse {
@@ -819,4 +871,250 @@ export interface PublicPortalConfig {
   quicksupport_url_path: string;
   quicksupport_custom_domain: string;
   code_signing_enabled: boolean;
+}
+
+export interface ScheduledAutomation {
+  id: string;
+  name: string;
+  description: string;
+  script_id: string;
+  script_name?: string;
+  cron_expr?: string;
+  cron_expression?: string;
+  target_type: 'all' | 'tenant' | 'site' | 'smart_group' | 'device' | string;
+  target_id?: string | null;
+  run_as: 'system' | 'user';
+  params?: Record<string, string>;
+  missed_run_catchup?: number | boolean;
+  enabled: number | boolean;
+  last_run_at?: string | null;
+  next_run_at?: string | null;
+  last_status?: string | null;
+  run_count?: number;
+  created_by?: string;
+  created_at: string;
+}
+
+export interface SoftwarePackage {
+  id: string;
+  name: string;
+  vendor: string;
+  version: string;
+  platform?: string;
+  os_type?: string;
+  package_type?: string;
+  package_manager?: string;
+  package_identifier: string;
+  install_args?: string;
+  uninstall_args?: string;
+  installer_url?: string | null;
+  sha256_hash?: string | null;
+  category: string;
+  is_required_baseline?: number | boolean;
+  created_at: string;
+}
+
+export interface SoftwareDeployment {
+  id: string;
+  package_id: string;
+  package_name: string;
+  device_id: string;
+  hostname: string;
+  action: 'install' | 'upgrade' | 'uninstall';
+  status: string;
+  exit_code?: number | null;
+  output: string;
+  triggered_by: string;
+  created_at: string;
+  completed_at?: string | null;
+}
+
+export interface KbBlacklistEntry {
+  id: string;
+  kb_or_pkg_id: string;
+  kb_id?: string;
+  platform: string;
+  reason: string;
+  tenant_id?: string | null;
+  created_by: string;
+  created_at: string;
+}
+
+export interface AlertIncident {
+  id: string;
+  tenant_id?: string | null;
+  tenant_name?: string | null;
+  device_id?: string | null;
+  appliance_id?: string | null;
+  entity_name: string;
+  condition_id: string;
+  title: string;
+  detail: string;
+  severity: 'info' | 'warning' | 'critical' | string;
+  status: 'open' | 'acknowledged' | 'snoozed' | 'resolved';
+  assigned_to?: string | null;
+  acknowledged_by?: string | null;
+  snoozed_until?: string | null;
+  psa_ticket_id?: string | null;
+  psa_ticket_number?: string | null;
+  occurrence_count?: number;
+  triggered_at: string;
+  last_seen_at?: string;
+  acknowledged_at?: string | null;
+  resolved_at?: string | null;
+}
+
+export interface NotificationChannel {
+  id: string;
+  name: string;
+  channel_type: 'slack' | 'teams' | 'discord' | 'pagerduty' | 'webhook';
+  webhook_url?: string;
+  signing_secret?: string;
+  routing_key?: string;
+  min_severity: string;
+  tenant_id?: string | null;
+  events: string[];
+  enabled: boolean;
+  last_triggered_at?: string | null;
+  last_status?: string | null;
+  created_at: string;
+}
+
+export interface DocumentationArticle {
+  id: string;
+  tenant_id?: string | null;
+  tenant_name?: string | null;
+  device_id?: string | null;
+  category: string;
+  title: string;
+  content_markdown: string;
+  tags: string[];
+  is_pinned: boolean;
+  linked_script_id?: string | null;
+  linked_script_name?: string | null;
+  has_encrypted_secrets?: boolean;
+  secrets?: Array<{ label: string; value: string }>;
+  version?: number;
+  author: string;
+  last_edited_by?: string | null;
+  updated_at: string;
+  created_at: string;
+}
+
+export interface PsaIntegration {
+  id: string;
+  name: string;
+  provider: 'itflow' | 'halopsa' | 'connectwise' | 'autotask' | 'syncro' | 'zammad' | 'generic_webhook';
+  base_url: string;
+  client_id?: string;
+  has_api_key?: boolean;
+  api_key?: string;
+  client_secret?: string;
+  default_board: string;
+  auto_sync_tickets: boolean;
+  auto_sync_assets: boolean;
+  enabled: boolean;
+  last_synced_at?: string | null;
+  last_status?: string | null;
+  created_at: string;
+}
+
+export interface PsaTimeEntry {
+  id: string;
+  ticket_id: string;
+  technician: string;
+  minutes_spent?: number;
+  minutes?: number;
+  billable: number | boolean;
+  work_type: string;
+  notes: string;
+  created_at: string;
+}
+
+export interface BackupPolicy {
+  id: string;
+  name: string;
+  tenant_id?: string | null;
+  engine: 'restic' | 'borg' | 'vss_wbadmin' | 'timemachine' | string;
+  repository_url?: string;
+  target_repo?: string;
+  schedule_cron: string;
+  include_paths_json?: string;
+  exclude_paths_json?: string;
+  retention_days: number;
+  enabled: number | boolean;
+  created_at: string;
+}
+
+export interface DeviceBackupJob {
+  id: string;
+  policy_id?: string | null;
+  device_id: string;
+  hostname?: string;
+  engine: string;
+  status: string;
+  snapshot_id: string;
+  bytes_processed?: number;
+  output?: string;
+  started_at?: string;
+  completed_at?: string | null;
+}
+
+export interface MdmProfile {
+  id: string;
+  name: string;
+  platform: 'macos' | 'windows' | 'linux';
+  profile_type: string;
+  tenant_id?: string | null;
+  payload_xml?: string;
+  settings?: Record<string, any>;
+  enabled: boolean;
+  created_at: string;
+}
+
+export interface CustomRole {
+  id: string;
+  name: string;
+  description: string;
+  base_tier?: string;
+  permissions: string[];
+  is_system: boolean;
+  created_at: string;
+}
+
+export interface ScopedApiKey {
+  id: string;
+  name: string;
+  role: string;
+  key_prefix: string;
+  scopes: string[];
+  tenant_id?: string | null;
+  created_by: string;
+  expires_at?: string | null;
+  last_used_at?: string | null;
+  revoked_at?: string | null;
+  revoked: boolean;
+  created_at: string;
+}
+
+export interface ActiveAuthSession {
+  sessionPrefix: string;
+  userId: string;
+  username: string;
+  role: string;
+  ipAddress: string | null;
+  userAgent: string | null;
+  mfaVerified: boolean;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface AuditLogRecord {
+  id: string;
+  username: string;
+  device_id?: string | null;
+  hostname?: string | null;
+  action: string;
+  details: string;
+  timestamp: string;
 }

@@ -16,7 +16,8 @@ import {
   Copy,
   Check,
   Download,
-  AlertTriangle
+  AlertTriangle,
+  AlertCircle
 } from 'lucide-react';
 import { Settings, MeshDiscoveryResult } from '../types/index.js';
 import {
@@ -30,6 +31,7 @@ import {
   acknowledgeBackupRecoveryKey,
   testOidcDiscovery
 } from '../services/api.js';
+import { copyToClipboard } from '../utils/clipboard.js';
 import { MfaChallengeModal } from './MfaChallengeModal.js';
 
 interface OnboardingWizardModalProps {
@@ -117,7 +119,7 @@ From: alerts@yourdomain.com`
     title: 'Walkthrough: OIDC Single Sign-On & Automated Self-Backup Retention',
     subtitle: 'Securing technician logins and scheduling automated self-restoring backups',
     bullets: [
-      'OpenID Connect (Authentik / Entra ID / Okta): Create an OAuth2/OIDC Provider with Redirect URI https://rmm.yourdomain.com/api/auth/callback.',
+      'OpenID Connect (Authentik / Entra ID / Okta): Create an OAuth2/OIDC Provider with Redirect URI https://rmm.yourdomain.com/api/auth/oidc/callback.',
       'Unified Self-Backup System: Every scheduled or pre-update backup bundles vitrine.db, the AES-256 LAPS vault, branding logos, and a schema version manifest into data/backups/.'
     ],
     codeSnippet: `# OIDC Redirect URI to register in Authentik / Keycloak / Entra ID:
@@ -149,6 +151,8 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
   });
 
   const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [showSaveMfa, setShowSaveMfa] = useState(false);
   const [guideOpenForStep, setGuideOpenForStep] = useState<number | null>(null);
   const [copiedProxyConfig, setCopiedProxyConfig] = useState(false);
 
@@ -161,10 +165,12 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
   const [lockSignedUpdates, setLockSignedUpdates] = useState(true);
   const [importingMesh, setImportingMesh] = useState(false);
   const [importSummary, setImportSummary] = useState<string | null>(null);
+  const [importIsError, setImportIsError] = useState(false);
 
   // Step 3: Code Signing Test State
   const [testingSigner, setTestingSigner] = useState(false);
   const [signerResult, setSignerResult] = useState<string | null>(null);
+  const [signerIsError, setSignerIsError] = useState(false);
 
   // Step 4: Reverse Proxy / TLS Test State
   const [testingProxy, setTestingProxy] = useState(false);
@@ -174,6 +180,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
   const [createInitialBackup, setCreateInitialBackup] = useState(true);
   const [testingOidc, setTestingOidc] = useState(false);
   const [oidcTestMsg, setOidcTestMsg] = useState<string | null>(null);
+  const [oidcIsError, setOidcIsError] = useState(false);
   const [revealedWizardBackupKey, setRevealedWizardBackupKey] = useState<string | null>(null);
   const [showWizardBackupKeyMfa, setShowWizardBackupKeyMfa] = useState(false);
   const [copiedWizardBackupKey, setCopiedWizardBackupKey] = useState(false);
@@ -237,10 +244,15 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
         lock_signed_binary_updates: lockSignedUpdates
       });
       if (res.success) {
+        setImportIsError(false);
         setImportSummary(res.message);
       } else {
+        setImportIsError(true);
         setImportSummary('Unable to import: check MeshCentral URL & API token.');
       }
+    } catch (err: any) {
+      setImportIsError(true);
+      setImportSummary(err?.message || 'Unable to import from MeshCentral.');
     } finally {
       setImportingMesh(false);
     }
@@ -251,12 +263,17 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
     try {
       const res = await testCodeSigningPipeline(formData.code_signing_url);
       if (res.success) {
+        setSignerIsError(false);
         setSignerResult(
           `Verified 3-Stage Signing Pipeline (${res.hsmStatus}) • ${res.ms2AutoUpdateProtection}`
         );
       } else {
-        setSignerResult(`Signing endpoint check: ${res.error || res.hsmStatus || 'Unreachable'}`);
+        setSignerIsError(true);
+        setSignerResult(`Signing endpoint check failed: ${res.error || res.hsmStatus || 'Unreachable'}`);
       }
+    } catch (err: any) {
+      setSignerIsError(true);
+      setSignerResult(`Signing endpoint check failed: ${err?.message || 'Unreachable'}`);
     } finally {
       setTestingSigner(false);
     }
@@ -318,22 +335,31 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
 
   const handleSave = async () => {
     setSaving(true);
+    setSaveError(null);
     try {
       const res = await updateSettings({
         ...formData,
         oobe_completed: 1,
         is_onboarded: 1
       });
+      if (res.mfaRequired) {
+        setShowSaveMfa(true);
+        return;
+      }
+      if (!res.success) {
+        setSaveError(res.error || 'Failed to save OOBE configuration.');
+        return;
+      }
       if (createInitialBackup) {
         await createSystemBackup({
           triggerType: 'manual',
           notes: 'Initial Post-OOBE Baseline Backup Snapshot'
         }).catch(() => {});
       }
-      if (res.success) {
-        onSaved(res.settings);
-        onClose();
-      }
+      onSaved(res.settings);
+      onClose();
+    } catch (err: any) {
+      setSaveError(err?.message || 'Failed to save OOBE configuration.');
     } finally {
       setSaving(false);
     }
@@ -591,7 +617,26 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                 </button>
               </div>
 
-              {discoveryResult && (
+              {discoveryResult && !discoveryResult.reachable && (
+                <div
+                  style={{
+                    background: 'rgba(239, 68, 68, 0.14)',
+                    border: '1px solid rgba(239, 68, 68, 0.35)',
+                    borderRadius: '10px',
+                    padding: '0.85rem 1rem',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.6rem',
+                    fontSize: '0.82rem',
+                    color: '#f87171'
+                  }}
+                >
+                  <AlertCircle size={16} style={{ flexShrink: 0 }} />
+                  <span>{discoveryResult.error || discoveryResult.summary || 'MeshCentral server unreachable'}</span>
+                </div>
+              )}
+
+              {discoveryResult && discoveryResult.reachable && (
                 <div
                   style={{
                     background: 'rgba(0, 0, 0, 0.28)',
@@ -673,7 +718,9 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                       <span>{importingMesh ? 'Importing & Pushing Add-ons...' : 'Execute MS2 Import & Queue Companion Add-Ons'}</span>
                     </button>
                     {importSummary && (
-                      <span style={{ fontSize: '0.76rem', color: '#34d399', fontWeight: 600 }}>{importSummary}</span>
+                      <span style={{ fontSize: '0.76rem', color: importIsError ? '#f87171' : '#34d399', fontWeight: 600 }}>
+                        {importSummary}
+                      </span>
                     )}
                   </div>
                 </div>
@@ -757,8 +804,18 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
               </div>
 
               {signerResult && (
-                <div style={{ background: 'rgba(16, 185, 129, 0.12)', border: '1px solid rgba(16, 185, 129, 0.35)', padding: '0.75rem 1rem', borderRadius: '8px', fontSize: '0.8rem', color: '#34d399' }}>
-                  ✓ {signerResult}
+                <div
+                  style={{
+                    background: signerIsError ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+                    border: `1px solid ${signerIsError ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`,
+                    padding: '0.75rem 1rem',
+                    borderRadius: '8px',
+                    fontSize: '0.8rem',
+                    color: signerIsError ? '#f87171' : '#34d399'
+                  }}
+                >
+                  {signerIsError ? '⚠ ' : '✓ '}
+                  {signerResult}
                 </div>
               )}
             </div>
@@ -842,10 +899,12 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                     type="button"
                     className="btn-glass"
                     style={{ fontSize: '0.72rem', padding: '0.25rem 0.6rem' }}
-                    onClick={() => {
-                      navigator.clipboard.writeText(getGeneratedProxyConfig());
-                      setCopiedProxyConfig(true);
-                      setTimeout(() => setCopiedProxyConfig(false), 2000);
+                    onClick={async () => {
+                      const ok = await copyToClipboard(getGeneratedProxyConfig());
+                      if (ok) {
+                        setCopiedProxyConfig(true);
+                        setTimeout(() => setCopiedProxyConfig(false), 2000);
+                      }
                     }}
                   >
                     {copiedProxyConfig ? <Check size={12} color="#10b981" /> : <Copy size={12} />}
@@ -987,16 +1046,21 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                   onClick={async () => {
                     setTestingOidc(true);
                     setOidcTestMsg(null);
+                    setOidcIsError(false);
                     try {
                       const res = await testOidcDiscovery({
                         issuerUrl: formData.oidc_issuer_url,
                         clientId: formData.oidc_client_id
                       });
+                      setOidcIsError(!res.success);
                       setOidcTestMsg(
                         res.success
                           ? `✓ OIDC Discovery verified (${res.issuer}) — Auth endpoint ready.`
                           : `OIDC check failed: ${res.error || 'Unable to fetch .well-known/openid-configuration'}`
                       );
+                    } catch (err: any) {
+                      setOidcIsError(true);
+                      setOidcTestMsg(`OIDC check failed: ${err?.message || 'Unable to reach OIDC issuer'}`);
                     } finally {
                       setTestingOidc(false);
                     }
@@ -1039,7 +1103,16 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
               </div>
 
               {oidcTestMsg && (
-                <div style={{ padding: '0.6rem 0.9rem', borderRadius: '8px', background: 'rgba(0, 242, 254, 0.1)', border: '1px solid rgba(0, 242, 254, 0.35)', fontSize: '0.78rem' }}>
+                <div
+                  style={{
+                    padding: '0.6rem 0.9rem',
+                    borderRadius: '8px',
+                    background: oidcIsError ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+                    border: `1px solid ${oidcIsError ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`,
+                    color: oidcIsError ? '#f87171' : '#34d399',
+                    fontSize: '0.78rem'
+                  }}
+                >
                   {oidcTestMsg}
                 </div>
               )}
@@ -1089,10 +1162,12 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                       type="button"
                       className="btn-glass"
                       style={{ fontSize: '0.74rem', padding: '0.35rem 0.65rem' }}
-                      onClick={() => {
-                        navigator.clipboard.writeText(revealedWizardBackupKey);
-                        setCopiedWizardBackupKey(true);
-                        setTimeout(() => setCopiedWizardBackupKey(false), 2000);
+                      onClick={async () => {
+                        const ok = await copyToClipboard(revealedWizardBackupKey);
+                        if (ok) {
+                          setCopiedWizardBackupKey(true);
+                          setTimeout(() => setCopiedWizardBackupKey(false), 2000);
+                        }
                       }}
                     >
                       {copiedWizardBackupKey ? <Check size={13} color="#10b981" /> : <Copy size={13} />}
@@ -1197,6 +1272,26 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                   <span>Create an initial self-restoring baseline backup archive (DB + LAPS Vault + Branding) upon completing OOBE</span>
                 </label>
               </div>
+            </div>
+          )}
+
+          {saveError && (
+            <div
+              style={{
+                marginTop: '1rem',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.55rem',
+                padding: '0.75rem 1rem',
+                borderRadius: '8px',
+                background: 'rgba(239, 68, 68, 0.14)',
+                border: '1px solid rgba(239, 68, 68, 0.35)',
+                color: '#f87171',
+                fontSize: '0.82rem'
+              }}
+            >
+              <AlertCircle size={16} style={{ flexShrink: 0 }} />
+              <span>{saveError}</span>
             </div>
           )}
         </div>
@@ -1304,6 +1399,18 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
         title="Step-Up MFA: Reveal Backup Recovery Key"
         description="Enter your 6-digit TOTP authenticator code or recovery code to view and download the AES-256-GCM Backup Encryption Passphrase."
         secretType="backup_recovery_key"
+      />
+
+      <MfaChallengeModal
+        isOpen={showSaveMfa}
+        onClose={() => setShowSaveMfa(false)}
+        onSuccess={() => {
+          setShowSaveMfa(false);
+          handleSave();
+        }}
+        title="Step-Up MFA: Complete OOBE Setup"
+        description="Enter your 6-digit TOTP authenticator code or recovery code to authorize saving global RMM & OOBE setup settings."
+        secretType="system_settings"
       />
     </div>
   );

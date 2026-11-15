@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { Device, GuestAccessGrant } from '../types/index.js';
 import { fetchGuestGrants, createGuestGrant, revokeGuestGrant } from '../services/api.js';
+import { copyToClipboard as copyTextToClipboard } from '../utils/clipboard.js';
 
 interface GuestAccessModalProps {
   devices: Device[];
@@ -139,7 +140,7 @@ export const GuestAccessModal: React.FC<GuestAccessModalProps> = ({ devices, onC
   };
 
   const copyToClipboard = (text: string, id: string) => {
-    navigator.clipboard.writeText(text);
+    copyTextToClipboard(text);
     setCopiedId(id);
     setTimeout(() => setCopiedId(null), 2500);
   };

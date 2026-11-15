@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
-import { ShieldAlert, ShieldCheck, X, AlertTriangle } from 'lucide-react';
+import { ShieldAlert, ShieldCheck, X, AlertTriangle, AlertCircle } from 'lucide-react';
 import { Device } from '../types/index.js';
 import { toggleQuarantine } from '../services/api.js';
+import { MfaChallengeModal } from './MfaChallengeModal.js';
 
 interface CyberIsolationModalProps {
   device: Device;
@@ -15,14 +16,27 @@ export const CyberIsolationModal: React.FC<CyberIsolationModalProps> = ({
   onUpdated
 }) => {
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [mfaOpen, setMfaOpen] = useState(false);
   const isIsolated = Boolean(device.quarantined);
 
   const handleToggle = async () => {
     setLoading(true);
+    setError(null);
     try {
       const res = await toggleQuarantine(device.id, !isIsolated);
+      if (res.mfaRequired) {
+        setMfaOpen(true);
+        return;
+      }
+      if (!res.success) {
+        setError(res.error || 'Failed to update endpoint quarantine state.');
+        return;
+      }
       onUpdated(res.quarantined);
       onClose();
+    } catch (err: any) {
+      setError(err?.message || 'Failed to update endpoint quarantine state.');
     } finally {
       setLoading(false);
     }
@@ -80,6 +94,25 @@ export const CyberIsolationModal: React.FC<CyberIsolationModalProps> = ({
             Target: <strong>{device.hostname}</strong> ({device.ip_address})<br />
             Tenant: <strong>{device.tenant_name || 'Unassigned Client'}</strong>
           </div>
+
+          {error && (
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.55rem',
+                padding: '0.7rem 0.9rem',
+                borderRadius: '8px',
+                background: 'rgba(239, 68, 68, 0.14)',
+                border: '1px solid rgba(239, 68, 68, 0.35)',
+                color: '#f87171',
+                fontSize: '0.8rem'
+              }}
+            >
+              <AlertCircle size={16} style={{ flexShrink: 0 }} />
+              <span>{error}</span>
+            </div>
+          )}
         </div>
 
         <div className="modal-footer">
@@ -104,6 +137,19 @@ export const CyberIsolationModal: React.FC<CyberIsolationModalProps> = ({
           </button>
         </div>
       </div>
+
+      <MfaChallengeModal
+        isOpen={mfaOpen}
+        onClose={() => setMfaOpen(false)}
+        onSuccess={() => {
+          setMfaOpen(false);
+          handleToggle();
+        }}
+        title="Step-Up MFA: Endpoint Cyber Isolation"
+        description="Enter your 6-digit TOTP authenticator code or recovery code to modify endpoint quarantine firewall containment."
+        secretType="device_quarantine"
+        deviceId={device.id}
+      />
     </div>
   );
 };

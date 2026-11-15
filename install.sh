@@ -3,13 +3,6 @@
 # Exit immediately on command failure or unset variable errors
 set -euo pipefail
 
-echo "=========================================================="
-echo "             Vitrine RMM Installation Script              "
-echo "=========================================================="
-echo "Modern, Glassmorphic Self-Hosted RMM (v2.5.1)"
-echo "Powered by MeshCentral 2 Remote Engine (Co-Existence Safe)"
-echo "=========================================================="
-
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJ_ROOT"
 
@@ -18,6 +11,15 @@ if ! command -v node &> /dev/null; then
     echo "Error: node is not installed. Please install Node.js 20 LTS or higher."
     exit 1
 fi
+
+APP_VERSION="$(node -p "try { require('./package.json').version || require('./backend/package.json').version } catch { '2.6.0' }" 2>/dev/null || echo "2.6.0")"
+
+echo "=========================================================="
+echo "             Vitrine RMM Installation Script              "
+echo "=========================================================="
+echo "Modern, Glassmorphic Self-Hosted RMM (v${APP_VERSION})"
+echo "Powered by MeshCentral 2 Remote Engine (Co-Existence Safe)"
+echo "=========================================================="
 
 NODE_VER=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
 if [ "$NODE_VER" -lt 18 ]; then
@@ -29,22 +31,58 @@ fi
 
 echo "--> Node.js $(node -v) and npm $(npm -v) detected."
 
-# 2. Strictly Read-Only MeshCentral 2 Co-Existence Check (ZERO writes outside $PROJ_ROOT)
+# 2. Strictly Read-Only MeshCentral 2 Co-Existence Check (ZERO writes outside $PROJ_ROOT, SIGPIPE-safe)
 echo "--> Checking for neighboring MeshCentral 2 services (strictly read-only)..."
-if systemctl list-unit-files 2>/dev/null | grep -q "meshcentral.service"; then
-    echo "    [✓] Detected neighboring systemd unit: meshcentral.service (Isolated — never modified or restarted)."
+if command -v systemctl &> /dev/null; then
+    UNIT_FILES="$(systemctl list-unit-files --no-pager 2>/dev/null || true)"
+    if [[ "$UNIT_FILES" == *"meshcentral.service"* ]]; then
+        echo "    [✓] Detected neighboring systemd unit: meshcentral.service (Isolated — never modified or restarted)."
+    fi
 fi
 
-# 3. Port Collision Check (Never collide with MeshCentral 443, 80, 4430, 4433)
-DEFAULT_PORT=${PORT:-8080}
-if command -v ss &> /dev/null; then
-    if ss -tuln | grep -q ":${DEFAULT_PORT} "; then
-        echo "    [!] Port ${DEFAULT_PORT} is currently in use."
-        DEFAULT_PORT=8085
-        echo "    [✓] Auto-selected non-conflicting port: ${DEFAULT_PORT}"
+# 3. Port Collision Check (Never collide with MeshCentral 443, 80, 4430, 4433; scan 8080..8090 SIGPIPE-safely)
+is_port_in_use() {
+    local check_port="$1"
+    if command -v ss &> /dev/null; then
+        local ss_out
+        ss_out="$(ss -tuln 2>/dev/null || true)"
+        if [[ "$ss_out" =~ :${check_port}([[:space:]]|$) ]]; then
+            return 0
+        fi
+        return 1
+    fi
+    node -e "const net=require('net');const s=net.createServer();s.once('error',()=>process.exit(0));s.once('listening',()=>s.close(()=>process.exit(1)));s.listen(${check_port},'0.0.0.0');" 2>/dev/null
+}
+
+DEFAULT_PORT="${PORT:-}"
+if [ -n "$DEFAULT_PORT" ]; then
+    if is_port_in_use "$DEFAULT_PORT"; then
+        echo "    [!] Requested PORT=${DEFAULT_PORT} is currently in use; scanning 8080..8090 for an open port..."
+        DEFAULT_PORT=""
     else
         echo "    [✓] Port ${DEFAULT_PORT} is available and isolated from MeshCentral ports."
     fi
+fi
+
+if [ -z "$DEFAULT_PORT" ]; then
+    for candidate_port in $(seq 8080 8090); do
+        if ! is_port_in_use "$candidate_port"; then
+            DEFAULT_PORT="$candidate_port"
+            if [ "$candidate_port" -eq 8080 ]; then
+                echo "    [✓] Port ${DEFAULT_PORT} is available and isolated from MeshCentral ports."
+            else
+                echo "    [✓] Auto-selected available non-conflicting port: ${DEFAULT_PORT}"
+            fi
+            break
+        else
+            echo "    [!] Port ${candidate_port} is currently in use."
+        fi
+    done
+fi
+
+if [ -z "$DEFAULT_PORT" ]; then
+    echo "Error: All candidate ports 8080..8090 are currently in use. Set PORT=<free_port> and re-run install.sh."
+    exit 1
 fi
 
 echo "--> Installing Root & Workspace dependencies..."
@@ -83,9 +121,9 @@ fi
 
 # Record current git commit SHA and version metadata for the Self-Updater
 GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "release-build")
-echo "{\"version\":\"2.5.0\",\"commit\":\"$GIT_COMMIT\",\"installedAt\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > "$PROJ_ROOT/data/install-meta.json"
+node -e "const fs=require('fs');fs.writeFileSync(process.argv[1],JSON.stringify({version:process.argv[2],commit:process.argv[3],installedAt:new Date().toISOString()}));" "$PROJ_ROOT/data/install-meta.json" "$APP_VERSION" "$GIT_COMMIT"
 
-echo "--> Vitrine RMM v2.5.0 compilation completed successfully!"
+echo "--> Vitrine RMM v${APP_VERSION} compilation completed successfully!"
 
 # 5. Systemd Service Creation Option (Strictly isolated to vitrine-rmm.service)
 SETUP_SERVICE="n"
@@ -97,9 +135,15 @@ if [ -t 0 ]; then
 fi
 
 if [[ "$SETUP_SERVICE" =~ ^[Yy]$ ]]; then
-    NODE_PATH=$(command -v node)
+    NODE_PATH="$(command -v node)"
     SERVER_PATH="$PROJ_ROOT/backend/dist/server.js"
+    WORK_DIR="$PROJ_ROOT/backend"
+    DATA_PATH="$PROJ_ROOT/data"
+    BRAND_PATH="$PROJ_ROOT/branding"
     TMP_UNIT="$PROJ_ROOT/data/vitrine-rmm.service.tmp"
+
+    # Escape any embedded double quotes/backslashes for systemd quoted assignment syntax
+    esc_systemd() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
     echo "--> Generating isolated vitrine-rmm.service unit..."
     cat <<EOF > "$TMP_UNIT"
@@ -110,13 +154,12 @@ After=network.target
 [Service]
 Type=simple
 User=$CURR_USER
-WorkingDirectory=$PROJ_ROOT/backend
-Environment=NODE_ENV=production
-Environment=PORT=$DEFAULT_PORT
-Environment=DATA_DIR=$PROJ_ROOT/data
-Environment=BRANDING_DIR=$PROJ_ROOT/branding
-Environment=VITRINE_ENABLE_GIT_SELF_PULL=true
-ExecStart=$NODE_PATH $SERVER_PATH
+WorkingDirectory="$(esc_systemd "$WORK_DIR")"
+Environment="NODE_ENV=production"
+Environment="PORT=$DEFAULT_PORT"
+Environment="DATA_DIR=$(esc_systemd "$DATA_PATH")"
+Environment="BRANDING_DIR=$(esc_systemd "$BRAND_PATH")"
+ExecStart="$(esc_systemd "$NODE_PATH")" "$(esc_systemd "$SERVER_PATH")"
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -127,7 +170,7 @@ WantedBy=multi-user.target
 EOF
 
     echo "--> Installing service unit to systemd (sudo permission required)..."
-    sudo cp "$TMP_UNIT" /etc/systemd/system/vitrine-rmm.service
+    sudo install -m 0644 "$TMP_UNIT" /etc/systemd/system/vitrine-rmm.service
     rm -f "$TMP_UNIT"
     sudo systemctl daemon-reload
     sudo systemctl enable vitrine-rmm.service
@@ -140,7 +183,7 @@ fi
 
 echo ""
 echo "=========================================================="
-echo "Vitrine RMM v2.5.1 setup completed successfully!"
+echo "Vitrine RMM v${APP_VERSION} setup completed successfully!"
 echo "Neighboring MeshCentral 2 installations were left untouched."
 echo ""
 echo "Open http://localhost:${DEFAULT_PORT}/ in your browser to create"

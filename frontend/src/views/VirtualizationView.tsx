@@ -7,6 +7,8 @@ import {
   deleteVirtualizationHost,
   syncVirtualizationHost
 } from '../services/api.js';
+import { AuthUser } from '../types/index.js';
+import { canMutateFleet } from '../utils/permissions.js';
 
 interface GuestVm {
   vmid: number | string;
@@ -35,7 +37,12 @@ interface HypervisorHost {
   vms: GuestVm[];
 }
 
-export const VirtualizationView: React.FC = () => {
+interface VirtualizationViewProps {
+  currentUser?: AuthUser | null;
+}
+
+export const VirtualizationView: React.FC<VirtualizationViewProps> = ({ currentUser }) => {
+  const canMutate = canMutateFleet(currentUser);
   const [hosts, setHosts] = useState<HypervisorHost[]>([]);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
   const [syncingHostId, setSyncingHostId] = useState<string | null>(null);
@@ -118,25 +125,30 @@ export const VirtualizationView: React.FC = () => {
             Agentless API integration for Proxmox VE, Hyper-V, and VMware ESXi clusters with AES-256-GCM credential vaulting
           </span>
         </div>
-        <button className="btn-glass btn-primary" onClick={() => setShowAddHost(true)}>
-          <Plus size={15} /> Add Hypervisor Host
-        </button>
+        {canMutate && (
+          <button className="btn-glass btn-primary" onClick={() => setShowAddHost(true)}>
+            <Plus size={15} /> Add Hypervisor Host
+          </button>
+        )}
       </div>
 
-      {actionMsg && (
-        <div
-          className="glass-card"
-          style={{
-            padding: '0.75rem 1.25rem',
-            background: 'rgba(16, 185, 129, 0.12)',
-            borderColor: 'rgba(16, 185, 129, 0.35)',
-            color: '#34d399',
-            fontSize: '0.85rem'
-          }}
-        >
-          ✓ {actionMsg}
-        </div>
-      )}
+      {actionMsg && (() => {
+        const isVirtErr = /error|issue|fail|unreach|reject/i.test(actionMsg);
+        return (
+          <div
+            className="glass-card"
+            style={{
+              padding: '0.75rem 1.25rem',
+              background: isVirtErr ? 'rgba(239, 68, 68, 0.12)' : 'rgba(16, 185, 129, 0.12)',
+              borderColor: isVirtErr ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)',
+              color: isVirtErr ? '#fca5a5' : '#34d399',
+              fontSize: '0.85rem'
+            }}
+          >
+            {isVirtErr ? '⚠ ' : '✓ '}{actionMsg}
+          </div>
+        );
+      })()}
 
       {hosts.length === 0 && (
         <div className="glass-card" style={{ textAlign: 'center', padding: '3rem', color: 'var(--text-muted)' }}>
@@ -164,24 +176,28 @@ export const VirtualizationView: React.FC = () => {
                 <span className={`status-pill ${isOnline ? 'status-online' : 'status-offline'}`}>
                   {h.status || 'Connected'}
                 </span>
-                <button
-                  type="button"
-                  className="btn-glass"
-                  style={{ fontSize: '0.75rem', padding: '0.3rem 0.65rem' }}
-                  disabled={syncingHostId === h.id}
-                  title="Poll Live Hypervisor API (Proxmox VE / vSphere / TCP Probe)"
-                  onClick={() => handleSyncHost(h)}
-                >
-                  <RefreshCw size={13} className={syncingHostId === h.id ? 'spin' : ''} />
-                  <span>{syncingHostId === h.id ? 'Syncing...' : 'Sync Host'}</span>
-                </button>
-                <button
-                  className="btn-glass btn-icon"
-                  title="Remove Hypervisor Host"
-                  onClick={() => handleDeleteHost(h.id, h.name)}
-                >
-                  <Trash2 size={14} color="#ef4444" />
-                </button>
+                {canMutate && (
+                  <>
+                    <button
+                      type="button"
+                      className="btn-glass"
+                      style={{ fontSize: '0.75rem', padding: '0.3rem 0.65rem' }}
+                      disabled={syncingHostId === h.id}
+                      title="Poll Live Hypervisor API (Proxmox VE / vSphere / TCP Probe)"
+                      onClick={() => handleSyncHost(h)}
+                    >
+                      <RefreshCw size={13} className={syncingHostId === h.id ? 'spin' : ''} />
+                      <span>{syncingHostId === h.id ? 'Syncing...' : 'Sync Host'}</span>
+                    </button>
+                    <button
+                      className="btn-glass btn-icon"
+                      title="Remove Hypervisor Host"
+                      onClick={() => handleDeleteHost(h.id, h.name)}
+                    >
+                      <Trash2 size={14} color="#ef4444" />
+                    </button>
+                  </>
+                )}
               </div>
             </div>
 
@@ -229,23 +245,27 @@ export const VirtualizationView: React.FC = () => {
                           </span>
                         </td>
                         <td style={{ textAlign: 'right' }}>
-                          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.35rem' }}>
-                            {vm.status !== 'Running' ? (
-                              <button className="btn-glass btn-icon" title="Start VM" onClick={() => handleVmPower(h.id, vm.vmid, 'start')}>
-                                <Play size={13} color="#10b981" />
+                          {canMutate ? (
+                            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.35rem' }}>
+                              {vm.status !== 'Running' ? (
+                                <button className="btn-glass btn-icon" title="Start VM" onClick={() => handleVmPower(h.id, vm.vmid, 'start')}>
+                                  <Play size={13} color="#10b981" />
+                                </button>
+                              ) : (
+                                <button className="btn-glass btn-icon" title="Stop VM" onClick={() => handleVmPower(h.id, vm.vmid, 'stop')}>
+                                  <Square size={13} color="#ef4444" />
+                                </button>
+                              )}
+                              <button className="btn-glass btn-icon" title="Reboot VM" onClick={() => handleVmPower(h.id, vm.vmid, 'reboot')}>
+                                <RotateCcw size={13} color="#fbbf24" />
                               </button>
-                            ) : (
-                              <button className="btn-glass btn-icon" title="Stop VM" onClick={() => handleVmPower(h.id, vm.vmid, 'stop')}>
-                                <Square size={13} color="#ef4444" />
+                              <button className="btn-glass btn-icon" title="Take Snapshot" onClick={() => handleVmPower(h.id, vm.vmid, 'snapshot')}>
+                                <Camera size={13} color="#38bdf8" />
                               </button>
-                            )}
-                            <button className="btn-glass btn-icon" title="Reboot VM" onClick={() => handleVmPower(h.id, vm.vmid, 'reboot')}>
-                              <RotateCcw size={13} color="#fbbf24" />
-                            </button>
-                            <button className="btn-glass btn-icon" title="Take Snapshot" onClick={() => handleVmPower(h.id, vm.vmid, 'snapshot')}>
-                              <Camera size={13} color="#38bdf8" />
-                            </button>
-                          </div>
+                            </div>
+                          ) : (
+                            <span style={{ fontSize: '0.72rem', color: 'var(--text-dim)' }}>Read-Only</span>
+                          )}
                         </td>
                       </tr>
                     ))}

@@ -12,9 +12,13 @@ import {
   Sun,
   Moon,
   Sparkles,
-  FileText
+  FileText,
+  BellRing,
+  BookOpen,
+  ScrollText
 } from 'lucide-react';
 import { AuthUser } from '../types/index.js';
+import { isSuperAdmin as checkIsSuperAdmin } from '../utils/permissions.js';
 
 interface SidebarProps {
   currentView: string;
@@ -48,24 +52,23 @@ export const Sidebar: React.FC<SidebarProps> = ({
   appVersion = '2.5.0'
 }) => {
   const isClientAdmin = currentUser?.role === 'client_admin';
-  const isSuperAdmin =
-    !currentUser ||
-    currentUser.role === 'msp_super_admin' ||
-    currentUser.role === 'super_admin' ||
-    currentUser.role === 'admin';
+  const isSuperAdmin = Boolean(currentUser && checkIsSuperAdmin(currentUser));
 
   const coreNavItems = [
     { id: 'dashboard', label: 'Fleet Dashboard', icon: LayoutDashboard, allowClient: true },
+    { id: 'alerts', label: 'Alerts & Incidents', icon: BellRing, allowClient: true },
     { id: 'policies', label: 'Policy Hierarchy', icon: ShieldCheck, allowClient: false },
-    { id: 'patching', label: 'Patch Management', icon: RefreshCw, allowClient: true },
-    { id: 'scripts', label: 'Script Library', icon: Code2, allowClient: false },
+    { id: 'patching', label: 'Patch & Software', icon: RefreshCw, allowClient: true },
+    { id: 'scripts', label: 'Scripts & Schedules', icon: Code2, allowClient: false },
     { id: 'self-healing', label: 'Self-Healing', icon: HeartPulse, allowClient: false }
   ].filter((item) => !isClientAdmin || item.allowClient);
 
   const infraNavItems = [
+    { id: 'documentation', label: 'MSP Documentation', icon: BookOpen, allowClient: true },
     { id: 'topology', label: 'Network & Topology', icon: Network, allowClient: false },
     { id: 'virtualization', label: 'Hypervisors & VMs', icon: Server, allowClient: false },
-    { id: 'psa', label: 'PSA / ITFlow Sync', icon: Ticket, allowClient: false },
+    { id: 'psa', label: 'PSA & Time Tracking', icon: Ticket, allowClient: false },
+    { id: 'audit', label: 'Audit Explorer', icon: ScrollText, allowClient: false },
     ...(isSuperAdmin ? [{ id: 'settings', label: 'White-Label & Setup', icon: Settings, allowClient: false }] : [])
   ].filter((item) => !isClientAdmin || item.allowClient);
 

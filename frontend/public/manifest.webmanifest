@@ -1,18 +1,18 @@
 {
-  "name": "Vitrine RMM",
-  "short_name": "Vitrine",
-  "description": "Next-generation, glassmorphic self-hosted RMM powered by MeshCentral 2 and hierarchical policy automation.",
+  "name": "Vitrine Unified Endpoint Management & RMM",
+  "short_name": "Vitrine RMM",
+  "description": "Self-Hosted Multi-TenantMSP RMM & Endpoint Security Control Plane",
   "start_url": "/",
   "display": "standalone",
+  "background_color": "#070b14",
+  "theme_color": "#070b14",
   "orientation": "any",
-  "background_color": "#050b14",
-  "theme_color": "#00f2fe",
   "icons": [
     {
       "src": "/logo.png",
-      "sizes": "192x192 512x512",
+      "sizes": "910x804",
       "type": "image/png",
-      "purpose": "any maskable"
+      "purpose": "any"
     }
   ]
 }

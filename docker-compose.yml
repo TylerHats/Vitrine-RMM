@@ -6,9 +6,9 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      # Persistent SQLite database, AES-256-GCM vault key, backups, and white-label branding
-      - ./data:/app/data
-      - ./branding:/app/branding
+      # Named volumes are populated from the image with `node:node` ownership so `USER node` never hits EACCES
+      - vitrine_data:/app/data
+      - vitrine_branding:/app/branding
     environment:
       - PORT=8080
       - DATA_DIR=/app/data
@@ -23,7 +23,10 @@ services:
       start_period: 15s
     restart: unless-stopped
 
-  # Optional isolated MeshCentral 2 container (only started with --profile full-stack)
+  # Optional isolated MeshCentral 2 container (only started with `docker compose --profile full-stack up -d`).
+  # Networking note:
+  # - Inside Vitrine RMM Settings (container-to-container), use internal URL: https://meshcentral:443
+  # - For external agents/browsers reaching the host, set MESHCENTRAL_HOSTNAME to your public FQDN/IP (host port 4430 -> container 443).
   meshcentral:
     image: ghcr.io/ylianst/meshcentral:latest
     container_name: vitrine-meshcentral
@@ -31,10 +34,17 @@ services:
     ports:
       - "4430:443"
     environment:
-      - HOSTNAME=127.0.0.1
-      - REVERSE_PROXY=false
+      - HOSTNAME=${MESHCENTRAL_HOSTNAME:-meshcentral}
+      - REVERSE_PROXY=${MESHCENTRAL_REVERSE_PROXY:-false}
+      - ALLOW_NEW_ACCOUNTS=${MESHCENTRAL_ALLOW_NEW_ACCOUNTS:-true}
     volumes:
-      - ./meshcentral/data:/opt/meshcentral/meshcentral-data
-      - ./meshcentral/files:/opt/meshcentral/meshcentral-files
+      - meshcentral_data:/opt/meshcentral/meshcentral-data
+      - meshcentral_files:/opt/meshcentral/meshcentral-files
     profiles:
       - full-stack
+
+volumes:
+  vitrine_data:
+  vitrine_branding:
+  meshcentral_data:
+  meshcentral_files:

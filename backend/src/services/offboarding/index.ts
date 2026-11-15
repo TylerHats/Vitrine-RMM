@@ -1,8 +1,73 @@
 import crypto from 'crypto';
 import { db } from '../../db/index.js';
 import { resolveEffectiveDevicePolicy } from '../policy/index.js';
-import { rotateLapsPassword } from '../laps/index.js';
+import { rotateLapsPasswordVerifiedAsync } from '../laps/index.js';
 import { meshBridge } from '../meshcentral/index.js';
+import { decryptVaultSecret } from '../vault/index.js';
+
+function normalizeEndpointOs(rawOs?: string | null): 'windows' | 'linux' | 'macos' {
+  const lower = String(rawOs || 'windows').trim().toLowerCase();
+  if (lower === 'linux') return 'linux';
+  if (lower === 'macos' || lower === 'darwin' || lower === 'mac') return 'macos';
+  return 'windows';
+}
+
+function hashPlainAgentToken(encryptedOrPlainToken?: string | null, isEncrypted = true): string | null {
+  if (!encryptedOrPlainToken) return null;
+  const plain = isEncrypted ? decryptVaultSecret(encryptedOrPlainToken) : encryptedOrPlainToken;
+  if (!plain) return null;
+  return crypto.createHash('sha256').update(plain, 'utf8').digest('hex');
+}
+
+function upsertDeletedDeviceTombstoneRow(params: {
+  deviceId: string;
+  meshNodeId: string | null;
+  hostname: string;
+  tenantId: string;
+  tenantName: string;
+  lapsAction: string;
+  lapsAccountName: string;
+  osType: string;
+  quietOffboardedAt: string | null;
+  agentTokenHash: string | null;
+}): void {
+  try {
+    db.prepare(`
+      INSERT OR REPLACE INTO deleted_tenant_device_tombstones (
+        device_id, mesh_node_id, hostname, tenant_id, tenant_name,
+        laps_action, laps_account_name, os_type, quiet_offboarded_at, agent_token_hash
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      params.deviceId,
+      params.meshNodeId,
+      params.hostname,
+      params.tenantId,
+      params.tenantName,
+      params.lapsAction,
+      params.lapsAccountName,
+      params.osType,
+      params.quietOffboardedAt,
+      params.agentTokenHash
+    );
+  } catch {
+    db.prepare(`
+      INSERT OR REPLACE INTO deleted_tenant_device_tombstones (
+        device_id, mesh_node_id, hostname, tenant_id, tenant_name,
+        laps_action, laps_account_name, os_type, quiet_offboarded_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      params.deviceId,
+      params.meshNodeId,
+      params.hostname,
+      params.tenantId,
+      params.tenantName,
+      params.lapsAction,
+      params.lapsAccountName,
+      params.osType,
+      params.quietOffboardedAt
+    );
+  }
+}
 
 export type LapsOffboardAction =
   | 'remove_account'
@@ -101,17 +166,29 @@ export function initiateDeviceOffboard(
 
   if (isOnline) {
     if (resolvedLapsAction === 'keep_account_rotate_final') {
-      rotateLapsPassword(deviceId, { forceFinalArchiveSnapshot: true, actorUsername: actor });
+      // Kick off verified LAPS rotation while status is still 'online', and dispatch self-uninstall ONLY after verified LAPS completes!
+      const verifiedRotPromise = rotateLapsPasswordVerifiedAsync(deviceId, {
+        forceFinalArchiveSnapshot: true,
+        actorUsername: actor
+      });
+      void verifiedRotPromise
+        .catch(() => {})
+        .finally(() => {
+          meshBridge.dispatchAgentOffboard(deviceId, {
+            lapsAccountName: policy.lapsAccountName,
+            lapsAction: resolvedLapsAction
+          });
+        });
       stepsExecuted.push(
-        `Rotated managed local admin (${policy.lapsAccountName}) to a final break-glass password and sealed it in the Archive Vault.`
+        `Rotated managed local admin (${policy.lapsAccountName}) to a verified final break-glass password and sealed it in the Archive Vault.`
       );
+    } else {
+      // Dispatch actual OS cleanup & agent self-uninstall via MeshCentral tunnel / Companion
+      meshBridge.dispatchAgentOffboard(deviceId, {
+        lapsAccountName: policy.lapsAccountName,
+        lapsAction: resolvedLapsAction
+      });
     }
-
-    // Dispatch actual OS cleanup & agent self-uninstall via MeshCentral tunnel
-    meshBridge.dispatchAgentOffboard(deviceId, {
-      lapsAccountName: policy.lapsAccountName,
-      lapsAction: resolvedLapsAction
-    });
 
     stepsExecuted.push(
       `Reverted endpoint policy overrides (restored OS power defaults, removed scheduled self-healing watchdogs, and verified built-in administrator fallback).`
@@ -259,25 +336,74 @@ export function initiateDeviceOffboard(
     `Queued offboarding for offline endpoint ${device.hostname}. Auto-archives after ${policy.offboardOfflineAutoArchiveDays || 14}d offline.`
   );
 
-  return {
-    success: true,
-    deviceId,
-    hostname: device.hostname,
-    previousState: device.lifecycle_state || 'active',
-    newLifecycleState: 'pending_offboard',
-    wasOnline: false,
-    triggerSource,
-    lapsAccountName: policy.lapsAccountName,
-    lapsActionTaken: resolvedLapsAction,
-    autoArchiveAfterDays: policy.offboardOfflineAutoArchiveDays || 14,
-    preservedData: {
-      bitlockerKeyPreserved: Boolean(device.bitlocker_key),
-      lapsHistoryPreserved: true,
-      hardwareHistoryPreserved: true
-    },
-    stepsExecuted,
-    message: `${device.hostname} is offline: queued in Pending Offboarding (will clean up on next check-in or auto-archive after ${policy.offboardOfflineAutoArchiveDays || 14} days).`
-  };
+    return {
+      success: true,
+      deviceId,
+      hostname: device.hostname,
+      previousState: device.lifecycle_state || 'active',
+      newLifecycleState: 'pending_offboard',
+      wasOnline: false,
+      triggerSource,
+      lapsAccountName: policy.lapsAccountName,
+      lapsActionTaken: resolvedLapsAction,
+      autoArchiveAfterDays: policy.offboardOfflineAutoArchiveDays || 14,
+      preservedData: {
+        bitlockerKeyPreserved: Boolean(device.bitlocker_key),
+        lapsHistoryPreserved: true,
+        hardwareHistoryPreserved: true
+      },
+      stepsExecuted,
+      message: `${device.hostname} is offline: queued in Pending Offboarding (will clean up on next check-in or auto-archive after ${policy.offboardOfflineAutoArchiveDays || 14} days).`
+    };
+}
+
+export async function initiateDeviceOffboardAsync(
+  deviceId: string,
+  options: {
+    reason?: string;
+    triggerSource?: 'explicit_device' | 'client_archived' | 'client_deleted';
+    overrideLapsAction?: LapsOffboardAction;
+    forceImmediateArchive?: boolean;
+    actorUsername?: string;
+  } = {}
+): Promise<DeviceOffboardResult> {
+  const device = db.prepare('SELECT * FROM devices WHERE id = ?').get(deviceId) as any;
+  if (!device) {
+    throw new Error(`Device ${deviceId} not found`);
+  }
+  const actor = options.actorUsername || 'admin';
+  const policy = resolveEffectiveDevicePolicy(deviceId);
+  const triggerSource = options.triggerSource || 'explicit_device';
+  let resolvedLapsAction: LapsOffboardAction = policy.lapsOffboardExplicitDeviceAction || 'remove_account';
+  if (triggerSource === 'client_archived') {
+    resolvedLapsAction = policy.lapsOffboardClientArchivedAction || 'keep_account_rotate_final';
+  } else if (triggerSource === 'client_deleted') {
+    resolvedLapsAction = policy.lapsOffboardClientDeletedAction || 'remove_account';
+  }
+  if (options.overrideLapsAction) {
+    resolvedLapsAction = options.overrideLapsAction;
+  }
+
+  if (device.status === 'online' && resolvedLapsAction === 'keep_account_rotate_final') {
+    try {
+      await rotateLapsPasswordVerifiedAsync(deviceId, {
+        forceFinalArchiveSnapshot: true,
+        actorUsername: actor
+      });
+    } catch {}
+    // Now that final LAPS password has already been verified & committed, dispatch self-uninstall with keep_account_as_is so we don't double-rotate
+    const res = initiateDeviceOffboard(deviceId, {
+      ...options,
+      overrideLapsAction: 'keep_account_as_is'
+    });
+    db.prepare('UPDATE devices SET offboard_laps_action_taken = ? WHERE id = ?').run(resolvedLapsAction, deviceId);
+    return {
+      ...res,
+      lapsActionTaken: resolvedLapsAction
+    };
+  }
+
+  return initiateDeviceOffboard(deviceId, options);
 }
 
 export function offboardClientTenant(
@@ -321,12 +447,6 @@ export function offboardClientTenant(
       ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     `).run(tenant.id, tenant.name, tenant.slug, tenant.mesh_group_id || null, deletedLapsAction);
 
-    const insertDeviceTombstone = db.prepare(`
-      INSERT OR REPLACE INTO deleted_tenant_device_tombstones (
-        device_id, mesh_node_id, hostname, tenant_id, tenant_name, laps_action, quiet_offboarded_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
-    `);
-
     for (const dev of devices) {
       let devPol: any = null;
       try {
@@ -335,33 +455,52 @@ export function offboardClientTenant(
       const devLapsAction: LapsOffboardAction =
         options.overrideLapsAction || devPol?.lapsOffboardClientDeletedAction || deletedLapsAction;
       const lapsAccount = devPol?.lapsAccountName || 'LocalAdmin';
+      const devOsType = normalizeEndpointOs(dev.os_type);
+      const agentTokenHash = hashPlainAgentToken(dev.agent_auth_token, true);
 
       if (dev.status === 'online') {
         onlineOffboardedCount++;
-        meshBridge.dispatchAgentOffboard(dev.id, {
+        const rawNodeTarget = dev.mesh_node_id || dev.id;
+        if (devLapsAction === 'keep_account_rotate_final') {
+          const rotTask = rotateLapsPasswordVerifiedAsync(dev.id, {
+            forceFinalArchiveSnapshot: true,
+            actorUsername: actor
+          });
+          void rotTask.catch(() => {}).finally(() => {
+            meshBridge.dispatchRawNodeOffboard(rawNodeTarget, lapsAccount, devLapsAction, devOsType, dev.id);
+          });
+        } else {
+          meshBridge.dispatchAgentOffboard(dev.id, {
+            lapsAccountName: lapsAccount,
+            lapsAction: devLapsAction
+          });
+        }
+        upsertDeletedDeviceTombstoneRow({
+          deviceId: dev.id,
+          meshNodeId: dev.mesh_node_id || null,
+          hostname: dev.hostname,
+          tenantId: tenant.id,
+          tenantName: tenant.name,
+          lapsAction: devLapsAction,
           lapsAccountName: lapsAccount,
-          lapsAction: devLapsAction
+          osType: devOsType,
+          quietOffboardedAt: new Date().toISOString(),
+          agentTokenHash
         });
-        insertDeviceTombstone.run(
-          dev.id,
-          dev.mesh_node_id || null,
-          dev.hostname,
-          tenant.id,
-          tenant.name,
-          devLapsAction,
-          new Date().toISOString()
-        );
       } else {
         offlineQueuedCount++;
-        insertDeviceTombstone.run(
-          dev.id,
-          dev.mesh_node_id || null,
-          dev.hostname,
-          tenant.id,
-          tenant.name,
-          devLapsAction,
-          null
-        );
+        upsertDeletedDeviceTombstoneRow({
+          deviceId: dev.id,
+          meshNodeId: dev.mesh_node_id || null,
+          hostname: dev.hostname,
+          tenantId: tenant.id,
+          tenantName: tenant.name,
+          lapsAction: devLapsAction,
+          lapsAccountName: lapsAccount,
+          osType: devOsType,
+          quietOffboardedAt: null,
+          agentTokenHash
+        });
       }
     }
 
@@ -432,6 +571,44 @@ export function offboardClientTenant(
   };
 }
 
+export async function offboardClientTenantAsync(
+  tenantId: string,
+  options: {
+    mode: 'archive_client' | 'delete_client_permanently';
+    reason?: string;
+    overrideLapsAction?: LapsOffboardAction;
+    forceArchiveOfflineDevices?: boolean;
+    actorUsername?: string;
+  }
+) {
+  const actor = options.actorUsername || 'admin';
+  if (options.mode === 'archive_client') {
+    const devices = db.prepare('SELECT id, status, lifecycle_state FROM devices WHERE tenant_id = ?').all(tenantId) as any[];
+    for (const dev of devices) {
+      if (dev.lifecycle_state === 'archived' || dev.status !== 'online') continue;
+      let pol: any = null;
+      try {
+        pol = resolveEffectiveDevicePolicy(dev.id);
+      } catch {}
+      const resolvedAction: LapsOffboardAction =
+        options.overrideLapsAction || pol?.lapsOffboardClientArchivedAction || 'keep_account_rotate_final';
+      if (resolvedAction === 'keep_account_rotate_final') {
+        try {
+          await rotateLapsPasswordVerifiedAsync(dev.id, {
+            forceFinalArchiveSnapshot: true,
+            actorUsername: actor
+          });
+        } catch {}
+      }
+    }
+    return offboardClientTenant(tenantId, {
+      ...options,
+      overrideLapsAction: options.overrideLapsAction || 'keep_account_as_is'
+    });
+  }
+  return offboardClientTenant(tenantId, options);
+}
+
 export function reactivateArchivedClient(tenantId: string): { success: boolean; message: string } {
   const tenant = db.prepare('SELECT * FROM tenants WHERE id = ?').get(tenantId) as any;
   if (!tenant) throw new Error('Client not found');
@@ -450,7 +627,9 @@ export function reactivateArchivedClient(tenantId: string): { success: boolean; 
 
 export function handleAgentCheckInOrWake(
   deviceIdentifier: string,
-  triggerType: 'wake_checkin' | 'reinstall_agent' = 'wake_checkin'
+  triggerType: 'wake_checkin' | 'reinstall_agent' = 'wake_checkin',
+  tenantIdHint?: string,
+  agentAuthToken?: string
 ): {
   success: boolean;
   deviceId: string;
@@ -464,26 +643,74 @@ export function handleAgentCheckInOrWake(
   lapsActionExecuted?: string;
   message: string;
 } {
-  const device = db
-    .prepare('SELECT * FROM devices WHERE id = ? OR mesh_node_id = ? OR LOWER(hostname) = LOWER(?) LIMIT 1')
-    .get(deviceIdentifier, deviceIdentifier, deviceIdentifier) as any;
+  let device = db
+    .prepare('SELECT * FROM devices WHERE id = ? OR mesh_node_id = ? LIMIT 1')
+    .get(deviceIdentifier, deviceIdentifier) as any;
+
+  // Scope hostname fallback strictly by tenantIdHint (or require unique hostname match) to prevent cross-tenant collisions!
+  if (!device) {
+    if (tenantIdHint) {
+      device = db
+        .prepare('SELECT * FROM devices WHERE tenant_id = ? AND LOWER(hostname) = LOWER(?) LIMIT 1')
+        .get(tenantIdHint, deviceIdentifier) as any;
+    } else {
+      const hostMatches = db
+        .prepare('SELECT * FROM devices WHERE LOWER(hostname) = LOWER(?) LIMIT 2')
+        .all(deviceIdentifier) as any[];
+      if (hostMatches.length === 1) {
+        device = hostMatches[0];
+      }
+    }
+  }
 
   // Check per-device tombstone table if parent client was permanently deleted (cascade-removing devices row)
   if (!device) {
-    const devTombstone = db
-      .prepare(
-        'SELECT * FROM deleted_tenant_device_tombstones WHERE device_id = ? OR mesh_node_id = ? OR LOWER(hostname) = LOWER(?) LIMIT 1'
-      )
-      .get(deviceIdentifier, deviceIdentifier, deviceIdentifier) as any;
+    let devTombstone = db
+      .prepare('SELECT * FROM deleted_tenant_device_tombstones WHERE device_id = ? OR mesh_node_id = ? LIMIT 1')
+      .get(deviceIdentifier, deviceIdentifier) as any;
+
+    if (!devTombstone) {
+      const candidateTokenHash = agentAuthToken
+        ? hashPlainAgentToken(agentAuthToken, false)
+        : /^[0-9a-fA-F]{64}$/.test(deviceIdentifier)
+        ? deviceIdentifier.toLowerCase()
+        : hashPlainAgentToken(deviceIdentifier, false);
+      if (candidateTokenHash) {
+        try {
+          devTombstone = db
+            .prepare('SELECT * FROM deleted_tenant_device_tombstones WHERE agent_token_hash = ? LIMIT 1')
+            .get(candidateTokenHash) as any;
+        } catch {}
+      }
+    }
+
+    if (!devTombstone && tenantIdHint) {
+      devTombstone = db
+        .prepare('SELECT * FROM deleted_tenant_device_tombstones WHERE tenant_id = ? AND LOWER(hostname) = LOWER(?) LIMIT 1')
+        .get(tenantIdHint, deviceIdentifier) as any;
+    } else if (!devTombstone) {
+      const tMatches = db
+        .prepare('SELECT * FROM deleted_tenant_device_tombstones WHERE LOWER(hostname) = LOWER(?) LIMIT 2')
+        .all(deviceIdentifier) as any[];
+      if (tMatches.length === 1) {
+        devTombstone = tMatches[0];
+      }
+    }
 
     if (!devTombstone) {
       throw new Error(`Device ${deviceIdentifier} not found`);
     }
 
     const lapsAction: LapsOffboardAction = devTombstone.laps_action || 'remove_account';
-    if (devTombstone.mesh_node_id) {
-      meshBridge.dispatchRawNodeOffboard(devTombstone.mesh_node_id, 'LocalAdmin', lapsAction);
-    }
+    const lapsAccountName = devTombstone.laps_account_name || 'LocalAdmin';
+    const tombstoneOs = normalizeEndpointOs(devTombstone.os_type);
+    meshBridge.dispatchRawNodeOffboard(
+      devTombstone.mesh_node_id || devTombstone.device_id,
+      lapsAccountName,
+      lapsAction,
+      tombstoneOs,
+      devTombstone.device_id
+    );
 
     db.prepare(`
       UPDATE deleted_tenant_device_tombstones
@@ -529,18 +756,26 @@ export function handleAgentCheckInOrWake(
       ? tombstone?.laps_offboard_action || policy?.lapsOffboardClientDeletedAction || 'remove_account'
       : policy?.lapsOffboardClientArchivedAction || 'keep_account_rotate_final';
 
-    // Device just checked in online; rotate final archive password if required
+    // Device just checked in online; rotate verified final archive password BEFORE dispatching self-uninstall!
     db.prepare("UPDATE devices SET status = 'online', last_seen = CURRENT_TIMESTAMP WHERE id = ?").run(deviceId);
+    const targetLapsAccount = policy?.lapsAccountName || 'LocalAdmin';
     if (lapsAction === 'keep_account_rotate_final') {
-      try {
-        rotateLapsPassword(deviceId, { forceFinalArchiveSnapshot: true, actorUsername: 'system' });
-      } catch {}
+      const rotTask = rotateLapsPasswordVerifiedAsync(deviceId, {
+        forceFinalArchiveSnapshot: true,
+        actorUsername: 'system'
+      });
+      void rotTask.catch(() => {}).finally(() => {
+        meshBridge.dispatchAgentOffboard(deviceId, {
+          lapsAccountName: targetLapsAccount,
+          lapsAction
+        });
+      });
+    } else {
+      meshBridge.dispatchAgentOffboard(deviceId, {
+        lapsAccountName: targetLapsAccount,
+        lapsAction
+      });
     }
-
-    meshBridge.dispatchAgentOffboard(deviceId, {
-      lapsAccountName: policy?.lapsAccountName || 'LocalAdmin',
-      lapsAction
-    });
 
     db.prepare(`
       UPDATE devices
@@ -605,7 +840,21 @@ export function handleAgentCheckInOrWake(
   }
 
   // RULE 3: If device is in 'archived' AND parent Client is Active -> Return entry to life!
+  // Guard against trailing heartbeats arriving within 90s of an active offboard!
   if (device.lifecycle_state === 'archived') {
+    if (triggerType === 'wake_checkin' && device.offboarded_at) {
+      const offboardMs = new Date(String(device.offboarded_at).replace(' ', 'T') + (String(device.offboarded_at).includes('Z') ? '' : 'Z')).getTime();
+      if (!Number.isNaN(offboardMs) && Date.now() - offboardMs < 90000) {
+        return {
+          success: true,
+          deviceId,
+          hostname: device.hostname,
+          actionTaken: 'quiet_offboard_executed',
+          newLifecycleState: 'archived',
+          message: `Ignored trailing heartbeat within 90s cooldown after offboarding ${device.hostname}.`
+        };
+      }
+    }
     db.prepare(`
       UPDATE devices
       SET lifecycle_state = 'active',
@@ -617,9 +866,7 @@ export function handleAgentCheckInOrWake(
       WHERE id = ?
     `).run(deviceId);
 
-    try {
-      rotateLapsPassword(deviceId, { actorUsername: 'system' });
-    } catch {}
+    void rotateLapsPasswordVerifiedAsync(deviceId, { actorUsername: 'system' }).catch(() => {});
 
     db.prepare(`
       INSERT INTO audit_logs (id, username, device_id, action, details)
@@ -643,7 +890,7 @@ export function handleAgentCheckInOrWake(
   // Normal active device check-in
   db.prepare("UPDATE devices SET status = 'online', last_seen = CURRENT_TIMESTAMP WHERE id = ?").run(deviceId);
 
-  // Execute deferred LAPS rotation if due while offline
+  // Execute deferred LAPS rotation via verified async pipeline if due while offline
   const lapsRow = db.prepare('SELECT * FROM laps_vault WHERE device_id = ?').get(deviceId) as any;
   let deferredRotatedNote = '';
   if (
@@ -651,10 +898,8 @@ export function handleAgentCheckInOrWake(
     (lapsRow.rotation_pending_online === 1 ||
       (lapsRow.expires_at && new Date(lapsRow.expires_at).getTime() <= Date.now()))
   ) {
-    try {
-      const rotated = rotateLapsPassword(deviceId, { actorUsername: 'system' });
-      deferredRotatedNote = ` Deferred LAPS rotation for '${rotated.accountName}' was now safely executed and confirmed online (previous password retained in N-1 history).`;
-    } catch {}
+    void rotateLapsPasswordVerifiedAsync(deviceId, { actorUsername: 'system' }).catch(() => {});
+    deferredRotatedNote = ` Deferred LAPS rotation for '${lapsRow.account_name}' was triggered via verified live agent delivery.`;
   }
 
   return {

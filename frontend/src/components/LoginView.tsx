@@ -13,8 +13,10 @@ import {
   LifeBuoy,
   Globe
 } from 'lucide-react';
-import { setupInitialSuperAdmin, loginWithPassword } from '../services/api.js';
+import { setupInitialSuperAdmin, loginWithPassword, getLocalQrSvgUrl } from '../services/api.js';
 import { AuthStatusResponse, AuthUser } from '../types/index.js';
+import { copyToClipboard } from '../utils/clipboard.js';
+import { isSuperAdmin as checkIsSuperAdmin } from '../utils/permissions.js';
 
 interface LoginViewProps {
   authStatus: AuthStatusResponse;
@@ -55,6 +57,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
     user: AuthUser;
     totpSecret: string;
     otpAuthUri: string;
+    qrSvg?: string;
     recoveryCodes: string[];
   } | null>(null);
   const [copiedSecret, setCopiedSecret] = useState(false);
@@ -93,6 +96,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
         user: res.user,
         totpSecret: res.totpSecret || '',
         otpAuthUri: res.otpAuthUri || '',
+        qrSvg: res.qrSvg || undefined,
         recoveryCodes: res.recoveryCodes || []
       });
     } catch (err: any) {
@@ -120,7 +124,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
         setError(res.error || 'Invalid username or password.');
         return;
       }
-      onAuthenticated(res.user, !authStatus.isOnboarded);
+      onAuthenticated(res.user, !authStatus.isOnboarded && checkIsSuperAdmin(res.user));
     } catch (err: any) {
       setError(err?.message || 'Authentication request failed.');
     } finally {
@@ -188,9 +192,32 @@ export const LoginView: React.FC<LoginViewProps> = ({
               marginBottom: '1.1rem'
             }}
           >
-            <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--primary)', marginBottom: '0.35rem' }}>
-              1. Add Base32 Secret to Authenticator App (1Password, Bitwarden, Authy, Google/Microsoft Authenticator)
+            <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--primary)', marginBottom: '0.5rem' }}>
+              1. Scan QR Code or Add Base32 Secret to Authenticator App (1Password, Bitwarden, Authy, Google/Microsoft Authenticator)
             </div>
+            {provisionedMfa.otpAuthUri && (
+              <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '0.75rem' }}>
+                <div
+                  style={{
+                    background: '#ffffff',
+                    padding: '0.6rem',
+                    borderRadius: '10px',
+                    display: 'inline-flex',
+                    boxShadow: '0 6px 20px rgba(0, 0, 0, 0.35)'
+                  }}
+                >
+                  <img
+                    src={
+                      provisionedMfa.qrSvg
+                        ? `data:image/svg+xml;utf8,${encodeURIComponent(provisionedMfa.qrSvg)}`
+                        : getLocalQrSvgUrl(provisionedMfa.otpAuthUri)
+                    }
+                    alt="TOTP MFA Enrollment QR Code"
+                    style={{ width: 168, height: 168, display: 'block' }}
+                  />
+                </div>
+              </div>
+            )}
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
               <input
                 type="text"
@@ -202,10 +229,12 @@ export const LoginView: React.FC<LoginViewProps> = ({
               <button
                 type="button"
                 className="btn-glass"
-                onClick={() => {
-                  navigator.clipboard.writeText(provisionedMfa.totpSecret);
-                  setCopiedSecret(true);
-                  setTimeout(() => setCopiedSecret(false), 2000);
+                onClick={async () => {
+                  const ok = await copyToClipboard(provisionedMfa.totpSecret);
+                  if (ok) {
+                    setCopiedSecret(true);
+                    setTimeout(() => setCopiedSecret(false), 2000);
+                  }
                 }}
               >
                 {copiedSecret ? <CheckCircle size={15} color="#10b981" /> : <Copy size={15} />}
@@ -232,10 +261,12 @@ export const LoginView: React.FC<LoginViewProps> = ({
                   type="button"
                   className="btn-glass"
                   style={{ padding: '0.3rem 0.65rem', fontSize: '0.75rem' }}
-                  onClick={() => {
-                    navigator.clipboard.writeText(provisionedMfa.recoveryCodes.join('\n'));
-                    setCopiedCodes(true);
-                    setTimeout(() => setCopiedCodes(false), 2000);
+                  onClick={async () => {
+                    const ok = await copyToClipboard(provisionedMfa.recoveryCodes.join('\n'));
+                    if (ok) {
+                      setCopiedCodes(true);
+                      setTimeout(() => setCopiedCodes(false), 2000);
+                    }
                   }}
                 >
                   {copiedCodes ? <CheckCircle size={13} color="#10b981" /> : <Copy size={13} />}

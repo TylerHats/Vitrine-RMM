@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   ShieldCheck,
   Download,
@@ -42,6 +42,19 @@ export const QuickSupportPortalView: React.FC<QuickSupportPortalViewProps> = ({ 
     allSigned: boolean;
     stages: SigningStageReport[];
   } | null>(null);
+  const timersRef = useRef<Array<ReturnType<typeof setTimeout>>>([]);
+
+  const clearAllTimers = () => {
+    timersRef.current.forEach(clearTimeout);
+    timersRef.current = [];
+  };
+
+  useEffect(() => {
+    return () => {
+      timersRef.current.forEach(clearTimeout);
+      timersRef.current = [];
+    };
+  }, []);
 
   useEffect(() => {
     fetchPublicPortalConfig()
@@ -68,13 +81,14 @@ export const QuickSupportPortalView: React.FC<QuickSupportPortalViewProps> = ({ 
 
   const handleStartQuickSupport = async (e: React.FormEvent) => {
     e.preventDefault();
+    clearAllTimers();
     setPreparing(true);
     setErrorMsg(null);
     setSessionResult(null);
     setActiveStageIdx(1);
 
-    setTimeout(() => setActiveStageIdx(2), 300);
-    setTimeout(() => setActiveStageIdx(3), 600);
+    timersRef.current.push(setTimeout(() => setActiveStageIdx(2), 300));
+    timersRef.current.push(setTimeout(() => setActiveStageIdx(3), 600));
 
     try {
       const res = await createQuickSupportSession({
@@ -83,22 +97,31 @@ export const QuickSupportPortalView: React.FC<QuickSupportPortalViewProps> = ({ 
         session_code: sessionCodeInput.trim() || undefined
       });
 
-      setTimeout(() => {
+      if (!res.success || !res.session) {
+        clearAllTimers();
         setPreparing(false);
-        setActiveStageIdx(4);
-        if (res.success && res.session) {
+        setActiveStageIdx(0);
+        setErrorMsg(res.error || 'Unable to generate QuickSupport launcher at this time.');
+        return;
+      }
+
+      const confirmedSession = res.session;
+      timersRef.current.push(
+        setTimeout(() => {
+          setPreparing(false);
+          setActiveStageIdx(4);
           setSessionResult({
-            sessionCode: res.session.session_code,
+            sessionCode: confirmedSession.session_code,
             downloadUrl: res.downloadUrl,
             allSigned: Boolean(res.signingPipeline?.allSigned),
             stages: res.signingPipeline?.stages || []
           });
-        } else {
-          setErrorMsg(res.error || 'Unable to generate QuickSupport launcher at this time.');
-        }
-      }, 800);
+        }, 400)
+      );
     } catch (err: any) {
+      clearAllTimers();
       setPreparing(false);
+      setActiveStageIdx(0);
       setErrorMsg(err?.message || 'Network error generating QuickSupport launcher.');
     }
   };

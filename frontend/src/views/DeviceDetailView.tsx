@@ -35,7 +35,7 @@ import {
   Archive,
   Download
 } from 'lucide-react';
-import { AuthUser, Device, CustomFieldDefinition, OemWarranty, ChatMessage, HardwareHistoryItem, NetworkHistoryItem, SoftwareItem, DeviceNote, SessionRecording, WakeOnLanResult } from '../types/index.js';
+import { AuthUser, Device, CustomFieldDefinition, OemWarranty, ChatMessage, HardwareHistoryItem, NetworkHistoryItem, SoftwareItem, DeviceNote, SessionRecording, WakeOnLanResult, DeviceBackupJob, DocumentationArticle } from '../types/index.js';
 import {
   fetchDeviceCustomFields,
   revealDeviceSecretCustomFields,
@@ -58,14 +58,21 @@ import {
   fetchRecordings,
   getRecordingDownloadUrl,
   revealDeviceBitlockerKey,
-  getStoredSessionToken,
+  fetchWsTicket,
   elevateRemoteAgent,
   offboardDevice,
   forceArchiveDevice,
   simulateDeviceCheckin,
-  purgeArchivedDevice
+  purgeArchivedDevice,
+  runEndpointSecurityAction,
+  fetchDeviceBackupJobs,
+  runDeviceBackupNow,
+  fetchDocumentation,
+  acknowledgeHardwareDrift
 } from '../services/api.js';
 import { MfaChallengeModal } from '../components/MfaChallengeModal.js';
+import { copyToClipboard } from '../utils/clipboard.js';
+import { canMutateFleet } from '../utils/permissions.js';
 
 interface DeviceDetailViewProps {
   device: Device;
@@ -104,6 +111,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
   currentUser,
   onRefreshFleet
 }) => {
+  const canMutate = canMutateFleet(currentUser);
   const [activeTab, setActiveTab] = useState<'overview' | 'history' | 'software' | 'attributes' | 'chat'>('overview');
 
   // Maintenance state
@@ -139,6 +147,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
   // Hardware & Network History state
   const [hardwareHistory, setHardwareHistory] = useState<HardwareHistoryItem[]>([]);
   const [networkHistory, setNetworkHistory] = useState<NetworkHistoryItem[]>([]);
+  const [ackingHistId, setAckingHistId] = useState<string | null>(null);
 
   // BitLocker Key Security Reveal state
   const [isBitlockerRevealed, setIsBitlockerRevealed] = useState(false);
@@ -152,11 +161,17 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
   const [liveRam, setLiveRam] = useState<number>(device.ram_used_gb);
   const [liveNetMbps, setLiveNetMbps] = useState<string>(device.status === 'online' ? '1.2' : '0.0');
 
-  // Technician Runbook Notes & Session Recordings state
+  // Technician Runbook Notes, Session Recordings, Backups & Endpoint Security state
   const [notes, setNotes] = useState<DeviceNote[]>([]);
   const [newNoteContent, setNewNoteContent] = useState('');
   const [recordings, setRecordings] = useState<SessionRecording[]>([]);
+  const [playingRecId, setPlayingRecId] = useState<string | null>(null);
   const [upgradingSoftId, setUpgradingSoftId] = useState<string | null>(null);
+  const [backupJobs, setBackupJobs] = useState<DeviceBackupJob[]>([]);
+  const [runningBackup, setRunningBackup] = useState(false);
+  const [securityActionOutput, setSecurityActionOutput] = useState<string | null>(null);
+  const [runningSecAction, setRunningSecAction] = useState<string | null>(null);
+  const [linkedDocs, setLinkedDocs] = useState<DocumentationArticle[]>([]);
 
   useEffect(() => {
     setIsMaintenanceActive(Boolean(device.maintenance_active));
@@ -203,30 +218,85 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
     fetchDeviceSoftware(device.id).then(setSoftwareItems).catch(console.error);
     fetchDeviceNotes(device.id).then(setNotes).catch(console.error);
     fetchRecordings(device.id).then(setRecordings).catch(console.error);
-  }, [device.id, device.cpu_usage, device.ram_used_gb]);
+    fetchDeviceBackupJobs(device.id).then(setBackupJobs).catch(() => setBackupJobs([]));
+    fetchDocumentation({ tenant_id: device.tenant_id }).then(setLinkedDocs).catch(() => setLinkedDocs([]));
+  }, [device.id, device.tenant_id, device.cpu_usage, device.ram_used_gb]);
+
+  useEffect(() => {
+    if (activeTab !== 'chat') return;
+    fetchChatMessages(device.id).then(setChatMessages).catch(() => {});
+    const chatPollTimer = setInterval(() => {
+      fetchChatMessages(device.id).then(setChatMessages).catch(() => {});
+    }, 5000);
+    return () => clearInterval(chatPollTimer);
+  }, [activeTab, device.id]);
 
   useEffect(() => {
     if (deviceStatus !== 'online') return;
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const token = getStoredSessionToken();
-    const tokenQuery = token ? `&token=${encodeURIComponent(token)}` : '';
-    const ws = new WebSocket(
-      `${protocol}//${window.location.host}/ws/telemetry?deviceId=${encodeURIComponent(device.id)}${tokenQuery}`
-    );
-    ws.onmessage = (event) => {
+    let cancelled = false;
+    let ws: WebSocket | null = null;
+    (async () => {
+      let ticketQuery = '';
       try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'telemetry_tick') {
-          setLiveCpu(Number(msg.cpu));
-          setLiveRam(Number(msg.ramGb));
-          setLiveNetMbps(String(msg.netMbps));
-        }
+        const t = await fetchWsTicket();
+        if (t?.ticket) ticketQuery = `&ticket=${encodeURIComponent(t.ticket)}`;
       } catch {
-        // ignore parse errors
+        // Same-origin cookie fallback
       }
+      if (cancelled) return;
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(
+        `${protocol}//${window.location.host}/ws/telemetry?deviceId=${encodeURIComponent(device.id)}${ticketQuery}`
+      );
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'telemetry_tick') {
+            setLiveCpu(Number(msg.cpu));
+            setLiveRam(Number(msg.ramGb));
+            setLiveNetMbps(String(msg.netMbps));
+          } else if (typeof msg.cpuUsage === 'number') {
+            setLiveCpu(Number(msg.cpuUsage));
+            setLiveRam(Number(msg.ramUsageGb || 0));
+            setLiveNetMbps(String(msg.networkMbps || '0.0'));
+          }
+        } catch {
+          // ignore parse errors
+        }
+      };
+    })();
+    return () => {
+      cancelled = true;
+      ws?.close();
     };
-    return () => ws.close();
   }, [device.id, deviceStatus]);
+
+  const handleRunSecurityAction = async (
+    action: 'av_quick_scan' | 'av_full_scan' | 'av_update_signatures' | 'verify_encryption' | 'enable_encryption'
+  ) => {
+    setRunningSecAction(action);
+    setSecurityActionOutput(null);
+    try {
+      const res = await runEndpointSecurityAction(device.id, action);
+      setSecurityActionOutput(res.output || (res.success ? 'Action completed.' : res.error || 'Failed'));
+      onRefreshFleet?.();
+    } catch (err: any) {
+      setSecurityActionOutput(err?.message || 'Endpoint security command failed');
+    } finally {
+      setRunningSecAction(null);
+    }
+  };
+
+  const handleRunBackupSnapshot = async () => {
+    setRunningBackup(true);
+    try {
+      await runDeviceBackupNow(device.id);
+      const updated = await fetchDeviceBackupJobs(device.id);
+      setBackupJobs(updated);
+    } finally {
+      setRunningBackup(false);
+    }
+  };
 
   const handleRequestBitlockerReveal = async () => {
     try {
@@ -301,6 +371,29 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
     }
   };
 
+  const handleAckHardwareDrift = async (histId: string) => {
+    setAckingHistId(histId);
+    try {
+      const res = await acknowledgeHardwareDrift(device.id, histId);
+      if (res.success) {
+        setHardwareHistory((prev) =>
+          prev.map((item) =>
+            item.id === histId
+              ? {
+                  ...item,
+                  acknowledged: 1,
+                  acknowledged_by: currentUser?.username || 'Technician',
+                  acknowledged_at: new Date().toISOString()
+                }
+              : item
+          )
+        );
+      }
+    } finally {
+      setAckingHistId(null);
+    }
+  };
+
   const handleWakeOnLan = async (bootTarget: 'normal' | 'bios_uefi' | 'pxe' = 'normal') => {
     setWakingUp(true);
     setWolNotice('Executing 5-Tier Same-Company & Same-Network Peer Reachability Chain (Cloud CIRA -> Peer LAN AMT 16993 -> Multi-Peer WoL Magic Packets -> Historical Roaming Subnets -> ARP Verification)...');
@@ -308,11 +401,15 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
       const res = await wakeDeviceOnLan(device.id, { wakeAndOnline: true, bootTarget });
       if (res.success) {
         setWolChainResult(res);
-        setDeviceStatus('online');
         const relayStr = res.dispatchedRelays?.length
           ? `Relayed via same-company peers: ${res.dispatchedRelays.join(', ')}.`
           : 'Dispatched via local subnet broadcast.';
-        setWolNotice(`⚡ 5-Tier Wake & AMT Reachability Chain Succeeded for ${res.targetHostname} (${res.targetMac}). ${relayStr} Endpoint verified ONLINE via Peer ARP & Agent TLS Handshake!`);
+        if (res.verifiedOnline) {
+          setDeviceStatus('online');
+          setWolNotice(`⚡ 5-Tier Wake & AMT Reachability Chain Succeeded for ${res.targetHostname} (${res.targetMac}). ${relayStr} Endpoint verified ONLINE via Peer ARP & Agent TLS Handshake!`);
+        } else {
+          setWolNotice(`📡 Wake-on-LAN / Peer Relay packets dispatched for ${res.targetHostname} (${res.targetMac}). ${relayStr} Awaiting live Agent TLS check-in before marking endpoint online.`);
+        }
       } else {
         setWolNotice(`Failed to execute reachability chain: ${res.error || 'Unknown error'}`);
       }
@@ -583,96 +680,98 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
         </div>
 
         {/* Quick Action Toolbar */}
-        <div style={{ display: 'flex', gap: '0.65rem', flexWrap: 'wrap' }}>
-          <button
-            className="btn-glass"
-            style={{ background: 'rgba(56, 189, 248, 0.16)', color: '#38bdf8', border: '1px solid rgba(56, 189, 248, 0.4)' }}
-            onClick={() => handleWakeOnLan('normal')}
-            disabled={wakingUp}
-            title="Execute 5-Tier Reachability Chain (Cloud CIRA -> Same-Subnet Peer AMT 16993 -> Same-Subnet Peer Magic Packets -> Historical Roaming Subnet Relay -> ARP Link-Up Verification)"
-          >
-            <Zap size={15} /> {wakingUp ? 'Relaying 5-Tier Wake...' : deviceStatus === 'offline' ? '5-Tier Wake (WoL + Peer AMT)' : 'Test 5-Tier Peer Reachability'}
-          </button>
-          {Boolean(device.intel_amt_enabled) && (
+        {canMutate && (
+          <div style={{ display: 'flex', gap: '0.65rem', flexWrap: 'wrap' }}>
             <button
               className="btn-glass"
-              style={{ background: 'rgba(245, 158, 11, 0.2)', color: '#fbbf24', border: '1px solid rgba(245, 158, 11, 0.4)' }}
-              onClick={() => handleWakeOnLan('bios_uefi')}
+              style={{ background: 'rgba(56, 189, 248, 0.16)', color: '#38bdf8', border: '1px solid rgba(56, 189, 248, 0.4)' }}
+              onClick={() => handleWakeOnLan('normal')}
               disabled={wakingUp}
-              title="Relay Intel AMT / vPro WS-Management Power-On / Force UEFI Setup via Online Peer on the Same LAN Subnet"
+              title="Execute 5-Tier Reachability Chain (Cloud CIRA -> Same-Subnet Peer AMT 16993 -> Same-Subnet Peer Magic Packets -> Historical Roaming Subnet Relay -> ARP Link-Up Verification)"
             >
-              <Power size={15} /> Peer-Relayed AMT Boot
+              <Zap size={15} /> {wakingUp ? 'Relaying 5-Tier Wake...' : deviceStatus === 'offline' ? '5-Tier Wake (WoL + Peer AMT)' : 'Test 5-Tier Peer Reachability'}
             </button>
-          )}
+            {Boolean(device.intel_amt_enabled) && (
+              <button
+                className="btn-glass"
+                style={{ background: 'rgba(245, 158, 11, 0.2)', color: '#fbbf24', border: '1px solid rgba(245, 158, 11, 0.4)' }}
+                onClick={() => handleWakeOnLan('bios_uefi')}
+                disabled={wakingUp}
+                title="Relay Intel AMT / vPro WS-Management Power-On / Force UEFI Setup via Online Peer on the Same LAN Subnet"
+              >
+                <Power size={15} /> Peer-Relayed AMT Boot
+              </button>
+            )}
 
-          {deviceStatus === 'online' && (
-            <button
-              className="btn-glass"
-              style={{ background: 'rgba(56, 189, 248, 0.12)', color: '#38bdf8', border: '1px solid rgba(56, 189, 248, 0.3)' }}
-              onClick={handleEnableWol}
-              disabled={enablingWol}
-              title="Configure Windows Driver properties, disable Fast Startup, and execute OEM WMI BIOS commands without a manual reboot"
-            >
-              <Zap size={15} /> {enablingWol ? 'Configuring WoL...' : 'Enable WoL (OS & BIOS)'}
+            {deviceStatus === 'online' && (
+              <button
+                className="btn-glass"
+                style={{ background: 'rgba(56, 189, 248, 0.12)', color: '#38bdf8', border: '1px solid rgba(56, 189, 248, 0.3)' }}
+                onClick={handleEnableWol}
+                disabled={enablingWol}
+                title="Configure Windows Driver properties, disable Fast Startup, and execute OEM WMI BIOS commands without a manual reboot"
+              >
+                <Zap size={15} /> {enablingWol ? 'Configuring WoL...' : 'Enable WoL (OS & BIOS)'}
+              </button>
+            )}
+
+            {deviceStatus === 'online' && (
+              <button
+                className="btn-glass"
+                style={{
+                  background: device.intel_amt_enabled ? 'rgba(16, 185, 129, 0.12)' : 'rgba(168, 85, 247, 0.12)',
+                  color: device.intel_amt_enabled ? '#34d399' : '#c084fc',
+                  border: `1px solid ${device.intel_amt_enabled ? 'rgba(16, 185, 129, 0.35)' : 'rgba(168, 85, 247, 0.35)'}`
+                }}
+                onClick={handleProvisionAmt}
+                disabled={provisioningAmt}
+                title="Inspect Intel MEI driver and provision Intel vPro AMT CIRA tunnel without duplicate nodes"
+              >
+                <Cpu size={15} /> {provisioningAmt ? 'Provisioning...' : device.intel_amt_enabled ? '⚡ vPro Provisioned' : 'Auto-Provision vPro'}
+              </button>
+            )}
+
+            <button className="btn-glass btn-primary" onClick={() => onOpenRemote(device, false)}>
+              <Monitor size={15} /> Remote Desktop
             </button>
-          )}
-
-          {deviceStatus === 'online' && (
+            <button className="btn-glass" onClick={() => onOpenRemote(device, true)}>
+              <EyeOff size={15} color="#c084fc" /> Ghost Session
+            </button>
+            <button className="btn-glass" onClick={() => onOpenBgTools(device, 'terminal')}>
+              <Terminal size={15} /> Shell
+            </button>
+            <button className="btn-glass" onClick={() => onOpenLaps(device)}>
+              <KeyRound size={15} color="#fbbf24" /> LAPS Vault
+            </button>
             <button
               className="btn-glass"
               style={{
-                background: device.intel_amt_enabled ? 'rgba(16, 185, 129, 0.12)' : 'rgba(168, 85, 247, 0.12)',
-                color: device.intel_amt_enabled ? '#34d399' : '#c084fc',
-                border: `1px solid ${device.intel_amt_enabled ? 'rgba(16, 185, 129, 0.35)' : 'rgba(168, 85, 247, 0.35)'}`
+                background: showElevateCard ? 'rgba(245, 158, 11, 0.22)' : 'rgba(245, 158, 11, 0.1)',
+                color: '#fbbf24',
+                border: '1px solid rgba(245, 158, 11, 0.4)'
               }}
-              onClick={handleProvisionAmt}
-              disabled={provisioningAmt}
-              title="Inspect Intel MEI driver and provision Intel vPro AMT CIRA tunnel without duplicate nodes"
+              onClick={() => setShowElevateCard(!showElevateCard)}
+              title="Remotely self-elevate a non-admin QuickSupport agent or promote it to a permanent signed service"
             >
-              <Cpu size={15} /> {provisioningAmt ? 'Provisioning...' : device.intel_amt_enabled ? '⚡ vPro Provisioned' : 'Auto-Provision vPro'}
+              <ShieldCheck size={15} /> Elevate / Promote Agent
             </button>
-          )}
-
-          <button className="btn-glass btn-primary" onClick={() => onOpenRemote(device, false)}>
-            <Monitor size={15} /> Remote Desktop
-          </button>
-          <button className="btn-glass" onClick={() => onOpenRemote(device, true)}>
-            <EyeOff size={15} color="#c084fc" /> Ghost Session
-          </button>
-          <button className="btn-glass" onClick={() => onOpenBgTools(device, 'terminal')}>
-            <Terminal size={15} /> Shell
-          </button>
-          <button className="btn-glass" onClick={() => onOpenLaps(device)}>
-            <KeyRound size={15} color="#fbbf24" /> LAPS Vault
-          </button>
-          <button
-            className="btn-glass"
-            style={{
-              background: showElevateCard ? 'rgba(245, 158, 11, 0.22)' : 'rgba(245, 158, 11, 0.1)',
-              color: '#fbbf24',
-              border: '1px solid rgba(245, 158, 11, 0.4)'
-            }}
-            onClick={() => setShowElevateCard(!showElevateCard)}
-            title="Remotely self-elevate a non-admin QuickSupport agent or promote it to a permanent signed service"
-          >
-            <ShieldCheck size={15} /> Elevate / Promote Agent
-          </button>
-          <button className={`btn-glass ${device.quarantined ? 'btn-primary' : 'btn-danger'}`} onClick={() => onOpenQuarantine(device)}>
-            <ShieldAlert size={15} /> {device.quarantined ? 'Restore Network' : 'Quarantine'}
-          </button>
-          <button
-            className="btn-glass"
-            style={{
-              background: showOffboardCard ? 'rgba(239, 68, 68, 0.22)' : 'rgba(239, 68, 68, 0.1)',
-              color: '#f87171',
-              border: '1px solid rgba(239, 68, 68, 0.4)'
-            }}
-            onClick={() => setShowOffboardCard(!showOffboardCard)}
-            title="Cleanly offboard endpoint (revert policies, apply LAPS local admin rule, uninstall agents, and preserve BitLocker & LAPS in Archive)"
-          >
-            <Archive size={15} /> {lifecycleState === 'archived' ? 'Archived Vault Controls' : 'Offboard Endpoint'}
-          </button>
-        </div>
+            <button className={`btn-glass ${device.quarantined ? 'btn-primary' : 'btn-danger'}`} onClick={() => onOpenQuarantine(device)}>
+              <ShieldAlert size={15} /> {device.quarantined ? 'Restore Network' : 'Quarantine'}
+            </button>
+            <button
+              className="btn-glass"
+              style={{
+                background: showOffboardCard ? 'rgba(239, 68, 68, 0.22)' : 'rgba(239, 68, 68, 0.1)',
+                color: '#f87171',
+                border: '1px solid rgba(239, 68, 68, 0.4)'
+              }}
+              onClick={() => setShowOffboardCard(!showOffboardCard)}
+              title="Cleanly offboard endpoint (revert policies, apply LAPS local admin rule, uninstall agents, and preserve BitLocker & LAPS in Archive)"
+            >
+              <Archive size={15} /> {lifecycleState === 'archived' ? 'Archived Vault Controls' : 'Offboard Endpoint'}
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Offboarding, Data Archive Vault, Auto-Resurrection & Quiet Offboard Engine Card */}
@@ -704,7 +803,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
               </span>
             </div>
             <div style={{ display: 'flex', gap: '0.45rem', flexWrap: 'wrap' }}>
-              {lifecycleState === 'pending_offboard' && (
+              {canMutate && lifecycleState === 'pending_offboard' && (
                 <button
                   type="button"
                   className="btn-glass"
@@ -714,7 +813,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                   Force Move to Archive Now
                 </button>
               )}
-              {lifecycleState !== 'active' && (
+              {canMutate && lifecycleState !== 'active' && (
                 <button
                   type="button"
                   className="btn-glass"
@@ -725,7 +824,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                   <Zap size={13} /> Simulate Wake / Re-Install Check-In
                 </button>
               )}
-              {lifecycleState === 'archived' && (
+              {canMutate && lifecycleState === 'archived' && (
                 <button
                   type="button"
                   className="btn-glass btn-danger"
@@ -747,7 +846,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
             Offboarded endpoints are retained in the <strong>Data Archive Vault</strong> so you never lose escrowed <strong>BitLocker recovery keys</strong> or <strong>LAPS password history</strong> months later. Online agents immediately revert policy changes, execute the configured LAPS local admin rule, and cleanly uninstall software. Offline agents queue in <code>pending_offboard</code> (or can be force-archived immediately). If an archived PC wakes up or re-installs while its parent client is active, it automatically returns to life!
           </p>
 
-          {lifecycleState === 'active' && (
+          {canMutate && lifecycleState === 'active' && (
             <div className="grid-3" style={{ gap: '0.85rem', alignItems: 'end' }}>
               <div>
                 <label className="form-label">Offboard Reason / Audit Note</label>
@@ -795,21 +894,24 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
             </div>
           )}
 
-          {offboardNotice && (
-            <div
-              style={{
-                marginTop: '0.85rem',
-                padding: '0.65rem 0.9rem',
-                borderRadius: '8px',
-                background: 'rgba(56, 189, 248, 0.14)',
-                border: '1px solid rgba(56, 189, 248, 0.35)',
-                fontSize: '0.8rem',
-                color: 'var(--text-main)'
-              }}
-            >
-              {offboardNotice}
-            </div>
-          )}
+          {offboardNotice && (() => {
+            const isOffboardErr = /error|fail/i.test(offboardNotice);
+            return (
+              <div
+                style={{
+                  marginTop: '0.85rem',
+                  padding: '0.65rem 0.9rem',
+                  borderRadius: '8px',
+                  background: isOffboardErr ? 'rgba(239, 68, 68, 0.14)' : 'rgba(56, 189, 248, 0.14)',
+                  border: `1px solid ${isOffboardErr ? 'rgba(239, 68, 68, 0.35)' : 'rgba(56, 189, 248, 0.35)'}`,
+                  fontSize: '0.8rem',
+                  color: isOffboardErr ? '#fca5a5' : 'var(--text-main)'
+                }}
+              >
+                {offboardNotice}
+              </div>
+            );
+          })()}
         </div>
       )}
 
@@ -874,42 +976,58 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
               </div>
             </div>
           )}
-          {elevateNotice && (
-            <div style={{ marginTop: '0.85rem', padding: '0.65rem 0.9rem', borderRadius: '8px', background: 'rgba(16, 185, 129, 0.14)', border: '1px solid rgba(16, 185, 129, 0.35)', fontSize: '0.8rem', color: 'var(--text-main)' }}>
-              {elevateNotice}
-            </div>
-          )}
+          {elevateNotice && (() => {
+            const isElevateErr = /fail|error/i.test(elevateNotice);
+            return (
+              <div
+                style={{
+                  marginTop: '0.85rem',
+                  padding: '0.65rem 0.9rem',
+                  borderRadius: '8px',
+                  background: isElevateErr ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.14)',
+                  border: `1px solid ${isElevateErr ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`,
+                  fontSize: '0.8rem',
+                  color: isElevateErr ? '#fca5a5' : 'var(--text-main)'
+                }}
+              >
+                {elevateNotice}
+              </div>
+            );
+          })()}
         </div>
       )}
 
       {/* Maintenance Mode Banner & WoL Status Notice */}
-      {wolNotice && (
-        <div
-          style={{
-            padding: '0.85rem 1.25rem',
-            background: 'rgba(56, 189, 248, 0.12)',
-            border: '1px solid rgba(56, 189, 248, 0.35)',
-            borderRadius: '10px',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            color: '#38bdf8',
-            fontSize: '0.82rem'
-          }}
-        >
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
-            <Zap size={18} />
-            <span>{wolNotice}</span>
-          </div>
-          <button
-            className="btn-glass"
-            style={{ padding: '0.2rem 0.5rem', fontSize: '0.72rem' }}
-            onClick={() => setWolNotice(null)}
+      {wolNotice && (() => {
+        const isWolErr = /^(failed|error|wol configuration failed)/i.test(wolNotice.trim());
+        return (
+          <div
+            style={{
+              padding: '0.85rem 1.25rem',
+              background: isWolErr ? 'rgba(239, 68, 68, 0.12)' : 'rgba(56, 189, 248, 0.12)',
+              border: `1px solid ${isWolErr ? 'rgba(239, 68, 68, 0.35)' : 'rgba(56, 189, 248, 0.35)'}`,
+              borderRadius: '10px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              color: isWolErr ? '#fca5a5' : '#38bdf8',
+              fontSize: '0.82rem'
+            }}
           >
-            Dismiss
-          </button>
-        </div>
-      )}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+              <Zap size={18} />
+              <span>{wolNotice}</span>
+            </div>
+            <button
+              className="btn-glass"
+              style={{ padding: '0.2rem 0.5rem', fontSize: '0.72rem' }}
+              onClick={() => setWolNotice(null)}
+            >
+              Dismiss
+            </button>
+          </div>
+        );
+      })()}
 
       {/* 5-Tier Peer-Relayed Wake-on-LAN & Intel AMT Execution Trace Card */}
       {wolChainResult?.stages && (
@@ -920,8 +1038,11 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
               <strong style={{ fontSize: '0.95rem', color: 'var(--text-main)' }}>
                 5-Tier Same-Company &amp; Same-Network Peer Reachability Chain — {wolChainResult.targetHostname} ({wolChainResult.targetIp})
               </strong>
-              <span className="status-pill status-online" style={{ fontSize: '0.7rem' }}>
-                {wolChainResult.bootTarget || 'Verified Online'}
+              <span
+                className={`status-pill ${wolChainResult.verifiedOnline ? 'status-online' : 'status-reboot'}`}
+                style={{ fontSize: '0.7rem' }}
+              >
+                {wolChainResult.verifiedOnline ? (wolChainResult.bootTarget || 'Verified Online') : 'Wake Dispatched (Awaiting Check-In)'}
               </span>
             </div>
             <button
@@ -971,33 +1092,36 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
         </div>
       )}
 
-      {amtNotice && (
-        <div
-          style={{
-            padding: '0.85rem 1.25rem',
-            background: 'rgba(16, 185, 129, 0.12)',
-            border: '1px solid rgba(16, 185, 129, 0.35)',
-            borderRadius: '10px',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            color: '#34d399',
-            fontSize: '0.82rem'
-          }}
-        >
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
-            <Cpu size={18} />
-            <span>{amtNotice}</span>
-          </div>
-          <button
-            className="btn-glass"
-            style={{ padding: '0.2rem 0.5rem', fontSize: '0.72rem' }}
-            onClick={() => setAmtNotice(null)}
+      {amtNotice && (() => {
+        const isAmtErr = /fail|error/i.test(amtNotice);
+        return (
+          <div
+            style={{
+              padding: '0.85rem 1.25rem',
+              background: isAmtErr ? 'rgba(239, 68, 68, 0.12)' : 'rgba(16, 185, 129, 0.12)',
+              border: `1px solid ${isAmtErr ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`,
+              borderRadius: '10px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              color: isAmtErr ? '#fca5a5' : '#34d399',
+              fontSize: '0.82rem'
+            }}
           >
-            Dismiss
-          </button>
-        </div>
-      )}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+              <Cpu size={18} />
+              <span>{amtNotice}</span>
+            </div>
+            <button
+              className="btn-glass"
+              style={{ padding: '0.2rem 0.5rem', fontSize: '0.72rem' }}
+              onClick={() => setAmtNotice(null)}
+            >
+              Dismiss
+            </button>
+          </div>
+        );
+      })()}
 
       {isMaintenanceActive && (
         <div
@@ -1020,13 +1144,15 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
               <strong>{maintenanceUntil ? new Date(maintenanceUntil).toLocaleTimeString() : 'manually cleared'}</strong> (Auto-clear limit: 24h online).
             </span>
           </div>
-          <button
-            className="btn-glass"
-            style={{ padding: '0.25rem 0.75rem', fontSize: '0.75rem', background: '#f59e0b', color: '#000', fontWeight: 600 }}
-            onClick={handleToggleMaintenance}
-          >
-            End Maintenance
-          </button>
+          {canMutate && (
+            <button
+              className="btn-glass"
+              style={{ padding: '0.25rem 0.75rem', fontSize: '0.75rem', background: '#f59e0b', color: '#000', fontWeight: 600 }}
+              onClick={handleToggleMaintenance}
+            >
+              End Maintenance
+            </button>
+          )}
         </div>
       )}
 
@@ -1109,9 +1235,11 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                   <Award size={20} color="var(--primary)" />
                   <h3 style={{ fontSize: '1.1rem', fontWeight: 600 }}>OEM Hardware Lifecycle &amp; Warranty</h3>
                 </div>
-                <button className="btn-glass" onClick={handleLookupWarranty} disabled={loadingWarranty} style={{ fontSize: '0.78rem' }}>
-                  <RotateCw size={13} /> {loadingWarranty ? 'Querying OEM...' : 'Refresh OEM'}
-                </button>
+                {canMutate && (
+                  <button className="btn-glass" onClick={handleLookupWarranty} disabled={loadingWarranty} style={{ fontSize: '0.78rem' }}>
+                    <RotateCw size={13} /> {loadingWarranty ? 'Querying OEM...' : 'Refresh OEM'}
+                  </button>
+                )}
               </div>
 
               {warranty ? (
@@ -1203,7 +1331,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                     className="glass-select"
                     value={maintenanceDuration}
                     onChange={(e) => setMaintenanceDuration(parseInt(e.target.value, 10))}
-                    disabled={isMaintenanceActive}
+                    disabled={isMaintenanceActive || !canMutate}
                   >
                     <option value={30}>30 Minutes</option>
                     <option value={60}>1 Hour</option>
@@ -1212,14 +1340,16 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                   </select>
                 </div>
 
-                <button
-                  className={`btn-glass ${isMaintenanceActive ? 'btn-danger' : 'btn-primary'}`}
-                  onClick={handleToggleMaintenance}
-                  style={{ width: '100%', justifyContent: 'center' }}
-                >
-                  <Clock size={15} />
-                  <span>{isMaintenanceActive ? 'Cancel Active Maintenance Window' : `Engage Maintenance (${maintenanceDuration}m)`}</span>
-                </button>
+                {canMutate && (
+                  <button
+                    className={`btn-glass ${isMaintenanceActive ? 'btn-danger' : 'btn-primary'}`}
+                    onClick={handleToggleMaintenance}
+                    style={{ width: '100%', justifyContent: 'center' }}
+                  >
+                    <Clock size={15} />
+                    <span>{isMaintenanceActive ? 'Cancel Active Maintenance Window' : `Engage Maintenance (${maintenanceDuration}m)`}</span>
+                  </button>
+                )}
               </div>
             </div>
           </div>
@@ -1242,19 +1372,21 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.25rem' }}>
                     <span style={{ color: 'var(--text-dim)', fontSize: '0.75rem' }}>ESCROWED RECOVERY KEY</span>
                     {!isBitlockerRevealed ? (
-                      <button
-                        className="btn-glass"
-                        style={{ padding: '0.2rem 0.5rem', fontSize: '0.72rem', display: 'flex', alignItems: 'center', gap: '0.35rem', color: 'var(--primary)' }}
-                        onClick={handleRequestBitlockerReveal}
-                      >
-                        <Eye size={12} /> Reveal Key (MFA)
-                      </button>
+                      canMutate ? (
+                        <button
+                          className="btn-glass"
+                          style={{ padding: '0.2rem 0.5rem', fontSize: '0.72rem', display: 'flex', alignItems: 'center', gap: '0.35rem', color: 'var(--primary)' }}
+                          onClick={handleRequestBitlockerReveal}
+                        >
+                          <Eye size={12} /> Reveal Key (MFA)
+                        </button>
+                      ) : null
                     ) : revealedBitlockerKey ? (
                       <button
                         className="btn-glass"
                         style={{ padding: '0.2rem 0.5rem', fontSize: '0.72rem', display: 'flex', alignItems: 'center', gap: '0.35rem' }}
-                        onClick={() => {
-                          navigator.clipboard.writeText(revealedBitlockerKey);
+                        onClick={async () => {
+                          await copyToClipboard(revealedBitlockerKey);
                           setBitlockerCopied(true);
                           setTimeout(() => setBitlockerCopied(false), 2000);
                         }}
@@ -1321,6 +1453,139 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                     <div style={{ fontFamily: 'var(--font-mono)' }}>{device.mac_address}</div>
                   </div>
                 </div>
+
+                {/* NinjaOne Parity: Managed Antivirus / Defender & Encryption Live Remediation Controls */}
+                {canMutate && (
+                  <div style={{ display: 'flex', gap: '0.45rem', flexWrap: 'wrap', paddingTop: '0.4rem', borderTop: '1px solid var(--glass-border)' }}>
+                    <button
+                      type="button"
+                      className="btn-glass"
+                      style={{ fontSize: '0.72rem', padding: '0.25rem 0.55rem' }}
+                      disabled={Boolean(runningSecAction)}
+                      onClick={() => handleRunSecurityAction('av_quick_scan')}
+                    >
+                      {runningSecAction === 'av_quick_scan' ? 'Scanning...' : 'AV Quick Scan'}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-glass"
+                      style={{ fontSize: '0.72rem', padding: '0.25rem 0.55rem' }}
+                      disabled={Boolean(runningSecAction)}
+                      onClick={() => handleRunSecurityAction('av_update_signatures')}
+                    >
+                      {runningSecAction === 'av_update_signatures' ? 'Updating...' : 'Update Signatures'}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-glass"
+                      style={{ fontSize: '0.72rem', padding: '0.25rem 0.55rem' }}
+                      disabled={Boolean(runningSecAction)}
+                      onClick={() => handleRunSecurityAction('verify_encryption')}
+                    >
+                      {runningSecAction === 'verify_encryption' ? 'Checking...' : 'Verify Encryption'}
+                    </button>
+                  </div>
+                )}
+                {securityActionOutput && (
+                  <pre style={{ margin: 0, padding: '0.5rem 0.7rem', borderRadius: '6px', background: 'rgba(0,0,0,0.35)', fontSize: '0.72rem', color: '#34d399', whiteSpace: 'pre-wrap', maxHeight: '110px', overflowY: 'auto' }}>
+                    {securityActionOutput}
+                  </pre>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Endpoint Backup Snapshots & Linked Client Runbooks */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem' }}>
+            <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                  <HardDrive size={18} color="#38bdf8" />
+                  <h3 style={{ fontSize: '1.05rem', fontWeight: 600, margin: 0 }}>
+                    Endpoint Backup Snapshots ({backupJobs.length})
+                  </h3>
+                </div>
+                {canMutate && (
+                  <button
+                    type="button"
+                    className="btn-glass btn-primary"
+                    style={{ fontSize: '0.75rem', padding: '0.28rem 0.65rem' }}
+                    disabled={runningBackup}
+                    onClick={handleRunBackupSnapshot}
+                  >
+                    <RotateCw size={12} /> {runningBackup ? 'Snapshotting...' : 'Run Backup Now'}
+                  </button>
+                )}
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem', maxHeight: '165px', overflowY: 'auto' }}>
+                {backupJobs.length === 0 ? (
+                  <div style={{ fontSize: '0.8rem', color: 'var(--text-dim)' }}>
+                    No endpoint backup snapshots recorded yet. Trigger a VSS / restic / Time Machine snapshot above.
+                  </div>
+                ) : (
+                  backupJobs.map((bj) => (
+                    <div
+                      key={bj.id}
+                      style={{
+                        padding: '0.55rem 0.75rem',
+                        borderRadius: '8px',
+                        background: 'rgba(255,255,255,0.03)',
+                        border: '1px solid var(--glass-border)',
+                        fontSize: '0.76rem',
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center'
+                      }}
+                    >
+                      <div>
+                        <strong>{bj.snapshot_id || bj.id}</strong>
+                        <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)' }}>
+                          {bj.started_at ? new Date(bj.started_at).toLocaleString() : 'Completed'}
+                        </div>
+                      </div>
+                      <span className={`status-pill ${bj.status === 'completed' ? 'status-online' : 'status-reboot'}`} style={{ fontSize: '0.68rem' }}>
+                        {bj.status}
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+
+            <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                <FileText size={18} color="#f59e0b" />
+                <h3 style={{ fontSize: '1.05rem', fontWeight: 600, margin: 0 }}>
+                  Client Documentation &amp; SOP Runbooks ({linkedDocs.length})
+                </h3>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem', maxHeight: '165px', overflowY: 'auto' }}>
+                {linkedDocs.length === 0 ? (
+                  <div style={{ fontSize: '0.8rem', color: 'var(--text-dim)' }}>
+                    No client or global SOP runbooks published yet. Author articles in MSP Documentation.
+                  </div>
+                ) : (
+                  linkedDocs.slice(0, 6).map((doc) => (
+                    <div
+                      key={doc.id}
+                      style={{
+                        padding: '0.55rem 0.75rem',
+                        borderRadius: '8px',
+                        background: 'rgba(255,255,255,0.03)',
+                        border: '1px solid var(--glass-border)',
+                        fontSize: '0.76rem'
+                      }}
+                    >
+                      <div style={{ fontWeight: 600 }}>
+                        {doc.is_pinned ? '📌 ' : ''}
+                        {doc.title} <span style={{ color: 'var(--text-dim)', fontWeight: 400 }}>({doc.category})</span>
+                      </div>
+                      <div style={{ fontSize: '0.71rem', color: 'var(--text-muted)', marginTop: '0.15rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {doc.content_markdown}
+                      </div>
+                    </div>
+                  ))
+                )}
               </div>
             </div>
           </div>
@@ -1336,19 +1601,21 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                 </h3>
               </div>
 
-              <form onSubmit={handleAddNote} style={{ display: 'flex', gap: '0.5rem' }}>
-                <input
-                  type="text"
-                  className="glass-input"
-                  style={{ fontSize: '0.8rem' }}
-                  placeholder="Add pinned runbook note or escalation instructions..."
-                  value={newNoteContent}
-                  onChange={(e) => setNewNoteContent(e.target.value)}
-                />
-                <button type="submit" className="btn-glass btn-primary" style={{ fontSize: '0.8rem' }}>
-                  <Plus size={14} /> Add
-                </button>
-              </form>
+              {canMutate && (
+                <form onSubmit={handleAddNote} style={{ display: 'flex', gap: '0.5rem' }}>
+                  <input
+                    type="text"
+                    className="glass-input"
+                    style={{ fontSize: '0.8rem' }}
+                    placeholder="Add pinned runbook note or escalation instructions..."
+                    value={newNoteContent}
+                    onChange={(e) => setNewNoteContent(e.target.value)}
+                  />
+                  <button type="submit" className="btn-glass btn-primary" style={{ fontSize: '0.8rem' }}>
+                    <Plus size={14} /> Add
+                  </button>
+                </form>
+              )}
 
               <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', maxHeight: '180px', overflowY: 'auto' }}>
                 {notes.map((n) => (
@@ -1372,14 +1639,16 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                         {n.author} • {new Date(n.created_at).toLocaleString()}
                       </div>
                     </div>
-                    <button
-                      type="button"
-                      className="btn-glass btn-icon"
-                      onClick={() => handleDeleteNote(n.id)}
-                      title="Delete Note"
-                    >
-                      <Trash2 size={12} color="#ef4444" />
-                    </button>
+                    {canMutate && (
+                      <button
+                        type="button"
+                        className="btn-glass btn-icon"
+                        onClick={() => handleDeleteNote(n.id)}
+                        title="Delete Note"
+                      >
+                        <Trash2 size={12} color="#ef4444" />
+                      </button>
+                    )}
                   </div>
                 ))}
               </div>
@@ -1424,8 +1693,18 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                         </div>
                       </div>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                        {(rec.has_video || rec.mime_type?.startsWith('video/')) && (
+                          <button
+                            type="button"
+                            className="btn-glass"
+                            style={{ padding: '0.2rem 0.5rem', fontSize: '0.7rem' }}
+                            onClick={() => setPlayingRecId(playingRecId === rec.id ? null : rec.id)}
+                          >
+                            {playingRecId === rec.id ? 'Hide Video' : '▶ Play WebM'}
+                          </button>
+                        )}
                         <span className="status-pill status-online" style={{ fontSize: '0.68rem' }}>
-                          Archived
+                          {rec.has_video ? 'WebM Video' : 'Archived'}
                         </span>
                         <a
                           href={getRecordingDownloadUrl(rec.id)}
@@ -1439,6 +1718,17 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                       </div>
                     </div>
                   ))
+                )}
+                {playingRecId && (
+                  <div style={{ marginTop: '0.5rem', borderRadius: '8px', overflow: 'hidden', border: '1px solid var(--glass-border)', background: '#000' }}>
+                    <video
+                      key={playingRecId}
+                      controls
+                      autoPlay
+                      src={getRecordingDownloadUrl(playingRecId)}
+                      style={{ width: '100%', maxHeight: '260px', display: 'block' }}
+                    />
+                  </div>
                 )}
               </div>
             </div>
@@ -1502,9 +1792,26 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                         {item.device_id_pci && <span>PCI Device: <code>{item.device_id_pci}</code></span>}
                       </div>
                     </div>
-                    <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
-                      {new Date(item.timestamp).toLocaleString()}
-                    </span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
+                        {new Date(item.timestamp).toLocaleString()}
+                      </span>
+                      {Boolean(item.acknowledged) ? (
+                        <span className="status-pill status-online" style={{ fontSize: '0.68rem' }}>
+                          ✓ Acknowledged{item.acknowledged_by ? ` (${item.acknowledged_by})` : ''}
+                        </span>
+                      ) : canMutate ? (
+                        <button
+                          type="button"
+                          className="btn-glass"
+                          style={{ padding: '0.2rem 0.55rem', fontSize: '0.72rem' }}
+                          disabled={ackingHistId === item.id}
+                          onClick={() => handleAckHardwareDrift(item.id)}
+                        >
+                          <Check size={12} /> {ackingHistId === item.id ? 'Acknowledging...' : 'Acknowledge'}
+                        </button>
+                      ) : null}
+                    </div>
                   </div>
                 ))}
               </div>
@@ -1713,7 +2020,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                             )}
                           </td>
                           <td>
-                            {soft.cve_count > 0 && (
+                            {soft.cve_count > 0 && canMutate && (
                               <button
                                 className="btn-glass btn-primary"
                                 style={{ padding: '0.2rem 0.5rem', fontSize: '0.72rem' }}
@@ -1745,9 +2052,11 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                 Ninja-style device custom fields. Values are injected into scripts and automation runbooks as <code>$vitrine.CustomField</code>.
               </span>
             </div>
-            <button className="btn-glass btn-primary" onClick={handleSaveCustomFields} disabled={savingFields}>
-              <Save size={15} /> {savingFields ? 'Saving...' : 'Save Attributes'}
-            </button>
+            {canMutate && (
+              <button className="btn-glass btn-primary" onClick={handleSaveCustomFields} disabled={savingFields}>
+                <Save size={15} /> {savingFields ? 'Saving...' : 'Save Attributes'}
+              </button>
+            )}
           </div>
 
           {fieldsSavedNotice && (
@@ -1783,6 +2092,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                     <select
                       className="glass-select"
                       value={currentVal}
+                      disabled={!canMutate}
                       onChange={(e) => setFieldValues({ ...fieldValues, [f.id]: e.target.value })}
                     >
                       <option value="">-- Unassigned --</option>
@@ -1793,10 +2103,11 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                       ))}
                     </select>
                   ) : f.field_type === 'checkbox' ? (
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', fontSize: '0.85rem' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: canMutate ? 'pointer' : 'default', fontSize: '0.85rem' }}>
                       <input
                         type="checkbox"
                         checked={currentVal === 'true'}
+                        disabled={!canMutate}
                         onChange={(e) => setFieldValues({ ...fieldValues, [f.id]: e.target.checked ? 'true' : 'false' })}
                       />
                       <span>Enabled</span>
@@ -1808,9 +2119,10 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                         className="glass-input"
                         placeholder="Enter secret value (AES-256-GCM encrypted at rest)"
                         value={currentVal}
+                        disabled={!canMutate}
                         onChange={(e) => setFieldValues({ ...fieldValues, [f.id]: e.target.value })}
                       />
-                      {currentUser?.role !== 'client_admin' && (f.has_secret || Boolean(currentVal)) && (
+                      {canMutate && (f.has_secret || Boolean(currentVal)) && (
                         <button
                           type="button"
                           className="btn-glass"
@@ -1827,6 +2139,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                       type="text"
                       className="glass-input"
                       value={currentVal}
+                      disabled={!canMutate}
                       onChange={(e) => setFieldValues({ ...fieldValues, [f.id]: e.target.value })}
                     />
                   )}
@@ -1892,19 +2205,21 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
           </div>
 
           {/* Chat Form */}
-          <form onSubmit={handleSendChat} style={{ display: 'flex', gap: '0.65rem', borderTop: '1px solid var(--glass-border)', paddingTop: '0.85rem' }}>
-            <input
-              type="text"
-              className="glass-input"
-              placeholder="Type message to pop up on user's desktop..."
-              value={chatInput}
-              onChange={(e) => setChatInput(e.target.value)}
-              disabled={sendingChat}
-            />
-            <button type="submit" className="btn-glass btn-primary" disabled={sendingChat || !chatInput.trim()}>
-              <Send size={15} /> Send Message
-            </button>
-          </form>
+          {canMutate && (
+            <form onSubmit={handleSendChat} style={{ display: 'flex', gap: '0.65rem', borderTop: '1px solid var(--glass-border)', paddingTop: '0.85rem' }}>
+              <input
+                type="text"
+                className="glass-input"
+                placeholder="Type message to pop up on user's desktop..."
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                disabled={sendingChat}
+              />
+              <button type="submit" className="btn-glass btn-primary" disabled={sendingChat || !chatInput.trim()}>
+                <Send size={15} /> Send Message
+              </button>
+            </form>
+          )}
         </div>
       )}
 

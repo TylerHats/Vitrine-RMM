@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { Play, Zap, Clock, Ticket, Plus, Trash2, RefreshCw, X } from 'lucide-react';
-import { SelfHealingMonitor, RemediationLog, ScriptItem } from '../types/index.js';
+import { SelfHealingMonitor, RemediationLog, ScriptItem, AuthUser } from '../types/index.js';
 import {
   fetchSelfHealing,
   fetchRemediationLogs,
@@ -10,8 +10,14 @@ import {
   evaluateSelfHealingMonitors,
   fetchScripts
 } from '../services/api.js';
+import { canMutateFleet } from '../utils/permissions.js';
 
-export const SelfHealingView: React.FC = () => {
+interface SelfHealingViewProps {
+  currentUser?: AuthUser | null;
+}
+
+export const SelfHealingView: React.FC<SelfHealingViewProps> = ({ currentUser }) => {
+  const canMutate = canMutateFleet(currentUser);
   const [monitors, setMonitors] = useState<SelfHealingMonitor[]>([]);
   const [logs, setLogs] = useState<RemediationLog[]>([]);
   const [scripts, setScripts] = useState<ScriptItem[]>([]);
@@ -86,14 +92,16 @@ export const SelfHealingView: React.FC = () => {
             Event-driven watchdog engine evaluating stopped services, low storage, or high load with automatic script triggers and circuit-breaker flap protection
           </span>
         </div>
-        <div style={{ display: 'flex', gap: '0.65rem' }}>
-          <button className="btn-glass" onClick={handleEvaluateNow} disabled={evaluating}>
-            <RefreshCw size={15} /> {evaluating ? 'Evaluating Fleet...' : 'Evaluate Fleet Now'}
-          </button>
-          <button className="btn-glass btn-primary" onClick={() => setShowCreateModal(true)}>
-            <Plus size={15} /> New Watchdog Monitor
-          </button>
-        </div>
+        {canMutate && (
+          <div style={{ display: 'flex', gap: '0.65rem' }}>
+            <button className="btn-glass" onClick={handleEvaluateNow} disabled={evaluating}>
+              <RefreshCw size={15} /> {evaluating ? 'Evaluating Fleet...' : 'Evaluate Fleet Now'}
+            </button>
+            <button className="btn-glass btn-primary" onClick={() => setShowCreateModal(true)}>
+              <Plus size={15} /> New Watchdog Monitor
+            </button>
+          </div>
+        )}
       </div>
 
       {statusMessage && (
@@ -207,21 +215,25 @@ export const SelfHealingView: React.FC = () => {
                   <td>
                     <span
                       className={`status-pill ${m.enabled ? 'status-online' : 'status-offline'}`}
-                      style={{ cursor: 'pointer' }}
-                      onClick={() => handleToggleMonitor(m)}
-                      title="Click to toggle monitor state"
+                      style={{ cursor: canMutate ? 'pointer' : 'default' }}
+                      onClick={canMutate ? () => handleToggleMonitor(m) : undefined}
+                      title={canMutate ? 'Click to toggle monitor state' : undefined}
                     >
                       <div className="pulse-dot" /> {m.enabled ? 'Guarding' : 'Paused'}
                     </span>
                   </td>
                   <td style={{ textAlign: 'right' }}>
-                    <button
-                      className="btn-glass btn-icon"
-                      title="Delete Watchdog Monitor"
-                      onClick={() => handleDeleteMonitor(m.id)}
-                    >
-                      <Trash2 size={14} color="#ef4444" />
-                    </button>
+                    {canMutate ? (
+                      <button
+                        className="btn-glass btn-icon"
+                        title="Delete Watchdog Monitor"
+                        onClick={() => handleDeleteMonitor(m.id)}
+                      >
+                        <Trash2 size={14} color="#ef4444" />
+                      </button>
+                    ) : (
+                      <span style={{ fontSize: '0.72rem', color: 'var(--text-dim)' }}>—</span>
+                    )}
                   </td>
                 </tr>
               ))}

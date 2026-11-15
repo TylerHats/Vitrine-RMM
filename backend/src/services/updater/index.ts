@@ -8,11 +8,13 @@ import {
   APP_VERSION,
   APP_SCHEMA_VERSION,
   APP_INSTALLED_COMMIT,
-  runDatabaseMigrations
+  runDatabaseMigrations,
+  isRunningInDocker
 } from '../../db/index.js';
 import { backupService } from '../backup/index.js';
 import { installerGenerator } from '../agent/installerGenerator.js';
 import { sendAlertEmailUsingStoredSettings } from '../smtp/index.js';
+import { safeOutboundFetch } from '../vault/index.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -37,21 +39,7 @@ export interface ReleaseInfo {
 
 const GITHUB_REPO = process.env.VITRINE_GITHUB_REPO || 'TylerHats/Vitrine-RMM';
 
-export function isRunningInDocker(): boolean {
-  if (process.env.VITRINE_DOCKER === 'true') return true;
-  if (fs.existsSync('/.dockerenv')) return true;
-  try {
-    if (fs.existsSync('/proc/1/cgroup')) {
-      const cgroup = fs.readFileSync('/proc/1/cgroup', 'utf8');
-      if (cgroup.includes('docker') || cgroup.includes('containerd') || cgroup.includes('kubepods')) {
-        return true;
-      }
-    }
-  } catch {
-    // Ignore
-  }
-  return false;
-}
+export { isRunningInDocker };
 
 function compareSemver(a: string, b: string): number {
   const cleanA = String(a || '0.0.0').replace(/^v/i, '').split('-')[0].split('.').map((n) => parseInt(n, 10) || 0);
@@ -165,18 +153,18 @@ export class SystemUpdaterService {
       };
 
       const [relRes, comRes] = await Promise.allSettled([
-        fetch(`https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=10`, {
+        safeOutboundFetch(`https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=10`, {
           headers,
-          signal: AbortSignal.timeout(4500)
+          timeoutMs: 4500
         }),
-        fetch(`https://api.github.com/repos/${GITHUB_REPO}/commits?sha=main&per_page=15`, {
+        safeOutboundFetch(`https://api.github.com/repos/${GITHUB_REPO}/commits?sha=main&per_page=15`, {
           headers,
-          signal: AbortSignal.timeout(4500)
+          timeoutMs: 4500
         })
       ]);
 
       if (comRes.status === 'fulfilled' && comRes.value.ok) {
-        const comJson = (await comRes.value.json()) as any[];
+        const comJson = JSON.parse(comRes.value.body.toString('utf8')) as any[];
         if (Array.isArray(comJson) && comJson.length > 0) {
           // GitHub returns newest -> oldest; store chronological oldest -> newest
           this.cachedCommits = comJson
@@ -194,7 +182,7 @@ export class SystemUpdaterService {
       }
 
       if (relRes.status === 'fulfilled' && relRes.value.ok) {
-        const relJson = (await relRes.value.json()) as any[];
+        const relJson = JSON.parse(relRes.value.body.toString('utf8')) as any[];
         if (Array.isArray(relJson)) {
           const stableOnly = relJson.filter((r) => !r.draft && !r.prerelease);
           if (stableOnly.length > 0) {
@@ -202,12 +190,23 @@ export class SystemUpdaterService {
               .slice()
               .reverse()
               .map((r: any) => {
-                const tag = String(r.tag_name || 'v2.5.0');
+                const tag = String(r.tag_name || 'v2.5.0').trim();
                 const ver = tag.replace(/^v/i, '');
+                const rawTargetCommitish = String(r.target_commitish || '').trim();
+                const isHexCommitSha = /^[0-9a-f]{7,40}$/i.test(rawTargetCommitish);
+                const matchedFromCommits = this.cachedCommits.find(
+                  (c) =>
+                    c.message.includes(tag) ||
+                    c.message.includes(`v${ver}`) ||
+                    (isHexCommitSha && c.sha.toLowerCase() === rawTargetCommitish.slice(0, 7).toLowerCase())
+                );
+                const resolvedCommitSha = isHexCommitSha
+                  ? rawTargetCommitish.slice(0, 7)
+                  : matchedFromCommits?.sha || tag;
                 return {
                   version: ver,
                   tag,
-                  commitSha: String(r.target_commitish || APP_INSTALLED_COMMIT).slice(0, 7),
+                  commitSha: resolvedCommitSha,
                   publishedAt: String(r.published_at || new Date().toISOString()),
                   schemaVersion: APP_SCHEMA_VERSION,
                   title: String(r.name || `Vitrine RMM ${tag}`),
@@ -413,6 +412,85 @@ export class SystemUpdaterService {
     };
   }
 
+  private installAndBuildPackages(repoRoot: string): void {
+    const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+    for (const pkgDir of ['frontend', 'backend']) {
+      const hasLockfile = fs.existsSync(path.join(repoRoot, pkgDir, 'package-lock.json'));
+      const installArgs = hasLockfile
+        ? ['ci', '--no-audit', '--no-fund', '--prefix', pkgDir]
+        : ['install', '--ignore-scripts', '--no-audit', '--no-fund', '--prefix', pkgDir];
+      execFileSync(npmBin, installArgs, {
+        cwd: repoRoot,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 180000
+      });
+      execFileSync(npmBin, ['run', 'build', '--prefix', pkgDir], {
+        cwd: repoRoot,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 180000
+      });
+    }
+  }
+
+  public async executeRollback(options?: {
+    backupId?: string;
+    targetCommit?: string;
+    actorUsername?: string;
+  }) {
+    const actor = options?.actorUsername || 'admin';
+    const deploymentMode: 'docker' | 'bare_metal' = isRunningInDocker() ? 'docker' : 'bare_metal';
+    if (deploymentMode === 'docker') {
+      throw new Error('Containerized deployments must roll back by pulling the desired image tag (`docker compose up -d`).');
+    }
+
+    const repoCandidates = [path.resolve(__dirname, '../../..'), path.resolve(__dirname, '../../../..')];
+    const repoRoot = repoCandidates.find((r) => fs.existsSync(path.join(r, '.git'))) || null;
+    if (!repoRoot) {
+      throw new Error('Git repository root (.git) not found; bare-metal rollback cannot run.');
+    }
+
+    const lastCompleted = db
+      .prepare("SELECT * FROM system_updates WHERE status = 'completed' ORDER BY executed_at DESC LIMIT 1")
+      .get() as any;
+    const rollbackRef = (options?.targetCommit || lastCompleted?.from_commit || '').trim();
+    const rollbackBackupId = options?.backupId || lastCompleted?.backup_id || null;
+
+    if (rollbackRef) {
+      if (!/^[a-zA-Z0-9._/-]+$/.test(rollbackRef)) {
+        throw new Error(`Invalid rollback git reference '${rollbackRef}'.`);
+      }
+      execFileSync('git', ['reset', '--hard', rollbackRef], {
+        cwd: repoRoot,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 30000
+      });
+      this.installAndBuildPackages(repoRoot);
+    }
+
+    let dbRestored = false;
+    if (rollbackBackupId) {
+      const res = backupService.restoreFromBackup(rollbackBackupId, 'auto_migrate', undefined, actor);
+      dbRestored = Boolean(res.success);
+    }
+
+    db.prepare(`
+      INSERT INTO audit_logs (id, username, device_id, action, details)
+      VALUES (?, ?, NULL, 'System Rollback Executed', ?)
+    `).run(
+      `aud-rb-${crypto.randomUUID()}`,
+      actor,
+      `Rolled back bare-metal installation to '${rollbackRef || 'unchanged'}' (Backup restored: ${dbRestored ? rollbackBackupId : 'none'}).`
+    );
+
+    return {
+      success: true,
+      rolledBackToCommit: rollbackRef || null,
+      backupRestored: dbRestored,
+      backupId: rollbackBackupId,
+      status: this.getStatus()
+    };
+  }
+
   public async executeUpdate(options?: { actorUsername?: string }) {
     await this.refreshUpstreamCatalog(true);
     const status = this.getStatus();
@@ -425,7 +503,7 @@ export class SystemUpdaterService {
       status.channel === 'stable'
         ? status.latestStable.version
         : `${status.latestStable.version}-alpha.${status.latestAlpha.sha}`;
-    const targetCommit =
+    let recordedCommit =
       status.channel === 'stable' ? status.latestStable.commitSha : status.latestAlpha.sha;
     const targetNotes =
       status.channel === 'stable'
@@ -437,7 +515,7 @@ export class SystemUpdaterService {
     if (settings.update_auto_backup) {
       const bak = backupService.createBackup({
         triggerType: 'pre-update',
-        notes: `Automatic pre-update snapshot before upgrading ${fromVersion} (${fromCommit}) -> ${targetVersion} (${targetCommit})`
+        notes: `Automatic pre-update snapshot before upgrading ${fromVersion} (${fromCommit}) -> ${targetVersion} (${recordedCommit})`
       });
       preUpdateBackupId = bak.id;
     }
@@ -468,75 +546,77 @@ export class SystemUpdaterService {
       const gitSelfPullDisabled = process.env.VITRINE_DISABLE_GIT_SELF_PULL === 'true';
       const explicitGitSelfPull = process.env.VITRINE_ENABLE_GIT_SELF_PULL === 'true';
 
-      if (repoRoot && !gitSelfPullDisabled && (explicitGitSelfPull || status.updateAvailable)) {
-        const dirtyStatus = execFileSync('git', ['status', '--porcelain'], {
+      if (!repoRoot) {
+        throw new Error(
+          'Git repository root (.git) was not found on disk. Bare-metal self-update cannot proceed without a git working tree.'
+        );
+      }
+      if (gitSelfPullDisabled) {
+        throw new Error(
+          'Bare-metal git self-pull is disabled by environment policy (VITRINE_DISABLE_GIT_SELF_PULL=true).'
+        );
+      }
+
+      const dirtyStatus = execFileSync('git', ['status', '--porcelain'], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 15000
+      }).trim();
+
+      if (dirtyStatus) {
+        throw new Error(
+          'Local repository has uncommitted modifications (`git status --porcelain` is non-empty). Commit or stash local changes before running bare-metal self-update.'
+        );
+      }
+
+      preHeadSha = execFileSync('git', ['rev-parse', 'HEAD'], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 10000
+      }).trim();
+
+      const rawTag = String(status.latestStable.tag || `v${status.latestStable.version}`).trim();
+      const rawRef = status.channel === 'stable' ? `refs/tags/${rawTag}` : 'origin/main';
+      if (!/^[a-zA-Z0-9._/-]+$/.test(rawRef)) {
+        throw new Error(`Invalid target git reference '${rawRef}'.`);
+      }
+
+      execFileSync('git', ['fetch', '--tags', '--force', 'origin'], {
+        cwd: repoRoot,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 60000
+      });
+
+      if (status.channel === 'stable') {
+        execFileSync('git', ['checkout', rawRef], {
           cwd: repoRoot,
-          encoding: 'utf8',
           stdio: ['ignore', 'pipe', 'pipe'],
-          timeout: 15000
-        }).trim();
-
-        if (dirtyStatus && !explicitGitSelfPull) {
-          throw new Error(
-            'Local repository has uncommitted modifications (`git status --porcelain` is non-empty). Commit or stash local changes before running bare-metal self-update.'
-          );
-        }
-
-        preHeadSha = execFileSync('git', ['rev-parse', 'HEAD'], {
-          cwd: repoRoot,
-          encoding: 'utf8',
-          stdio: ['ignore', 'pipe', 'pipe'],
-          timeout: 10000
-        }).trim();
-
-        const rawRef = status.channel === 'stable' ? status.latestStable.tag : 'origin/main';
-        if (!/^[a-zA-Z0-9._/-]+$/.test(rawRef)) {
-          throw new Error(`Invalid target git reference '${rawRef}'.`);
-        }
-
-        execFileSync('git', ['fetch', '--tags', 'origin'], {
-          cwd: repoRoot,
-          stdio: ['ignore', 'pipe', 'pipe'],
-          timeout: 60000
+          timeout: 30000
         });
-
-        if (status.channel === 'stable') {
-          execFileSync('git', ['checkout', rawRef], {
-            cwd: repoRoot,
-            stdio: ['ignore', 'pipe', 'pipe'],
-            timeout: 30000
-          });
-        } else {
-          execFileSync('git', ['merge', '--ff-only', rawRef], {
-            cwd: repoRoot,
-            stdio: ['ignore', 'pipe', 'pipe'],
-            timeout: 30000
-          });
-        }
-
-        const postHeadSha = execFileSync('git', ['rev-parse', 'HEAD'], {
+      } else {
+        execFileSync('git', ['merge', '--ff-only', rawRef], {
           cwd: repoRoot,
-          encoding: 'utf8',
           stdio: ['ignore', 'pipe', 'pipe'],
-          timeout: 10000
-        }).trim();
+          timeout: 30000
+        });
+      }
 
-        if (postHeadSha !== preHeadSha || explicitGitSelfPull) {
-          gitUpdated = postHeadSha !== preHeadSha;
-          const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-          for (const pkgDir of ['frontend', 'backend']) {
-            execFileSync(npmBin, ['install', '--no-audit', '--no-fund', '--prefix', pkgDir], {
-              cwd: repoRoot,
-              stdio: ['ignore', 'pipe', 'pipe'],
-              timeout: 180000
-            });
-            execFileSync(npmBin, ['run', 'build', '--prefix', pkgDir], {
-              cwd: repoRoot,
-              stdio: ['ignore', 'pipe', 'pipe'],
-              timeout: 180000
-            });
-          }
-        }
+      const postHeadSha = execFileSync('git', ['rev-parse', 'HEAD'], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 10000
+      }).trim();
+
+      if (postHeadSha) {
+        recordedCommit = postHeadSha.slice(0, 7);
+      }
+
+      if (postHeadSha !== preHeadSha || explicitGitSelfPull) {
+        gitUpdated = postHeadSha !== preHeadSha;
+        this.installAndBuildPackages(repoRoot);
       }
 
       // Re-verify code signing pipeline for updated agent packages
@@ -553,7 +633,7 @@ export class SystemUpdaterService {
           installed_commit = ?,
           db_schema_version = ?
         WHERE id = 1
-      `).run(targetVersion, targetCommit, APP_SCHEMA_VERSION);
+      `).run(targetVersion, recordedCommit, APP_SCHEMA_VERSION);
 
       const updateId = `upd-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`;
       db.prepare(`
@@ -566,7 +646,7 @@ export class SystemUpdaterService {
         fromVersion,
         targetVersion,
         fromCommit,
-        targetCommit,
+        recordedCommit,
         preUpdateBackupId,
         targetNotes
       );
@@ -577,7 +657,7 @@ export class SystemUpdaterService {
       `).run(
         `aud-upd-${crypto.randomUUID()}`,
         actor,
-        `Updated on ${status.channel.toUpperCase()} channel: ${fromVersion} (${fromCommit}) -> ${targetVersion} (${targetCommit}). Pre-update backup: ${preUpdateBackupId || 'none'}.`
+        `Updated on ${status.channel.toUpperCase()} channel: ${fromVersion} (${fromCommit}) -> ${targetVersion} (${recordedCommit}). Pre-update backup: ${preUpdateBackupId || 'none'}.`
       );
 
       // If running under systemd and git compiled new server artifacts, schedule clean service restart after HTTP reply flushes
@@ -596,7 +676,7 @@ export class SystemUpdaterService {
         fromVersion,
         toVersion: targetVersion,
         fromCommit,
-        toCommit: targetCommit,
+        toCommit: recordedCommit,
         preUpdateBackupId,
         ms2AgentsResigned: true,
         status: this.getStatus()
@@ -606,25 +686,15 @@ export class SystemUpdaterService {
       let rolledBack = false;
 
       if (settings.update_auto_rollback) {
-        // 1. Revert git working tree & recompile previous working build if git HEAD changed
+        // 1. Revert git working tree, restore previous node_modules, & recompile previous working build if git HEAD was captured
         if (repoRoot && preHeadSha) {
           try {
-            const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm';
             execFileSync('git', ['reset', '--hard', preHeadSha], {
               cwd: repoRoot,
               stdio: ['ignore', 'pipe', 'pipe'],
               timeout: 30000
             });
-            execFileSync(npmBin, ['run', 'build', '--prefix', 'frontend'], {
-              cwd: repoRoot,
-              stdio: ['ignore', 'pipe', 'pipe'],
-              timeout: 180000
-            });
-            execFileSync(npmBin, ['run', 'build', '--prefix', 'backend'], {
-              cwd: repoRoot,
-              stdio: ['ignore', 'pipe', 'pipe'],
-              timeout: 180000
-            });
+            this.installAndBuildPackages(repoRoot);
             rolledBack = true;
           } catch {
             // Continue to DB snapshot restore
@@ -634,8 +704,8 @@ export class SystemUpdaterService {
         // 2. Restore pre-update atomic SQLite + Vault snapshot
         if (preUpdateBackupId) {
           try {
-            backupService.restoreFromBackup(preUpdateBackupId, 'auto_migrate');
-            rolledBack = true;
+            const rbRes = backupService.restoreFromBackup(preUpdateBackupId, 'auto_migrate', undefined, actor);
+            rolledBack = Boolean(rbRes.success);
           } catch {
             rolledBack = false;
           }
@@ -653,7 +723,7 @@ export class SystemUpdaterService {
         fromVersion,
         targetVersion,
         fromCommit,
-        targetCommit,
+        recordedCommit,
         rolledBack ? 'rolled_back' : 'failed',
         preUpdateBackupId,
         errorTrace,

@@ -1,11 +1,23 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { ArrowRight, Sliders, Edit3, X, Clock, KeyRound, ShieldCheck, Database, Zap, Plus, Trash2, Bell } from 'lucide-react';
-import { Policy, Device, Tenant, ConditionAlertRule } from '../types/index.js';
-import { fetchPolicies, updatePolicy, createPolicy, deletePolicy, evaluatePolicyConditions } from '../services/api.js';
+import { ArrowRight, Sliders, Edit3, X, Clock, KeyRound, ShieldCheck, Database, Zap, Plus, Trash2, Bell, AlertCircle } from 'lucide-react';
+import { Policy, Device, Tenant, ConditionAlertRule, BackupPolicy, MdmProfile, AuthUser } from '../types/index.js';
+import {
+  fetchPolicies,
+  updatePolicy,
+  createPolicy,
+  deletePolicy,
+  evaluatePolicyConditions,
+  fetchEffectiveDevicePolicy,
+  fetchBackupPolicies,
+  fetchMdmProfiles
+} from '../services/api.js';
+import { canMutateFleet } from '../utils/permissions.js';
+import { MfaChallengeModal } from '../components/MfaChallengeModal.js';
 
 interface PoliciesViewProps {
   devices: Device[];
   tenants?: Tenant[];
+  currentUser?: AuthUser | null;
 }
 
 interface InheritanceNode {
@@ -35,15 +47,26 @@ interface EffectivePolicy {
   lapsOffboardClientArchivedAction?: string;
   lapsOffboardClientDeletedAction?: string;
   offboardOfflineAutoArchiveDays?: number;
+  patchRing?: 'canary' | 'pilot' | 'production';
+  patchDelayDays?: number;
+  managedDefenderEnabled?: boolean;
+  backupPolicyId?: string | null;
+  mdmProfileId?: string | null;
   alertRules?: ConditionAlertRule[];
 }
 
-export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [] }) => {
+export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [], currentUser }) => {
+  const canMutate = canMutateFleet(currentUser);
   const [policies, setPolicies] = useState<Policy[]>([]);
+  const [backupPolicies, setBackupPolicies] = useState<BackupPolicy[]>([]);
+  const [mdmProfiles, setMdmProfiles] = useState<MdmProfile[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>(devices[0]?.id || '');
   const [effectivePolicy, setEffectivePolicy] = useState<EffectivePolicy | null>(null);
   const [editingPolicy, setEditingPolicy] = useState<Policy | null>(null);
   const [savingPolicy, setSavingPolicy] = useState(false);
+  const [policyError, setPolicyError] = useState<string | null>(null);
+  const [createPolicyError, setCreatePolicyError] = useState<string | null>(null);
+  const [mfaRetryAction, setMfaRetryAction] = useState<'save' | 'create' | null>(null);
   const [evaluatingConditions, setEvaluatingConditions] = useState(false);
   const [evalSummaryMsg, setEvalSummaryMsg] = useState<string | null>(null);
 
@@ -79,40 +102,63 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
   const [newPolicyPatchSchedule, setNewPolicyPatchSchedule] = useState('Sat 03:00 AM');
 
   const loadPolicies = useCallback(() => {
-    fetchPolicies().then(setPolicies);
+    fetchPolicies().then(setPolicies).catch(() => {});
+    fetchBackupPolicies().then(setBackupPolicies).catch(() => {});
+    fetchMdmProfiles().then(setMdmProfiles).catch(() => {});
   }, []);
 
   useEffect(() => {
     loadPolicies();
   }, [loadPolicies]);
 
+  useEffect(() => {
+    if (!selectedDeviceId && devices[0]?.id) {
+      setSelectedDeviceId(devices[0].id);
+    }
+  }, [devices, selectedDeviceId]);
+
   const loadEffective = useCallback(() => {
     if (!selectedDeviceId) return;
-    fetch(`/api/policies/effective/${selectedDeviceId}`)
-      .then((res) => res.json())
-      .then(setEffectivePolicy);
+    fetchEffectiveDevicePolicy(selectedDeviceId)
+      .then((res) => setEffectivePolicy(res as EffectivePolicy))
+      .catch(() => {});
   }, [selectedDeviceId]);
 
   useEffect(() => {
     loadEffective();
   }, [loadEffective]);
 
+  const performCreatePolicy = async () => {
+    if (!newPolicyName.trim()) return;
+    setCreatePolicyError(null);
+    try {
+      const res = await createPolicy({
+        name: newPolicyName.trim(),
+        tier: newPolicyTier,
+        target_id: newPolicyTargetId,
+        telemetry_interval_sec: newPolicyTelemetry,
+        patch_schedule: newPolicyPatchSchedule
+      });
+      if (res.mfaRequired) {
+        setMfaRetryAction('create');
+        return;
+      }
+      if (res.success) {
+        loadPolicies();
+        loadEffective();
+        setShowCreateModal(false);
+        setNewPolicyName('');
+      } else {
+        setCreatePolicyError(res.error || 'Failed to create policy.');
+      }
+    } catch (err: any) {
+      setCreatePolicyError(err?.message || 'Failed to create policy.');
+    }
+  };
+
   const handleCreatePolicy = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newPolicyName.trim()) return;
-    const res = await createPolicy({
-      name: newPolicyName.trim(),
-      tier: newPolicyTier,
-      target_id: newPolicyTargetId,
-      telemetry_interval_sec: newPolicyTelemetry,
-      patch_schedule: newPolicyPatchSchedule
-    });
-    if (res.success) {
-      loadPolicies();
-      loadEffective();
-      setShowCreateModal(false);
-      setNewPolicyName('');
-    }
+    await performCreatePolicy();
   };
 
   const handleDeletePolicy = async (id: string) => {
@@ -121,20 +167,26 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
     loadEffective();
   };
 
-  const handleSavePolicy = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const performSavePolicy = async () => {
     if (!editingPolicy) return;
     setSavingPolicy(true);
+    setPolicyError(null);
     try {
-      await updatePolicy(editingPolicy.id, {
+      const res = await updatePolicy(editingPolicy.id, {
         name: editingPolicy.name,
         telemetry_interval_sec: editingPolicy.telemetry_interval_sec,
         require_remote_consent: editingPolicy.require_remote_consent,
         consent_timeout_sec: editingPolicy.consent_timeout_sec,
         consent_timeout_action: editingPolicy.consent_timeout_action,
         auto_lock_on_disconnect: editingPolicy.auto_lock_on_disconnect,
-        patch_schedule: editingPolicy.patch_schedule,
-        patch_reboot_enforcement: editingPolicy.patch_reboot_enforcement,
+        bitlocker_enforced: editingPolicy.bitlocker_enforced ?? editingPolicy.bitlocker_enforcement ?? 1,
+        patch_schedule: editingPolicy.patch_schedule || '',
+        patch_ring: editingPolicy.patch_ring || 'production',
+        patch_delay_days: editingPolicy.patch_delay_days ?? 0,
+        defender_managed: editingPolicy.defender_managed ?? editingPolicy.managed_defender_enabled ?? 1,
+        backup_policy_id: editingPolicy.backup_policy_id || null,
+        mdm_profile_id: editingPolicy.mdm_profile_id || null,
+        patch_reboot_enforcement: editingPolicy.patch_reboot_enforcement || '',
         max_snooze_hours: editingPolicy.max_snooze_hours,
         force_reboot_after_snooze: editingPolicy.force_reboot_after_snooze,
         final_countdown_sec: editingPolicy.final_countdown_sec,
@@ -164,14 +216,27 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
         self_healing_alert_psa: editingPolicy.self_healing_alert_psa,
         alert_rules: editingPolicy.alert_rules
       });
+      if (res.mfaRequired) {
+        setMfaRetryAction('save');
+        return;
+      }
+      if (!res.success) {
+        setPolicyError(res.error || 'Failed to update policy.');
+        return;
+      }
       loadPolicies();
       loadEffective();
       setEditingPolicy(null);
-    } catch (err) {
-      console.error('Failed to update policy:', err);
+    } catch (err: any) {
+      setPolicyError(err?.message || 'Failed to update policy.');
     } finally {
       setSavingPolicy(false);
     }
+  };
+
+  const handleSavePolicy = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await performSavePolicy();
   };
 
   return (
@@ -185,20 +250,28 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
             Multi-tiered governance cascading from Global &rarr; Client Tenant &rarr; Site Location &rarr; Device Role with configurable tray snooze and transparent forced reboot HUD timers
           </span>
         </div>
-        <div style={{ display: 'flex', gap: '0.65rem', flexWrap: 'wrap' }}>
-          <button
-            className="btn-glass"
-            style={{ borderColor: 'rgba(56, 189, 248, 0.45)', color: '#38bdf8' }}
-            disabled={evaluatingConditions}
-            onClick={handleEvaluateConditionsNow}
-          >
-            <Bell size={15} />{' '}
-            {evaluatingConditions ? 'Evaluating 4-Tier Conditions...' : 'Evaluate Fleet Conditions & Dispatch Alerts'}
-          </button>
-          <button className="btn-glass btn-primary" onClick={() => setShowCreateModal(true)}>
-            <Plus size={16} /> Create Tier Policy
-          </button>
-        </div>
+        {canMutate && (
+          <div style={{ display: 'flex', gap: '0.65rem', flexWrap: 'wrap' }}>
+            <button
+              className="btn-glass"
+              style={{ borderColor: 'rgba(56, 189, 248, 0.45)', color: '#38bdf8' }}
+              disabled={evaluatingConditions}
+              onClick={handleEvaluateConditionsNow}
+            >
+              <Bell size={15} />{' '}
+              {evaluatingConditions ? 'Evaluating 4-Tier Conditions...' : 'Evaluate Fleet Conditions & Dispatch Alerts'}
+            </button>
+            <button
+              className="btn-glass btn-primary"
+              onClick={() => {
+                setCreatePolicyError(null);
+                setShowCreateModal(true);
+              }}
+            >
+              <Plus size={16} /> Create Tier Policy
+            </button>
+          </div>
+        )}
       </div>
 
       {evalSummaryMsg && (
@@ -289,26 +362,33 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
                       )}
                     </td>
                     <td>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
-                        <button
-                          className="btn-glass"
-                          onClick={() => setEditingPolicy(p)}
-                          style={{ padding: '0.2rem 0.5rem', fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.3rem' }}
-                        >
-                          <Edit3 size={12} />
-                          <span>Edit</span>
-                        </button>
-                        {p.tier !== 'global' && (
+                      {canMutate ? (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
                           <button
-                            className="btn-glass btn-icon"
-                            title="Delete Tier Policy"
-                            style={{ padding: '0.2rem 0.4rem' }}
-                            onClick={() => handleDeletePolicy(p.id)}
+                            className="btn-glass"
+                            onClick={() => {
+                              setPolicyError(null);
+                              setEditingPolicy(p);
+                            }}
+                            style={{ padding: '0.2rem 0.5rem', fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.3rem' }}
                           >
-                            <Trash2 size={12} color="#ef4444" />
+                            <Edit3 size={12} />
+                            <span>Edit</span>
                           </button>
-                        )}
-                      </div>
+                          {p.tier !== 'global' && (
+                            <button
+                              className="btn-glass btn-icon"
+                              title="Delete Tier Policy"
+                              style={{ padding: '0.2rem 0.4rem' }}
+                              onClick={() => handleDeletePolicy(p.id)}
+                            >
+                              <Trash2 size={12} color="#ef4444" />
+                            </button>
+                          )}
+                        </div>
+                      ) : (
+                        <span style={{ fontSize: '0.72rem', color: 'var(--text-dim)' }}>Read-only</span>
+                      )}
                     </td>
                   </tr>
                 ))}
@@ -386,9 +466,14 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
                 </div>
 
                 <div className="glass-card" style={{ padding: '0.85rem', gridColumn: 'span 2' }}>
-                  <div style={{ color: 'var(--text-dim)', fontSize: '0.75rem' }}>Patch Reboot Enforcement Rule</div>
-                  <div style={{ fontWeight: 600, fontSize: '0.95rem', marginTop: '0.15rem' }}>
-                    {effectivePolicy.patchRebootEnforcement}
+                  <div style={{ color: 'var(--text-dim)', fontSize: '0.75rem' }}>Patch Ring &amp; Reboot Enforcement Rule</div>
+                  <div style={{ fontWeight: 600, fontSize: '0.92rem', marginTop: '0.15rem' }}>
+                    Ring: <span style={{ color: '#38bdf8' }}>{(effectivePolicy.patchRing || 'production').toUpperCase()}</span>{' '}
+                    ({effectivePolicy.patchDelayDays ?? 0}d delay) • {effectivePolicy.patchRebootEnforcement || 'Standard Window'}
+                  </div>
+                  <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.2rem' }}>
+                    Managed AV/Defender: <strong>{effectivePolicy.managedDefenderEnabled !== false ? 'Enforced' : 'Monitor Only'}</strong> •{' '}
+                    Disk Encryption: <strong>{effectivePolicy.bitlockerEnforcement ? 'Enforced (TPM Escrow)' : 'Audit Only'}</strong>
                   </div>
                 </div>
 
@@ -495,8 +580,10 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
                       const tier = e.target.value as 'client' | 'site' | 'role';
                       setNewPolicyTier(tier);
                       if (tier === 'client') setNewPolicyTargetId(tenants[0]?.id || 'ten-1');
-                      else if (tier === 'site') setNewPolicyTargetId('site-1');
-                      else setNewPolicyTargetId('Workstation');
+                      else if (tier === 'site') {
+                        const firstSite = tenants.flatMap((t) => t.sites || [])[0];
+                        setNewPolicyTargetId(firstSite?.id || 'site-1');
+                      } else setNewPolicyTargetId('Workstation');
                     }}
                   >
                     <option value="client">Tier 2: Client Tenant</option>
@@ -567,6 +654,25 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
                   />
                 </div>
               </div>
+
+              {createPolicyError && (
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.5rem',
+                    padding: '0.65rem 0.85rem',
+                    borderRadius: '8px',
+                    background: 'rgba(239, 68, 68, 0.14)',
+                    border: '1px solid rgba(239, 68, 68, 0.35)',
+                    color: '#f87171',
+                    fontSize: '0.78rem'
+                  }}
+                >
+                  <AlertCircle size={15} style={{ flexShrink: 0 }} />
+                  <span>{createPolicyError}</span>
+                </div>
+              )}
 
               <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem', marginTop: '0.5rem' }}>
                 <button type="button" className="btn-glass" onClick={() => setShowCreateModal(false)}>
@@ -664,9 +770,99 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
                   <input
                     type="text"
                     className="glass-input"
-                    value={editingPolicy.patch_schedule}
+                    value={editingPolicy.patch_schedule || ''}
                     onChange={(e) => setEditingPolicy({ ...editingPolicy, patch_schedule: e.target.value })}
                   />
+                </div>
+              </div>
+
+              {/* NinjaOne Parity: Patch Deployment Rings, Managed Endpoint Security, Backup & MDM Bindings */}
+              <div style={{ background: 'rgba(56, 189, 248, 0.05)', border: '1px solid rgba(56, 189, 248, 0.22)', borderRadius: '8px', padding: '1rem', display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+                <div style={{ fontWeight: 600, fontSize: '0.9rem', color: '#38bdf8' }}>
+                  Patch Ring Rollout, Endpoint Security, Backup &amp; MDM Bindings
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.85rem' }}>
+                  <div>
+                    <label style={{ fontSize: '0.76rem', color: 'var(--text-dim)', display: 'block', marginBottom: '0.25rem' }}>
+                      Patch Deployment Ring
+                    </label>
+                    <select
+                      className="glass-select"
+                      value={editingPolicy.patch_ring || 'production'}
+                      onChange={(e) => setEditingPolicy({ ...editingPolicy, patch_ring: e.target.value as any })}
+                    >
+                      <option value="canary">Ring 0 — Canary / Internal IT (0d delay)</option>
+                      <option value="pilot">Ring 1 — Pilot Champions</option>
+                      <option value="production">Ring 2 — Broad Production Fleet</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{ fontSize: '0.76rem', color: 'var(--text-dim)', display: 'block', marginBottom: '0.25rem' }}>
+                      Ring Deferral Delay (Days post-release)
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={60}
+                      className="glass-input"
+                      value={editingPolicy.patch_delay_days ?? 0}
+                      onChange={(e) => setEditingPolicy({ ...editingPolicy, patch_delay_days: Number(e.target.value) })}
+                    />
+                  </div>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.85rem' }}>
+                  <div>
+                    <label style={{ fontSize: '0.76rem', color: 'var(--text-dim)', display: 'block', marginBottom: '0.25rem' }}>
+                      Endpoint Backup Policy
+                    </label>
+                    <select
+                      className="glass-select"
+                      value={editingPolicy.backup_policy_id || ''}
+                      onChange={(e) => setEditingPolicy({ ...editingPolicy, backup_policy_id: e.target.value || null })}
+                    >
+                      <option value="">-- Inherit / Unbound --</option>
+                      {backupPolicies.map((bp) => (
+                        <option key={bp.id} value={bp.id}>
+                          {bp.name} ({bp.engine})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{ fontSize: '0.76rem', color: 'var(--text-dim)', display: 'block', marginBottom: '0.25rem' }}>
+                      MDM / OS Configuration Profile
+                    </label>
+                    <select
+                      className="glass-select"
+                      value={editingPolicy.mdm_profile_id || ''}
+                      onChange={(e) => setEditingPolicy({ ...editingPolicy, mdm_profile_id: e.target.value || null })}
+                    >
+                      <option value="">-- Inherit / Unbound --</option>
+                      {mdmProfiles.map((mp) => (
+                        <option key={mp.id} value={mp.id}>
+                          {mp.name} ({mp.platform})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: '1.25rem', flexWrap: 'wrap', fontSize: '0.8rem' }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      checked={Boolean(editingPolicy.defender_managed ?? editingPolicy.managed_defender_enabled ?? 1)}
+                      onChange={(e) => setEditingPolicy({ ...editingPolicy, defender_managed: e.target.checked ? 1 : 0, managed_defender_enabled: e.target.checked ? 1 : 0 })}
+                    />
+                    <span>Enforce Managed Defender / ClamAV Real-Time Protection</span>
+                  </label>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      checked={Boolean(editingPolicy.bitlocker_enforced ?? editingPolicy.bitlocker_enforcement ?? 1)}
+                      onChange={(e) => setEditingPolicy({ ...editingPolicy, bitlocker_enforced: e.target.checked ? 1 : 0, bitlocker_enforcement: e.target.checked ? 1 : 0 })}
+                    />
+                    <span>Enforce BitLocker / FileVault / LUKS Volume Encryption &amp; Escrow</span>
+                  </label>
                 </div>
               </div>
 
@@ -740,7 +936,7 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
                 <input
                   type="text"
                   className="glass-input"
-                  value={editingPolicy.patch_reboot_enforcement}
+                  value={editingPolicy.patch_reboot_enforcement || ''}
                   onChange={(e) => setEditingPolicy({ ...editingPolicy, patch_reboot_enforcement: e.target.value })}
                 />
               </div>
@@ -1260,6 +1456,25 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
                 </div>
               )}
 
+              {policyError && (
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.55rem',
+                    padding: '0.75rem 1rem',
+                    borderRadius: '8px',
+                    background: 'rgba(239, 68, 68, 0.14)',
+                    border: '1px solid rgba(239, 68, 68, 0.35)',
+                    color: '#f87171',
+                    fontSize: '0.82rem'
+                  }}
+                >
+                  <AlertCircle size={16} style={{ flexShrink: 0 }} />
+                  <span>{policyError}</span>
+                </div>
+              )}
+
               <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem', marginTop: '0.75rem' }}>
                 <button
                   type="button"
@@ -1280,6 +1495,23 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
           </div>
         </div>
       )}
+
+      <MfaChallengeModal
+        isOpen={Boolean(mfaRetryAction)}
+        onClose={() => setMfaRetryAction(null)}
+        onSuccess={() => {
+          const action = mfaRetryAction;
+          setMfaRetryAction(null);
+          if (action === 'save') {
+            performSavePolicy();
+          } else if (action === 'create') {
+            performCreatePolicy();
+          }
+        }}
+        title="Step-Up MFA: Policy Governance"
+        description="Enter your 6-digit TOTP authenticator code or recovery code to authorize modifying hierarchical fleet security & LAPS policies."
+        secretType="policy_governance"
+      />
     </div>
   );
 };

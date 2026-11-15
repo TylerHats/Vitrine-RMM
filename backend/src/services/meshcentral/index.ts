@@ -1,9 +1,17 @@
 import WebSocket from 'ws';
 import crypto from 'crypto';
 import fs from 'fs';
+import net from 'net';
+import os from 'os';
 import path from 'path';
+import { execFile } from 'child_process';
 import { db } from '../../db/index.js';
-import { decryptVaultSecret, validateOutboundHostSafety } from '../vault/index.js';
+import {
+  decryptVaultSecret,
+  isBlockedOutboundIp,
+  safeOutboundFetch,
+  validateOutboundHostSafety
+} from '../vault/index.js';
 import { quotePowerShellLiteral, quoteBashLiteral } from '../agent/installerGenerator.js';
 
 export interface ProcessItem {
@@ -80,6 +88,8 @@ export interface SyncResult {
   success: boolean;
   imported: number;
   updated: number;
+  importedDevices?: number;
+  updatedDevices?: number;
   importedGroups: number;
   updatedGroups: number;
   unmappedMeshGroups: number;
@@ -100,27 +110,215 @@ export interface EventLogItem {
 }
 
 const SERVICE_NAME_REGEX = /^[a-zA-Z0-9._@-]{1,128}$/;
-const SAFE_ACCOUNT_NAME_REGEX = /^[a-zA-Z0-9._-]{1,32}$/;
+const SAFE_ACCOUNT_NAME_REGEX = /^[a-zA-Z0-9._-]{1,20}$/;
 
-function validateMeshServerUrl(rawUrl: string): { ok: boolean; normalized?: string; error?: string } {
+const PROTECTED_UNIX_PATHS = new Set([
+  '/',
+  '/bin',
+  '/boot',
+  '/dev',
+  '/etc',
+  '/home',
+  '/lib',
+  '/lib64',
+  '/opt',
+  '/proc',
+  '/root',
+  '/run',
+  '/sbin',
+  '/sys',
+  '/usr',
+  '/var',
+  '/System',
+  '/Library',
+  '/Applications',
+  '/Users'
+]);
+
+const PROTECTED_WINDOWS_PATHS = new Set([
+  'c:',
+  'c:\\',
+  'c:\\windows',
+  'c:\\windows\\system32',
+  'c:\\program files',
+  'c:\\program files (x86)',
+  'c:\\programdata',
+  'c:\\users'
+]);
+
+function isLoopbackExactHostname(rawUrl: string): boolean {
+  try {
+    const h = new URL(rawUrl).hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    return h === 'localhost' || h === '127.0.0.1' || h === '::1';
+  } catch {
+    return false;
+  }
+}
+
+function validateMeshServerUrl(rawUrl: string): {
+  ok: boolean;
+  normalized?: string;
+  loginKey?: string;
+  error?: string;
+} {
   try {
     const parsed = new URL(rawUrl.trim());
     if (!['http:', 'https:', 'ws:', 'wss:'].includes(parsed.protocol)) {
       return { ok: false, error: 'MeshCentral URL must start with http://, https://, ws://, or wss://.' };
     }
-    const host = parsed.hostname.toLowerCase();
+    const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
     if (
       host === '169.254.169.254' ||
       host.startsWith('169.254.') ||
       host === 'metadata.google.internal' ||
-      host.startsWith('fe80:')
+      host === '100.100.100.200' ||
+      host.startsWith('fe80:') ||
+      (net.isIP(host) !== 0 && isBlockedOutboundIp(host, { allowLoopback: true, allowPrivateLan: true }))
     ) {
       return { ok: false, error: 'Link-local and cloud metadata addresses are blocked.' };
     }
-    return { ok: true, normalized: parsed.origin };
+    const loginKey = parsed.searchParams.get('key') || undefined;
+    return { ok: true, normalized: parsed.origin, loginKey };
   } catch {
     return { ok: false, error: 'Invalid MeshCentral URL format.' };
   }
+}
+
+function buildMeshWsAuthParams(
+  normalizedOrigin: string,
+  apiToken: string,
+  loginKey?: string
+): { wsUrl: string; headers: Record<string, string> } {
+  const baseWs = normalizedOrigin.replace(/^http/i, 'ws');
+  const headers: Record<string, string> = {};
+  const queryParts: string[] = [];
+  if (loginKey) {
+    queryParts.push(`key=${encodeURIComponent(loginKey)}`);
+  }
+
+  // Support both MeshCentral `x-meshauth` (username:password or base64,base64) and `--logintoken` cookies
+  if (apiToken.includes(':') && !apiToken.startsWith('c=')) {
+    const idx = apiToken.indexOf(':');
+    const userPart = apiToken.slice(0, idx);
+    const passPart = apiToken.slice(idx + 1);
+    headers['x-meshauth'] =
+      `${Buffer.from(userPart, 'utf8').toString('base64')},${Buffer.from(passPart, 'utf8').toString('base64')}`;
+  } else if (/^[A-Za-z0-9+/=]+,[A-Za-z0-9+/=]+$/.test(apiToken)) {
+    headers['x-meshauth'] = apiToken;
+  } else {
+    headers['x-meshauth'] = apiToken;
+    queryParts.push(`auth=${encodeURIComponent(apiToken)}`);
+  }
+
+  const qs = queryParts.length > 0 ? `?${queryParts.join('&')}` : '';
+  return { wsUrl: `${baseWs}/control.ashx${qs}`, headers };
+}
+
+function normalizeWindowsRegistryLiteralPath(regPath: string): string {
+  const trimmed = String(regPath || '').trim().replace(/\0/g, '');
+  if (/^HKLM(\\|$)/i.test(trimmed)) {
+    return trimmed.replace(/^HKLM/i, 'Registry::HKEY_LOCAL_MACHINE');
+  }
+  if (/^HKEY_LOCAL_MACHINE(\\|$)/i.test(trimmed)) {
+    return `Registry::${trimmed}`;
+  }
+  if (/^HKCU(\\|$)/i.test(trimmed)) {
+    return trimmed.replace(/^HKCU/i, 'Registry::HKEY_CURRENT_USER');
+  }
+  if (/^HKEY_CURRENT_USER(\\|$)/i.test(trimmed)) {
+    return `Registry::${trimmed}`;
+  }
+  if (/^HKU(\\|$)/i.test(trimmed)) {
+    return trimmed.replace(/^HKU/i, 'Registry::HKEY_USERS');
+  }
+  if (/^HKCR(\\|$)/i.test(trimmed)) {
+    return trimmed.replace(/^HKCR/i, 'Registry::HKEY_CLASSES_ROOT');
+  }
+  if (/^HKCC(\\|$)/i.test(trimmed)) {
+    return trimmed.replace(/^HKCC/i, 'Registry::HKEY_CURRENT_CONFIG');
+  }
+  throw new Error('Registry path must begin with HKLM\\, HKCU\\, HKU\\, HKCR\\, or HKCC\\.');
+}
+
+function canonicalizeRemotePath(rawDir: string, osType: 'windows' | 'linux' | 'macos'): string {
+  const trimmed = String(rawDir || '').trim().replace(/\0/g, '');
+  if (osType === 'windows') {
+    const winInput = !trimmed || trimmed === '/' ? 'C:\\' : trimmed.replace(/\//g, '\\');
+    const normalized = path.win32.normalize(winInput);
+    if (!/^[a-zA-Z]:\\/.test(normalized)) {
+      throw new Error('Windows directory path must be an absolute drive path (e.g. C:\\Users).');
+    }
+    return normalized;
+  }
+  const posixInput = !trimmed || trimmed === 'C:\\' ? '/' : trimmed.replace(/\\/g, '/');
+  const normalized = path.posix.normalize(posixInput);
+  if (!normalized.startsWith('/')) {
+    throw new Error('POSIX directory path must begin with /.');
+  }
+  return normalized;
+}
+
+class BoundedTtlCache<V> {
+  private map = new Map<string, { value: V; expiresAt: number }>();
+  constructor(
+    private readonly maxEntries = 200,
+    private readonly ttlMs = 15000
+  ) {}
+
+  get(key: string): V | undefined {
+    const entry = this.map.get(key);
+    if (!entry) return undefined;
+    if (Date.now() > entry.expiresAt) {
+      this.map.delete(key);
+      return undefined;
+    }
+    return entry.value;
+  }
+
+  set(key: string, value: V, customTtlMs?: number): void {
+    if (this.map.size >= this.maxEntries && !this.map.has(key)) {
+      const oldestKey = this.map.keys().next().value;
+      if (oldestKey !== undefined) this.map.delete(oldestKey);
+    }
+    this.map.set(key, { value, expiresAt: Date.now() + (customTtlMs ?? this.ttlMs) });
+  }
+
+  delete(key: string): void {
+    this.map.delete(key);
+  }
+}
+
+interface FederatedSocketEntry {
+  serverId: string;
+  serverUrl: string;
+  ws: WebSocket | null;
+  connected: boolean;
+  reconnectAttempts: number;
+  reconnectTimer: ReturnType<typeof setTimeout> | null;
+}
+
+const CMD_SENTINEL_REGEX = /(?:\r?\n)?__VITRINE_RC:(-?\d+):([A-Za-z0-9_-]+)(?:\r?\n)?/;
+
+function extractCommandSentinel(rawOutput: string): {
+  cleanOutput: string;
+  exitCode: number | null;
+  cmdId: string | null;
+} {
+  const match = CMD_SENTINEL_REGEX.exec(rawOutput);
+  if (!match) {
+    return { cleanOutput: rawOutput, exitCode: null, cmdId: null };
+  }
+  const parsedRc = Number.parseInt(match[1], 10);
+  const exitCode = Number.isNaN(parsedRc) ? 0 : parsedRc;
+  const cmdId = match[2] || null;
+  const before = rawOutput.slice(0, match.index);
+  const after = rawOutput.slice(match.index + match[0].length);
+  const joined = before && after ? `${before}\n${after}` : `${before}${after}`;
+  return {
+    cleanOutput: joined.replace(/\r?\n$/, ''),
+    exitCode,
+    cmdId
+  };
 }
 
 export class MeshCentralBridge {
@@ -129,57 +327,95 @@ export class MeshCentralBridge {
   private isConfigured = false;
   private connectedServerUrl: string | null = null;
   private lastConnectionError: string | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectAttempts = 0;
+  private configEpoch = 0;
+
+  private federatedPool = new Map<string, FederatedSocketEntry>();
+  private nodeServerMap = new Map<string, string>();
 
   private pendingCmdWaiters = new Map<
     string,
-    { resolve: (output: string) => void; timer: ReturnType<typeof setTimeout> }
+    {
+      resolve: (res: { output: string; exitCode: number } | null) => void;
+      timer: ReturnType<typeof setTimeout>;
+      nodeId?: string;
+    }
+  >();
+  private pendingControlWaiters = new Map<
+    string,
+    { resolve: (msg: any) => void; timer: ReturnType<typeof setTimeout> }
   >();
 
-  // Stateful per-device caches for interactive background tools when live agent response is pending
-  private processStore = new Map<string, ProcessItem[]>();
-  private serviceStore = new Map<string, ServiceItem[]>();
-  private registryStore = new Map<string, { subkeys: string[]; values: RegistryEntry[] }>();
-  private taskStore = new Map<string, ScheduledTaskItem[]>();
-  private fileStore = new Map<string, FileItem[]>();
-  private fileContentCache = new Map<string, Buffer>();
+  // Bounded TTL caches storing ONLY real endpoint query responses
+  private processCache = new BoundedTtlCache<ProcessItem[]>(150, 10000);
+  private serviceCache = new BoundedTtlCache<ServiceItem[]>(150, 15000);
+  private registryCache = new BoundedTtlCache<{ subkeys: string[]; values: RegistryEntry[] }>(200, 20000);
+  private taskCache = new BoundedTtlCache<ScheduledTaskItem[]>(150, 20000);
+  private fileCache = new BoundedTtlCache<FileItem[]>(250, 12000);
+  private fileContentCache = new BoundedTtlCache<Buffer>(50, 120000);
 
   constructor() {
     this.checkConfig();
   }
 
   private closeExistingSocket() {
+    this.configEpoch++;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.meshWs) {
-      try {
-        this.meshWs.removeAllListeners();
-        if (
-          this.meshWs.readyState === WebSocket.OPEN ||
-          this.meshWs.readyState === WebSocket.CONNECTING
-        ) {
-          this.meshWs.close();
-        }
-      } catch {
-        // Ignore close errors
-      }
+      const oldWs = this.meshWs;
       this.meshWs = null;
+      try {
+        oldWs.removeAllListeners();
+        oldWs.on('error', () => {});
+        if (oldWs.readyState === WebSocket.OPEN) {
+          oldWs.close();
+        } else if (oldWs.readyState === WebSocket.CONNECTING) {
+          oldWs.terminate();
+        }
+      } catch {}
     }
     this.isConnected = false;
+
+    for (const [, entry] of this.federatedPool) {
+      if (entry.reconnectTimer) clearTimeout(entry.reconnectTimer);
+      if (entry.ws) {
+        const oldFedWs = entry.ws;
+        entry.ws = null;
+        try {
+          oldFedWs.removeAllListeners();
+          oldFedWs.on('error', () => {});
+          if (oldFedWs.readyState === WebSocket.OPEN) {
+            oldFedWs.close();
+          } else if (oldFedWs.readyState === WebSocket.CONNECTING) {
+            oldFedWs.terminate();
+          }
+        } catch {}
+      }
+    }
+    this.federatedPool.clear();
   }
 
   public checkConfig() {
     this.closeExistingSocket();
+    this.reconnectAttempts = 0;
     try {
       const settings = (db.prepare('SELECT * FROM settings WHERE id = 1').get() || {}) as any;
       let serverUrl = (settings.meshcentral_url || '').trim();
       let apiToken = decryptVaultSecret(settings.meshcentral_api_token);
 
-      // Fallback to primary federated mesh_servers entry if primary settings fields are blank
-      if (!serverUrl || !apiToken) {
-        const defaultSrv = db
-          .prepare('SELECT url, api_token FROM mesh_servers ORDER BY is_primary DESC, created_at ASC LIMIT 1')
-          .get() as any;
-        if (defaultSrv?.url && defaultSrv?.api_token) {
-          serverUrl = String(defaultSrv.url).trim();
-          apiToken = decryptVaultSecret(defaultSrv.api_token);
+      const allServers = db
+        .prepare('SELECT id, url, api_token, is_primary FROM mesh_servers ORDER BY is_primary DESC, created_at ASC')
+        .all() as Array<{ id: string; url: string; api_token: string; is_primary: number }>;
+
+      if ((!serverUrl || !apiToken) && allServers.length > 0) {
+        const primary = allServers[0];
+        if (primary?.url && primary?.api_token) {
+          serverUrl = String(primary.url).trim();
+          apiToken = decryptVaultSecret(primary.api_token);
         }
       }
 
@@ -197,11 +433,136 @@ export class MeshCentralBridge {
         this.connectedServerUrl = serverUrl || null;
         this.lastConnectionError = null;
       }
+
+      // Connect additional federated MeshCentral servers into the multi-server pool
+      for (const srv of allServers) {
+        const srvUrl = String(srv.url || '').trim();
+        const srvToken = decryptVaultSecret(srv.api_token);
+        if (!srvUrl || !srvToken || srvUrl === serverUrl) continue;
+        this.initFederatedSocket(srv.id, srvUrl, srvToken, Boolean(settings.meshcentral_allow_self_signed));
+      }
     } catch (e: any) {
       this.isConfigured = false;
       this.isConnected = false;
       this.lastConnectionError = e?.message || 'Database not initialized';
     }
+  }
+
+  private handleIncomingMeshFrame(raw: WebSocket.RawData, serverId = 'primary') {
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (!msg || typeof msg !== 'object') return;
+
+      // Track node -> server mapping and online status transitions live!
+      if (msg.action === 'nodes' && msg.nodes && typeof msg.nodes === 'object') {
+        for (const arr of Object.values(msg.nodes)) {
+          if (!Array.isArray(arr)) continue;
+          for (const n of arr as any[]) {
+            if (n?._id) {
+              this.nodeServerMap.set(String(n._id), serverId);
+            }
+          }
+        }
+      } else if (msg.action === 'event' && msg.event?.nodeid) {
+        const nid = String(msg.event.nodeid);
+        this.nodeServerMap.set(nid, serverId);
+        if (msg.event.etype === 'node' && typeof msg.event.conn === 'number') {
+          const isOnline = (msg.event.conn & 1) !== 0;
+          try {
+            db.prepare(
+              "UPDATE devices SET status = CASE WHEN quarantined = 1 THEN 'isolated' ELSE ? END, last_seen = ? WHERE mesh_node_id = ?"
+            ).run(isOnline ? 'online' : 'offline', new Date().toISOString(), nid);
+          } catch {}
+        }
+      }
+
+      // Resolve control RPC waiters (e.g., createDeviceShareLink, authcookie)
+      const respId = msg.responseid || msg.tag;
+      if (respId && this.pendingControlWaiters.has(String(respId))) {
+        // Ignore the initial runcommands 'OK' ack if a command output waiter owns it
+        const ctl = this.pendingControlWaiters.get(String(respId))!;
+        clearTimeout(ctl.timer);
+        this.pendingControlWaiters.delete(String(respId));
+        ctl.resolve(msg);
+      }
+
+      // Resolve live command execution output (`reply: true` sends `action: 'msg', type: 'runcommands'` or `result`)
+      if (respId && this.pendingCmdWaiters.has(String(respId))) {
+        // MeshCentral sends `{ action: 'runcommands', result: 'OK', responseid }` first as dispatch ack,
+        // followed by `{ action: 'msg', type: 'console'|'runcommands', value/result, responseid }` when output arrives.
+        // If MeshCentral rejects the nodeid (e.g. `{ action: 'runcommands', result: 'Invalid nodeids' }` on a standalone Companion node),
+        // resolve `null` so `executeCommandOnNode` falls through to Local Host / Companion Queue!
+        if (msg.action === 'runcommands' && msg.value === undefined && msg.output === undefined) {
+          if (msg.result === 'OK') {
+            return;
+          }
+          const waiter = this.pendingCmdWaiters.get(String(respId))!;
+          clearTimeout(waiter.timer);
+          this.pendingCmdWaiters.delete(String(respId));
+          waiter.resolve(null);
+          return;
+        }
+        const rawOut = String(msg.result ?? msg.value ?? msg.output ?? '');
+        const parsed = extractCommandSentinel(rawOut);
+        const inferredExit =
+          parsed.exitCode !== null
+            ? parsed.exitCode
+            : /CategoryInfo|FullyQualifiedErrorId|Exception/i.test(rawOut)
+              ? 1
+              : 0;
+        const waiter = this.pendingCmdWaiters.get(String(respId))!;
+        clearTimeout(waiter.timer);
+        this.pendingCmdWaiters.delete(String(respId));
+        waiter.resolve({ output: parsed.cleanOutput, exitCode: inferredExit });
+        return;
+      }
+
+      // Match pending waiters by deterministic `<cmdId>` sentinel in output when `responseid` is absent,
+      // falling back to `nodeid` only if no sentinel ID matched.
+      if (
+        (msg.action === 'msg' || msg.type === 'runcommands' || msg.type === 'console') &&
+        (msg.result !== undefined || msg.value !== undefined || msg.output !== undefined)
+      ) {
+        const rawOut = String(msg.result ?? msg.value ?? msg.output ?? '');
+        const parsed = extractCommandSentinel(rawOut);
+        if (parsed.cmdId && this.pendingCmdWaiters.has(parsed.cmdId)) {
+          const waiter = this.pendingCmdWaiters.get(parsed.cmdId)!;
+          clearTimeout(waiter.timer);
+          this.pendingCmdWaiters.delete(parsed.cmdId);
+          waiter.resolve({ output: parsed.cleanOutput, exitCode: parsed.exitCode ?? 0 });
+          return;
+        }
+        if (msg.nodeid) {
+          for (const [k, waiter] of this.pendingCmdWaiters.entries()) {
+            if (waiter.nodeId === String(msg.nodeid)) {
+              clearTimeout(waiter.timer);
+              this.pendingCmdWaiters.delete(k);
+              const inferredExit =
+                parsed.exitCode !== null
+                  ? parsed.exitCode
+                  : /CategoryInfo|FullyQualifiedErrorId|Exception/i.test(rawOut)
+                    ? 1
+                    : 0;
+              waiter.resolve({ output: parsed.cleanOutput, exitCode: inferredExit });
+              break;
+            }
+          }
+        }
+      }
+    } catch {
+      // Ignore binary/non-JSON frames
+    }
+  }
+
+  private schedulePrimaryReconnect(serverUrl: string, apiToken: string, allowSelfSigned: boolean) {
+    if (!this.isConfigured || this.reconnectTimer) return;
+    const delayMs = Math.min(30000, 2000 * Math.pow(2, Math.min(4, this.reconnectAttempts++)));
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.isConfigured) {
+        this.initLiveConnection(serverUrl, apiToken, allowSelfSigned);
+      }
+    }, delayMs);
   }
 
   private initLiveConnection(serverUrl: string, apiToken: string, allowSelfSigned = false) {
@@ -212,58 +573,164 @@ export class MeshCentralBridge {
       return;
     }
 
-    try {
-      const baseWs = check.normalized.replace(/^http/i, 'ws');
-      const wsUrl = `${baseWs}/control.ashx?auth=${encodeURIComponent(apiToken)}`;
-      this.connectedServerUrl = check.normalized;
+    const normalizedUrl = check.normalized;
+    const epoch = this.configEpoch;
+    this.connectedServerUrl = normalizedUrl;
 
+    void (async () => {
+      const dnsSafety = await validateOutboundHostSafety(normalizedUrl, {
+        allowLoopback: true,
+        allowPrivateLan: true
+      });
+      if (epoch !== this.configEpoch || !this.isConfigured) return;
+      if (!dnsSafety.safe) {
+        this.isConnected = false;
+        this.lastConnectionError = dnsSafety.reason || 'MeshCentral URL blocked by outbound safety policy';
+        return;
+      }
+
+      try {
+        const { wsUrl, headers } = buildMeshWsAuthParams(normalizedUrl, apiToken, check.loginKey);
+
+        const allowInsecure =
+          allowSelfSigned ||
+          process.env.MESHCENTRAL_ALLOW_SELF_SIGNED === 'true' ||
+          isLoopbackExactHostname(normalizedUrl);
+
+        const ws = new WebSocket(wsUrl, {
+          headers,
+          rejectUnauthorized: !allowInsecure,
+          handshakeTimeout: 5000
+        });
+        this.meshWs = ws;
+
+        ws.on('open', () => {
+          if (this.meshWs !== ws) return;
+          this.isConnected = true;
+          this.reconnectAttempts = 0;
+          this.lastConnectionError = null;
+          try {
+            ws.send(JSON.stringify({ action: 'nodes' }));
+          } catch {}
+          console.log(`[MeshCentralBridge] Connected to live MeshCentral server (${normalizedUrl})`);
+        });
+
+        ws.on('message', (raw) => this.handleIncomingMeshFrame(raw, 'primary'));
+
+        ws.on('error', (err) => {
+          if (this.meshWs !== ws) return;
+          this.isConnected = false;
+          this.lastConnectionError = err.message;
+        });
+
+        ws.on('close', () => {
+          if (this.meshWs !== ws) return;
+          this.isConnected = false;
+          this.schedulePrimaryReconnect(serverUrl, apiToken, allowSelfSigned);
+        });
+      } catch (e: any) {
+        this.isConnected = false;
+        this.lastConnectionError = e?.message || 'Failed to initialize WebSocket';
+        this.schedulePrimaryReconnect(serverUrl, apiToken, allowSelfSigned);
+      }
+    })();
+  }
+
+  private initFederatedSocket(serverId: string, serverUrl: string, apiToken: string, allowSelfSigned: boolean) {
+    const check = validateMeshServerUrl(serverUrl);
+    if (!check.ok || !check.normalized) return;
+
+    const normalizedUrl = check.normalized;
+    const epoch = this.configEpoch;
+    const entry: FederatedSocketEntry = this.federatedPool.get(serverId) || {
+      serverId,
+      serverUrl: normalizedUrl,
+      ws: null,
+      connected: false,
+      reconnectAttempts: 0,
+      reconnectTimer: null
+    };
+    entry.serverUrl = normalizedUrl;
+    this.federatedPool.set(serverId, entry);
+
+    void (async () => {
+      const dnsSafety = await validateOutboundHostSafety(normalizedUrl, {
+        allowLoopback: true,
+        allowPrivateLan: true
+      });
+      if (epoch !== this.configEpoch || !this.federatedPool.has(serverId)) return;
+      if (!dnsSafety.safe) {
+        entry.connected = false;
+        return;
+      }
+
+      const { wsUrl, headers } = buildMeshWsAuthParams(normalizedUrl, apiToken, check.loginKey);
       const allowInsecure =
         allowSelfSigned ||
         process.env.MESHCENTRAL_ALLOW_SELF_SIGNED === 'true' ||
-        check.normalized.includes('localhost') ||
-        check.normalized.includes('127.0.0.1');
+        isLoopbackExactHostname(normalizedUrl);
 
-      const ws = new WebSocket(wsUrl, {
-        rejectUnauthorized: !allowInsecure,
-        handshakeTimeout: 5000
-      });
-      this.meshWs = ws;
+      try {
+        const ws = new WebSocket(wsUrl, {
+          headers,
+          rejectUnauthorized: !allowInsecure,
+          handshakeTimeout: 5000
+        });
+        entry.ws = ws;
 
-      ws.on('open', () => {
-        if (this.meshWs !== ws) return;
-        this.isConnected = true;
-        this.lastConnectionError = null;
-        console.log(`[MeshCentralBridge] Connected to live MeshCentral server (${check.normalized})`);
-      });
+        ws.on('open', () => {
+          entry.connected = true;
+          entry.reconnectAttempts = 0;
+          try {
+            ws.send(JSON.stringify({ action: 'nodes' }));
+            db.prepare("UPDATE mesh_servers SET status = 'online', last_synced = ? WHERE id = ?").run(
+              new Date().toISOString(),
+              serverId
+            );
+          } catch {}
+        });
 
-      ws.on('message', (raw) => {
-        try {
-          const msg = JSON.parse(raw.toString());
-          if (msg && msg.tag && this.pendingCmdWaiters.has(String(msg.tag))) {
-            const waiter = this.pendingCmdWaiters.get(String(msg.tag))!;
-            clearTimeout(waiter.timer);
-            this.pendingCmdWaiters.delete(String(msg.tag));
-            waiter.resolve(String(msg.result ?? msg.output ?? msg.value ?? 'Command executed on remote node.'));
-          }
-        } catch {
-          // Ignore non-JSON control frames
+        ws.on('message', (raw) => this.handleIncomingMeshFrame(raw, serverId));
+
+        ws.on('error', () => {
+          entry.connected = false;
+        });
+
+        ws.on('close', () => {
+          entry.connected = false;
+          if (!this.federatedPool.has(serverId)) return;
+          const delay = Math.min(30000, 3000 * Math.pow(2, Math.min(4, entry.reconnectAttempts++)));
+          entry.reconnectTimer = setTimeout(() => {
+            this.initFederatedSocket(serverId, serverUrl, apiToken, allowSelfSigned);
+          }, delay);
+        });
+      } catch {}
+    })();
+  }
+
+  private getOpenSocketAndServerForNode(meshNodeId?: string): { sock: WebSocket | null; serverUrl: string | null } {
+    if (meshNodeId) {
+      const ownerId = this.nodeServerMap.get(meshNodeId);
+      if (ownerId && ownerId !== 'primary') {
+        const fed = this.federatedPool.get(ownerId);
+        if (fed?.ws && fed.ws.readyState === WebSocket.OPEN) {
+          return { sock: fed.ws, serverUrl: fed.serverUrl };
         }
-      });
-
-      ws.on('error', (err) => {
-        if (this.meshWs !== ws) return;
-        this.isConnected = false;
-        this.lastConnectionError = err.message;
-      });
-
-      ws.on('close', () => {
-        if (this.meshWs !== ws) return;
-        this.isConnected = false;
-      });
-    } catch (e: any) {
-      this.isConnected = false;
-      this.lastConnectionError = e?.message || 'Failed to initialize WebSocket';
+      }
     }
+    if (this.meshWs && this.meshWs.readyState === WebSocket.OPEN) {
+      return { sock: this.meshWs, serverUrl: this.connectedServerUrl };
+    }
+    for (const [, fed] of this.federatedPool) {
+      if (fed.ws && fed.ws.readyState === WebSocket.OPEN) {
+        return { sock: fed.ws, serverUrl: fed.serverUrl };
+      }
+    }
+    return { sock: null, serverUrl: this.connectedServerUrl };
+  }
+
+  private getOpenSocketForNode(meshNodeId?: string): WebSocket | null {
+    return this.getOpenSocketAndServerForNode(meshNodeId).sock;
   }
 
   public resolveMeshNodeId(deviceId: string): string {
@@ -274,22 +741,89 @@ export class MeshCentralBridge {
       if (row?.mesh_node_id && row.mesh_node_id.trim()) {
         return row.mesh_node_id.trim();
       }
-    } catch {
-      // Fallback
-    }
+    } catch {}
     return deviceId;
   }
 
   public dispatchRpc(payload: Record<string, unknown>): boolean {
-    if (this.meshWs && this.meshWs.readyState === WebSocket.OPEN) {
+    const nodeIds = Array.isArray(payload.nodeids) ? (payload.nodeids as string[]) : undefined;
+    const targetNode = (payload.nodeid as string | undefined) || nodeIds?.[0];
+    const sock = this.getOpenSocketForNode(targetNode);
+    if (sock && sock.readyState === WebSocket.OPEN) {
       try {
-        this.meshWs.send(JSON.stringify(payload));
+        sock.send(JSON.stringify(payload));
         return true;
       } catch {
         return false;
       }
     }
     return false;
+  }
+
+  public async createLiveDeviceSessionUrl(params: {
+    deviceId: string;
+    mode?: 'desktop' | 'terminal' | 'files';
+    viewOnly?: boolean;
+    durationMinutes?: number;
+    guestName?: string;
+    requireConsent?: boolean;
+  }): Promise<{ live: boolean; url: string | null; serverUrl: string | null; error?: string }> {
+    const meshNodeId = this.resolveMeshNodeId(params.deviceId);
+    const { sock, serverUrl: matchedServerUrl } = this.getOpenSocketAndServerForNode(meshNodeId);
+    if (!sock || sock.readyState !== WebSocket.OPEN) {
+      return {
+        live: false,
+        url: null,
+        serverUrl: matchedServerUrl,
+        error: 'MeshCentral live control tunnel is not connected.'
+      };
+    }
+
+    const responseId = `share-${crypto.randomUUID()}`;
+    const pFlag = params.mode === 'terminal' ? 1 : params.mode === 'files' ? 4 : 2;
+    const consentFlags = params.requireConsent ? 0x0008 | 0x0040 : 0x0040; // Desktop prompt + connection toolbar
+
+    const msgPromise = new Promise<any>((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingControlWaiters.delete(responseId);
+        resolve(null);
+      }, 4500);
+      this.pendingControlWaiters.set(responseId, { resolve, timer });
+    });
+
+    try {
+      sock.send(
+        JSON.stringify({
+          action: 'createDeviceShareLink',
+          nodeid: meshNodeId,
+          p: pFlag,
+          viewOnly: Boolean(params.viewOnly),
+          guestName: String(params.guestName || 'Vitrine Technician').slice(0, 48),
+          duration: Math.max(5, Math.min(480, Number(params.durationMinutes || 60))),
+          consent: consentFlags,
+          responseid: responseId
+        })
+      );
+    } catch (err: any) {
+      this.pendingControlWaiters.delete(responseId);
+      return { live: false, url: null, serverUrl: matchedServerUrl, error: err?.message };
+    }
+
+    const reply = await msgPromise;
+    if (reply && reply.url) {
+      return {
+        live: true,
+        url: String(reply.url),
+        serverUrl: matchedServerUrl
+      };
+    }
+
+    return {
+      live: false,
+      url: null,
+      serverUrl: matchedServerUrl,
+      error: reply?.result || 'MeshCentral did not return a device share URL (verify node exists on server).'
+    };
   }
 
   public getStatus() {
@@ -307,13 +841,15 @@ export class MeshCentralBridge {
       activeTunnels = 0;
     }
 
+    const anyFedConnected = Array.from(this.federatedPool.values()).some((f) => f.connected);
+
     return {
-      connected: this.isConnected,
-      configured: this.isConfigured,
+      connected: this.isConnected || anyFedConnected,
+      configured: this.isConfigured || this.federatedPool.size > 0,
       serverUrl: this.connectedServerUrl,
       lastError: this.lastConnectionError,
-      engine: 'MeshCentral 2 Micro-Agent Relay',
-      version: '2.5.0',
+      engine: 'MeshCentral 2 Micro-Agent Relay + Vitrine Companion',
+      version: '2.6.0',
       activeTunnels,
       federatedServers
     };
@@ -325,25 +861,85 @@ export class MeshCentralBridge {
       if (row?.os_type === 'linux' || row?.os_type === 'macos' || row?.os_type === 'windows') {
         return row.os_type;
       }
-    } catch {
-      // Fallback
-    }
+    } catch {}
     if (deviceId.includes('mac')) return 'macos';
     if (deviceId.includes('lin')) return 'linux';
     return 'windows';
   }
 
+  private isLocalEnrolledHost(dev: any): boolean {
+    if (process.env.VITRINE_ALLOW_LOCAL_SELF_EXEC !== 'true') return false;
+    if (!dev || !dev.id || !dev.agent_auth_token) return false;
+    const identityPath = '/opt/vitrineagent/agent-identity.json';
+    try {
+      if (!fs.existsSync(identityPath)) return false;
+      const st = fs.lstatSync(identityPath);
+      if (st.isSymbolicLink() || !st.isFile()) return false;
+      const ident = JSON.parse(fs.readFileSync(identityPath, 'utf8')) as {
+        deviceId?: unknown;
+        agentAuthToken?: unknown;
+        agentToken?: unknown;
+      };
+      if (!ident || typeof ident.deviceId !== 'string' || ident.deviceId !== String(dev.id)) {
+        return false;
+      }
+      const diskToken =
+        typeof ident.agentAuthToken === 'string' && ident.agentAuthToken.length > 0
+          ? ident.agentAuthToken
+          : typeof ident.agentToken === 'string' && ident.agentToken.length > 0
+            ? ident.agentToken
+            : '';
+      const dbToken = decryptVaultSecret(String(dev.agent_auth_token));
+      if (!diskToken || !dbToken) return false;
+      const diskBuf = Buffer.from(diskToken, 'utf8');
+      const dbBuf = Buffer.from(dbToken, 'utf8');
+      if (diskBuf.length !== dbBuf.length) return false;
+      return crypto.timingSafeEqual(diskBuf, dbBuf);
+    } catch {
+      return false;
+    }
+  }
+
+  private execLocalBash(command: string, envVars?: Record<string, string>, timeoutMs = 8000): Promise<{ exitCode: number; output: string }> {
+    return new Promise((resolve) => {
+      execFile(
+        '/bin/bash',
+        ['-c', command],
+        {
+          timeout: timeoutMs,
+          maxBuffer: 2 * 1024 * 1024,
+          env: { ...process.env, ...(envVars || {}) }
+        },
+        (err, stdout, stderr) => {
+          const combined = `${stdout || ''}${stderr ? (stdout ? '\n' : '') + stderr : ''}`.trimEnd();
+          if (err) {
+            const code = typeof (err as any).code === 'number' ? (err as any).code : 1;
+            resolve({ exitCode: code, output: combined || err.message });
+          } else {
+            resolve({ exitCode: 0, output: combined });
+          }
+        }
+      );
+    });
+  }
+
   // ============================================================================
-  // Live Command Execution + Safe LAPS & Offboarding Agent Dispatchers
+  // Live Command Execution (MeshCentral 2 WS -> Companion Agent -> Honest Error)
   // ============================================================================
   public async executeCommandOnNode(
     deviceId: string,
     command: string,
-    options?: { runAs?: 'system' | 'user'; shell?: string; timeoutMs?: number }
-  ): Promise<{ live: boolean; exitCode: number; output: string }> {
+    options?: {
+      runAs?: 'system' | 'user';
+      shell?: string;
+      timeoutMs?: number;
+      env?: Record<string, string>;
+      executionId?: string;
+    }
+  ): Promise<{ live: boolean; exitCode: number; output: string; queued?: boolean; taskId?: string }> {
     const dev = db
       .prepare(
-        'SELECT id, mesh_node_id, hostname, os_type, os_version, ip_address, cpu_model, ram_total_gb, ram_used_gb, disk_total_gb, disk_free_gb, status, lifecycle_state, bitlocker_status FROM devices WHERE id = ?'
+        'SELECT id, tenant_id, mesh_node_id, hostname, os_type, os_version, ip_address, status, lifecycle_state, agent_auth_token, last_seen FROM devices WHERE id = ?'
       )
       .get(deviceId) as any;
 
@@ -363,7 +959,7 @@ export class MeshCentralBridge {
       };
     }
 
-    if (dev.status !== 'online') {
+    if (dev.status !== 'online' && dev.status !== 'isolated') {
       return {
         live: false,
         exitCode: 1,
@@ -376,102 +972,240 @@ export class MeshCentralBridge {
     const runAs = options?.runAs === 'user' ? 'user' : 'system';
     const shell = options?.shell || (osType === 'macos' ? 'zsh' : osType === 'linux' ? 'bash' : 'powershell');
     const meshNodeId = dev.mesh_node_id || dev.id;
+    const timeoutMs = options?.timeoutMs || 8000;
 
-    // 1. If connected to a live MeshCentral 2 server, dispatch over control.ashx and await response
-    if (this.isConnected && this.meshWs && this.meshWs.readyState === WebSocket.OPEN) {
-      const tag = `cmd-${crypto.randomUUID()}`;
-      const timeoutMs = options?.timeoutMs || 4500;
+    // Prepend safe environment variable assignments when provided (zero code interpolation!)
+    let wrappedCommand = command;
+    if (options?.env && Object.keys(options.env).length > 0) {
+      if (osType === 'windows') {
+        const envLines = Object.entries(options.env)
+          .filter(([k]) => /^VITRINE_PARAM_[A-Z0-9_]{1,64}$/.test(k))
+          .map(([k, v]) => `$env:${k} = ${quotePowerShellLiteral(String(v))}`);
+        if (envLines.length > 0) {
+          wrappedCommand = `${envLines.join('; ')}; ${command}`;
+        }
+      } else {
+        const envLines = Object.entries(options.env)
+          .filter(([k]) => /^VITRINE_PARAM_[A-Z0-9_]{1,64}$/.test(k))
+          .map(([k, v]) => `export ${k}=${quoteBashLiteral(String(v))}`);
+        if (envLines.length > 0) {
+          wrappedCommand = `${envLines.join('; ')}; ${command}`;
+        }
+      }
+    }
+
+    // 1. Live MeshCentral 2 `/control.ashx` (`runcommands` with `reply: true` & `responseid`)
+    // Standalone Vitrine Companion nodes (`node//dev-...`) are not registered on MeshCentral unless mapped in `nodeServerMap`.
+    const isGenuineMeshNode = !meshNodeId.startsWith('node//dev-') || this.nodeServerMap.has(meshNodeId);
+    const sock = isGenuineMeshNode ? this.getOpenSocketForNode(meshNodeId) : null;
+    if (sock && sock.readyState === WebSocket.OPEN && dev.mesh_node_id && isGenuineMeshNode) {
+      const responseId = `cmd-${crypto.randomUUID()}`;
       const cmdType = osType === 'windows' ? (shell === 'cmd' ? 0 : 2) : 0;
+      const sep = wrappedCommand.includes('#') || wrappedCommand.includes('\n') ? '\n' : '; ';
+      const sentinelCommand =
+        osType === 'windows'
+          ? cmdType === 0
+            ? `${wrappedCommand} & call echo __VITRINE_RC:%ERRORLEVEL%:${responseId}`
+            : `${wrappedCommand}${sep}Write-Output "__VITRINE_RC:$(if($?){0}else{1}):${responseId}"`
+          : `${wrappedCommand}${sep}echo "__VITRINE_RC:$?:${responseId}"`;
 
-      const replyPromise = new Promise<string | null>((resolve) => {
+      const replyPromise = new Promise<{ output: string; exitCode: number } | null>((resolve) => {
         const timer = setTimeout(() => {
-          this.pendingCmdWaiters.delete(tag);
+          this.pendingCmdWaiters.delete(responseId);
           resolve(null);
         }, timeoutMs);
-        this.pendingCmdWaiters.set(tag, {
-          resolve: (out) => resolve(out),
-          timer
+        this.pendingCmdWaiters.set(responseId, {
+          resolve: (res) => resolve(res),
+          timer,
+          nodeId: meshNodeId
         });
       });
 
-      this.dispatchRpc({
-        action: 'runcommands',
-        nodeids: [meshNodeId],
-        type: cmdType,
-        runAsUser: runAs === 'user' ? 1 : 0,
-        cmds: command,
-        tag
-      });
-
-      const liveOut = await replyPromise;
-      if (liveOut !== null) {
-        return { live: true, exitCode: 0, output: liveOut };
+      try {
+        sock.send(
+          JSON.stringify({
+            action: 'runcommands',
+            nodeids: [meshNodeId],
+            type: cmdType,
+            runAsUser: runAs === 'user' ? 1 : 0,
+            cmds: sentinelCommand,
+            reply: true,
+            responseid: responseId
+          })
+        );
+        const liveRes = await replyPromise;
+        if (liveRes !== null) {
+          return { live: true, exitCode: liveRes.exitCode, output: liveRes.output };
+        }
+      } catch {
+        this.pendingCmdWaiters.delete(responseId);
       }
+    }
+
+    // 2. Enrolled Local Host Companion Fast-Path (executes directly on local Linux host when strictly enabled & verified)
+    if (os.platform() === 'linux' && osType === 'linux' && this.isLocalEnrolledHost(dev)) {
+      const localRes = await this.execLocalBash(command, options?.env, timeoutMs);
       return {
         live: true,
-        exitCode: 0,
-        output: `[MeshCentral Relay] Dispatched command to node ${meshNodeId} (${dev.hostname}) as ${runAs.toUpperCase()} (${shell}). Async execution acknowledged.`
+        exitCode: localRes.exitCode,
+        output: localRes.output
       };
     }
 
-    // 2. Standalone / Offline-Relay Inspection Fallback (derived strictly from real DB device state)
-    const cmd = command.trim();
-    const identity =
-      osType === 'windows'
-        ? runAs === 'system'
-          ? 'nt authority\\system'
-          : `${dev.hostname.toLowerCase()}\\localuser`
-        : runAs === 'system'
-          ? 'root'
-          : 'localuser';
+    // 3. Enrolled Remote Vitrine Companion Agent Queue (`agent_tasks`)
+    if (dev.agent_auth_token) {
+      const taskId = `task-cmd-${crypto.randomUUID()}`;
+      db.prepare(`
+        INSERT INTO agent_tasks (id, device_id, tenant_id, task_type, payload_json, status)
+        VALUES (?, ?, ?, 'script', ?, 'queued')
+      `).run(
+        taskId,
+        dev.id,
+        dev.tenant_id || null,
+        JSON.stringify({
+          executionId: options?.executionId || undefined,
+          language: shell,
+          shell,
+          code: command,
+          env: options?.env || {},
+          runAs,
+          timeoutSec: Math.ceil(timeoutMs / 1000)
+        })
+      );
 
-    let out = '';
-    if (cmd === 'whoami') {
-      out = identity;
-    } else if (cmd === 'hostname') {
-      out = dev.hostname;
-    } else if (cmd === 'id') {
-      out =
-        osType === 'windows'
-          ? `User Name: ${identity} (${runAs === 'system' ? 'S-1-5-18' : 'Interactive User Token'})`
-          : runAs === 'system'
-            ? 'uid=0(root) gid=0(root) groups=0(root)'
-            : 'uid=1000(localuser) gid=1000(localuser)';
-    } else if (cmd.startsWith('uname')) {
-      out = `${osType === 'macos' ? 'Darwin' : osType === 'linux' ? 'Linux' : 'Windows_NT'} ${dev.hostname} (${dev.os_version || 'OS'})`;
-    } else if (cmd === 'ipconfig' || cmd === 'Get-NetIPConfiguration' || cmd === 'ip a' || cmd === 'ifconfig') {
-      out = `Interface Primary (${dev.hostname}):\r\n  IPv4 Address : ${dev.ip_address || '0.0.0.0'}`;
-    } else if (cmd === 'df -h') {
-      const total = Number(dev.disk_total_gb || 500);
-      const free = Number(dev.disk_free_gb || 250);
-      const used = Math.max(0, total - free);
-      const pct = total > 0 ? Math.round((used / total) * 100) : 0;
-      out = `Filesystem      Size   Used  Avail Use% Mounted on\r\nprimary-vol    ${total}G  ${used}G  ${free}G  ${pct}% /`;
-    } else if (cmd === 'free -m') {
-      const totalMb = Math.round(Number(dev.ram_total_gb || 16) * 1024);
-      const usedMb = Math.round(Number(dev.ram_used_gb || 4) * 1024);
-      const freeMb = Math.max(0, totalMb - usedMb);
-      out = `               total        used        free\r\nMem:           ${totalMb}       ${usedMb}       ${freeMb}`;
-    } else if (cmd === 'systeminfo') {
-      out = [
-        `Host Name:             ${dev.hostname}`,
-        `OS Version:            ${dev.os_version || osType}`,
-        `Processor:             ${dev.cpu_model || 'Unknown CPU'}`,
-        `Total Physical Memory: ${Math.round(Number(dev.ram_total_gb || 16) * 1024)} MB`,
-        `IPv4 Address:          ${dev.ip_address || 'N/A'}`,
-        `Disk Encryption:       ${dev.bitlocker_status || 'Unknown'}`
-      ].join('\r\n');
-    } else if (cmd === 'help') {
-      out = [
-        `Vitrine PTY Shell (${dev.hostname} — ${osType.toUpperCase()} / ${shell.toUpperCase()} as ${identity})`,
-        `MeshCentral Bridge Status: ${this.isConnected ? 'LIVE CONNECTED' : 'STANDALONE (Configure MeshCentral URL & Token in Settings for live remote execution)'}`,
-        `Built-in diagnostic commands: whoami, id, hostname, uname, ipconfig / ip a, df -h, free -m, systeminfo, clear`
-      ].join('\r\n');
-    } else {
-      out = `[Standalone Relay Notice] MeshCentral live tunnel is not connected. Configure a live MeshCentral 2 server in Settings -> General to execute "${cmd}" directly on ${dev.hostname}.`;
+      // Poll briefly in case Companion checks in during interactive window
+      const deadline = Date.now() + Math.min(timeoutMs, 500);
+      while (Date.now() < deadline) {
+        const row = db
+          .prepare('SELECT status, exit_code, stdout, stderr, result_json FROM agent_tasks WHERE id = ?')
+          .get(taskId) as any;
+        if (row && (row.status === 'completed' || row.status === 'failed')) {
+          let stdoutText = String(row.stdout || '');
+          let stderrText = String(row.stderr || '');
+          let fallbackExit: number | undefined;
+          if (!stdoutText && !stderrText && row.result_json) {
+            try {
+              const parsed = JSON.parse(String(row.result_json));
+              stdoutText = String(parsed?.stdout ?? parsed?.output ?? '');
+              stderrText = String(parsed?.stderr ?? '');
+              if (typeof parsed?.exitCode === 'number') {
+                fallbackExit = parsed.exitCode;
+              }
+            } catch {}
+          }
+          const combined = `${stdoutText}${stderrText ? (stdoutText ? '\n' : '') + stderrText : ''}`.trim();
+          return {
+            live: true,
+            taskId,
+            exitCode: Number(row.exit_code ?? fallbackExit ?? (row.status === 'completed' ? 0 : 1)),
+            output: combined
+          };
+        }
+        await new Promise((r) => setTimeout(r, 125));
+      }
+
+      return {
+        live: false,
+        queued: true,
+        taskId,
+        exitCode: -1,
+        output: 'Command queued for Companion Agent check-in.'
+      };
     }
 
-    return { live: false, exitCode: 0, output: out };
+    return {
+      live: false,
+      exitCode: 1,
+      output: `[Tunnel Unavailable] Neither a live MeshCentral 2 session nor an enrolled Vitrine Companion Agent is connected for '${dev.hostname}'. Connect MeshCentral in Settings or enroll the endpoint agent to run live commands.`
+    };
+  }
+
+  public async verifyAndPushLapsCredentialToNode(
+    deviceId: string,
+    opts: {
+      accountName: string;
+      password: string;
+      autoCreateAccount: boolean;
+      disableSid500: boolean;
+      previousAccountName?: string | null;
+      cleanupOldAccountAction?: 'disable' | 'delete' | 'keep';
+    }
+  ): Promise<{ delivered: boolean; verifiedLive: boolean; output: string }> {
+    if (!SAFE_ACCOUNT_NAME_REGEX.test(opts.accountName)) {
+      throw new Error(`Invalid local admin account name (1-20 safe chars required): ${opts.accountName}`);
+    }
+    const osType = this.getDeviceOs(deviceId);
+
+    let script = '';
+    if (osType === 'windows') {
+      const accLit = quotePowerShellLiteral(opts.accountName);
+      const passLit = quotePowerShellLiteral(opts.password);
+      const lines: string[] = [
+        `$ErrorActionPreference = 'Stop'`,
+        `$Acc = ${accLit}`,
+        `$Sec = ConvertTo-SecureString ${passLit} -AsPlainText -Force`,
+        `$Existing = Get-LocalUser -Name $Acc -ErrorAction SilentlyContinue`,
+        `if ($Existing) { Set-LocalUser -Name $Acc -Password $Sec; Enable-LocalUser -Name $Acc }`,
+        ...(opts.autoCreateAccount
+          ? [
+              `else { New-LocalUser -Name $Acc -Password $Sec -PasswordNeverExpires:$false -Description 'Managed by Vitrine RMM LAPS' | Out-Null; Add-LocalGroupMember -Group 'Administrators' -Member $Acc -ErrorAction SilentlyContinue }`
+            ]
+          : [`else { throw "Managed LAPS account $Acc does not exist on endpoint." }`]),
+        ...(opts.disableSid500
+          ? [
+              `$Sid500 = Get-LocalUser | Where-Object { $_.SID.Value -like '*-500' -and $_.Name -ne $Acc }`,
+              `if ($Sid500) { Disable-LocalUser -Name $Sid500.Name -ErrorAction SilentlyContinue }`
+            ]
+          : []),
+        `Write-Output "LAPS_ROTATE_OK:$Acc"`
+      ];
+
+      if (
+        opts.previousAccountName &&
+        opts.previousAccountName !== opts.accountName &&
+        SAFE_ACCOUNT_NAME_REGEX.test(opts.previousAccountName)
+      ) {
+        const prevLit = quotePowerShellLiteral(opts.previousAccountName);
+        if (opts.cleanupOldAccountAction === 'delete') {
+          lines.push(`Remove-LocalUser -Name ${prevLit} -ErrorAction SilentlyContinue`);
+        } else if (opts.cleanupOldAccountAction === 'disable') {
+          lines.push(`Disable-LocalUser -Name ${prevLit} -ErrorAction SilentlyContinue`);
+        }
+      }
+      script = lines.join('; ');
+    } else if (osType === 'macos') {
+      const accBash = quoteBashLiteral(opts.accountName);
+      const passBash = quoteBashLiteral(opts.password);
+      const ensureAcc = opts.autoCreateAccount
+        ? `(id -u ${accBash} >/dev/null 2>&1 || sysadminctl -addUser ${accBash} -fullName ${accBash} -password ${passBash} -admin)`
+        : `id -u ${accBash} >/dev/null 2>&1`;
+      let cleanupCmd = '';
+      if (
+        opts.previousAccountName &&
+        opts.previousAccountName !== opts.accountName &&
+        SAFE_ACCOUNT_NAME_REGEX.test(opts.previousAccountName)
+      ) {
+        const prevBash = quoteBashLiteral(opts.previousAccountName);
+        if (opts.cleanupOldAccountAction === 'delete') {
+          cleanupCmd = `; sysadminctl -deleteUser ${prevBash} 2>/dev/null || dscl . -delete /Users/${prevBash} 2>/dev/null || true`;
+        } else if (opts.cleanupOldAccountAction === 'disable') {
+          cleanupCmd = `; pwpolicy -u ${prevBash} -disableuser 2>/dev/null || dscl . -create /Users/${prevBash} UserShell /usr/bin/false 2>/dev/null || true`;
+        }
+      }
+      script = `${ensureAcc} && dscl . -passwd /Users/${accBash} ${passBash}${cleanupCmd} && echo "LAPS_ROTATE_OK"`;
+    } else {
+      const accBash = quoteBashLiteral(opts.accountName);
+      const passB64 = Buffer.from(`${opts.accountName}:${opts.password}\n`, 'utf8').toString('base64');
+      script = `(id -u ${accBash} >/dev/null 2>&1 || (${opts.autoCreateAccount ? `useradd -m -s /bin/bash ${accBash} && (usermod -aG sudo ${accBash} 2>/dev/null || usermod -aG wheel ${accBash} 2>/dev/null || true)` : 'exit 2'})) && printf '%s' '${passB64}' | base64 -d | chpasswd && echo "LAPS_ROTATE_OK"`;
+    }
+
+    const res = await this.executeCommandOnNode(deviceId, script, { runAs: 'system', timeoutMs: 8000 });
+    const verifiedLive = res.live && res.exitCode === 0 && res.output.includes('LAPS_ROTATE_OK');
+    return {
+      delivered: res.live && res.exitCode === 0,
+      verifiedLive,
+      output: res.output
+    };
   }
 
   public pushLapsCredentialToNode(
@@ -488,66 +1222,8 @@ export class MeshCentralBridge {
     if (!SAFE_ACCOUNT_NAME_REGEX.test(opts.accountName)) {
       throw new Error(`Invalid local admin account name: ${opts.accountName}`);
     }
-    const osType = this.getDeviceOs(deviceId);
-    const meshNodeId = this.resolveMeshNodeId(deviceId);
-
-    if (osType === 'windows') {
-      const accLit = quotePowerShellLiteral(opts.accountName);
-      const passLit = quotePowerShellLiteral(opts.password);
-      const lines: string[] = [
-        `$ErrorActionPreference = 'SilentlyContinue'`,
-        `$Acc = ${accLit}`,
-        `$Sec = ConvertTo-SecureString ${passLit} -AsPlainText -Force`,
-        `$Existing = Get-LocalUser -Name $Acc`,
-        `if ($Existing) { Set-LocalUser -Name $Acc -Password $Sec; Enable-LocalUser -Name $Acc }`,
-        ...(opts.autoCreateAccount
-          ? [
-              `elseif ($true) { New-LocalUser -Name $Acc -Password $Sec -PasswordNeverExpires -Description 'Managed by Vitrine RMM LAPS'; Add-LocalGroupMember -Group 'Administrators' -Member $Acc }`
-            ]
-          : []),
-        ...(opts.disableSid500
-          ? [
-              `$Sid500 = Get-LocalUser | Where-Object { $_.SID.Value -like '*-500' -and $_.Name -ne $Acc }`,
-              `if ($Sid500) { Disable-LocalUser -Name $Sid500.Name }`
-            ]
-          : [])
-      ];
-
-      if (
-        opts.previousAccountName &&
-        opts.previousAccountName !== opts.accountName &&
-        SAFE_ACCOUNT_NAME_REGEX.test(opts.previousAccountName)
-      ) {
-        const prevLit = quotePowerShellLiteral(opts.previousAccountName);
-        if (opts.cleanupOldAccountAction === 'delete') {
-          lines.push(`Remove-LocalUser -Name ${prevLit}`);
-        } else if (opts.cleanupOldAccountAction === 'disable') {
-          lines.push(`Disable-LocalUser -Name ${prevLit}`);
-        }
-      }
-
-      return this.dispatchRpc({
-        action: 'runcommands',
-        nodeids: [meshNodeId],
-        type: 2,
-        cmds: lines.join('; ')
-      });
-    }
-
-    // Linux / macOS
-    const accBash = quoteBashLiteral(opts.accountName);
-    const passBash = quoteBashLiteral(opts.password);
-    const cmd =
-      osType === 'macos'
-        ? `sysadminctl -resetPasswordFor ${accBash} -newPassword ${passBash} >/dev/null 2>&1 || true`
-        : `(id -u ${accBash} >/dev/null 2>&1 || (${opts.autoCreateAccount ? `useradd -m -s /bin/bash ${accBash} && usermod -aG sudo ${accBash}` : 'false'})) && printf '%s:%s\\n' ${accBash} ${passBash} | chpasswd`;
-
-    return this.dispatchRpc({
-      action: 'runcommands',
-      nodeids: [meshNodeId],
-      type: 0,
-      cmds: cmd
-    });
+    void this.verifyAndPushLapsCredentialToNode(deviceId, opts);
+    return this.getStatus().connected;
   }
 
   public dispatchAgentOffboard(
@@ -556,113 +1232,182 @@ export class MeshCentralBridge {
   ): boolean {
     const osType = this.getDeviceOs(deviceId);
     const meshNodeId = this.resolveMeshNodeId(deviceId);
-    return this.dispatchRawNodeOffboard(meshNodeId, opts.lapsAccountName, opts.lapsAction, osType);
+    return this.dispatchRawNodeOffboard(meshNodeId, opts.lapsAccountName, opts.lapsAction, osType, deviceId);
   }
 
   public dispatchRawNodeOffboard(
     meshNodeId: string,
     lapsAccountName: string,
     lapsAction: string,
-    osType: 'windows' | 'linux' | 'macos' = 'windows'
+    osType: 'windows' | 'linux' | 'macos' = 'windows',
+    deviceId?: string
   ): boolean {
     const safeAcc = SAFE_ACCOUNT_NAME_REGEX.test(lapsAccountName) ? lapsAccountName : 'LocalAdmin';
+    let safeServiceName = 'VitrineAgent';
+    try {
+      const settingsRow = db
+        .prepare('SELECT installer_service_name, brand_name FROM settings WHERE id = 1')
+        .get() as { installer_service_name?: string; brand_name?: string } | undefined;
+      const rawSvc =
+        settingsRow?.installer_service_name ||
+        (settingsRow?.brand_name ? String(settingsRow.brand_name).replace(/[^a-zA-Z0-9]/g, '') + 'Agent' : '');
+      const cleaned = String(rawSvc || '')
+        .replace(/[^a-zA-Z0-9_-]/g, '')
+        .slice(0, 40);
+      if (cleaned) safeServiceName = cleaned;
+    } catch {}
+    const safeServiceLower = safeServiceName.toLowerCase();
+
+    let targetCmd = '';
     if (osType === 'windows') {
       const accLit = quotePowerShellLiteral(safeAcc);
+      const trayKeyLit = quotePowerShellLiteral(`${safeServiceName}-Tray`);
+      const taskLit = quotePowerShellLiteral(`${safeServiceName}-Companion`);
+      const svcPatternLit = quotePowerShellLiteral(`${safeServiceName}*`);
+      const svcDirLit = quotePowerShellLiteral(`C:\\Program Files\\${safeServiceName}`);
+      const svcAgentExeLit = quotePowerShellLiteral(`C:\\Program Files\\${safeServiceName}\\${safeServiceName}.exe`);
+      // Safety net: on non-domain workgroup hosts, re-enable built-in SID-500 Administrator BEFORE removing LAPS account so endpoint is never locked out!
+      const sid500Guard =
+        lapsAction === 'remove_account' || lapsAction === 'disable_account'
+          ? `if (-not (Get-CimInstance Win32_ComputerSystem).PartOfDomain) { $s500 = Get-LocalUser | Where-Object { $_.SID.Value -like '*-500' }; if ($s500) { Enable-LocalUser -Name $s500.Name -ErrorAction SilentlyContinue } }`
+          : '';
       const lapsCmd =
         lapsAction === 'remove_account'
-          ? `Remove-LocalUser -Name ${accLit} -ErrorAction SilentlyContinue`
+          ? `${sid500Guard}; Remove-LocalUser -Name ${accLit} -ErrorAction SilentlyContinue`
           : lapsAction === 'disable_account'
-            ? `Disable-LocalUser -Name ${accLit} -ErrorAction SilentlyContinue`
+            ? `${sid500Guard}; Disable-LocalUser -Name ${accLit} -ErrorAction SilentlyContinue`
             : `# Preserving ${safeAcc}`;
-      const ps = [
+      targetCmd = [
         `$ErrorActionPreference = 'SilentlyContinue'`,
-        `Unregister-ScheduledTask -TaskPath '\\VitrineRMM\\' -Confirm:$false`,
+        `Remove-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run' -Name ${trayKeyLit} -ErrorAction SilentlyContinue`,
+        `Remove-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'VitrineAgent-Tray' -ErrorAction SilentlyContinue`,
+        `Unregister-ScheduledTask -TaskName ${taskLit} -Confirm:$false -ErrorAction SilentlyContinue`,
+        `Unregister-ScheduledTask -TaskName '*Vitrine*' -Confirm:$false -ErrorAction SilentlyContinue`,
         lapsCmd,
-        `Stop-Service -Name 'VitrineAgent' -Force`,
-        `sc.exe delete VitrineAgent`,
-        `Remove-Item -Path 'C:\\Program Files\\VitrineRMM' -Recurse -Force`,
-        `if (Test-Path 'C:\\Program Files\\Mesh Agent\\MeshAgent.exe') { Start-Process -FilePath 'C:\\Program Files\\Mesh Agent\\MeshAgent.exe' -ArgumentList '-fulluninstall' -WindowStyle Hidden }`
+        `Stop-Service -Name ${svcPatternLit} -Force -ErrorAction SilentlyContinue`,
+        `Stop-Service -Name 'VitrineAgent*' -Force -ErrorAction SilentlyContinue`,
+        `if (Test-Path -LiteralPath ${svcAgentExeLit}) { Start-Process -FilePath ${svcAgentExeLit} -ArgumentList '-fulluninstall' -WindowStyle Hidden }`,
+        `if (Test-Path 'C:\\Program Files\\Mesh Agent\\MeshAgent.exe') { Start-Process -FilePath 'C:\\Program Files\\Mesh Agent\\MeshAgent.exe' -ArgumentList '-fulluninstall' -WindowStyle Hidden }`,
+        `Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-WindowStyle', 'Hidden', '-Command', "Start-Sleep -Seconds 3; Remove-Item -LiteralPath ${svcDirLit} -Recurse -Force -ErrorAction SilentlyContinue") -WindowStyle Hidden`
       ].join('; ');
-      return this.dispatchRpc({ action: 'runcommands', nodeids: [meshNodeId], type: 2, cmds: ps });
+    } else {
+      const accBash = quoteBashLiteral(safeAcc);
+      const svcUnit = quoteBashLiteral(`${safeServiceLower}-companion.service`);
+      const plistLabel = quoteBashLiteral(`/Library/LaunchDaemons/com.${safeServiceLower}.companion.plist`);
+      const optDir = quoteBashLiteral(`/opt/${safeServiceLower}`);
+      const macDir = quoteBashLiteral(`/Library/Application Support/${safeServiceLower}`);
+      const lapsSh =
+        lapsAction === 'remove_account'
+          ? `userdel -r ${accBash} 2>/dev/null || sysadminctl -deleteUser ${accBash} 2>/dev/null || true`
+          : lapsAction === 'disable_account'
+            ? `usermod -L ${accBash} 2>/dev/null || pwpolicy -u ${accBash} -disableuser 2>/dev/null || true`
+            : `:`;
+      targetCmd = [
+        lapsSh,
+        `systemctl disable --now ${svcUnit} vitrineagent-companion.service 2>/dev/null || true`,
+        `rm -f /etc/systemd/system/${svcUnit} /etc/systemd/system/vitrineagent-companion.service`,
+        `launchctl bootout system ${plistLabel} 2>/dev/null || launchctl unload -w ${plistLabel} 2>/dev/null || true`,
+        `launchctl bootout system /Library/LaunchDaemons/com.vitrineagent.companion.plist 2>/dev/null || true`,
+        `rm -f ${plistLabel} /Library/LaunchDaemons/com.vitrineagent.companion.plist`,
+        `rm -rf ${optDir} /opt/vitrineagent ${macDir} '/Library/Application Support/vitrineagent'`
+      ].join('; ');
     }
 
-    const accBash = quoteBashLiteral(safeAcc);
-    const lapsSh =
-      lapsAction === 'remove_account'
-        ? `userdel -r ${accBash} 2>/dev/null || sysadminctl -deleteUser ${accBash} 2>/dev/null || true`
-        : lapsAction === 'disable_account'
-          ? `usermod -L ${accBash} 2>/dev/null || pwpolicy -u ${accBash} -disableuser 2>/dev/null || true`
-          : `:`;
-    const sh = `${lapsSh}; systemctl disable --now vitrine-agent 2>/dev/null || launchctl bootout system /Library/LaunchDaemons/com.vitrine.agent.plist 2>/dev/null || true; rm -rf /opt/vitrine-rmm '/Library/Application Support/VitrineRMM'`;
-    return this.dispatchRpc({ action: 'runcommands', nodeids: [meshNodeId], type: 0, cmds: sh });
+    if (deviceId) {
+      try {
+        const devRow = db
+          .prepare('SELECT id, tenant_id, status, lifecycle_state, agent_auth_token FROM devices WHERE id = ?')
+          .get(deviceId) as any;
+        if (devRow && devRow.lifecycle_state !== 'archived') {
+          if (devRow.status === 'online' || devRow.status === 'isolated') {
+            // Single unified dispatch (uses MeshCentral WS if connected for node, else queues Companion task — no duplicate execution)
+            void this.executeCommandOnNode(deviceId, targetCmd, { runAs: 'system', timeoutMs: 5000 });
+            return true;
+          }
+          if (devRow.agent_auth_token) {
+            db.prepare(`
+              INSERT INTO agent_tasks (id, device_id, tenant_id, task_type, payload_json, status)
+              VALUES (?, ?, ?, 'self_uninstall', ?, 'queued')
+            `).run(
+              `task-offboard-${crypto.randomUUID()}`,
+              devRow.id,
+              devRow.tenant_id || null,
+              JSON.stringify({
+                lapsAccountName: safeAcc,
+                lapsAction,
+                serviceName: safeServiceName,
+                code: targetCmd
+              })
+            );
+            return true;
+          }
+        }
+      } catch {}
+    }
+
+    return this.dispatchRpc({
+      action: 'runcommands',
+      nodeids: [meshNodeId],
+      type: osType === 'windows' ? 2 : 0,
+      cmds: targetCmd
+    });
   }
 
   // ============================================================================
-  // Silent Background Process Manager
+  // Live Silent Background Process Manager (Zero Hardcoded Fake Processes)
   // ============================================================================
-  public getProcesses(deviceId: string): ProcessItem[] {
-    if (!this.processStore.has(deviceId)) {
-      const osType = this.getDeviceOs(deviceId);
-      const dev = db.prepare('SELECT hostname FROM devices WHERE id = ?').get(deviceId) as { hostname?: string } | undefined;
-      const hostPrefix = (dev?.hostname || 'WORKSTATION').toUpperCase();
-      if (osType === 'windows') {
-        this.processStore.set(deviceId, [
-          { pid: 4, name: 'System', user: 'NT AUTHORITY\\SYSTEM', cpu: 1.2, memoryMb: 142.5, threads: 240 },
-          { pid: 748, name: 'smss.exe', user: 'NT AUTHORITY\\SYSTEM', cpu: 0.0, memoryMb: 4.8, threads: 4 },
-          { pid: 980, name: 'csrss.exe', user: 'NT AUTHORITY\\SYSTEM', cpu: 0.3, memoryMb: 18.2, threads: 18 },
-          { pid: 1044, name: 'wininit.exe', user: 'NT AUTHORITY\\SYSTEM', cpu: 0.1, memoryMb: 12.0, threads: 8 },
-          { pid: 1112, name: 'services.exe', user: 'NT AUTHORITY\\SYSTEM', cpu: 0.8, memoryMb: 34.6, threads: 32 },
-          { pid: 1128, name: 'lsass.exe', user: 'NT AUTHORITY\\SYSTEM', cpu: 0.9, memoryMb: 88.4, threads: 24 },
-          { pid: 1420, name: 'svchost.exe (DcomLaunch)', user: 'NT AUTHORITY\\SYSTEM', cpu: 1.4, memoryMb: 94.2, threads: 64 },
-          { pid: 2180, name: 'svchost.exe (RPCSS)', user: 'NT AUTHORITY\\NETWORK SERVICE', cpu: 0.5, memoryMb: 52.8, threads: 40 },
-          { pid: 3120, name: 'spoolsv.exe', user: 'NT AUTHORITY\\SYSTEM', cpu: 0.0, memoryMb: 24.1, threads: 12 },
-          { pid: 4210, name: 'MsMpEng.exe', user: 'NT AUTHORITY\\SYSTEM', cpu: 2.8, memoryMb: 320.4, threads: 48 },
-          { pid: 5124, name: 'VitrineAgentService.exe', user: 'NT AUTHORITY\\SYSTEM', cpu: 0.4, memoryMb: 42.1, threads: 16 },
-          { pid: 5892, name: 'MeshAgent.exe', user: 'NT AUTHORITY\\SYSTEM', cpu: 0.3, memoryMb: 28.5, threads: 14 },
-          { pid: 6812, name: 'explorer.exe', user: `${hostPrefix}\\InteractiveUser`, cpu: 2.1, memoryMb: 210.0, threads: 72 }
-        ]);
-      } else if (osType === 'macos') {
-        this.processStore.set(deviceId, [
-          { pid: 0, name: 'kernel_task', user: 'root', cpu: 3.8, memoryMb: 1140.0, threads: 312 },
-          { pid: 1, name: 'launchd', user: 'root', cpu: 0.2, memoryMb: 26.4, threads: 6 },
-          { pid: 158, name: 'WindowServer', user: '_windowserver', cpu: 5.4, memoryMb: 482.0, threads: 28 },
-          { pid: 312, name: 'mds_stores (Spotlight)', user: 'root', cpu: 1.1, memoryMb: 215.6, threads: 14 },
-          { pid: 440, name: 'securityd', user: 'root', cpu: 0.1, memoryMb: 24.2, threads: 6 },
-          { pid: 618, name: 'vitrine-agent-darwin', user: 'root', cpu: 0.3, memoryMb: 34.8, threads: 9 },
-          { pid: 645, name: 'meshagent_osx64', user: 'root', cpu: 0.2, memoryMb: 22.1, threads: 6 },
-          { pid: 892, name: 'Finder', user: 'consoleuser', cpu: 0.9, memoryMb: 178.4, threads: 16 }
-        ]);
-      } else {
-        this.processStore.set(deviceId, [
-          { pid: 1, name: 'systemd', user: 'root', cpu: 0.1, memoryMb: 18.5, threads: 1 },
-          { pid: 280, name: 'systemd-journald', user: 'root', cpu: 0.2, memoryMb: 32.1, threads: 4 },
-          { pid: 412, name: 'systemd-resolved', user: 'systemd-resolve', cpu: 0.1, memoryMb: 16.4, threads: 2 },
-          { pid: 512, name: 'sshd', user: 'root', cpu: 0.0, memoryMb: 14.8, threads: 2 },
-          { pid: 690, name: 'dockerd', user: 'root', cpu: 1.4, memoryMb: 148.2, threads: 24 },
-          { pid: 820, name: 'vitrine-agent', user: 'root', cpu: 0.3, memoryMb: 24.0, threads: 6 },
-          { pid: 910, name: 'meshagent', user: 'root', cpu: 0.2, memoryMb: 19.4, threads: 5 }
-        ]);
+  public async getProcesses(deviceId: string): Promise<ProcessItem[]> {
+    const cached = this.processCache.get(deviceId);
+    if (cached) return cached;
+
+    const osType = this.getDeviceOs(deviceId);
+    if (osType === 'windows') {
+      const ps = `Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 40 Id, ProcessName, @{N='CpuSec';E={[math]::Round($_.CPU,1)}}, @{N='MemMb';E={[math]::Round($_.WorkingSet64/1MB,1)}}, @{N='Threads';E={$_.Threads.Count}} | ConvertTo-Json -Compress`;
+      const res = await this.executeCommandOnNode(deviceId, ps, { runAs: 'system', timeoutMs: 7000 });
+      if (res.live && res.exitCode === 0 && res.output) {
+        try {
+          const parsed = JSON.parse(res.output);
+          const arr = Array.isArray(parsed) ? parsed : [parsed];
+          const items: ProcessItem[] = arr
+            .filter((p) => p && typeof p.Id === 'number')
+            .map((p) => ({
+              pid: Number(p.Id),
+              name: String(p.ProcessName || 'process'),
+              user: 'SYSTEM/User',
+              cpu: Number(p.CpuSec || 0),
+              memoryMb: Number(p.MemMb || 0),
+              threads: Number(p.Threads || 1)
+            }));
+          this.processCache.set(deviceId, items);
+          return items;
+        } catch {}
+      }
+    } else {
+      const py = `python3 -c 'import subprocess,json; out=subprocess.check_output(["ps","-eo","pid,user,pcpu,rss,nlwp,comm","--no-headers"],text=True); rows=[]; [rows.append({"pid":int(p[0]),"user":p[1],"cpu":float(p[2]),"memoryMb":round(int(p[3])/1024.0,1),"threads":int(p[4]),"name":p[5]}) for line in out.splitlines() for p in [line.split(None,5)] if len(p)==6]; rows.sort(key=lambda x:x["memoryMb"],reverse=True); print(json.dumps(rows[:50]))'`;
+      const res = await this.executeCommandOnNode(deviceId, py, { runAs: 'system', timeoutMs: 7000 });
+      if (res.live && res.exitCode === 0 && res.output) {
+        try {
+          const items = JSON.parse(res.output) as ProcessItem[];
+          if (Array.isArray(items)) {
+            this.processCache.set(deviceId, items);
+            return items;
+          }
+        } catch {}
       }
     }
-    return this.processStore.get(deviceId) || [];
+
+    return [];
   }
 
-  public killProcess(deviceId: string, pid: number, actorUsername = 'admin'): boolean {
+  public async killProcess(deviceId: string, pid: number, actorUsername = 'admin'): Promise<boolean> {
     const cleanPid = Number(pid);
-    if (!Number.isInteger(cleanPid) || cleanPid <= 0) {
-      throw new Error('Invalid PID: must be a positive integer.');
+    if (!Number.isInteger(cleanPid) || cleanPid <= 1) {
+      throw new Error('Invalid PID: must be an integer greater than 1.');
     }
-    const list = this.getProcesses(deviceId);
-    const target = list.find((p) => p.pid === cleanPid);
     const osType = this.getDeviceOs(deviceId);
-    const meshNodeId = this.resolveMeshNodeId(deviceId);
-
-    this.processStore.set(
-      deviceId,
-      list.filter((p) => p.pid !== cleanPid)
-    );
-    const killCmd = osType === 'windows' ? `taskkill /PID ${cleanPid} /F` : `kill -9 ${cleanPid}`;
-    this.dispatchRpc({ action: 'runcommands', nodeids: [meshNodeId], type: 0, cmds: killCmd });
+    const killCmd = osType === 'windows' ? `Stop-Process -Id ${cleanPid} -Force` : `kill -9 ${cleanPid}`;
+    const res = await this.executeCommandOnNode(deviceId, killCmd, { runAs: 'system', timeoutMs: 6000 });
+    this.processCache.delete(deviceId);
 
     db.prepare(`
       INSERT INTO audit_logs (id, username, device_id, action, details)
@@ -671,67 +1416,71 @@ export class MeshCentralBridge {
       `aud-kill-${crypto.randomUUID()}`,
       actorUsername,
       deviceId,
-      `Terminated PID ${cleanPid} (${target?.name || 'process'}) via ${killCmd}`
+      `Terminated PID ${cleanPid} (${res.live ? 'live verified' : 'queued'})`
     );
-    return true;
+    return res.exitCode === 0;
   }
 
   // ============================================================================
-  // Silent Background Services / Daemons Manager
+  // Live Silent Background Services / Daemons Manager
   // ============================================================================
-  public getServices(deviceId: string): ServiceItem[] {
-    if (!this.serviceStore.has(deviceId)) {
-      const osType = this.getDeviceOs(deviceId);
-      if (osType === 'windows') {
-        this.serviceStore.set(deviceId, [
-          { name: 'Spooler', displayName: 'Print Spooler', status: 'Running', startType: 'Automatic' },
-          { name: 'wuauserv', displayName: 'Windows Update', status: 'Running', startType: 'Automatic' },
-          { name: 'WinDefend', displayName: 'Microsoft Defender Antivirus Service', status: 'Running', startType: 'Automatic' },
-          { name: 'VitrineAgent', displayName: 'Vitrine RMM Orchestration Engine', status: 'Running', startType: 'Automatic' },
-          { name: 'MeshAgent', displayName: 'MeshCentral Remote Management Agent', status: 'Running', startType: 'Automatic' },
-          { name: 'BITS', displayName: 'Background Intelligent Transfer Service', status: 'Running', startType: 'Automatic' },
-          { name: 'CryptSvc', displayName: 'Cryptographic Services', status: 'Running', startType: 'Automatic' },
-          { name: 'Dhcp', displayName: 'DHCP Client', status: 'Running', startType: 'Automatic' },
-          { name: 'Dnscache', displayName: 'DNS Client', status: 'Running', startType: 'Automatic' },
-          { name: 'LanmanServer', displayName: 'Server (SMB File Sharing)', status: 'Running', startType: 'Automatic' },
-          { name: 'LanmanWorkstation', displayName: 'Workstation', status: 'Running', startType: 'Automatic' },
-          { name: 'TermService', displayName: 'Remote Desktop Services', status: 'Running', startType: 'Manual' },
-          { name: 'W32Time', displayName: 'Windows Time NTP Sync', status: 'Running', startType: 'Automatic' }
-        ]);
-      } else if (osType === 'macos') {
-        this.serviceStore.set(deviceId, [
-          { name: 'com.vitrine.agent', displayName: 'Vitrine RMM Daemon (LaunchDaemon)', status: 'Running', startType: 'Automatic' },
-          { name: 'com.meshcentral.agent', displayName: 'MeshCentral Darwin Micro-Agent', status: 'Running', startType: 'Automatic' },
-          { name: 'com.apple.WindowServer', displayName: 'macOS Quartz Compositor & CGSession', status: 'Running', startType: 'Automatic' },
-          { name: 'com.openssh.sshd', displayName: 'Remote Login (OpenSSH Server)', status: 'Running', startType: 'Automatic' },
-          { name: 'com.apple.metadata.mds', displayName: 'Spotlight Metadata Server', status: 'Running', startType: 'Automatic' },
-          { name: 'com.apple.backupd', displayName: 'Time Machine Backup Daemon', status: 'Stopped', startType: 'Manual' },
-          { name: 'com.apple.alf', displayName: 'Application Layer Firewall (SocketFilterFW)', status: 'Running', startType: 'Automatic' },
-          { name: 'com.apple.softwareupdated', displayName: 'macOS Software Update Service', status: 'Running', startType: 'Automatic' }
-        ]);
-      } else {
-        this.serviceStore.set(deviceId, [
-          { name: 'vitrine-agent.service', displayName: 'Vitrine RMM Telemetry & Enforcement Daemon', status: 'Running', startType: 'Automatic' },
-          { name: 'meshagent.service', displayName: 'MeshCentral Linux Agent Tunnel', status: 'Running', startType: 'Automatic' },
-          { name: 'ssh.service', displayName: 'OpenBSD Secure Shell Server (sshd)', status: 'Running', startType: 'Automatic' },
-          { name: 'docker.service', displayName: 'Docker Application Container Engine', status: 'Running', startType: 'Automatic' },
-          { name: 'postgresql.service', displayName: 'PostgreSQL RDBMS Cluster Service', status: 'Running', startType: 'Automatic' },
-          { name: 'nginx.service', displayName: 'A high performance web server and reverse proxy', status: 'Running', startType: 'Automatic' },
-          { name: 'ufw.service', displayName: 'Uncomplicated Firewall (Netfilter)', status: 'Running', startType: 'Automatic' },
-          { name: 'cron.service', displayName: 'Regular background program processing daemon', status: 'Running', startType: 'Automatic' },
-          { name: 'unattended-upgrades.service', displayName: 'Unattended APT Security Upgrades', status: 'Running', startType: 'Automatic' }
-        ]);
+  public async getServices(deviceId: string): Promise<ServiceItem[]> {
+    const cached = this.serviceCache.get(deviceId);
+    if (cached) return cached;
+
+    const osType = this.getDeviceOs(deviceId);
+    if (osType === 'windows') {
+      const ps = `Get-Service | Select-Object -First 60 Name, DisplayName, @{N='StatusStr';E={$_.Status.ToString()}}, @{N='StartStr';E={$_.StartType.ToString()}} | ConvertTo-Json -Compress`;
+      const res = await this.executeCommandOnNode(deviceId, ps, { runAs: 'system', timeoutMs: 7000 });
+      if (res.live && res.exitCode === 0 && res.output) {
+        try {
+          const parsed = JSON.parse(res.output);
+          const arr = Array.isArray(parsed) ? parsed : [parsed];
+          const items: ServiceItem[] = arr.map((s: any) => ({
+            name: String(s.Name || ''),
+            displayName: String(s.DisplayName || s.Name || ''),
+            status: s.StatusStr === 'Running' ? 'Running' : s.StatusStr === 'Paused' ? 'Paused' : 'Stopped',
+            startType: s.StartStr === 'Automatic' ? 'Automatic' : s.StartStr === 'Disabled' ? 'Disabled' : 'Manual'
+          }));
+          this.serviceCache.set(deviceId, items);
+          return items;
+        } catch {}
+      }
+    } else if (osType === 'linux') {
+      const py = `python3 -c 'import subprocess,json; out=subprocess.check_output(["systemctl","list-units","--type=service","--all","--no-pager","--no-legend"],text=True); items=[]; [items.append({"name":p[0],"displayName":p[4] if len(p)>4 else p[0],"status":"Running" if p[2]=="active" and p[3]=="running" else "Stopped","startType":"Automatic"}) for l in out.splitlines() for p in [l.lstrip("● ").split(None,4)] if len(p)>=4 and p[0].endswith(".service")]; print(json.dumps(items[:60]))'`;
+      const res = await this.executeCommandOnNode(deviceId, py, { runAs: 'system', timeoutMs: 7000 });
+      if (res.live && res.exitCode === 0 && res.output) {
+        try {
+          const items = JSON.parse(res.output) as ServiceItem[];
+          if (Array.isArray(items)) {
+            this.serviceCache.set(deviceId, items);
+            return items;
+          }
+        } catch {}
+      }
+    } else {
+      const py = `python3 -c 'import subprocess,json; out=subprocess.check_output(["launchctl","list"],text=True); items=[]; [items.append({"name":p[2],"displayName":p[2],"status":"Running" if p[0]!="-" else "Stopped","startType":"Automatic"}) for l in out.splitlines()[1:61] for p in [l.split(None,2)] if len(p)==3]; print(json.dumps(items))'`;
+      const res = await this.executeCommandOnNode(deviceId, py, { runAs: 'system', timeoutMs: 7000 });
+      if (res.live && res.exitCode === 0 && res.output) {
+        try {
+          const items = JSON.parse(res.output) as ServiceItem[];
+          if (Array.isArray(items)) {
+            this.serviceCache.set(deviceId, items);
+            return items;
+          }
+        } catch {}
       }
     }
-    return this.serviceStore.get(deviceId) || [];
+
+    return [];
   }
 
-  public manageService(
+  public async manageService(
     deviceId: string,
     serviceName: string,
     action: 'start' | 'stop' | 'restart',
     actorUsername = 'admin'
-  ): boolean {
+  ): Promise<boolean> {
     if (!SERVICE_NAME_REGEX.test(serviceName)) {
       throw new Error('Invalid service name: only alphanumeric characters, dots, underscores, @, and hyphens are allowed.');
     }
@@ -739,20 +1488,7 @@ export class MeshCentralBridge {
       throw new Error('Invalid service action: must be start, stop, or restart.');
     }
 
-    const services = this.getServices(deviceId);
     const osType = this.getDeviceOs(deviceId);
-    const meshNodeId = this.resolveMeshNodeId(deviceId);
-    const updated = services.map((s) => {
-      if (s.name.toLowerCase() === serviceName.toLowerCase()) {
-        return {
-          ...s,
-          status: (action === 'stop' ? 'Stopped' : 'Running') as 'Running' | 'Stopped'
-        };
-      }
-      return s;
-    });
-    this.serviceStore.set(deviceId, updated);
-
     const psVerb = action === 'start' ? 'Start-Service' : action === 'stop' ? 'Stop-Service' : 'Restart-Service';
     const nativeCmd =
       osType === 'windows'
@@ -761,141 +1497,71 @@ export class MeshCentralBridge {
           ? `launchctl ${action === 'restart' ? 'kickstart -k' : action} ${quoteBashLiteral(`system/${serviceName}`)}`
           : `systemctl ${action} ${quoteBashLiteral(serviceName)}`;
 
-    this.dispatchRpc({
-      action: 'runcommands',
-      nodeids: [meshNodeId],
-      type: osType === 'windows' ? 2 : 0,
-      cmds: nativeCmd
-    });
+    const res = await this.executeCommandOnNode(deviceId, nativeCmd, { runAs: 'system', timeoutMs: 8000 });
+    this.serviceCache.delete(deviceId);
 
     db.prepare(`
       INSERT INTO audit_logs (id, username, device_id, action, details)
       VALUES (?, ?, ?, 'Service State Changed', ?)
     `).run(`aud-svc-${crypto.randomUUID()}`, actorUsername, deviceId, `Action '${action}' executed on ${serviceName}`);
-    return true;
+    return res.exitCode === 0;
   }
 
   // ============================================================================
-  // Remote Registry / sysctl / plist Browser
+  // Live Remote Registry / sysctl / plist Browser
   // ============================================================================
-  public getRegistryKeys(regPath: string, deviceId = 'default'): { subkeys: string[]; values: RegistryEntry[] } {
+  public async getRegistryKeys(regPath: string, deviceId = 'default'): Promise<{ subkeys: string[]; values: RegistryEntry[] }> {
     const osType = this.getDeviceOs(deviceId);
     const normalizedPath =
       regPath ||
       (osType === 'windows'
-        ? 'HKLM\\SOFTWARE\\VitrineRMM'
+        ? 'HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion'
         : osType === 'macos'
-          ? '/Library/Preferences/com.vitrine.agent.plist'
-          : '/etc/sysctl.d/99-vitrine-hardening.conf');
-    const key = `${deviceId}::${normalizedPath}`;
-    if (!this.registryStore.has(key)) {
-      if (osType === 'macos') {
-        if (normalizedPath.includes('alf') || normalizedPath.includes('security')) {
-          this.registryStore.set(key, {
-            subkeys: ['FirewallExceptions', 'StealthMode', 'SignedApps'],
-            values: [
-              { path: normalizedPath, name: 'globalstate', type: 'REG_DWORD', value: '1 (Enabled)' },
-              { path: normalizedPath, name: 'stealthenabled', type: 'REG_DWORD', value: '1' },
-              { path: normalizedPath, name: 'allowsignedenabled', type: 'REG_DWORD', value: '1' },
-              { path: normalizedPath, name: 'GatekeeperAssessment', type: 'REG_SZ', value: 'Enforced' }
-            ]
-          });
-        } else {
-          this.registryStore.set(key, {
-            subkeys: [
-              '/Library/Preferences/com.vitrine.agent.plist',
-              '/Library/Preferences/com.apple.alf.plist',
-              '/Library/Preferences/com.apple.SoftwareUpdate.plist',
-              '/Library/Preferences/.GlobalPreferences.plist'
-            ],
-            values: [
-              { path: normalizedPath, name: 'CFBundleIdentifier', type: 'REG_SZ', value: 'com.vitrine.rmm.agent' },
-              { path: normalizedPath, name: 'AgentVersion', type: 'REG_SZ', value: '2.5.0-darwin-universal' },
-              { path: normalizedPath, name: 'GhostCGSessionEnabled', type: 'REG_DWORD', value: '1' },
-              { path: normalizedPath, name: 'HeartbeatIntervalSec', type: 'REG_DWORD', value: '30' },
-              { path: normalizedPath, name: 'AutomaticCheckEnabled', type: 'REG_DWORD', value: '1' }
-            ]
-          });
-        }
-      } else if (osType === 'linux') {
-        if (normalizedPath.includes('ssh')) {
-          this.registryStore.set(key, {
-            subkeys: ['/etc/ssh/sshd_config.d'],
-            values: [
-              { path: normalizedPath, name: 'PermitRootLogin', type: 'REG_SZ', value: 'prohibit-password' },
-              { path: normalizedPath, name: 'PasswordAuthentication', type: 'REG_SZ', value: 'no' },
-              { path: normalizedPath, name: 'PubkeyAuthentication', type: 'REG_SZ', value: 'yes' },
-              { path: normalizedPath, name: 'MaxAuthTries', type: 'REG_DWORD', value: '3' }
-            ]
-          });
-        } else {
-          this.registryStore.set(key, {
-            subkeys: [
-              '/etc/sysctl.d/99-vitrine-hardening.conf',
-              '/etc/ssh/sshd_config',
-              '/etc/vitrine/agent.conf',
-              '/etc/security/limits.conf'
-            ],
-            values: [
-              { path: normalizedPath, name: 'net.ipv4.ip_forward', type: 'REG_DWORD', value: '1' },
-              { path: normalizedPath, name: 'net.ipv4.conf.all.rp_filter', type: 'REG_DWORD', value: '1' },
-              { path: normalizedPath, name: 'vm.swappiness', type: 'REG_DWORD', value: '10' },
-              { path: normalizedPath, name: 'fs.file-max', type: 'REG_DWORD', value: '2097152' },
-              { path: normalizedPath, name: 'kernel.kptr_restrict', type: 'REG_DWORD', value: '2' },
-              { path: normalizedPath, name: 'agent.headless_xvfb_display', type: 'REG_SZ', value: ':99' }
-            ]
-          });
-        }
-      } else {
-        if (normalizedPath === 'HKLM\\SOFTWARE\\VitrineRMM') {
-          this.registryStore.set(key, {
-            subkeys: ['Policies', 'Telemetry', 'Security', 'MeshBridge'],
-            values: [
-              { path: normalizedPath, name: 'AgentVersion', type: 'REG_SZ', value: '2.5.0-vitrine' },
-              { path: normalizedPath, name: 'InstalledDate', type: 'REG_SZ', value: '2026-10-01T08:00:00Z' },
-              { path: normalizedPath, name: 'HeartbeatInterval', type: 'REG_DWORD', value: '30' },
-              { path: normalizedPath, name: 'ConsentStrictness', type: 'REG_SZ', value: 'EnforceUnlessLocked' },
-              { path: normalizedPath, name: 'QuarantineStatus', type: 'REG_DWORD', value: '0' }
-            ]
-          });
-        } else if (normalizedPath === 'HKLM\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server') {
-          this.registryStore.set(key, {
-            subkeys: ['AddIns', 'Keyboard', 'Utilities', 'Wds'],
-            values: [
-              { path: normalizedPath, name: 'fDenyTSConnections', type: 'REG_DWORD', value: '0' },
-              { path: normalizedPath, name: 'TSAppCompat', type: 'REG_DWORD', value: '1' }
-            ]
-          });
-        } else {
-          this.registryStore.set(key, {
-            subkeys: ['Microsoft', 'Policies', 'VitrineRMM', 'RegisteredApplications'],
-            values: [{ path: normalizedPath, name: '(Default)', type: 'REG_SZ', value: '(value not set)' }]
-          });
-        }
+          ? '/Library/Preferences/.GlobalPreferences.plist'
+          : '/proc/sys/kernel');
+    const cacheKey = `${deviceId}::${normalizedPath}`;
+    const cached = this.registryCache.get(cacheKey);
+    if (cached) return cached;
+
+    if (osType === 'windows') {
+      const litPath = normalizeWindowsRegistryLiteralPath(normalizedPath);
+      const ps = `$p = ${quotePowerShellLiteral(litPath)}; $subs = @(Get-ChildItem -LiteralPath $p -ErrorAction SilentlyContinue | Select-Object -ExpandProperty PSChildName); $vals = @(); $item = Get-Item -LiteralPath $p -ErrorAction SilentlyContinue; if ($item) { foreach ($vn in $item.GetValueNames()) { $vals += @{ path = ${quotePowerShellLiteral(normalizedPath)}; name = if ($vn) { $vn } else { '(Default)' }; type = 'REG_' + $item.GetValueKind($vn).ToString().ToUpper(); value = [string]$item.GetValue($vn) } } }; @{ subkeys = $subs; values = $vals } | ConvertTo-Json -Depth 4 -Compress`;
+      const res = await this.executeCommandOnNode(deviceId, ps, { runAs: 'system', timeoutMs: 7000 });
+      if (res.live && res.exitCode === 0 && res.output) {
+        try {
+          const parsed = JSON.parse(res.output);
+          const result = {
+            subkeys: Array.isArray(parsed.subkeys) ? parsed.subkeys.map(String) : [],
+            values: Array.isArray(parsed.values) ? parsed.values : []
+          };
+          this.registryCache.set(cacheKey, result);
+          return result;
+        } catch {}
+      }
+    } else if (osType === 'linux') {
+      const py = `python3 -c 'import subprocess,json; out=subprocess.check_output(["sysctl","-a"],text=True,stderr=subprocess.DEVNULL); vals=[]; [vals.append({"path":"sysctl","name":k.strip(),"type":"REG_SZ","value":v.strip()}) for l in out.splitlines()[:60] if "=" in l for k,v in [l.split("=",1)]]; print(json.dumps({"subkeys":["kernel","net.ipv4","vm","fs"],"values":vals}))'`;
+      const res = await this.executeCommandOnNode(deviceId, py, { runAs: 'system', timeoutMs: 7000 });
+      if (res.live && res.exitCode === 0 && res.output) {
+        try {
+          const parsed = JSON.parse(res.output);
+          this.registryCache.set(cacheKey, parsed);
+          return parsed;
+        } catch {}
       }
     }
-    return this.registryStore.get(key)!;
+
+    return { subkeys: [], values: [] };
   }
 
-  public setRegistryValue(
+  public async setRegistryValue(
     deviceId: string,
     regPath: string,
     entry: RegistryEntry,
     actorUsername = 'admin'
-  ): { subkeys: string[]; values: RegistryEntry[] } {
-    const current = this.getRegistryKeys(regPath, deviceId);
-    const existingIdx = current.values.findIndex((v) => v.name === entry.name);
-    if (existingIdx >= 0) {
-      current.values[existingIdx] = { ...entry, path: regPath };
-    } else {
-      current.values.push({ ...entry, path: regPath });
-    }
-    this.registryStore.set(`${deviceId}::${regPath}`, current);
-
+  ): Promise<{ subkeys: string[]; values: RegistryEntry[] }> {
     const osType = this.getDeviceOs(deviceId);
-    const meshNodeId = this.resolveMeshNodeId(deviceId);
     if (osType === 'windows') {
-      const psPath = regPath.replace(/^HKLM\\/i, 'HKLM:\\').replace(/^HKCU\\/i, 'HKCU:\\');
+      const litPath = normalizeWindowsRegistryLiteralPath(regPath);
       const psType =
         entry.type === 'REG_DWORD'
           ? 'DWord'
@@ -904,298 +1570,290 @@ export class MeshCentralBridge {
             : entry.type === 'REG_MULTI_SZ'
               ? 'MultiString'
               : 'String';
-      const cmd = `New-Item -Path ${quotePowerShellLiteral(psPath)} -Force | Out-Null; Set-ItemProperty -Path ${quotePowerShellLiteral(psPath)} -Name ${quotePowerShellLiteral(entry.name)} -Value ${quotePowerShellLiteral(String(entry.value))} -Type ${psType}`;
-      this.dispatchRpc({ action: 'runcommands', nodeids: [meshNodeId], type: 2, cmds: cmd });
+      const cmd = `if (-not (Test-Path -LiteralPath ${quotePowerShellLiteral(litPath)})) { New-Item -Path ${quotePowerShellLiteral(litPath)} -Force | Out-Null }; Set-ItemProperty -LiteralPath ${quotePowerShellLiteral(litPath)} -Name ${quotePowerShellLiteral(entry.name)} -Value ${quotePowerShellLiteral(String(entry.value))} -Type ${psType}`;
+      await this.executeCommandOnNode(deviceId, cmd, { runAs: 'system', timeoutMs: 7000 });
+    } else if (osType === 'linux' && /^[a-z0-9_.-]{2,96}$/i.test(entry.name)) {
+      await this.executeCommandOnNode(
+        deviceId,
+        `sysctl -w ${quoteBashLiteral(`${entry.name}=${String(entry.value)}`)}`,
+        { runAs: 'system', timeoutMs: 6000 }
+      );
     }
 
+    this.registryCache.delete(`${deviceId}::${regPath}`);
     db.prepare(`
       INSERT INTO audit_logs (id, username, device_id, action, details)
       VALUES (?, ?, ?, 'System Config / Registry Modified', ?)
     `).run(`aud-reg-${crypto.randomUUID()}`, actorUsername, deviceId, `Set ${regPath}\\${entry.name} (${entry.type}) = ${entry.value}`);
-    return current;
+    return this.getRegistryKeys(regPath, deviceId);
   }
 
-  public deleteRegistryValue(
+  public async deleteRegistryValue(
     deviceId: string,
     regPath: string,
     name: string,
     actorUsername = 'admin'
-  ): { subkeys: string[]; values: RegistryEntry[] } {
-    const current = this.getRegistryKeys(regPath, deviceId);
-    current.values = current.values.filter((v) => v.name !== name);
-    this.registryStore.set(`${deviceId}::${regPath}`, current);
-
+  ): Promise<{ subkeys: string[]; values: RegistryEntry[] }> {
     const osType = this.getDeviceOs(deviceId);
-    const meshNodeId = this.resolveMeshNodeId(deviceId);
     if (osType === 'windows') {
-      const psPath = regPath.replace(/^HKLM\\/i, 'HKLM:\\').replace(/^HKCU\\/i, 'HKCU:\\');
-      const cmd = `Remove-ItemProperty -Path ${quotePowerShellLiteral(psPath)} -Name ${quotePowerShellLiteral(name)} -ErrorAction SilentlyContinue`;
-      this.dispatchRpc({ action: 'runcommands', nodeids: [meshNodeId], type: 2, cmds: cmd });
+      const litPath = normalizeWindowsRegistryLiteralPath(regPath);
+      const cmd = `Remove-ItemProperty -LiteralPath ${quotePowerShellLiteral(litPath)} -Name ${quotePowerShellLiteral(name)} -ErrorAction SilentlyContinue`;
+      await this.executeCommandOnNode(deviceId, cmd, { runAs: 'system', timeoutMs: 7000 });
     }
 
+    this.registryCache.delete(`${deviceId}::${regPath}`);
     db.prepare(`
       INSERT INTO audit_logs (id, username, device_id, action, details)
       VALUES (?, ?, ?, 'System Config / Registry Deleted', ?)
     `).run(`aud-reg-${crypto.randomUUID()}`, actorUsername, deviceId, `Deleted config/registry value ${regPath}\\${name}`);
-    return current;
+    return this.getRegistryKeys(regPath, deviceId);
   }
 
   // ============================================================================
-  // Task Scheduler / Cron & systemd Timers / launchd Jobs
+  // Live Task Scheduler / Cron & systemd Timers / launchd Jobs
   // ============================================================================
-  public getScheduledTasks(deviceId: string): ScheduledTaskItem[] {
-    if (!this.taskStore.has(deviceId)) {
-      const osType = this.getDeviceOs(deviceId);
-      if (osType === 'macos') {
-        this.taskStore.set(deviceId, [
-          { name: 'com.vitrine.telemetry.periodic', path: '/Library/LaunchDaemons/com.vitrine.telemetry.plist', state: 'Ready', lastRunTime: 'Daily 04:00 AM', nextRunTime: 'Tomorrow 04:00 AM', lastResult: '0 (Success)' },
-          { name: 'com.vitrine.admin.keyrotate', path: '/Library/LaunchDaemons/com.vitrine.keyrotate.plist', state: 'Ready', lastRunTime: 'Weekly 02:30 AM', nextRunTime: 'Scheduled', lastResult: '0 (Success)' },
-          { name: 'com.apple.periodic-daily', path: '/System/Library/LaunchDaemons/com.apple.periodic-daily.plist', state: 'Ready', lastRunTime: 'Daily 03:15 AM', nextRunTime: 'Tomorrow 03:15 AM', lastResult: '0 (Success)' }
-        ]);
-      } else if (osType === 'linux') {
-        this.taskStore.set(deviceId, [
-          { name: 'vitrine-health-audit.timer', path: '/etc/systemd/system/vitrine-health-audit.timer', state: 'Ready', lastRunTime: 'Daily 04:00 AM', nextRunTime: 'Tomorrow 04:00 AM', lastResult: '0 (EXIT_SUCCESS)' },
-          { name: 'apt-daily-upgrade.timer', path: '/lib/systemd/system/apt-daily-upgrade.timer', state: 'Ready', lastRunTime: 'Daily 06:10 AM', nextRunTime: 'Tomorrow 06:10 AM', lastResult: '0 (EXIT_SUCCESS)' },
-          { name: 'fstrim.timer', path: '/lib/systemd/system/fstrim.timer', state: 'Ready', lastRunTime: 'Weekly 00:00 AM', nextRunTime: 'Next Week', lastResult: '0 (EXIT_SUCCESS)' }
-        ]);
-      } else {
-        this.taskStore.set(deviceId, [
-          { name: 'Vitrine Daily Health Telemetry', path: '\\VitrineRMM\\HealthAudit', state: 'Ready', lastRunTime: 'Daily 04:00 AM', nextRunTime: 'Tomorrow 04:00 AM', lastResult: '0x0 (Success)' },
-          { name: 'Automated LAPS Credential Re-sign', path: '\\VitrineRMM\\LapsRotate', state: 'Ready', lastRunTime: 'Scheduled', nextRunTime: 'Policy-Driven', lastResult: '0x0 (Success)' },
-          { name: 'Self-Healing Condition Watcher', path: '\\VitrineRMM\\Watchdog', state: 'Running', lastRunTime: 'Every 15m', nextRunTime: 'Active', lastResult: '0x0 (Success)' },
-          { name: 'Windows Defender Scheduled QuickScan', path: '\\Microsoft\\Windows\\Windows Defender\\Scan', state: 'Ready', lastRunTime: 'Daily 12:00 PM', nextRunTime: 'Tomorrow 12:00 PM', lastResult: '0x0 (Success)' }
-        ]);
+  public async getScheduledTasks(deviceId: string): Promise<ScheduledTaskItem[]> {
+    const cached = this.taskCache.get(deviceId);
+    if (cached) return cached;
+
+    const osType = this.getDeviceOs(deviceId);
+    if (osType === 'windows') {
+      const ps = `Get-ScheduledTask | Where-Object { $_.TaskPath -notlike '\\Microsoft\\Windows\\*' } | Select-Object -First 40 TaskName, TaskPath, @{N='StateStr';E={$_.State.ToString()}} | ConvertTo-Json -Compress`;
+      const res = await this.executeCommandOnNode(deviceId, ps, { runAs: 'system', timeoutMs: 7000 });
+      if (res.live && res.exitCode === 0 && res.output) {
+        try {
+          const parsed = JSON.parse(res.output);
+          const arr = Array.isArray(parsed) ? parsed : [parsed];
+          const items: ScheduledTaskItem[] = arr.map((t: any) => ({
+            name: String(t.TaskName || ''),
+            path: String(t.TaskPath || '\\'),
+            state: t.StateStr === 'Running' ? 'Running' : t.StateStr === 'Disabled' ? 'Disabled' : 'Ready',
+            lastRunTime: 'Live',
+            nextRunTime: 'Scheduled',
+            lastResult: '0x0'
+          }));
+          this.taskCache.set(deviceId, items);
+          return items;
+        } catch {}
+      }
+    } else if (osType === 'linux') {
+      const py = `python3 -c 'import subprocess,json; out=subprocess.check_output(["systemctl","list-timers","--all","--no-pager","--no-legend"],text=True); items=[]; [items.append({"name":p[-2],"path":"/lib/systemd/system/"+p[-2],"state":"Ready","lastRunTime":"Active","nextRunTime":p[0]+" "+p[1],"lastResult":"0"}) for l in out.splitlines() for p in [l.split()] if len(p)>=4 and ".timer" in l]; print(json.dumps(items[:40]))'`;
+      const res = await this.executeCommandOnNode(deviceId, py, { runAs: 'system', timeoutMs: 7000 });
+      if (res.live && res.exitCode === 0 && res.output) {
+        try {
+          const items = JSON.parse(res.output) as ScheduledTaskItem[];
+          if (Array.isArray(items)) {
+            this.taskCache.set(deviceId, items);
+            return items;
+          }
+        } catch {}
+      }
+    } else if (osType === 'macos') {
+      const py = `python3 -c 'import subprocess,json; out=subprocess.check_output(["launchctl","list"],text=True); items=[]; [items.append({"name":p[2],"path":"/Library/LaunchDaemons/"+p[2]+".plist","state":"Running" if p[0]!="-" else "Ready","lastRunTime":"launchd","nextRunTime":"OnDemand","lastResult":p[1]}) for l in out.splitlines()[1:41] for p in [l.split(None,2)] if len(p)==3]; print(json.dumps(items))'`;
+      const res = await this.executeCommandOnNode(deviceId, py, { runAs: 'system', timeoutMs: 7000 });
+      if (res.live && res.exitCode === 0 && res.output) {
+        try {
+          const items = JSON.parse(res.output) as ScheduledTaskItem[];
+          if (Array.isArray(items)) {
+            this.taskCache.set(deviceId, items);
+            return items;
+          }
+        } catch {}
       }
     }
-    return this.taskStore.get(deviceId) || [];
+
+    return [];
   }
 
-  public manageScheduledTask(
+  public async manageScheduledTask(
     deviceId: string,
     taskName: string,
     action: 'run' | 'enable' | 'disable',
     actorUsername = 'admin'
-  ): ScheduledTaskItem[] {
+  ): Promise<ScheduledTaskItem[]> {
     if (!['run', 'enable', 'disable'].includes(action)) {
       throw new Error('Invalid scheduled task action.');
     }
-    const tasks = this.getScheduledTasks(deviceId);
-    const nowStr = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
-    const updated = tasks.map((t) => {
-      if (t.name === taskName) {
-        if (action === 'run') {
-          return { ...t, state: 'Running' as const, lastRunTime: `Just now (${nowStr})`, lastResult: '0x0 (Success)' };
-        }
-        return { ...t, state: (action === 'disable' ? 'Disabled' : 'Ready') as 'Ready' | 'Disabled' };
-      }
-      return t;
-    });
-    this.taskStore.set(deviceId, updated);
-
     const osType = this.getDeviceOs(deviceId);
-    const meshNodeId = this.resolveMeshNodeId(deviceId);
     if (osType === 'windows') {
       const verb =
         action === 'run' ? 'Start-ScheduledTask' : action === 'enable' ? 'Enable-ScheduledTask' : 'Disable-ScheduledTask';
-      this.dispatchRpc({
-        action: 'runcommands',
-        nodeids: [meshNodeId],
-        type: 2,
-        cmds: `${verb} -TaskName ${quotePowerShellLiteral(taskName)} -ErrorAction SilentlyContinue`
-      });
+      await this.executeCommandOnNode(
+        deviceId,
+        `${verb} -TaskName ${quotePowerShellLiteral(taskName)} -ErrorAction SilentlyContinue`,
+        { runAs: 'system', timeoutMs: 7000 }
+      );
+    } else if (osType === 'linux' && SERVICE_NAME_REGEX.test(taskName)) {
+      const cmd =
+        action === 'run'
+          ? `systemctl start ${quoteBashLiteral(taskName.replace(/\.timer$/, '.service'))}`
+          : `systemctl ${action} ${quoteBashLiteral(taskName)}`;
+      await this.executeCommandOnNode(deviceId, cmd, { runAs: 'system', timeoutMs: 7000 });
+    } else if (osType === 'macos' && SERVICE_NAME_REGEX.test(taskName)) {
+      const targetDomain = quoteBashLiteral(`system/${taskName}`);
+      const cmd =
+        action === 'run' ? `launchctl kickstart -k ${targetDomain}` : `launchctl ${action} ${targetDomain}`;
+      await this.executeCommandOnNode(deviceId, cmd, { runAs: 'system', timeoutMs: 7000 });
     }
 
+    this.taskCache.delete(deviceId);
     db.prepare(`
       INSERT INTO audit_logs (id, username, device_id, action, details)
       VALUES (?, ?, ?, 'Scheduled Task Action', ?)
     `).run(`aud-tsk-${crypto.randomUUID()}`, actorUsername, deviceId, `Executed '${action}' on scheduled task "${taskName}"`);
-    return updated;
+    return this.getScheduledTasks(deviceId);
   }
 
   // ============================================================================
-  // Remote File Manager (Upload, Download, Mkdir, Delete)
+  // Live Remote File Manager (Upload, Download, Mkdir, Safe Delete)
   // ============================================================================
-  public getDirectoryListing(deviceId: string, dirPath: string): FileItem[] {
+  public async getDirectoryListing(deviceId: string, dirPath: string): Promise<FileItem[]> {
     const osType = this.getDeviceOs(deviceId);
-    const normalizedDir = dirPath || (osType === 'windows' ? 'C:\\' : '/');
-    const key = `${deviceId}::${normalizedDir}`;
-    if (!this.fileStore.has(key)) {
-      if (osType === 'windows') {
-        if (normalizedDir === 'C:\\' || normalizedDir === 'C:/' || normalizedDir === '/') {
-          this.fileStore.set(key, [
-            { name: 'Program Files', path: 'C:\\Program Files', size: 0, isDirectory: true, modified: '2026-09-14 11:20', permissions: 'drwxr-xr-x' },
-            { name: 'Program Files (x86)', path: 'C:\\Program Files (x86)', size: 0, isDirectory: true, modified: '2026-09-14 11:20', permissions: 'drwxr-xr-x' },
-            { name: 'Windows', path: 'C:\\Windows', size: 0, isDirectory: true, modified: '2026-10-09 18:44', permissions: 'drwxr-xr-x' },
-            { name: 'Users', path: 'C:\\Users', size: 0, isDirectory: true, modified: '2026-10-01 09:12', permissions: 'drwxr-xr-x' },
-            { name: 'ProgramData', path: 'C:\\ProgramData', size: 0, isDirectory: true, modified: '2026-10-10 14:02', permissions: 'drwxr-xr-x' },
-            { name: 'VitrineData', path: 'C:\\VitrineData', size: 0, isDirectory: true, modified: '2026-10-11 10:15', permissions: 'drwxr-xr-x' }
-          ]);
-        } else {
-          this.fileStore.set(key, [
-            { name: 'VitrineAgent.exe', path: `${normalizedDir}\\VitrineAgent.exe`, size: 14205820, isDirectory: false, modified: '2026-10-10 12:00', permissions: '-rwxr-xr-x' },
-            { name: 'MeshAgent.exe', path: `${normalizedDir}\\MeshAgent.exe`, size: 8421000, isDirectory: false, modified: '2026-10-08 09:30', permissions: '-rwxr-xr-x' },
-            { name: 'config.json', path: `${normalizedDir}\\config.json`, size: 1420, isDirectory: false, modified: '2026-10-11 08:15', permissions: '-rw-r--r--' },
-            { name: 'logs', path: `${normalizedDir}\\logs`, size: 0, isDirectory: true, modified: '2026-10-11 16:30', permissions: 'drwxr-xr-x' }
-          ]);
-        }
-      } else if (osType === 'macos') {
-        if (normalizedDir === '/' || normalizedDir === 'C:\\') {
-          this.fileStore.set(key, [
-            { name: 'Applications', path: '/Applications', size: 0, isDirectory: true, modified: '2026-10-20 14:10', permissions: 'drwxrwxr-x' },
-            { name: 'Library', path: '/Library', size: 0, isDirectory: true, modified: '2026-10-18 09:30', permissions: 'drwxr-xr-x' },
-            { name: 'System', path: '/System', size: 0, isDirectory: true, modified: '2026-09-12 08:00', permissions: 'drwxr-xr-x' },
-            { name: 'Users', path: '/Users', size: 0, isDirectory: true, modified: '2026-10-25 11:45', permissions: 'drwxr-xr-x' },
-            { name: 'opt', path: '/opt', size: 0, isDirectory: true, modified: '2026-10-15 16:20', permissions: 'drwxr-xr-x' },
-            { name: 'var', path: '/var', size: 0, isDirectory: true, modified: '2026-11-05 12:00', permissions: 'drwxr-xr-x' }
-          ]);
-        } else {
-          this.fileStore.set(key, [
-            { name: 'vitrine-agent-darwin', path: `${normalizedDir}/vitrine-agent-darwin`, size: 11840200, isDirectory: false, modified: '2026-10-22 10:00', permissions: '-rwxr-xr-x' },
-            { name: 'com.vitrine.agent.plist', path: `${normalizedDir}/com.vitrine.agent.plist`, size: 2140, isDirectory: false, modified: '2026-10-22 10:05', permissions: '-rw-r--r--' },
-            { name: 'agent.log', path: `${normalizedDir}/agent.log`, size: 84120, isDirectory: false, modified: '2026-11-05 16:40', permissions: '-rw-r-----' }
-          ]);
-        }
-      } else {
-        if (normalizedDir === '/' || normalizedDir === 'C:\\') {
-          this.fileStore.set(key, [
-            { name: 'bin', path: '/bin', size: 0, isDirectory: true, modified: '2026-08-10 09:00', permissions: 'drwxr-xr-x' },
-            { name: 'etc', path: '/etc', size: 0, isDirectory: true, modified: '2026-10-10 12:00', permissions: 'drwxr-xr-x' },
-            { name: 'opt', path: '/opt', size: 0, isDirectory: true, modified: '2026-10-12 15:30', permissions: 'drwxr-xr-x' },
-            { name: 'var', path: '/var', size: 0, isDirectory: true, modified: '2026-10-11 16:00', permissions: 'drwxr-xr-x' },
-            { name: 'home', path: '/home', size: 0, isDirectory: true, modified: '2026-09-01 10:00', permissions: 'drwxr-xr-x' },
-            { name: 'usr', path: '/usr', size: 0, isDirectory: true, modified: '2026-09-15 11:00', permissions: 'drwxr-xr-x' }
-          ]);
-        } else {
-          this.fileStore.set(key, [
-            { name: 'vitrine-agent', path: `${normalizedDir}/vitrine-agent`, size: 12450800, isDirectory: false, modified: '2026-10-19 11:00', permissions: '-rwxr-xr-x' },
-            { name: 'agent.yaml', path: `${normalizedDir}/agent.yaml`, size: 1890, isDirectory: false, modified: '2026-10-21 14:22', permissions: '-rw-r--r--' },
-            { name: 'telemetry.db', path: `${normalizedDir}/telemetry.db`, size: 524288, isDirectory: false, modified: '2026-11-05 16:45', permissions: '-rw-r-----' }
-          ]);
-        }
+    const normalizedDir = canonicalizeRemotePath(dirPath, osType);
+    const cacheKey = `${deviceId}::${normalizedDir}`;
+    const cached = this.fileCache.get(cacheKey);
+    if (cached) return cached;
+
+    if (osType === 'windows') {
+      const ps = `Get-ChildItem -LiteralPath ${quotePowerShellLiteral(normalizedDir)} -Force -ErrorAction Stop | Select-Object -First 150 Name, FullName, @{N='Size';E={if ($_.PSIsContainer) {0} else {[long]$_.Length}}}, PSIsContainer, @{N='Mod';E={$_.LastWriteTime.ToString('yyyy-MM-dd HH:mm')}}, Mode | ConvertTo-Json -Compress`;
+      const res = await this.executeCommandOnNode(deviceId, ps, { runAs: 'system', timeoutMs: 7000 });
+      if (res.live && res.exitCode === 0 && res.output) {
+        try {
+          const parsed = JSON.parse(res.output);
+          const arr = Array.isArray(parsed) ? parsed : [parsed];
+          const items: FileItem[] = arr
+            .filter((f) => f && f.Name)
+            .map((f) => ({
+              name: String(f.Name),
+              path: String(f.FullName),
+              size: Number(f.Size || 0),
+              isDirectory: Boolean(f.PSIsContainer),
+              modified: String(f.Mod || ''),
+              permissions: String(f.Mode || '-rw-r--r--')
+            }));
+          this.fileCache.set(cacheKey, items);
+          return items;
+        } catch {}
+      }
+    } else {
+      const py = `python3 - ${quoteBashLiteral(normalizedDir)} <<'PY'\nimport os, stat, time, json, sys\np = sys.argv[1]\nout = []\nfor entry in sorted(os.scandir(p), key=lambda e: (not e.is_dir(follow_symlinks=False), e.name.lower()))[:150]:\n    st = entry.stat(follow_symlinks=False)\n    out.append({\n        "name": entry.name,\n        "path": os.path.join(p, entry.name),\n        "size": 0 if stat.S_ISDIR(st.st_mode) else st.st_size,\n        "isDirectory": stat.S_ISDIR(st.st_mode),\n        "modified": time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime)),\n        "permissions": stat.filemode(st.st_mode)\n    })\nprint(json.dumps(out))\nPY`;
+      const res = await this.executeCommandOnNode(deviceId, py, { runAs: 'system', timeoutMs: 7000 });
+      if (res.live && res.exitCode === 0 && res.output) {
+        try {
+          const items = JSON.parse(res.output) as FileItem[];
+          if (Array.isArray(items)) {
+            this.fileCache.set(cacheKey, items);
+            return items;
+          }
+        } catch {}
       }
     }
-    return this.fileStore.get(key) || [];
+
+    return [];
   }
 
-  public manageFile(
+  public async manageFile(
     deviceId: string,
     dirPath: string,
     action: 'mkdir' | 'delete' | 'upload',
     name: string,
-    size = 2048,
+    _size = 2048,
     contentBase64?: string,
     actorUsername = 'admin'
-  ): FileItem[] {
-    const cleanName = String(name || '').trim();
+  ): Promise<FileItem[]> {
+    const cleanName = String(name || '').trim().replace(/\0/g, '');
     if (!cleanName || cleanName === '.' || cleanName === '..' || cleanName.includes('/') || cleanName.includes('\\')) {
       throw new Error('Invalid file or directory name.');
     }
 
     const osType = this.getDeviceOs(deviceId);
-    const meshNodeId = this.resolveMeshNodeId(deviceId);
-    const normalizedDir = dirPath || (osType === 'windows' ? 'C:\\' : '/');
-    const items = this.getDirectoryListing(deviceId, normalizedDir);
-    const sep = normalizedDir.includes('/') ? '/' : '\\';
-    const fullPath = normalizedDir.endsWith(sep) ? `${normalizedDir}${cleanName}` : `${normalizedDir}${sep}${cleanName}`;
-    const nowStr = new Date().toISOString().slice(0, 16).replace('T', ' ');
+    const normalizedDir = canonicalizeRemotePath(dirPath, osType);
+    const fullPath =
+      osType === 'windows' ? path.win32.join(normalizedDir, cleanName) : path.posix.join(normalizedDir, cleanName);
 
     if (action === 'delete') {
-      const filtered = items.filter((f) => f.name !== cleanName);
-      this.fileStore.set(`${deviceId}::${normalizedDir}`, filtered);
+      if (osType === 'windows') {
+        if (PROTECTED_WINDOWS_PATHS.has(fullPath.toLowerCase().replace(/\\+$/, ''))) {
+          throw new Error(`Refusing to delete protected operating system root path: ${fullPath}`);
+        }
+      } else {
+        if (PROTECTED_UNIX_PATHS.has(fullPath.replace(/\/+$/, '') || '/')) {
+          throw new Error(`Refusing to delete protected operating system root path: ${fullPath}`);
+        }
+      }
       this.fileContentCache.delete(`${deviceId}::${fullPath}`);
-
       const delCmd =
         osType === 'windows'
-          ? `Remove-Item -LiteralPath ${quotePowerShellLiteral(fullPath)} -Recurse -Force -ErrorAction SilentlyContinue`
+          ? `Remove-Item -LiteralPath ${quotePowerShellLiteral(fullPath)} -Recurse -Force`
           : `rm -rf -- ${quoteBashLiteral(fullPath)}`;
-      this.dispatchRpc({ action: 'runcommands', nodeids: [meshNodeId], type: osType === 'windows' ? 2 : 0, cmds: delCmd });
+      await this.executeCommandOnNode(deviceId, delCmd, { runAs: 'system', timeoutMs: 8000 });
     } else if (action === 'mkdir') {
-      if (!items.some((f) => f.name === cleanName)) {
-        items.push({ name: cleanName, path: fullPath, size: 0, isDirectory: true, modified: nowStr, permissions: 'drwxr-xr-x' });
-      }
-      this.fileStore.set(`${deviceId}::${normalizedDir}`, items);
-
       const mkdirCmd =
         osType === 'windows'
           ? `New-Item -ItemType Directory -Path ${quotePowerShellLiteral(fullPath)} -Force | Out-Null`
           : `mkdir -p -- ${quoteBashLiteral(fullPath)}`;
-      this.dispatchRpc({ action: 'runcommands', nodeids: [meshNodeId], type: osType === 'windows' ? 2 : 0, cmds: mkdirCmd });
+      await this.executeCommandOnNode(deviceId, mkdirCmd, { runAs: 'system', timeoutMs: 7000 });
     } else if (action === 'upload') {
-      let actualSize = size;
-      if (contentBase64) {
-        const cleanB64 = contentBase64.includes(',') ? contentBase64.split(',').pop()! : contentBase64;
-        const buf = Buffer.from(cleanB64, 'base64');
-        if (buf.length > 10 * 1024 * 1024) {
-          throw new Error('Remote file upload exceeds 10 MB inline transfer limit.');
-        }
-        actualSize = buf.length;
-        // Evict oldest cached buffer if cache exceeds 50 entries
-        if (this.fileContentCache.size >= 50) {
-          const firstKey = this.fileContentCache.keys().next().value;
-          if (firstKey) this.fileContentCache.delete(firstKey);
-        }
-        this.fileContentCache.set(`${deviceId}::${fullPath}`, buf);
-
-        const b64Safe = buf.toString('base64');
-        const uploadCmd =
-          osType === 'windows'
-            ? `[IO.File]::WriteAllBytes(${quotePowerShellLiteral(fullPath)}, [Convert]::FromBase64String('${b64Safe}'))`
-            : `printf '%s' '${b64Safe}' | base64 -d > ${quoteBashLiteral(fullPath)}`;
-        this.dispatchRpc({ action: 'runcommands', nodeids: [meshNodeId], type: osType === 'windows' ? 2 : 0, cmds: uploadCmd });
+      if (!contentBase64) {
+        throw new Error('Missing base64 file content for upload.');
       }
-
-      const existing = items.findIndex((f) => f.name === cleanName);
-      const entry: FileItem = {
-        name: cleanName,
-        path: fullPath,
-        size: actualSize,
-        isDirectory: false,
-        modified: nowStr,
-        permissions: '-rw-r--r--'
-      };
-      if (existing >= 0) items[existing] = entry;
-      else items.push(entry);
-      this.fileStore.set(`${deviceId}::${normalizedDir}`, items);
+      const cleanB64 = contentBase64.includes(',') ? contentBase64.split(',').pop()! : contentBase64;
+      const buf = Buffer.from(cleanB64, 'base64');
+      if (buf.length > 10 * 1024 * 1024) {
+        throw new Error('Remote file upload exceeds 10 MB inline transfer limit.');
+      }
+      this.fileContentCache.set(`${deviceId}::${fullPath}`, buf);
+      const b64Safe = buf.toString('base64');
+      const uploadCmd =
+        osType === 'windows'
+          ? `[IO.File]::WriteAllBytes(${quotePowerShellLiteral(fullPath)}, [Convert]::FromBase64String('${b64Safe}'))`
+          : `printf '%s' '${b64Safe}' | base64 -d > ${quoteBashLiteral(fullPath)}`;
+      await this.executeCommandOnNode(deviceId, uploadCmd, { runAs: 'system', timeoutMs: 12000 });
     }
 
+    this.fileCache.delete(`${deviceId}::${normalizedDir}`);
     db.prepare(`
       INSERT INTO audit_logs (id, username, device_id, action, details)
       VALUES (?, ?, ?, 'Remote File Operation', ?)
     `).run(`aud-file-${crypto.randomUUID()}`, actorUsername, deviceId, `Executed '${action}' on ${fullPath}`);
 
-    return this.fileStore.get(`${deviceId}::${normalizedDir}`) || [];
+    return this.getDirectoryListing(deviceId, normalizedDir);
   }
 
-  public downloadFile(deviceId: string, filePath: string, actorUsername = 'admin'): {
+  public async downloadFile(deviceId: string, filePath: string, actorUsername = 'admin'): Promise<{
     filename: string;
     contentBase64: string;
     size: number;
-  } {
-    const cacheKey = `${deviceId}::${filePath}`;
-    const filename = path.posix.basename(filePath.replace(/\\/g, '/')) || 'download.bin';
-    const cached = this.fileContentCache.get(cacheKey);
-    const buf =
-      cached ||
-      Buffer.from(
-        JSON.stringify(
-          {
-            deviceId,
-            path: filePath,
-            exportedAt: new Date().toISOString(),
-            note: this.isConnected
-              ? 'Streamed via MeshCentral file channel'
-              : 'Diagnostic configuration snapshot (MeshCentral live tunnel offline)'
-          },
-          null,
-          2
-        ),
-        'utf8'
-      );
+  }> {
+    const osType = this.getDeviceOs(deviceId);
+    const cleanPath = canonicalizeRemotePath(filePath, osType);
+    const filename =
+      (osType === 'windows' ? path.win32.basename(cleanPath) : path.posix.basename(cleanPath)) || 'download.bin';
+    const cacheKey = `${deviceId}::${cleanPath}`;
+
+    let buf = this.fileContentCache.get(cacheKey);
+    if (!buf) {
+      const q = quoteBashLiteral(cleanPath);
+      const readCmd =
+        osType === 'windows'
+          ? `$bytes = [IO.File]::ReadAllBytes(${quotePowerShellLiteral(cleanPath)}); if ($bytes.Length -gt 10485760) { throw 'File exceeds 10MB download limit' }; [Convert]::ToBase64String($bytes)`
+          : `test -f ${q} && [ "$(wc -c < ${q})" -le 10485760 ] && { base64 -w 0 ${q} 2>/dev/null || base64 ${q}; }`;
+      const res = await this.executeCommandOnNode(deviceId, readCmd, { runAs: 'system', timeoutMs: 12000 });
+      const cleaned = String(res.output || '').replace(/\s+/g, '');
+      if (!res.live || res.exitCode !== 0 || !cleaned || !/^[A-Za-z0-9+/=]+$/.test(cleaned)) {
+        throw new Error(
+          res.output ||
+            `Unable to stream remote file '${cleanPath}' — endpoint offline, file missing/unreadable, empty, or exceeds 10 MB limit.`
+        );
+      }
+      buf = Buffer.from(cleaned, 'base64');
+      this.fileContentCache.set(cacheKey, buf);
+    }
 
     db.prepare(`
       INSERT INTO audit_logs (id, username, device_id, action, details)
       VALUES (?, ?, ?, 'Remote File Downloaded', ?)
-    `).run(`aud-fget-${crypto.randomUUID()}`, actorUsername, deviceId, `Downloaded ${filePath} (${buf.length} bytes)`);
+    `).run(`aud-fget-${crypto.randomUUID()}`, actorUsername, deviceId, `Downloaded ${cleanPath} (${buf.length} bytes)`);
 
     return {
       filename,
@@ -1205,7 +1863,7 @@ export class MeshCentralBridge {
   }
 
   // ============================================================================
-  // Endpoint Network Quarantine (Cyber Isolation)
+  // Endpoint Network Quarantine (Genuine Host Firewall Isolation)
   // ============================================================================
   public toggleQuarantine(deviceId: string, quarantine: boolean, actorUsername = 'admin'): boolean {
     const dev = db.prepare('SELECT id, status, os_type FROM devices WHERE id = ?').get(deviceId) as any;
@@ -1219,32 +1877,142 @@ export class MeshCentralBridge {
     );
 
     const osType = this.getDeviceOs(deviceId);
-    const meshNodeId = this.resolveMeshNodeId(deviceId);
+    const settings = (db.prepare('SELECT custom_domain, meshcentral_url FROM settings WHERE id = 1').get() || {}) as any;
 
-    // Extract management host so quarantine rules never sever the RMM control plane itself
-    let mgmtHost = '';
+    const rawCandidateUrls: Array<string | null | undefined> = [
+      this.connectedServerUrl,
+      settings.meshcentral_url,
+      settings.custom_domain,
+      process.env.VITRINE_PUBLIC_URL,
+      process.env.PUBLIC_URL,
+      process.env.PORT ? `http://127.0.0.1:${process.env.PORT}` : null
+    ];
     try {
-      if (this.connectedServerUrl) {
-        mgmtHost = new URL(this.connectedServerUrl).hostname;
+      const fedServers = db.prepare('SELECT url FROM mesh_servers').all() as Array<{ url?: string }>;
+      for (const s of fedServers) {
+        if (s?.url) rawCandidateUrls.push(s.url);
       }
-    } catch {
-      mgmtHost = '';
+    } catch {}
+
+    const mgmtEndpoints = new Map<string, { hostname: string; port: number; ipFamily: number }>();
+    for (const raw of rawCandidateUrls) {
+      if (!raw || !String(raw).trim()) continue;
+      try {
+        const trimmed = String(raw).trim();
+        const u = trimmed.includes('://') ? new URL(trimmed) : new URL(`https://${trimmed}`);
+        const cleanHost = u.hostname.replace(/^\[|\]$/g, '');
+        const ipFamily = net.isIP(cleanHost);
+        if (ipFamily === 0 && !/^[a-zA-Z0-9.-]+$/.test(cleanHost)) continue;
+        const port = u.port
+          ? Number.parseInt(u.port, 10)
+          : u.protocol === 'http:' || u.protocol === 'ws:'
+            ? 80
+            : 443;
+        if (!Number.isInteger(port) || port < 1 || port > 65535) continue;
+        mgmtEndpoints.set(`${cleanHost.toLowerCase()}:${port}`, { hostname: cleanHost, port, ipFamily });
+      } catch {}
     }
 
+    const endpointList = Array.from(mgmtEndpoints.values());
+
     if (osType === 'windows') {
+      // On Windows Firewall, Explicit Block rules override Allow rules!
+      // Proper isolation sets Profile DefaultOutboundAction=Block + DefaultInboundAction=Block
+      // and adds explicit Allow rules ONLY for DNS, DHCP, MeshAgent/VitrineAgent binaries, AND
+      // outbound TCP to management endpoints:ports (so powershell.exe Companion & custom ports stay reachable)!
+      const mgmtPsRules = endpointList.map((ep, idx) => {
+        if (ep.ipFamily !== 0) {
+          return `New-NetFirewallRule -DisplayName 'VitrineQuar-Mgmt-${idx}' -Group 'VitrineQuarantine' -Direction Outbound -Protocol TCP -RemoteAddress ${quotePowerShellLiteral(ep.hostname)} -RemotePort ${ep.port} -Action Allow -Profile Any -ErrorAction SilentlyContinue | Out-Null`;
+        }
+        const hostLit = quotePowerShellLiteral(ep.hostname);
+        return `try { $mIps = @([System.Net.Dns]::GetHostAddresses(${hostLit}) | ForEach-Object { $_.IPAddressToString } | Select-Object -Unique); if ($mIps.Count -gt 0) { New-NetFirewallRule -DisplayName 'VitrineQuar-Mgmt-${idx}' -Group 'VitrineQuarantine' -Direction Outbound -Protocol TCP -RemoteAddress $mIps -RemotePort ${ep.port} -Action Allow -Profile Any -ErrorAction SilentlyContinue | Out-Null } } catch {}`;
+      });
+
       const cmd = quarantine
-        ? `New-NetFirewallRule -DisplayName 'VitrineQuarantineOut' -Group 'VitrineQuarantine' -Direction Outbound -Action Block -Profile Any -ErrorAction SilentlyContinue; New-NetFirewallRule -DisplayName 'VitrineQuarantineIn' -Group 'VitrineQuarantine' -Direction Inbound -Action Block -Profile Any -ErrorAction SilentlyContinue; Get-Process -Name 'MeshAgent','VitrineAgent*' -ErrorAction SilentlyContinue | ForEach-Object { if ($_.Path) { New-NetFirewallRule -DisplayName "VitrineAllow-$($_.Name)" -Group 'VitrineQuarantine' -Direction Outbound -Program $_.Path -Action Allow -Profile Any -ErrorAction SilentlyContinue } }`
-        : `Remove-NetFirewallRule -Group 'VitrineQuarantine' -ErrorAction SilentlyContinue`;
-      this.dispatchRpc({ action: 'runcommands', nodeids: [meshNodeId], type: 2, cmds: cmd });
+        ? [
+            `Remove-NetFirewallRule -Group 'VitrineQuarantine' -ErrorAction SilentlyContinue`,
+            `New-NetFirewallRule -DisplayName 'VitrineQuar-DNS-UDP' -Group 'VitrineQuarantine' -Direction Outbound -Protocol UDP -RemotePort 53 -Action Allow -Profile Any | Out-Null`,
+            `New-NetFirewallRule -DisplayName 'VitrineQuar-DNS-TCP' -Group 'VitrineQuarantine' -Direction Outbound -Protocol TCP -RemotePort 53 -Action Allow -Profile Any | Out-Null`,
+            `New-NetFirewallRule -DisplayName 'VitrineQuar-DHCP' -Group 'VitrineQuarantine' -Direction Outbound -Protocol UDP -LocalPort 68 -RemotePort 67 -Action Allow -Profile Any | Out-Null`,
+            `Get-Process -Name 'MeshAgent*','VitrineAgent*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Path -Unique | Where-Object { $_ } | ForEach-Object { New-NetFirewallRule -DisplayName "VitrineAllow-$((Split-Path $_ -Leaf))" -Group 'VitrineQuarantine' -Direction Outbound -Program $_ -Action Allow -Profile Any -ErrorAction SilentlyContinue | Out-Null }`,
+            ...mgmtPsRules,
+            `Set-NetFirewallProfile -Profile Domain,Public,Private -DefaultInboundAction Block -DefaultOutboundAction Block`
+          ].join('; ')
+        : `Set-NetFirewallProfile -Profile Domain,Public,Private -DefaultInboundAction Block -DefaultOutboundAction Allow; Remove-NetFirewallRule -Group 'VitrineQuarantine' -ErrorAction SilentlyContinue`;
+      void this.executeCommandOnNode(deviceId, cmd, { runAs: 'system', timeoutMs: 8000 });
     } else if (osType === 'linux') {
-      const allowHostRule =
-        mgmtHost && /^[0-9.]+$/.test(mgmtHost)
-          ? `iptables -I OUTPUT 1 -d ${mgmtHost} -j ACCEPT; iptables -I INPUT 1 -s ${mgmtHost} -j ACCEPT;`
-          : '';
+      const v4EndpointStmts: string[] = [];
+      const v6EndpointStmts: string[] = [];
+      for (const ep of endpointList) {
+        const qHost = quoteBashLiteral(ep.hostname);
+        if (ep.ipFamily === 4) {
+          v4EndpointStmts.push(
+            `iptables -A VITRINE_QUAR -p tcp -d ${qHost} --dport ${ep.port} -j ACCEPT`,
+            `iptables -A VITRINE_QUAR -p tcp -s ${qHost} --sport ${ep.port} -j ACCEPT`
+          );
+        } else if (ep.ipFamily === 6) {
+          v6EndpointStmts.push(
+            `ip6tables -A VITRINE_QUAR -p tcp -d ${qHost} --dport ${ep.port} -j ACCEPT`,
+            `ip6tables -A VITRINE_QUAR -p tcp -s ${qHost} --sport ${ep.port} -j ACCEPT`
+          );
+        } else {
+          v4EndpointStmts.push(
+            `for ip in $(getent ahostsv4 ${qHost} 2>/dev/null | awk '{print $1}' | sort -u); do iptables -A VITRINE_QUAR -p tcp -d "$ip" --dport ${ep.port} -j ACCEPT; iptables -A VITRINE_QUAR -p tcp -s "$ip" --sport ${ep.port} -j ACCEPT; done`
+          );
+          v6EndpointStmts.push(
+            `for ip6 in $(getent ahostsv6 ${qHost} 2>/dev/null | awk '{print $1}' | sort -u); do ip6tables -A VITRINE_QUAR -p tcp -d "$ip6" --dport ${ep.port} -j ACCEPT; ip6tables -A VITRINE_QUAR -p tcp -s "$ip6" --sport ${ep.port} -j ACCEPT; done`
+          );
+        }
+      }
+
+      const ip6ApplyBlock = [
+        `if command -v ip6tables >/dev/null 2>&1; then`,
+        `ip6tables -N VITRINE_QUAR 2>/dev/null || ip6tables -F VITRINE_QUAR;`,
+        `ip6tables -A VITRINE_QUAR -i lo -j ACCEPT;`,
+        `ip6tables -A VITRINE_QUAR -o lo -j ACCEPT;`,
+        `ip6tables -A VITRINE_QUAR -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT;`,
+        `ip6tables -A VITRINE_QUAR -p udp --dport 53 -j ACCEPT;`,
+        `ip6tables -A VITRINE_QUAR -p tcp --dport 53 -j ACCEPT;`,
+        `ip6tables -A VITRINE_QUAR -p ipv6-icmp -j ACCEPT;`,
+        ...(v6EndpointStmts.length > 0 ? [`${v6EndpointStmts.join('; ')};`] : []),
+        `ip6tables -A VITRINE_QUAR -j DROP;`,
+        `ip6tables -C OUTPUT -j VITRINE_QUAR 2>/dev/null || ip6tables -I OUTPUT 1 -j VITRINE_QUAR;`,
+        `ip6tables -C INPUT -j VITRINE_QUAR 2>/dev/null || ip6tables -I INPUT 1 -j VITRINE_QUAR;`,
+        `fi`
+      ].join(' ');
+
       const cmd = quarantine
-        ? `iptables -N VITRINE_QUAR 2>/dev/null || iptables -F VITRINE_QUAR; ${allowHostRule} iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT`
-        : `iptables -F VITRINE_QUAR 2>/dev/null || true`;
-      this.dispatchRpc({ action: 'runcommands', nodeids: [meshNodeId], type: 0, cmds: cmd });
+        ? [
+            `iptables -N VITRINE_QUAR 2>/dev/null || iptables -F VITRINE_QUAR`,
+            `iptables -A VITRINE_QUAR -i lo -j ACCEPT`,
+            `iptables -A VITRINE_QUAR -o lo -j ACCEPT`,
+            `iptables -A VITRINE_QUAR -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT`,
+            `iptables -A VITRINE_QUAR -p udp --dport 53 -j ACCEPT`,
+            `iptables -A VITRINE_QUAR -p tcp --dport 53 -j ACCEPT`,
+            `iptables -A VITRINE_QUAR -p udp --sport 68 --dport 67 -j ACCEPT`,
+            ...v4EndpointStmts,
+            `iptables -A VITRINE_QUAR -j DROP`,
+            `iptables -C OUTPUT -j VITRINE_QUAR 2>/dev/null || iptables -I OUTPUT 1 -j VITRINE_QUAR`,
+            `iptables -C INPUT -j VITRINE_QUAR 2>/dev/null || iptables -I INPUT 1 -j VITRINE_QUAR`,
+            ip6ApplyBlock
+          ].join('; ')
+        : [
+            `while iptables -D OUTPUT -j VITRINE_QUAR 2>/dev/null; do :; done`,
+            `while iptables -D INPUT -j VITRINE_QUAR 2>/dev/null; do :; done`,
+            `iptables -F VITRINE_QUAR 2>/dev/null || true`,
+            `iptables -X VITRINE_QUAR 2>/dev/null || true`,
+            `if command -v ip6tables >/dev/null 2>&1; then while ip6tables -D OUTPUT -j VITRINE_QUAR 2>/dev/null; do :; done; while ip6tables -D INPUT -j VITRINE_QUAR 2>/dev/null; do :; done; ip6tables -F VITRINE_QUAR 2>/dev/null || true; ip6tables -X VITRINE_QUAR 2>/dev/null || true; fi`
+          ].join('; ');
+      void this.executeCommandOnNode(deviceId, cmd, { runAs: 'system', timeoutMs: 8000 });
+    } else {
+      const endpointsJsonB64 = Buffer.from(
+        JSON.stringify(endpointList.map((e) => ({ h: e.hostname, p: e.port }))),
+        'utf8'
+      ).toString('base64');
+      const cmd = quarantine
+        ? `python3 -c 'import base64,json,socket,subprocess; eps=json.loads(base64.b64decode("${endpointsJsonB64}").decode()); rules=["pass quick on lo0 all","pass out quick proto { tcp, udp } to any port 53","pass out quick proto udp from port 68 to any port 67"]; seen=set()\nfor e in eps:\n  try:\n    for info in socket.getaddrinfo(e["h"], e["p"], 0, socket.SOCK_STREAM):\n      ip=info[4][0].split("%")[0]; key=(ip,int(e["p"]))\n      if key not in seen:\n        seen.add(key); rules.append(f"pass out quick proto tcp to {ip} port {int(e[\\"p\\"])}")\n  except Exception: pass\nrules.append("block drop all"); subprocess.run(["pfctl","-a","com.vitrine.quarantine","-f","-"],input="\\n".join(rules)+"\\n",text=True,stderr=subprocess.DEVNULL); subprocess.run(["pfctl","-e"],stderr=subprocess.DEVNULL)' 2>/dev/null || true`
+        : `pfctl -a com.vitrine.quarantine -F all 2>/dev/null || true`;
+      void this.executeCommandOnNode(deviceId, cmd, { runAs: 'system', timeoutMs: 8000 });
     }
 
     db.prepare(`
@@ -1264,54 +2032,86 @@ export class MeshCentralBridge {
   }
 
   // ============================================================================
-  // Remote Event Viewer / journald / Unified Logs
+  // Live Remote Event Viewer / journald / Unified Logs
   // ============================================================================
-  public getEventLogs(deviceId: string, channel = 'All', level = 'all', limit = 50): EventLogItem[] {
+  public async getEventLogs(deviceId: string, channel = 'All', level = 'all', limit = 50): Promise<EventLogItem[]> {
+    const safeLimit = Math.max(1, Math.min(200, Number(limit || 50)));
     const osType = this.getDeviceOs(deviceId);
-    const dev = db.prepare('SELECT hostname FROM devices WHERE id = ?').get(deviceId) as { hostname?: string } | undefined;
-    const host = dev?.hostname || 'endpoint';
-    let events: EventLogItem[];
 
-    if (osType === 'macos') {
-      events = [
-        { id: 201, timeGenerated: new Date(Date.now() - 4 * 60000).toISOString(), source: 'com.vitrine.agent', eventId: 1001, level: 'Information', channel: 'system', message: `Vitrine Darwin LaunchDaemon active on ${host}.` },
-        { id: 202, timeGenerated: new Date(Date.now() - 18 * 60000).toISOString(), source: 'com.apple.securityd', eventId: 4012, level: 'Information', channel: 'securityd', message: 'FileVault 2 APFS volume verified encrypted.' },
-        { id: 203, timeGenerated: new Date(Date.now() - 42 * 60000).toISOString(), source: 'syspolicyd (Gatekeeper)', eventId: 2104, level: 'Warning', channel: 'securityd', message: 'Gatekeeper notarization assessment evaluated unsigned binary; execution blocked by policy.' },
-        { id: 204, timeGenerated: new Date(Date.now() - 95 * 60000).toISOString(), source: 'softwareupdated', eventId: 302, level: 'Information', channel: 'install', message: 'macOS Software Update catalog synchronized.' }
-      ];
+    if (osType === 'windows') {
+      const logName = channel && channel !== 'All' && channel !== 'all' ? channel : 'System';
+      const ps = `Get-WinEvent -LogName ${quotePowerShellLiteral(logName)} -MaxEvents ${safeLimit} -ErrorAction SilentlyContinue | Select-Object RecordId, @{N='TimeIso';E={$_.TimeCreated.ToUniversalTime().ToString('o')}}, ProviderName, Id, LevelDisplayName, LogName, Message | ConvertTo-Json -Compress`;
+      const res = await this.executeCommandOnNode(deviceId, ps, { runAs: 'system', timeoutMs: 8000 });
+      if (res.live && res.exitCode === 0 && res.output) {
+        try {
+          const parsed = JSON.parse(res.output);
+          const arr = Array.isArray(parsed) ? parsed : [parsed];
+          const items: EventLogItem[] = arr.map((e: any, idx: number) => ({
+            id: Number(e.RecordId || idx + 1),
+            timeGenerated: String(e.TimeIso || new Date().toISOString()),
+            source: String(e.ProviderName || 'Windows'),
+            eventId: Number(e.Id || 0),
+            level:
+              e.LevelDisplayName === 'Critical'
+                ? 'Critical'
+                : e.LevelDisplayName === 'Error'
+                  ? 'Error'
+                  : e.LevelDisplayName === 'Warning'
+                    ? 'Warning'
+                    : 'Information',
+            channel: String(e.LogName || logName),
+            message: String(e.Message || '').slice(0, 500)
+          }));
+          return level && level !== 'all'
+            ? items.filter((i) => i.level.toLowerCase() === level.toLowerCase())
+            : items;
+        } catch {}
+      }
     } else if (osType === 'linux') {
-      events = [
-        { id: 101, timeGenerated: new Date(Date.now() - 5 * 60000).toISOString(), source: 'systemd[1]', eventId: 1, level: 'Information', channel: 'journald', message: `Started vitrine-agent.service on ${host}.` },
-        { id: 102, timeGenerated: new Date(Date.now() - 19 * 60000).toISOString(), source: 'sshd[512]', eventId: 100, level: 'Information', channel: 'auth', message: 'Accepted publickey authentication for administrative session.' },
-        { id: 103, timeGenerated: new Date(Date.now() - 55 * 60000).toISOString(), source: 'sudo', eventId: 402, level: 'Warning', channel: 'auth', message: 'pam_unix(sudo:auth): authentication failure recorded.' },
-        { id: 105, timeGenerated: new Date(Date.now() - 210 * 60000).toISOString(), source: 'unattended-upgrade', eventId: 77, level: 'Information', channel: 'journald', message: 'Security package metadata verified.' }
-      ];
-    } else {
-      events = [
-        { id: 5001, timeGenerated: new Date(Date.now() - 3 * 60000).toISOString(), source: 'Service Control Manager', eventId: 7036, level: 'Information', channel: 'System', message: 'The Print Spooler service is in the running state.' },
-        { id: 5002, timeGenerated: new Date(Date.now() - 12 * 60000).toISOString(), source: 'Microsoft-Windows-WindowsUpdateClient', eventId: 19, level: 'Information', channel: 'System', message: 'Windows Update agent verified cumulative security state.' },
-        { id: 5003, timeGenerated: new Date(Date.now() - 45 * 60000).toISOString(), source: 'Microsoft-Windows-BitLocker-Driver', eventId: 24577, level: 'Information', channel: 'System', message: 'Operating system volume protection status checked.' },
-        { id: 5005, timeGenerated: new Date(Date.now() - 180 * 60000).toISOString(), source: 'Microsoft-Windows-Security-Auditing', eventId: 4625, level: 'Warning', channel: 'Security', message: 'An account failed to log on. Failure Reason: Unknown user name or bad password.' },
-        { id: 5008, timeGenerated: new Date(Date.now() - 480 * 60000).toISOString(), source: 'Microsoft-Windows-GroupPolicy', eventId: 1500, level: 'Information', channel: 'System', message: 'Computer policy settings processed without error.' }
-      ];
-    }
-
-    let filtered = events;
-    if (channel && channel !== 'All' && channel !== 'all') {
-      const matching = filtered.filter((e) => e.channel.toLowerCase() === channel.toLowerCase());
-      if (matching.length > 0) {
-        filtered = matching;
+      const py = `python3 -c 'import subprocess,json,datetime; out=subprocess.check_output(["journalctl","-n","${safeLimit}","-o","json","--no-pager"],text=True); items=[]; \nfor idx,l in enumerate(out.splitlines()):\n  try:\n    j=json.loads(l); p=int(j.get("PRIORITY",6)); lvl="Critical" if p<=2 else "Error" if p==3 else "Warning" if p==4 else "Information"; ts=int(j.get("__REALTIME_TIMESTAMP",0))/1e6; iso=datetime.datetime.fromtimestamp(ts,datetime.timezone.utc).isoformat() if ts else ""; items.append({"id":idx+1,"timeGenerated":iso,"source":j.get("SYSLOG_IDENTIFIER") or j.get("_COMM") or "kernel","eventId":int(j.get("_PID",0) or 0),"level":lvl,"channel":"journald","message":str(j.get("MESSAGE",""))[:500]})\n  except Exception: pass\nprint(json.dumps(items))'`;
+      const res = await this.executeCommandOnNode(deviceId, py, { runAs: 'system', timeoutMs: 8000 });
+      if (res.live && res.exitCode === 0 && res.output) {
+        try {
+          const items = JSON.parse(res.output) as EventLogItem[];
+          if (Array.isArray(items)) {
+            return level && level !== 'all'
+              ? items.filter((i) => i.level.toLowerCase() === level.toLowerCase())
+              : items;
+          }
+        } catch {}
+      }
+    } else if (osType === 'macos') {
+      const py = `python3 -c 'import subprocess,json; out=subprocess.check_output(["log","show","--style","compact","--last","30m"],text=True,stderr=subprocess.DEVNULL); lines=[l for l in out.splitlines() if l and not l.startswith("Timestamp")][-${safeLimit}:]; items=[]\nfor idx,l in enumerate(lines):\n  parts=l.split(None,4)\n  if len(parts)<5: continue\n  ts=parts[0]+"T"+parts[1]; ty=parts[2]; proc=parts[3]; msg=parts[4]\n  lvl="Critical" if ty=="F" else "Error" if ty=="E" else "Warning" if ty in ("W","A") else "Information"\n  items.append({"id":idx+1,"timeGenerated":ts,"source":proc.split("[")[0],"eventId":0,"level":lvl,"channel":"unified-log","message":msg[:500]})\nprint(json.dumps(items))'`;
+      const res = await this.executeCommandOnNode(deviceId, py, { runAs: 'system', timeoutMs: 10000 });
+      if (res.live && res.exitCode === 0 && res.output) {
+        try {
+          const items = JSON.parse(res.output) as EventLogItem[];
+          if (Array.isArray(items)) {
+            return level && level !== 'all'
+              ? items.filter((i) => i.level.toLowerCase() === level.toLowerCase())
+              : items;
+          }
+        } catch {}
       }
     }
-    if (level && level !== 'all') {
-      filtered = filtered.filter((e) => e.level.toLowerCase() === level.toLowerCase());
-    }
 
-    return filtered.slice(0, limit);
+    // Fallback to Vitrine's real recorded audit_logs for this device when endpoint tunnel is offline
+    const rows = db
+      .prepare('SELECT id, timestamp, username, action, details FROM audit_logs WHERE device_id = ? ORDER BY timestamp DESC LIMIT ?')
+      .all(deviceId, safeLimit) as any[];
+    return rows.map((r, idx) => ({
+      id: idx + 1,
+      timeGenerated: r.timestamp || new Date().toISOString(),
+      source: `vitrine-audit (${r.username || 'system'})`,
+      eventId: 1000 + idx,
+      level: 'Information',
+      channel: 'Audit',
+      message: `${r.action}: ${r.details || ''}`
+    }));
   }
 
   // ============================================================================
-  // Live MeshCentral 2 Server Discovery & Federation Sync (Zero Fake Demo Data)
+  // Live MeshCentral 2 Server Discovery & Federation Sync (Groups + Devices!)
   // ============================================================================
   public async discoverServerResources(params: {
     url: string;
@@ -1335,7 +2135,7 @@ export class MeshCentralBridge {
     }
 
     const normalizedUrl = urlCheck.normalized;
-    const dnsSafety = await validateOutboundHostSafety(normalizedUrl, { allowLoopback: true });
+    const dnsSafety = await validateOutboundHostSafety(normalizedUrl, { allowLoopback: true, allowPrivateLan: true });
     if (!dnsSafety.safe) {
       return {
         reachable: false,
@@ -1351,7 +2151,7 @@ export class MeshCentralBridge {
 
     const cleanToken = params.apiToken ? decryptVaultSecret(params.apiToken) || params.apiToken : '';
 
-    // 1. Try live WebSocket control.ashx probe (standard MeshCentral 2 protocol)
+    // 1. Live WebSocket control.ashx probe
     if (cleanToken) {
       try {
         const wsReport = await new Promise<{
@@ -1360,19 +2160,21 @@ export class MeshCentralBridge {
           nodes: DiscoveredMeshAgent[];
           error?: string;
         }>((resolve) => {
-          const wsUrl = `${normalizedUrl.replace(/^http/i, 'ws')}/control.ashx?auth=${encodeURIComponent(cleanToken)}`;
+          const { wsUrl, headers } = buildMeshWsAuthParams(normalizedUrl, cleanToken, urlCheck.loginKey);
           const allowInsecure =
             Boolean(params.allowSelfSigned) ||
             process.env.MESHCENTRAL_ALLOW_SELF_SIGNED === 'true' ||
-            normalizedUrl.includes('localhost') ||
-            normalizedUrl.includes('127.0.0.1');
+            isLoopbackExactHostname(normalizedUrl);
 
           let settled = false;
           const meshes: MeshGroup[] = [];
           const nodes: DiscoveredMeshAgent[] = [];
           const meshNameById = new Map<string, string>();
+          let gotMeshes = false;
+          let gotNodes = false;
 
           const ws = new WebSocket(wsUrl, {
+            headers,
             rejectUnauthorized: !allowInsecure,
             handshakeTimeout: 4000
           });
@@ -1383,9 +2185,7 @@ export class MeshCentralBridge {
             try {
               ws.removeAllListeners();
               ws.close();
-            } catch {
-              // Ignore
-            }
+            } catch {}
             resolve(res);
           };
 
@@ -1397,21 +2197,20 @@ export class MeshCentralBridge {
             try {
               ws.send(JSON.stringify({ action: 'meshes' }));
               ws.send(JSON.stringify({ action: 'nodes' }));
-            } catch {
-              // Ignore
-            }
-            // Give MS2 1.2s to stream meshes + nodes frames
+            } catch {}
             setTimeout(() => {
               clearTimeout(timer);
               finish({ ok: true, meshes, nodes });
-            }, 1200);
+            }, 1000);
           });
 
           ws.on('message', (raw) => {
             try {
               const msg = JSON.parse(raw.toString());
-              if (msg.action === 'meshes' && Array.isArray(msg.meshes)) {
-                for (const m of msg.meshes) {
+              if (msg.action === 'meshes' && msg.meshes) {
+                gotMeshes = true;
+                const list = Array.isArray(msg.meshes) ? msg.meshes : Object.values(msg.meshes);
+                for (const m of list as any[]) {
                   const id = String(m._id || m.meshid || '');
                   const name = String(m.name || id);
                   if (id) {
@@ -1420,6 +2219,7 @@ export class MeshCentralBridge {
                   }
                 }
               } else if (msg.action === 'nodes' && msg.nodes && typeof msg.nodes === 'object') {
+                gotNodes = true;
                 for (const [meshKey, arr] of Object.entries(msg.nodes)) {
                   if (!Array.isArray(arr)) continue;
                   for (const n of arr as any[]) {
@@ -1439,7 +2239,7 @@ export class MeshCentralBridge {
                       osDesc,
                       osType,
                       ipAddress: String(n.ip || ''),
-                      online: Boolean(n.conn && Number(n.conn) > 0)
+                      online: Boolean(n.conn && (Number(n.conn) & 1) !== 0)
                     });
                   }
                 }
@@ -1447,9 +2247,11 @@ export class MeshCentralBridge {
                   g.deviceCount = nodes.filter((n) => n.meshId === g.meshid).length;
                 }
               }
-            } catch {
-              // Ignore
-            }
+              if (gotMeshes && gotNodes) {
+                clearTimeout(timer);
+                finish({ ok: true, meshes, nodes });
+              }
+            } catch {}
           });
 
           ws.on('error', (err) => {
@@ -1460,7 +2262,7 @@ export class MeshCentralBridge {
           ws.on('close', (code) => {
             if (!settled && code >= 4000) {
               clearTimeout(timer);
-              finish({ ok: false, meshes: [], nodes: [], error: `MeshCentral rejected auth token (code ${code})` });
+              finish({ ok: false, meshes: [], nodes: [], error: `MeshCentral rejected auth credentials (code ${code})` });
             }
           });
         });
@@ -1476,118 +2278,109 @@ export class MeshCentralBridge {
             agents: wsReport.nodes
           };
         }
-      } catch {
-        // Proceed to HTTP probe / read-only local NeDB fallback
-      }
+      } catch {}
     }
 
-    // 2. Try HTTP/HTTPS reachability & /api/meshes check
+    // 2. HTTP/HTTPS reachability check via safeOutboundFetch
     let httpReachable = false;
     let httpError = '';
     try {
-      const headers: Record<string, string> = {};
-      if (cleanToken) headers['x-token'] = cleanToken;
-      const apiRes = await fetch(`${normalizedUrl}/api/meshes`, {
-        headers,
-        signal: AbortSignal.timeout(4000)
+      const allowInsecure =
+        Boolean(params.allowSelfSigned) ||
+        process.env.MESHCENTRAL_ALLOW_SELF_SIGNED === 'true' ||
+        isLoopbackExactHostname(normalizedUrl);
+      const rootRes = await safeOutboundFetch(normalizedUrl, {
+        timeoutMs: 3500,
+        allowInsecureTls: allowInsecure,
+        safety: { allowLoopback: true, allowPrivateLan: true }
       });
-      httpReachable = true;
-      if (apiRes.ok) {
-        const data = (await apiRes.json()) as any[];
-        if (Array.isArray(data)) {
-          return {
-            reachable: true,
-            authenticated: true,
-            source: 'http_rest_api',
-            serverUrl: normalizedUrl,
-            latencyMs: Date.now() - startMs,
-            groups: data.map((m: any) => ({
-              meshid: String(m._id || m.meshid),
-              name: String(m.name || 'Device Group'),
-              desc: String(m.desc || ''),
-              deviceCount: Number(m.deviceCount || 0)
-            })),
-            agents: []
-          };
-        }
-      } else {
-        const rootRes = await fetch(normalizedUrl, { signal: AbortSignal.timeout(3500) });
-        httpReachable = rootRes.status > 0 && rootRes.status < 500;
-      }
+      httpReachable = rootRes.status > 0 && rootRes.status < 500;
     } catch (err: any) {
       httpError = err?.message || 'Connection refused or timed out';
     }
 
-    // 3. Optional Read-Only Bare-Metal Same-Host NeDB Inspection (NEVER modifies /opt/meshcentral!)
+    // 3. Optional Read-Only Same-Host NeDB Inspection (restricted to verified MeshCentral directories)
     if (params.localConfigPath) {
       try {
-        const resolvedCfg = path.resolve(params.localConfigPath);
-        const dataDir = resolvedCfg.endsWith('.json') ? path.dirname(resolvedCfg) : resolvedCfg;
-        const nedbPath = path.join(dataDir, 'meshcentral.db');
-        if (fs.existsSync(nedbPath)) {
-          const stat = fs.statSync(nedbPath);
-          if (stat.isFile() && stat.size <= 50 * 1024 * 1024) {
-            const lines = fs.readFileSync(nedbPath, 'utf8').split(/\r?\n/);
-            const groups: MeshGroup[] = [];
-            const agents: DiscoveredMeshAgent[] = [];
-            const meshMap = new Map<string, MeshGroup>();
+        const resolvedCfg = fs.realpathSync(params.localConfigPath);
+        const allowedRoots = [
+          '/opt/meshcentral',
+          '/var/lib/meshcentral',
+          path.resolve(process.cwd(), 'dev-meshcentral'),
+          path.resolve(process.cwd(), '../dev-meshcentral')
+        ];
+        const isAllowedDir = allowedRoots.some((r) => {
+          try {
+            const rr = fs.existsSync(r) ? fs.realpathSync(r) : path.resolve(r);
+            return resolvedCfg.startsWith(rr + path.sep);
+          } catch {
+            return false;
+          }
+        });
+        if (isAllowedDir) {
+          const dataDir = resolvedCfg.endsWith('.json') ? path.dirname(resolvedCfg) : resolvedCfg;
+          const nedbPath = path.join(dataDir, 'meshcentral.db');
+          if (fs.existsSync(nedbPath)) {
+            const stat = fs.statSync(nedbPath);
+            if (stat.isFile() && stat.size <= 50 * 1024 * 1024) {
+              const lines = fs.readFileSync(nedbPath, 'utf8').split(/\r?\n/);
+              const groups: MeshGroup[] = [];
+              const agents: DiscoveredMeshAgent[] = [];
+              const meshMap = new Map<string, MeshGroup>();
 
-            for (const line of lines) {
-              if (!line.trim()) continue;
-              try {
-                const rec = JSON.parse(line);
-                if (rec.type === 'mesh' && rec._id && !rec.$$deleted) {
-                  const g: MeshGroup = {
-                    meshid: String(rec._id),
-                    name: String(rec.name || rec._id),
-                    desc: String(rec.desc || ''),
-                    deviceCount: 0
-                  };
-                  meshMap.set(g.meshid, g);
-                  groups.push(g);
-                } else if (rec.type === 'node' && rec._id && !rec.$$deleted) {
-                  const osDesc = String(rec.osdesc || 'Windows');
-                  const lower = osDesc.toLowerCase();
-                  const osType: 'windows' | 'linux' | 'macos' =
-                    lower.includes('darwin') || lower.includes('mac')
-                      ? 'macos'
-                      : lower.includes('linux')
-                        ? 'linux'
-                        : 'windows';
-                  agents.push({
-                    nodeId: String(rec._id),
-                    hostname: String(rec.name || rec.rname || 'endpoint'),
-                    meshId: String(rec.meshid || ''),
-                    meshName: meshMap.get(String(rec.meshid || ''))?.name || 'Mesh Group',
-                    osDesc,
-                    osType,
-                    ipAddress: String(rec.ip || ''),
-                    online: false
-                  });
-                }
-              } catch {
-                // Skip malformed line
+              for (const line of lines) {
+                if (!line.trim()) continue;
+                try {
+                  const rec = JSON.parse(line);
+                  if (rec.type === 'mesh' && rec._id && !rec.$$deleted) {
+                    const g: MeshGroup = {
+                      meshid: String(rec._id),
+                      name: String(rec.name || rec._id),
+                      desc: String(rec.desc || ''),
+                      deviceCount: 0
+                    };
+                    meshMap.set(g.meshid, g);
+                    groups.push(g);
+                  } else if (rec.type === 'node' && rec._id && !rec.$$deleted) {
+                    const osDesc = String(rec.osdesc || 'Windows');
+                    const lower = osDesc.toLowerCase();
+                    const osType: 'windows' | 'linux' | 'macos' =
+                      lower.includes('darwin') || lower.includes('mac')
+                        ? 'macos'
+                        : lower.includes('linux')
+                          ? 'linux'
+                          : 'windows';
+                    agents.push({
+                      nodeId: String(rec._id),
+                      hostname: String(rec.name || rec.rname || 'endpoint'),
+                      meshId: String(rec.meshid || ''),
+                      meshName: meshMap.get(String(rec.meshid || ''))?.name || 'Mesh Group',
+                      osDesc,
+                      osType,
+                      ipAddress: String(rec.ip || ''),
+                      online: false
+                    });
+                  }
+                } catch {}
               }
-            }
 
-            for (const g of groups) {
-              g.deviceCount = agents.filter((a) => a.meshId === g.meshid).length;
-            }
+              for (const g of groups) {
+                g.deviceCount = agents.filter((a) => a.meshId === g.meshid).length;
+              }
 
-            return {
-              reachable: httpReachable || true,
-              authenticated: Boolean(cleanToken),
-              source: 'local_nedb_readonly',
-              serverUrl: normalizedUrl,
-              latencyMs: Date.now() - startMs,
-              groups,
-              agents
-            };
+              return {
+                reachable: httpReachable || true,
+                authenticated: Boolean(cleanToken),
+                source: 'local_nedb_readonly',
+                serverUrl: normalizedUrl,
+                latencyMs: Date.now() - startMs,
+                groups,
+                agents
+              };
+            }
           }
         }
-      } catch {
-        // Ignore permission denied on neighboring bare-metal directory
-      }
+      } catch {}
     }
 
     return {
@@ -1598,8 +2391,8 @@ export class MeshCentralBridge {
       latencyMs: Date.now() - startMs,
       error: httpReachable
         ? cleanToken
-          ? 'MeshCentral HTTP server responded, but WebSocket API authentication failed. Verify the login token generated via `node meshcentral --logintoken`.'
-          : 'MeshCentral HTTP server is reachable. Provide a valid API token to enumerate groups and agents.'
+          ? 'MeshCentral HTTP server responded, but WebSocket API authentication failed. Provide username:password or a valid `node meshcentral --logintoken` token.'
+          : 'MeshCentral HTTP server is reachable. Provide API credentials to enumerate groups and agents.'
         : `Could not reach MeshCentral server at ${normalizedUrl}: ${httpError || 'Connection failed'}`,
       groups: [],
       agents: []
@@ -1632,9 +2425,50 @@ export class MeshCentralBridge {
   }
 
   public async syncDeviceGroupsWithClients(): Promise<SyncResult> {
-    const meshGroups = await this.fetchMeshGroups();
+    const settings = (db.prepare('SELECT * FROM settings WHERE id = 1').get() || {}) as any;
+    const serverConfigs: Array<{ url: string; token: string; localPath?: string }> = [];
+
+    const primaryToken = decryptVaultSecret(settings.meshcentral_api_token);
+    if (settings.meshcentral_url && primaryToken) {
+      serverConfigs.push({ url: settings.meshcentral_url, token: primaryToken });
+    }
+
+    const dbServers = db.prepare('SELECT url, api_token, local_config_path FROM mesh_servers').all() as any[];
+    for (const s of dbServers) {
+      const tok = decryptVaultSecret(s.api_token);
+      if (s.url && tok && !serverConfigs.some((c) => c.url === s.url)) {
+        serverConfigs.push({ url: s.url, token: tok, localPath: s.local_config_path || undefined });
+      }
+    }
+
+    const discoveredGroups: MeshGroup[] = [];
+    const discoveredAgents: DiscoveredMeshAgent[] = [];
+    let liveAuthenticatedReportReceived = false;
+
+    for (const cfg of serverConfigs) {
+      const rep = await this.discoverServerResources({
+        url: cfg.url,
+        apiToken: cfg.token,
+        localConfigPath: cfg.localPath,
+        allowSelfSigned: Boolean(settings.meshcentral_allow_self_signed)
+      });
+      if (rep.reachable && rep.authenticated) {
+        liveAuthenticatedReportReceived = true;
+      }
+      for (const g of rep.groups) {
+        if (!discoveredGroups.some((x) => x.meshid === g.meshid)) discoveredGroups.push(g);
+      }
+      for (const a of rep.agents) {
+        if (!discoveredAgents.some((x) => x.nodeId === a.nodeId)) discoveredAgents.push(a);
+      }
+    }
+
+    const meshGroups = discoveredGroups.length > 0 ? discoveredGroups : await this.fetchMeshGroups();
+
     let importedGroups = 0;
     let updatedGroups = 0;
+    let importedDevices = 0;
+    let updatedDevices = 0;
     const conflicts: Array<{ meshGroupId: string; meshGroupName: string; tenantId: string; deviceCount: number }> = [];
 
     const existingTenants = db.prepare('SELECT id, name, slug, mesh_group_id FROM tenants').all() as any[];
@@ -1642,29 +2476,108 @@ export class MeshCentralBridge {
     const tenantByName = new Map(existingTenants.map((t) => [t.name.toLowerCase(), t]));
 
     for (const mg of meshGroups) {
+      // Skip tombstoned deleted tenants
+      const tombTenant = db
+        .prepare('SELECT tenant_id FROM deleted_tenants_tombstones WHERE mesh_group_id = ?')
+        .get(mg.meshid);
+      if (tombTenant) continue;
+
       const match = tenantByMeshId.get(mg.meshid) || tenantByName.get(mg.name.toLowerCase());
       if (!match) {
-        const baseSlug = mg.name
-          .toLowerCase()
-          .replace(/[^a-z0-9]/g, '-')
-          .replace(/-+/g, '-')
-          .replace(/^-|-$/g, '') || 'client';
+        const baseSlug =
+          mg.name
+            .toLowerCase()
+            .replace(/[^a-z0-9]/g, '-')
+            .replace(/-+/g, '-')
+            .replace(/^-|-$/g, '') || 'client';
         const slug = `${baseSlug}-${crypto.randomBytes(2).toString('hex')}`;
         const id = `t-${slug}`;
         db.prepare(`
           INSERT INTO tenants (id, name, slug, contact_email, device_count, mesh_group_id)
           VALUES (?, ?, ?, ?, ?, ?)
         `).run(id, mg.name, slug, `admin@${baseSlug}.local`, mg.deviceCount || 0, mg.meshid);
+        tenantByMeshId.set(mg.meshid, { id, name: mg.name, slug, mesh_group_id: mg.meshid });
         importedGroups++;
       } else if (!match.mesh_group_id) {
         db.prepare('UPDATE tenants SET mesh_group_id = ? WHERE id = ?').run(mg.meshid, match.id);
+        match.mesh_group_id = mg.meshid;
+        tenantByMeshId.set(mg.meshid, match);
         updatedGroups++;
       }
     }
 
-    // Only flag external deletion conflicts when we received an authoritative non-empty live group list
-    if (this.isConnected && meshGroups.length > 0) {
-      const activeMeshIds = new Set(meshGroups.map((m) => m.meshid));
+    // Sync discovered MeshCentral nodes directly into `devices` inventory!
+    const nowIso = new Date().toISOString();
+    for (const ag of discoveredAgents) {
+      if (!ag.nodeId) continue;
+      const tombDev = db
+        .prepare('SELECT device_id FROM deleted_tenant_device_tombstones WHERE mesh_node_id = ?')
+        .get(ag.nodeId);
+      if (tombDev) continue;
+
+      const ownerTenant = tenantByMeshId.get(ag.meshId);
+      const targetTenantId = ownerTenant?.id || existingTenants[0]?.id || 't-default';
+
+      const existingDev = db
+        .prepare('SELECT id, quarantined FROM devices WHERE mesh_node_id = ? OR (tenant_id = ? AND LOWER(hostname) = LOWER(?))')
+        .get(ag.nodeId, targetTenantId, ag.hostname) as any;
+
+      const nextStatus = ag.online ? 'online' : 'offline';
+      if (!existingDev) {
+        const devId = `dev-${crypto.randomUUID().slice(0, 8)}`;
+        db.prepare(`
+          INSERT INTO devices (
+            id, tenant_id, mesh_node_id, hostname, os_type, os_version, ip_address, status, last_seen, enrolled_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          devId,
+          targetTenantId,
+          ag.nodeId,
+          ag.hostname,
+          ag.osType,
+          ag.osDesc,
+          ag.ipAddress || '0.0.0.0',
+          nextStatus,
+          nowIso,
+          nowIso
+        );
+        importedDevices++;
+      } else {
+        db.prepare(`
+          UPDATE devices
+          SET mesh_node_id = ?,
+              os_type = COALESCE(?, os_type),
+              os_version = COALESCE(?, os_version),
+              ip_address = CASE WHEN ? != '' THEN ? ELSE ip_address END,
+              status = CASE WHEN quarantined = 1 THEN 'isolated' ELSE ? END,
+              last_seen = CASE WHEN ? = 'online' THEN ? ELSE last_seen END
+          WHERE id = ?
+        `).run(
+          ag.nodeId,
+          ag.osType,
+          ag.osDesc,
+          ag.ipAddress,
+          ag.ipAddress,
+          nextStatus,
+          nextStatus,
+          nowIso,
+          existingDev.id
+        );
+        updatedDevices++;
+      }
+    }
+
+    // Recalculate accurate tenant device_count
+    db.exec(`
+      UPDATE tenants
+      SET device_count = (
+        SELECT COUNT(*) FROM devices d
+        WHERE d.tenant_id = tenants.id AND COALESCE(d.lifecycle_state, 'active') = 'active'
+      )
+    `);
+
+    if (liveAuthenticatedReportReceived && discoveredGroups.length > 0) {
+      const activeMeshIds = new Set(discoveredGroups.map((m) => m.meshid));
       for (const t of existingTenants) {
         if (t.mesh_group_id && !activeMeshIds.has(t.mesh_group_id)) {
           const deviceCount =
@@ -1700,15 +2613,17 @@ export class MeshCentralBridge {
 
     return {
       success: true,
-      imported: importedGroups,
-      updated: updatedGroups,
+      imported: importedGroups + importedDevices,
+      updated: updatedGroups + updatedDevices,
+      importedDevices,
+      updatedDevices,
       importedGroups,
       updatedGroups,
       unmappedMeshGroups: 0,
       conflicts,
       conflictsNotified: conflicts.length,
-      message: `MeshCentral sync complete: ${importedGroups} groups imported, ${updatedGroups} updated, ${conflicts.length} conflict alert(s) raised.`,
-      timestamp: new Date().toISOString()
+      message: `MeshCentral sync complete: ${importedGroups} group(s) & ${importedDevices} endpoint(s) imported, ${updatedGroups} group(s) & ${updatedDevices} endpoint(s) updated.`,
+      timestamp: nowIso
     };
   }
 
@@ -1719,7 +2634,7 @@ export class MeshCentralBridge {
   ): Promise<{ affectedDevices: number; action: string }> {
     const tenant = db.prepare('SELECT id, name, slug, mesh_group_id FROM tenants WHERE id = ?').get(tenantId) as any;
     const devices = db
-      .prepare('SELECT id, mesh_node_id, hostname FROM devices WHERE tenant_id = ?')
+      .prepare('SELECT id, mesh_node_id, hostname, os_type, agent_auth_token FROM devices WHERE tenant_id = ?')
       .all(tenantId) as any[];
     const affectedDevices = devices.length;
 
@@ -1732,14 +2647,46 @@ export class MeshCentralBridge {
       }
 
       for (const d of devices) {
-        db.prepare(`
-          INSERT OR REPLACE INTO deleted_tenant_device_tombstones (
-            device_id, mesh_node_id, hostname, tenant_id, tenant_name, laps_action
-          ) VALUES (?, ?, ?, ?, ?, 'remove_account')
-        `).run(d.id, d.mesh_node_id || null, d.hostname, tenantId, tenant?.name || 'Removed Client');
+        const vaultRow = db
+          .prepare('SELECT account_name FROM laps_vault WHERE device_id = ?')
+          .get(d.id) as { account_name?: string } | undefined;
+        const lapsAccount = vaultRow?.account_name || 'LocalAdmin';
+        const rawTok = d.agent_auth_token ? decryptVaultSecret(String(d.agent_auth_token)) : '';
+        const tokenHash = rawTok ? crypto.createHash('sha256').update(rawTok).digest('hex') : null;
+
+        try {
+          db.prepare(`
+            INSERT OR REPLACE INTO deleted_tenant_device_tombstones (
+              device_id, mesh_node_id, hostname, tenant_id, tenant_name, laps_action, laps_account_name, os_type, agent_token_hash
+            ) VALUES (?, ?, ?, ?, ?, 'remove_account', ?, ?, ?)
+          `).run(
+            d.id,
+            d.mesh_node_id || null,
+            d.hostname,
+            tenantId,
+            tenant?.name || 'Removed Client',
+            lapsAccount,
+            d.os_type || 'windows',
+            tokenHash
+          );
+        } catch {
+          db.prepare(`
+            INSERT OR REPLACE INTO deleted_tenant_device_tombstones (
+              device_id, mesh_node_id, hostname, tenant_id, tenant_name, laps_action, laps_account_name, os_type
+            ) VALUES (?, ?, ?, ?, ?, 'remove_account', ?, ?)
+          `).run(
+            d.id,
+            d.mesh_node_id || null,
+            d.hostname,
+            tenantId,
+            tenant?.name || 'Removed Client',
+            lapsAccount,
+            d.os_type || 'windows'
+          );
+        }
 
         this.dispatchAgentOffboard(d.id, {
-          lapsAccountName: 'LocalAdmin',
+          lapsAccountName: lapsAccount,
           lapsAction: 'remove_account'
         });
 
@@ -1757,7 +2704,6 @@ export class MeshCentralBridge {
           VALUES ('t-unassigned', 'Unassigned Endpoints', 'unassigned-endpoints', 'admin@internal', 0)
         `).run();
       }
-      // Clear site_id so moved devices do not retain dangling site foreign keys
       db.prepare("UPDATE devices SET tenant_id = 't-unassigned', site_id = NULL WHERE tenant_id = ?").run(tenantId);
       const countRow = db
         .prepare("SELECT COUNT(*) as c FROM devices WHERE tenant_id = 't-unassigned'")

@@ -6,6 +6,7 @@ import {
   User,
   Menu,
   AlertTriangle,
+  AlertCircle,
   CheckCircle,
   Info,
   RefreshCw,
@@ -17,6 +18,8 @@ import {
 } from 'lucide-react';
 import { Tenant, AppNotification, Device, AuthUser } from '../types/index.js';
 import { fetchNotifications, markNotificationRead, executeNotificationAction } from '../services/api.js';
+import { canMutateFleet } from '../utils/permissions.js';
+import { MfaChallengeModal } from './MfaChallengeModal.js';
 
 interface TopNavbarProps {
   searchQuery: string;
@@ -67,12 +70,19 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [isOpen, setIsOpen] = useState(false);
   const [actingId, setActingId] = useState<string | null>(null);
+  const [notifError, setNotifError] = useState<string | null>(null);
+  const [pendingMfaAction, setPendingMfaAction] = useState<{
+    notifId: string;
+    actionKey: string;
+    tenantId?: string;
+  } | null>(null);
   const [searchFocused, setSearchFocused] = useState(false);
   const notifRef = useRef<HTMLDivElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
-  const searchWrapperRef = useRef<HTMLDivElement>(null);
+  const searchWrapperRef = useRef<HTMLInputElement>(null);
 
   const isClientAdmin = currentUser?.role === 'client_admin';
+  const canMutate = canMutateFleet(currentUser);
 
   const loadNotifications = async () => {
     try {
@@ -126,11 +136,22 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
     setNotifications((prev) => prev.map((n) => (n.id === id ? { ...n, is_read: 1 } : n)));
   };
 
-  const handleExecuteAction = async (notifId: string, actionKey: string, tenantId?: string) => {
+  const handleNotificationAction = async (notifId: string, actionKey: string, tenantId?: string) => {
     setActingId(notifId);
+    setNotifError(null);
     try {
-      await executeNotificationAction(notifId, actionKey, tenantId);
+      const res = await executeNotificationAction(notifId, actionKey, tenantId);
+      if (res.mfaRequired) {
+        setPendingMfaAction({ notifId, actionKey, tenantId });
+        return;
+      }
+      if (!res.success) {
+        setNotifError(res.error || 'Failed to execute notification action.');
+        return;
+      }
       await loadNotifications();
+    } catch (err: any) {
+      setNotifError(err?.message || 'Failed to execute notification action.');
     } finally {
       setActingId(null);
     }
@@ -324,7 +345,7 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
           <span>{meshConnected ? 'MeshCentral Live' : 'Standalone Mode'}</span>
         </div>
 
-        {!isClientAdmin && (
+        {canMutate && (
           <>
             <button
               type="button"
@@ -470,6 +491,24 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
                   gap: '0.65rem'
                 }}
               >
+                {notifError && (
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.5rem',
+                      padding: '0.6rem 0.8rem',
+                      borderRadius: '8px',
+                      background: 'rgba(239, 68, 68, 0.15)',
+                      border: '1px solid rgba(239, 68, 68, 0.35)',
+                      color: '#f87171',
+                      fontSize: '0.76rem'
+                    }}
+                  >
+                    <AlertCircle size={14} style={{ flexShrink: 0 }} />
+                    <span>{notifError}</span>
+                  </div>
+                )}
                 {notifications.length === 0 ? (
                   <div style={{ textAlign: 'center', padding: '2rem 1rem', color: 'var(--text-dim)' }}>
                     <CheckCircle size={30} style={{ margin: '0 auto 0.5rem', color: 'var(--accent-success)' }} />
@@ -546,14 +585,14 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
                           <span style={{ fontSize: '0.68rem', color: 'var(--text-dim)' }}>
                             {new Date(notif.created_at).toLocaleString()}
                           </span>
-                          {parsedActions.length > 0 && (
+                          {canMutate && parsedActions.length > 0 && (
                             <div style={{ display: 'flex', gap: '0.35rem', flexWrap: 'wrap' }}>
                               {parsedActions.map((act, idx) => (
                                 <button
                                   key={idx}
                                   type="button"
                                   disabled={actingId === notif.id}
-                                  onClick={() => handleExecuteAction(notif.id, act.action, act.tenantId)}
+                                  onClick={() => handleNotificationAction(notif.id, act.action, act.tenantId)}
                                   className={act.danger ? 'btn-glass btn-danger' : 'btn-glass'}
                                   style={{ fontSize: '0.7rem', padding: '0.2rem 0.5rem' }}
                                 >
@@ -608,6 +647,21 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
           )}
         </div>
       </div>
+
+      <MfaChallengeModal
+        isOpen={Boolean(pendingMfaAction)}
+        onClose={() => setPendingMfaAction(null)}
+        onSuccess={() => {
+          const actionToRun = pendingMfaAction;
+          setPendingMfaAction(null);
+          if (actionToRun) {
+            handleNotificationAction(actionToRun.notifId, actionToRun.actionKey, actionToRun.tenantId);
+          }
+        }}
+        title="Step-Up MFA: Notification Action"
+        description="Enter your 6-digit TOTP authenticator code or recovery code to authorize this administrative notification action."
+        secretType="notification_action"
+      />
     </header>
   );
 };

@@ -1,4 +1,4 @@
-# Multi-stage Docker build for Vitrine RMM v2.5.1 (linux/amd64 & linux/arm64)
+# Multi-stage Docker build for Vitrine RMM v2.6.0 (linux/amd64 & linux/arm64)
 # Stage 1: Build Frontend and Backend (with native better-sqlite3 toolchain)
 FROM node:22-slim AS builder
 
@@ -33,11 +33,13 @@ FROM node:22-slim AS runner
 
 WORKDIR /app
 
+ARG VITRINE_GIT_COMMIT=v2.6.0
 ENV NODE_ENV=production
 ENV PORT=8080
 ENV DATA_DIR=/app/data
 ENV BRANDING_DIR=/app/branding
 ENV VITRINE_DOCKER=true
+ENV VITRINE_GIT_COMMIT=${VITRINE_GIT_COMMIT}
 
 # Copy pruned production backend dependencies & compiled artifacts
 COPY backend/package.json ./package.json
@@ -47,9 +49,14 @@ COPY --from=builder /app/frontend/dist ./frontend/dist
 COPY --from=builder /app/branding ./branding
 COPY --from=builder /app/branding ./branding-defaults
 
-RUN mkdir -p /app/data && chmod 700 /app/data
+RUN mkdir -p /app/data /app/data/backups /app/data/recordings /app/data/packages /app/data/signed-agents /app/branding /app/branding-defaults && \
+    chmod 700 /app/data /app/data/backups /app/data/recordings /app/data/packages && \
+    chmod 755 /app/branding /app/branding-defaults && \
+    chown -R node:node /app /app/data /app/branding /app/branding-defaults
 
 VOLUME ["/app/data", "/app/branding"]
+
+USER node
 
 EXPOSE 8080
 

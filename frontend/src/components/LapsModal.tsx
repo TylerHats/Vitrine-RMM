@@ -3,6 +3,7 @@ import { KeyRound, ShieldAlert, Copy, RotateCcw, X, CheckCircle, Eye, Clock, Ale
 import { Device, LapsCredential } from '../types/index.js';
 import { fetchLapsPassword, rotateLapsPassword } from '../services/api.js';
 import { MfaChallengeModal } from './MfaChallengeModal.js';
+import { copyToClipboard } from '../utils/clipboard.js';
 
 interface LapsModalProps {
   device: Device;
@@ -119,7 +120,7 @@ export const LapsModal: React.FC<LapsModalProps> = ({ device, onClose }) => {
 
   const handleCopy = () => {
     if (lapsData?.password && isRevealed && isPasswordCleartext(lapsData.password)) {
-      navigator.clipboard.writeText(lapsData.password);
+      copyToClipboard(lapsData.password);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     }

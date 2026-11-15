@@ -13,7 +13,9 @@ import {
   extractAuthContext,
   isSessionTokenActive,
   isTechnicianOrAbove,
-  canUserAccessTenant
+  canUserAccessTenant,
+  hasUserPermission,
+  consumeEphemeralWsTicket
 } from './services/auth/index.js';
 import { hmacVerifyToken } from './services/vault/index.js';
 import { meshBridge } from './services/meshcentral/index.js';
@@ -96,14 +98,25 @@ function sendVerifiedStaticFile(
   }
 }
 
-function isAllowedCorsOrigin(origin: string | undefined): boolean {
+const SAFE_BRANDING_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.ico']);
+
+export function isAllowedCorsOrigin(origin: string | undefined, requestHost?: string): boolean {
   if (!origin) return true;
   try {
     const parsed = new URL(origin);
     const host = parsed.hostname.toLowerCase();
+    const originHostWithPort = parsed.host.toLowerCase();
 
-    // Always allow local loopback origins for bare-metal local setup & Vite dev server
-    if (host === 'localhost' || host === '127.0.0.1' || host === '::1') {
+    // Same-origin requests (matching the HTTP Host header, e.g. LAN OOBE or reverse proxy) are always valid
+    if (requestHost && originHostWithPort === requestHost.trim().toLowerCase()) {
+      return true;
+    }
+
+    // Allow local loopback cross-port origins only in non-production dev mode (e.g. Vite 5173 -> Fastify 8080)
+    if (
+      process.env.NODE_ENV !== 'production' &&
+      (host === 'localhost' || host === '127.0.0.1' || host === '::1')
+    ) {
       return true;
     }
 
@@ -130,14 +143,6 @@ function isAllowedCorsOrigin(origin: string | undefined): boolean {
       if (extras.includes(origin.toLowerCase()) || extras.includes(host)) {
         return true;
       }
-    }
-
-    // If not yet onboarded, allow LAN admin browser access to complete OOBE
-    const oobeRow = db.prepare('SELECT is_onboarded FROM settings WHERE id = 1').get() as
-      | { is_onboarded?: number }
-      | undefined;
-    if (!oobeRow?.is_onboarded) {
-      return true;
     }
 
     return false;
@@ -172,6 +177,7 @@ function buildContentSecurityPolicy(): string {
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
     "font-src 'self' https://fonts.gstatic.com data:",
     "img-src 'self' data: blob: https:",
+    "media-src 'self' data: blob:",
     "connect-src 'self' ws: wss: https: http://localhost:* http://127.0.0.1:*",
     `frame-src ${Array.from(frameOrigins).join(' ')}`,
     "object-src 'none'",
@@ -185,41 +191,63 @@ async function startServer() {
   meshBridge.checkConfig();
 
   const server = Fastify({
-    trustProxy: true,
-    bodyLimit: 10 * 1024 * 1024, // 10 MiB default JSON body limit
+    trustProxy: process.env.VITRINE_TRUST_PROXY === 'true',
+    bodyLimit: 25 * 1024 * 1024, // 25 MiB body limit (supports encrypted backup & WebM recording uploads)
     logger: {
       level: process.env.NODE_ENV === 'production' ? 'warn' : 'info'
     }
   });
 
   // Defensive HTTP security headers & strict Content-Security-Policy on every response
-  server.addHook('onSend', async (_req, reply) => {
+  server.addHook('onSend', async (req, reply) => {
     reply.header('X-Content-Type-Options', 'nosniff');
     reply.header('X-Frame-Options', 'SAMEORIGIN');
     reply.header('Referrer-Policy', 'strict-origin-when-cross-origin');
     reply.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
-    reply.header('Content-Security-Policy', buildContentSecurityPolicy());
+    if ((req.raw.url || '').startsWith('/branding/')) {
+      reply.header('Content-Security-Policy', "default-src 'none'; sandbox");
+    } else {
+      reply.header('Content-Security-Policy', buildContentSecurityPolicy());
+    }
   });
 
   await server.register(cors, {
-    origin: (origin, cb) => {
-      if (isAllowedCorsOrigin(origin)) {
-        cb(null, true);
-      } else {
-        cb(null, false);
-      }
-    },
-    credentials: true
+    delegator: (req, cb) => {
+      cb(null, {
+        origin: (origin, originCb) => {
+          if (isAllowedCorsOrigin(origin, req.headers.host)) {
+            originCb(null, true);
+          } else {
+            originCb(null, false);
+          }
+        },
+        credentials: true,
+        methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+        allowedHeaders: [
+          'Content-Type',
+          'Authorization',
+          'X-API-Key',
+          'X-Vitrine-CSRF',
+          'X-Vitrine-Guest-Token',
+          'X-Guest-Token',
+          'X-Vitrine-Signature'
+        ]
+      });
+    }
   });
 
   await server.register(fastifyWebsocket);
 
   // ============================================================================
-  // Branding Assets Static Endpoint (/branding/*)
+  // Branding Assets Static Endpoint (/branding/*) — Raster Images Only
   // ============================================================================
   server.get('/branding/*', (req, reply) => {
     const params = req.params as { '*'?: string };
     const rel = params['*'] || '';
+    const ext = path.extname(rel).toLowerCase();
+    if (!SAFE_BRANDING_EXTENSIONS.has(ext)) {
+      return reply.status(403).send({ error: 'Unsupported branding asset format' });
+    }
     if (sendVerifiedStaticFile(BRANDING_DIR_PATH, rel, req, reply)) {
       return;
     }
@@ -231,7 +259,7 @@ async function startServer() {
   // ============================================================================
   server.get('/ws/terminal', { websocket: true }, (rawSocket, req) => {
     const socket = (rawSocket as any).socket || rawSocket;
-    if (!isAllowedCorsOrigin(req.headers.origin as string | undefined)) {
+    if (!isAllowedCorsOrigin(req.headers.origin as string | undefined, req.headers.host)) {
       try {
         socket.close(1008, 'Cross-origin WebSocket rejected');
       } catch {}
@@ -240,7 +268,7 @@ async function startServer() {
 
     const auth = extractAuthContext(req);
 
-    if (!auth || !isTechnicianOrAbove(auth.user.role)) {
+    if (!auth || !isTechnicianOrAbove(auth.user.role) || !hasUserPermission(auth.user, 'remote:connect')) {
       try {
         socket.send(
           JSON.stringify({
@@ -296,12 +324,12 @@ async function startServer() {
     };
 
     const buildBanner = () => {
-      const dev = getDeviceRow(currentDeviceId);
-      if (!dev) {
+      if (!currentDeviceId) {
         return `\r\n\x1b[33m[Vitrine PTY] Select an online endpoint to open a terminal session.\x1b[0m\r\n> `;
       }
-      if (!canUserAccessTenant(auth.user, dev.tenant_id)) {
-        return `\r\n\x1b[31m[Access Denied] You are not authorized for this tenant's endpoints.\x1b[0m\r\n`;
+      const dev = getDeviceRow(currentDeviceId);
+      if (!dev || !canUserAccessTenant(auth.user, dev.tenant_id)) {
+        return `\r\n\x1b[31m[Access Denied] Endpoint unavailable or not authorized for your account.\x1b[0m\r\n> `;
       }
       const osType = dev.os_type || 'windows';
       const shell = resolveShell(osType, currentShell);
@@ -342,7 +370,19 @@ async function startServer() {
         const parsed = JSON.parse(message.toString());
 
         if (parsed.type === 'switch_context') {
-          if (parsed.deviceId) currentDeviceId = String(parsed.deviceId);
+          if (parsed.deviceId) {
+            const candidateDev = getDeviceRow(String(parsed.deviceId));
+            if (!candidateDev || !canUserAccessTenant(auth.user, candidateDev.tenant_id)) {
+              socket.send(
+                JSON.stringify({
+                  type: 'output',
+                  data: `\r\n\x1b[31m[Access Denied] Endpoint unavailable or not authorized for your account.\x1b[0m\r\n> `
+                })
+              );
+              return;
+            }
+            currentDeviceId = candidateDev.id;
+          }
           if (parsed.runAs === 'system' || parsed.runAs === 'user') currentRunAs = parsed.runAs;
           if (parsed.shell) currentShell = String(parsed.shell);
           socket.send(
@@ -414,7 +454,7 @@ async function startServer() {
   // ============================================================================
   server.get('/ws/telemetry', { websocket: true }, (rawSocket, req) => {
     const socket = (rawSocket as any).socket || rawSocket;
-    if (!isAllowedCorsOrigin(req.headers.origin as string | undefined)) {
+    if (!isAllowedCorsOrigin(req.headers.origin as string | undefined, req.headers.host)) {
       try {
         socket.close(1008, 'Cross-origin WebSocket rejected');
       } catch {}
@@ -424,16 +464,27 @@ async function startServer() {
     const query = (req.query || {}) as Record<string, string>;
     const auth = extractAuthContext(req);
 
-    // Also allow scoped Guest Portal telemetry tokens if can_view_telemetry = 1
+    // Allow scoped Guest Portal telemetry via single-use ticket (preferred) or legacy guestToken
     let authorizedGuestDeviceId: string | null = null;
-    if (!auth && query.guestToken && query.guestGrantId) {
-      const verified = hmacVerifyToken<{ scope?: string; grantId?: string }>(query.guestToken);
-      if (verified && verified.scope === 'guest_portal' && verified.grantId === query.guestGrantId) {
+    let authorizedGuestGrantId: string | null = null;
+    if (!auth) {
+      let resolvedGrantId = '';
+      if (query.ticket) {
+        const consumed = consumeEphemeralWsTicket(query.ticket);
+        if (consumed?.grantId) resolvedGrantId = consumed.grantId;
+      } else if (query.guestToken && query.guestGrantId) {
+        const verified = hmacVerifyToken<{ scope?: string; grantId?: string }>(query.guestToken);
+        if (verified && verified.scope === 'guest_portal' && verified.grantId === query.guestGrantId) {
+          resolvedGrantId = query.guestGrantId;
+        }
+      }
+      if (resolvedGrantId) {
         const grant = db
-          .prepare('SELECT id, expires_at, can_view_telemetry, device_ids_json FROM guest_access_grants WHERE id = ?')
-          .get(query.guestGrantId) as any;
+          .prepare('SELECT id, status, expires_at, can_view_telemetry, device_ids_json FROM guest_access_grants WHERE id = ?')
+          .get(resolvedGrantId) as any;
         if (
           grant &&
+          grant.status !== 'revoked' &&
           grant.can_view_telemetry &&
           grant.expires_at &&
           new Date(grant.expires_at).getTime() > Date.now()
@@ -442,6 +493,7 @@ async function startServer() {
             const allowedIds: string[] = JSON.parse(grant.device_ids_json || '[]');
             if (query.deviceId && allowedIds.includes(query.deviceId)) {
               authorizedGuestDeviceId = query.deviceId;
+              authorizedGuestGrantId = resolvedGrantId;
             }
           } catch {
             authorizedGuestDeviceId = null;
@@ -471,10 +523,10 @@ async function startServer() {
           return;
         }
         auth.user = liveUser;
-      } else if (authorizedGuestDeviceId && query.guestGrantId) {
+      } else if (authorizedGuestDeviceId && authorizedGuestGrantId) {
         const grantCheck = db
           .prepare('SELECT status, expires_at FROM guest_access_grants WHERE id = ?')
-          .get(query.guestGrantId) as { status?: string; expires_at?: string } | undefined;
+          .get(authorizedGuestGrantId) as { status?: string; expires_at?: string } | undefined;
         if (
           !grantCheck ||
           grantCheck.status === 'revoked' ||
@@ -532,7 +584,12 @@ async function startServer() {
         return;
       }
 
-      // Control plane host telemetry fallback when no deviceId is passed
+      // Control plane host telemetry fallback when no deviceId is passed (restricted to MSP Technicians/Admins)
+      if (!auth || !isTechnicianOrAbove(auth.user.role)) {
+        socket.close(1008, 'Device ID required for scoped telemetry');
+        return;
+      }
+
       const cpus = os.cpus().length || 1;
       const loadPct = Number(Math.min(100, Math.max(0.5, (os.loadavg()[0] / cpus) * 100)).toFixed(1));
       const usedRamGb = Number(((os.totalmem() - os.freemem()) / (1024 * 1024 * 1024)).toFixed(1));
@@ -635,7 +692,7 @@ async function startServer() {
 
   try {
     await server.listen({ port: PORT, host: HOST });
-    console.log(`\n🔮 Vitrine RMM v2.5.1 control plane listening on http://${HOST}:${PORT}`);
+    console.log(`\n🔮 Vitrine RMM v2.6.0 control plane listening on http://${HOST}:${PORT}`);
   } catch (err) {
     server.log.error(err);
     process.exit(1);

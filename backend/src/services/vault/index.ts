@@ -1,6 +1,8 @@
 import crypto from 'crypto';
 import dns from 'dns';
 import fs from 'fs';
+import http from 'http';
+import https from 'https';
 import net from 'net';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -38,6 +40,12 @@ interface PersistedVaultKeyMaterial {
 }
 
 let cachedMasterKey: Buffer | null = null;
+let cachedEnvDeterministicKey: Buffer | null = null;
+const DETERMINISTIC_ENV_SALT = crypto
+  .createHash('sha256')
+  .update('vitrine-rmm-env-master-key-salt-v2')
+  .digest()
+  .subarray(0, 16);
 const LEGACY_SEED_KEY = crypto.scryptSync(
   'vitrine-rmm-laps-master-key-production-seed-9812',
   'salt',
@@ -51,6 +59,11 @@ export function getVaultMasterKey(): Buffer {
   const keyFilePath = path.join(dataDir, '.vault-key.json');
   let material: PersistedVaultKeyMaterial | null = null;
 
+  const envMaster =
+    (process.env.VITRINE_MASTER_KEY && process.env.VITRINE_MASTER_KEY.trim()) ||
+    (process.env.LAPS_MASTER_SECRET && process.env.LAPS_MASTER_SECRET.trim()) ||
+    '';
+
   if (fs.existsSync(keyFilePath)) {
     try {
       material = JSON.parse(fs.readFileSync(keyFilePath, 'utf8')) as PersistedVaultKeyMaterial;
@@ -60,9 +73,15 @@ export function getVaultMasterKey(): Buffer {
   }
 
   if (!material || !material.kdfSaltHex || !material.masterSecretHex) {
+    // Use deterministic salt when VITRINE_MASTER_KEY is configured so disaster recovery
+    // with VITRINE_MASTER_KEY alone succeeds even if .vault-key.json is lost.
+    const saltHex =
+      envMaster.length >= 16
+        ? DETERMINISTIC_ENV_SALT.toString('hex')
+        : crypto.randomBytes(16).toString('hex');
     material = {
       masterSecretHex: crypto.randomBytes(32).toString('hex'),
-      kdfSaltHex: crypto.randomBytes(16).toString('hex'),
+      kdfSaltHex: saltHex,
       createdAt: new Date().toISOString()
     };
     fs.writeFileSync(keyFilePath, JSON.stringify(material, null, 2), { encoding: 'utf8', mode: 0o600 });
@@ -73,13 +92,11 @@ export function getVaultMasterKey(): Buffer {
     }
   }
 
-  const envMaster =
-    (process.env.VITRINE_MASTER_KEY && process.env.VITRINE_MASTER_KEY.trim()) ||
-    (process.env.LAPS_MASTER_SECRET && process.env.LAPS_MASTER_SECRET.trim()) ||
-    '';
+  if (envMaster.length >= 16) {
+    cachedEnvDeterministicKey = crypto.scryptSync(envMaster, DETERMINISTIC_ENV_SALT, 32);
+  }
 
   const rawSecret = envMaster.length >= 16 ? envMaster : material.masterSecretHex;
-
   const saltBuf = Buffer.from(material.kdfSaltHex, 'hex');
   cachedMasterKey = crypto.scryptSync(rawSecret, saltBuf, 32);
   return cachedMasterKey;
@@ -87,40 +104,130 @@ export function getVaultMasterKey(): Buffer {
 
 export function reloadVaultMasterKey(): Buffer {
   cachedMasterKey = null;
+  cachedEnvDeterministicKey = null;
   return getVaultMasterKey();
 }
 
-export function isBlockedOutboundIp(ipRaw: string, allowLoopback = false): boolean {
-  let ip = (ipRaw || '').trim().toLowerCase();
-  if (!ip) return true;
-  if (ip.startsWith('::ffff:')) {
-    ip = ip.slice(7);
+function parseIpv6ToWords(ip: string): number[] | null {
+  let addr = ip.trim().toLowerCase();
+  const zoneIdx = addr.indexOf('%');
+  if (zoneIdx !== -1) addr = addr.slice(0, zoneIdx);
+  if (net.isIP(addr) !== 6) return null;
+
+  // Handle dotted-quad tail (e.g. ::ffff:127.0.0.1)
+  const lastColon = addr.lastIndexOf(':');
+  if (lastColon !== -1 && addr.slice(lastColon + 1).includes('.')) {
+    const v4Part = addr.slice(lastColon + 1);
+    const octets = v4Part.split('.').map((p) => parseInt(p, 10));
+    if (octets.length !== 4 || octets.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return null;
+    const hi = ((octets[0] << 8) | octets[1]).toString(16);
+    const lo = ((octets[2] << 8) | octets[3]).toString(16);
+    addr = `${addr.slice(0, lastColon)}:${hi}:${lo}`;
   }
+
+  const halves = addr.split('::');
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(':') : [];
+  const right = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const missing = 8 - (left.length + right.length);
+  if (halves.length === 1 && missing !== 0) return null;
+  if (halves.length === 2 && missing < 1) return null;
+
+  const full = [...left, ...Array(Math.max(0, missing)).fill('0'), ...right];
+  if (full.length !== 8) return null;
+  const words = full.map((h) => parseInt(h || '0', 16));
+  if (words.some((w) => Number.isNaN(w) || w < 0 || w > 0xffff)) return null;
+  return words;
+}
+
+export interface OutboundSafetyOptions {
+  allowLoopback?: boolean;
+  allowPrivateLan?: boolean;
+}
+
+export function isBlockedOutboundIp(
+  ipRaw: string,
+  allowLoopbackOrOptions: boolean | OutboundSafetyOptions = false
+): boolean {
+  const opts: OutboundSafetyOptions =
+    typeof allowLoopbackOrOptions === 'boolean'
+      ? { allowLoopback: allowLoopbackOrOptions, allowPrivateLan: false }
+      : allowLoopbackOrOptions;
+  const allowLoopback = Boolean(opts.allowLoopback);
+  const allowPrivateLan = Boolean(opts.allowPrivateLan);
+
+  const ip = (ipRaw || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!ip) return true;
+
+  const checkIpv4Octets = (parts: number[]): boolean => {
+    if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return true;
+    const [a, b, c] = parts;
+    // Unspecified 0.0.0.0/8
+    if (a === 0) return true;
+    // Loopback 127.0.0.0/8
+    if (a === 127) return !allowLoopback;
+    // Link-local / AWS & Azure & GCP cloud metadata 169.254.0.0/16
+    if (a === 169 && b === 254) return true;
+    // Carrier-Grade NAT 100.64.0.0/10 (includes Alibaba Cloud IMDS 100.100.100.200)
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    // RFC1918 Private LAN ranges (10/8, 172.16/12, 192.168/16)
+    if (a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)) {
+      return !allowPrivateLan;
+    }
+    // Special-purpose IETF / TEST-NET / Benchmarking ranges
+    if (a === 192 && b === 0 && (c === 0 || c === 2)) return true;
+    if (a === 198 && (b === 18 || b === 19)) return true;
+    if (a === 198 && b === 51 && c === 100) return true;
+    if (a === 203 && b === 0 && c === 113) return true;
+    // Multicast / broadcast 224.0.0.0+
+    if (a >= 224) return true;
+    return false;
+  };
 
   const version = net.isIP(ip);
   if (version === 4) {
-    const parts = ip.split('.').map((p) => parseInt(p, 10));
-    if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return true;
-    // Unspecified 0.0.0.0/8
-    if (parts[0] === 0) return true;
-    // Loopback 127.0.0.0/8
-    if (parts[0] === 127) return !allowLoopback;
-    // Link-local / AWS & Azure & GCP cloud metadata 169.254.0.0/16
-    if (parts[0] === 169 && parts[1] === 254) return true;
-    // Alibaba Cloud metadata 100.100.100.200
-    if (parts[0] === 100 && parts[1] === 100 && parts[2] === 100 && parts[3] === 200) return true;
-    // Multicast / broadcast 224.0.0.0+
-    if (parts[0] >= 224) return true;
-    return false;
+    return checkIpv4Octets(ip.split('.').map((p) => parseInt(p, 10)));
   }
 
   if (version === 6) {
-    if (ip === '::' || ip === '0:0:0:0:0:0:0:0') return true;
-    if (ip === '::1' || ip === '0:0:0:0:0:0:0:1') return !allowLoopback;
-    // IPv6 Link-local fe80::/10 or multicast ff00::/8
-    if (/^fe[89ab]/i.test(ip) || ip.startsWith('ff')) return true;
+    const words = parseIpv6ToWords(ip);
+    if (!words) return true;
+
+    const allZeroPrefix5 = words[0] === 0 && words[1] === 0 && words[2] === 0 && words[3] === 0 && words[4] === 0;
+    // Unspecified ::
+    if (allZeroPrefix5 && words[5] === 0 && words[6] === 0 && words[7] === 0) return true;
+    // Loopback ::1
+    if (allZeroPrefix5 && words[5] === 0 && words[6] === 0 && words[7] === 1) return !allowLoopback;
+
+    // IPv4-mapped (::ffff:0:0/96) or IPv4-compatible (::/96)
+    if (allZeroPrefix5 && (words[5] === 0xffff || words[5] === 0)) {
+      const octets = [(words[6] >> 8) & 0xff, words[6] & 0xff, (words[7] >> 8) & 0xff, words[7] & 0xff];
+      return checkIpv4Octets(octets);
+    }
+
+    // NAT64 well-known prefix 64:ff9b::/96 and local-use 64:ff9b:1::/48
+    if (words[0] === 0x0064 && words[1] === 0xff9b) {
+      const octets = [(words[6] >> 8) & 0xff, words[6] & 0xff, (words[7] >> 8) & 0xff, words[7] & 0xff];
+      return checkIpv4Octets(octets);
+    }
+
+    // 6to4 2002::/16 embeds IPv4 in words[1..2]
+    if (words[0] === 0x2002) {
+      const octets = [(words[1] >> 8) & 0xff, words[1] & 0xff, (words[2] >> 8) & 0xff, words[2] & 0xff];
+      return checkIpv4Octets(octets);
+    }
+
+    // Link-local fe80::/10 or multicast ff00::/8
+    if ((words[0] & 0xffc0) === 0xfe80 || (words[0] & 0xff00) === 0xff00) return true;
+
     // AWS EC2 IPv6 IMDS fd00:ec2::254
-    if (ip.startsWith('fd00:ec2:')) return true;
+    if (words[0] === 0xfd00 && words[1] === 0x0ec2) return true;
+
+    // IPv6 Unique Local Addresses fc00::/7
+    if ((words[0] & 0xfe00) === 0xfc00) {
+      return !allowPrivateLan;
+    }
+
     return false;
   }
 
@@ -129,9 +236,12 @@ export function isBlockedOutboundIp(ipRaw: string, allowLoopback = false): boole
 
 export async function validateOutboundHostSafety(
   rawUrlOrHost: string,
-  options?: { allowLoopback?: boolean }
-): Promise<{ safe: boolean; reason?: string; resolvedAddresses?: string[] }> {
+  options?: OutboundSafetyOptions
+): Promise<{ safe: boolean; reason?: string; resolvedAddresses?: string[]; hostname?: string }> {
   const allowLoopback = Boolean(options?.allowLoopback);
+  const allowPrivateLan = Boolean(options?.allowPrivateLan);
+  const safetyOpts: OutboundSafetyOptions = { allowLoopback, allowPrivateLan };
+
   const trimmed = (rawUrlOrHost || '').trim();
   if (!trimmed) {
     return { safe: false, reason: 'Target host or URL is empty.' };
@@ -141,7 +251,12 @@ export async function validateOutboundHostSafety(
   if (trimmed.includes('://')) {
     try {
       const parsed = new URL(trimmed);
-      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:' && parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
+      if (
+        parsed.protocol !== 'http:' &&
+        parsed.protocol !== 'https:' &&
+        parsed.protocol !== 'ws:' &&
+        parsed.protocol !== 'wss:'
+      ) {
         return { safe: false, reason: `Unsupported outbound protocol '${parsed.protocol}'.` };
       }
       hostname = parsed.hostname;
@@ -160,24 +275,30 @@ export async function validateOutboundHostSafety(
     return { safe: false, reason: 'Target hostname is empty.' };
   }
 
-  if (hostname === 'metadata.google.internal' || hostname === 'metadata' || hostname.endsWith('.metadata.google.internal')) {
+  if (
+    hostname === 'metadata.google.internal' ||
+    hostname === 'metadata' ||
+    hostname.endsWith('.metadata.google.internal') ||
+    hostname === 'instance-data' ||
+    hostname.endsWith('.internal.cloudapp.net')
+  ) {
     return { safe: false, reason: 'Cloud metadata hostnames are blocked for SSRF protection.' };
   }
 
   if (hostname === 'localhost' || hostname.endsWith('.localhost')) {
     return allowLoopback
-      ? { safe: true, resolvedAddresses: ['127.0.0.1'] }
+      ? { safe: true, resolvedAddresses: ['127.0.0.1'], hostname }
       : { safe: false, reason: 'Loopback targets are disallowed for this endpoint.' };
   }
 
   if (net.isIP(hostname) !== 0) {
-    if (isBlockedOutboundIp(hostname, allowLoopback)) {
+    if (isBlockedOutboundIp(hostname, safetyOpts)) {
       return {
         safe: false,
         reason: `Target IP '${hostname}' is blocked by outbound SSRF security policy.`
       };
     }
-    return { safe: true, resolvedAddresses: [hostname] };
+    return { safe: true, resolvedAddresses: [hostname], hostname };
   }
 
   try {
@@ -187,20 +308,162 @@ export async function validateOutboundHostSafety(
     }
     const addrs = records.map((r) => r.address);
     for (const addr of addrs) {
-      if (isBlockedOutboundIp(addr, allowLoopback)) {
+      if (isBlockedOutboundIp(addr, safetyOpts)) {
         return {
           safe: false,
           reason: `Hostname '${hostname}' resolved to restricted IP '${addr}' (DNS-rebinding / SSRF guard).`
         };
       }
     }
-    return { safe: true, resolvedAddresses: addrs };
+    return { safe: true, resolvedAddresses: addrs, hostname };
   } catch (err: any) {
     return {
       safe: false,
       reason: `DNS lookup failed for '${hostname}': ${err?.code || err?.message || 'ENOTFOUND'}`
     };
   }
+}
+
+export interface SafeOutboundResponse {
+  ok: boolean;
+  status: number;
+  headers: Record<string, string | string[] | undefined>;
+  body: Buffer;
+  bodyBuffer: Buffer;
+  text: () => string;
+  json: <T = any>() => T;
+}
+
+/**
+ * DNS-pinned, non-redirecting HTTP/HTTPS client that eliminates DNS-rebinding TOCTOU
+ * and prevents 301/302/307/308 credential forwarding to internal metadata services.
+ */
+export async function safeOutboundFetch(
+  urlStr: string,
+  options?: {
+    method?: string;
+    headers?: Record<string, string>;
+    body?: string | Buffer;
+    timeoutMs?: number;
+    maxBytes?: number;
+    rejectUnauthorized?: boolean;
+    allowSelfSigned?: boolean;
+    allowInsecureTls?: boolean;
+    expectedCertSha256?: string;
+    allowLoopback?: boolean;
+    allowPrivateLan?: boolean;
+    safety?: OutboundSafetyOptions;
+  }
+): Promise<SafeOutboundResponse> {
+  const parsed = new URL(urlStr);
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`Unsupported HTTP protocol: ${parsed.protocol}`);
+  }
+
+  const safety = await validateOutboundHostSafety(urlStr, {
+    allowLoopback: options?.allowLoopback ?? options?.safety?.allowLoopback,
+    allowPrivateLan: options?.allowPrivateLan ?? options?.safety?.allowPrivateLan
+  });
+  if (!safety.safe || !safety.resolvedAddresses?.length) {
+    throw new Error(safety.reason || 'Blocked by outbound SSRF policy');
+  }
+
+  const pinnedIp = safety.resolvedAddresses[0];
+  const pinnedFamily = net.isIP(pinnedIp) === 6 ? 6 : 4;
+  const timeoutMs = options?.timeoutMs ?? 8000;
+  const maxBytes = options?.maxBytes ?? 10 * 1024 * 1024;
+  const isHttps = parsed.protocol === 'https:';
+  const transport = isHttps ? https : http;
+
+  const pinnedLookup = (
+    _host: string,
+    lookupOpts: dns.LookupOptions,
+    cb: (err: NodeJS.ErrnoException | null, address: string | dns.LookupAddress[], family?: number) => void
+  ) => {
+    if (lookupOpts && lookupOpts.all) {
+      cb(null, [{ address: pinnedIp, family: pinnedFamily }]);
+    } else {
+      cb(null, pinnedIp, pinnedFamily);
+    }
+  };
+
+  return new Promise<SafeOutboundResponse>((resolve, reject) => {
+    const req = transport.request(
+      {
+        protocol: parsed.protocol,
+        hostname: parsed.hostname.replace(/^\[|\]$/g, ''),
+        port: parsed.port || (isHttps ? 443 : 80),
+        path: `${parsed.pathname}${parsed.search}`,
+        method: options?.method || 'GET',
+        headers: options?.headers || {},
+        lookup: pinnedLookup as any,
+        timeout: timeoutMs,
+        ...(isHttps
+          ? {
+              servername: net.isIP(parsed.hostname.replace(/^\[|\]$/g, '')) === 0 ? parsed.hostname : undefined,
+              rejectUnauthorized:
+                options?.rejectUnauthorized ??
+                (options?.allowSelfSigned || options?.allowInsecureTls ? false : true)
+            }
+          : {})
+      },
+      (res) => {
+        if (isHttps && options?.expectedCertSha256) {
+          const tlsSock = res.socket as any;
+          const cert = tlsSock?.getPeerCertificate?.();
+          const actualFp = String(cert?.fingerprint256 || '')
+            .replace(/:/g, '')
+            .toLowerCase();
+          const expectedFp = options.expectedCertSha256.replace(/:/g, '').toLowerCase();
+          if (!actualFp || actualFp !== expectedFp) {
+            res.destroy();
+            reject(new Error('TLS certificate SHA-256 fingerprint mismatch'));
+            return;
+          }
+        }
+
+        const status = res.statusCode || 0;
+        if (status >= 300 && status < 400) {
+          res.resume();
+          reject(new Error(`Outbound HTTP redirect (${status}) blocked by SSRF policy`));
+          return;
+        }
+
+        const chunks: Buffer[] = [];
+        let received = 0;
+        res.on('data', (chunk: Buffer) => {
+          received += chunk.length;
+          if (received > maxBytes) {
+            req.destroy(new Error(`Outbound response exceeded ${maxBytes} bytes limit`));
+            return;
+          }
+          chunks.push(Buffer.from(chunk));
+        });
+        res.on('end', () => {
+          const bodyBuffer = Buffer.concat(chunks);
+          resolve({
+            ok: status >= 200 && status < 300,
+            status,
+            headers: res.headers,
+            body: bodyBuffer,
+            bodyBuffer,
+            text: () => bodyBuffer.toString('utf8'),
+            json: <T = any>() => JSON.parse(bodyBuffer.toString('utf8')) as T
+          });
+        });
+      }
+    );
+
+    req.on('timeout', () => {
+      req.destroy(new Error(`Outbound HTTP request timed out after ${timeoutMs}ms`));
+    });
+    req.on('error', reject);
+
+    if (options?.body !== undefined) {
+      req.write(options.body);
+    }
+    req.end();
+  });
 }
 
 export function isEncryptedVaultSecret(val?: string | null): boolean {
@@ -231,13 +494,18 @@ export function decryptVaultSecret(stored?: string | null): string {
     const parts = stored.split(':');
     if (parts.length !== 5) return '';
     const [, , ivHex, tagHex, cipherHex] = parts;
-    try {
-      const decipher = crypto.createDecipheriv('aes-256-gcm', getVaultMasterKey(), Buffer.from(ivHex, 'hex'));
-      decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
-      return Buffer.concat([decipher.update(Buffer.from(cipherHex, 'hex')), decipher.final()]).toString('utf8');
-    } catch {
-      return '';
+    const primaryKey = getVaultMasterKey();
+    const candidateKeys = cachedEnvDeterministicKey ? [primaryKey, cachedEnvDeterministicKey] : [primaryKey];
+    for (const key of candidateKeys) {
+      try {
+        const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(ivHex, 'hex'));
+        decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
+        return Buffer.concat([decipher.update(Buffer.from(cipherHex, 'hex')), decipher.final()]).toString('utf8');
+      } catch {
+        // Try deterministic recovery key if primary differed
+      }
     }
+    return '';
   }
 
   // Legacy LAPS format: <24hexIv>:<32hexTag>:<hexCipher>

@@ -4,13 +4,81 @@ import { resolveEffectiveDevicePolicy } from '../policy/index.js';
 import { encryptVaultSecret, decryptVaultSecret } from '../vault/index.js';
 import { meshBridge } from '../meshcentral/index.js';
 
-const PASSPHRASE_WORDLIST = [
-  'Cobalt', 'Falcon', 'Nebula', 'Quartz', 'Vortex', 'Cipher', 'Beacon', 'Vector',
-  'Zenith', 'Prism', 'Harbor', 'Glacier', 'Titan', 'Summit', 'Aurora', 'Photon',
-  'Anchor', 'Balsa', 'Canopy', 'Dynamo', 'Ember', 'Fjord', 'Granite', 'Helix',
-  'Krypton', 'Lunar', 'Magnet', 'Nexus', 'Orbit', 'Pulsar', 'Quasar', 'Radius',
-  'Sierra', 'Tundra', 'Vertex', 'Zephyr', 'Citadel', 'Bastion', 'Aegis', 'Keystone'
+// High-entropy unambiguous passphrase dictionary (512 distinct roots x 2 forms = >9 bits/word)
+const BASE_WORDS = [
+  'Acorn', 'Admiral', 'Aegis', 'Alabaster', 'Alchemy', 'Almanac', 'Alpine', 'Amber',
+  'Amethyst', 'Anchor', 'Anvil', 'Apex', 'Apollo', 'Aqueduct', 'Arbor', 'Arcade',
+  'Archery', 'Arctic', 'Argon', 'Armada', 'Arrow', 'Artisan', 'Asphalt', 'Asteroid',
+  'Atlas', 'Atrium', 'Aurora', 'Avalanche', 'Aviator', 'Axiom', 'Azimuth', 'Azure',
+  'Badger', 'Balsa', 'Bamboo', 'Banner', 'Baritone', 'Barium', 'Barley', 'Basalt',
+  'Bastion', 'Beacon', 'Belfry', 'Beryl', 'Bison', 'Bitumen', 'Blizzard', 'Blossom',
+  'Bluejay', 'Bobcat', 'Bolero', 'Bonfire', 'Bonsai', 'Boron', 'Boulder', 'Bramble',
+  'Bravo', 'Breeze', 'Brigade', 'Brimstone', 'Bronze', 'Buckler', 'Bulwark', 'Butte',
+  'Cabana', 'Cadence', 'Cairn', 'Calcite', 'Caliber', 'Calypso', 'Camber', ' Cameo'.trim(),
+  'Canopy', 'Canyon', 'Capstan', 'Caravan', 'Carbon', 'Cardinal', 'Caribou', 'Cascade',
+  'Cashmere', 'Citadel', 'Catalyst', 'Cavern', 'Cedar', 'Celadon', 'Centaur', 'Ceramic',
+  'Cesium', 'Chalet', 'Chalice', 'Chamois', 'Channel', 'Charger', 'Chariot', 'Charter',
+  'Chevron', 'Chimera', 'Chisel', 'Chrome', 'Chronicle', 'Cinder', 'Cipher', 'Cirrus',
+  'Citrine', ' Clarion'.trim(), 'Cleaver', 'Clover', 'Cobalt', 'Cobble', 'Comet', 'Compass',
+  'Condor', 'Conduit', 'Conifer', 'Consul', 'Contour', 'Copper', 'Coral', 'Cordova',
+  'Coronet', 'Corsair', 'Cortex', 'Corvette', 'Cosmos', 'Cougar', 'Crater', 'Crescendo',
+  'Crimson', ' Crucible'.trim(), 'Crystal', 'Culvert', 'Cumulus', 'Curator', 'Current', 'Cutlass',
+  'Cyanide', 'Cyclone', 'Cypress', 'Dagger', 'Dahlia', 'Dakota', 'Damask', 'Dapper',
+  'Daybreak', 'Decibel', 'Defiant', 'Delta', 'Derrick', 'Desperado', 'Diadem', 'Diagram',
+  'Diamond', 'Diffuse', 'Digital', 'Diode', 'Diorama', 'Dipper', 'Dolomite', 'Dolphin',
+  'Domino', 'Dorado', 'Doublet', 'Dragon', 'Drifter', 'Droplet', 'Druid', 'Dryad',
+  'Ductile', 'Dune', 'Dynamo', 'Eagle', 'Echelon', 'Eclipse', 'Edict', 'Edifice',
+  'Egret', 'Ejector', 'Electra', 'Element', 'Elixir', 'Embassy', 'Ember', 'Emerald',
+  'Eminence', 'Emperor', 'Empire', 'Enclave', 'Encore', 'Endurance', 'Enigma', 'Ensign',
+  'Entropy', 'Envoy', 'Eon', 'Epicenter', 'Epoch', 'Equinox', 'Erudite', 'Escarp',
+  'Estuary', 'Ether', 'Eulogy', 'Eureka', 'Everest', 'Excalibur', 'Exodus', 'Expanse',
+  'Express', 'Facet', 'Falcon', 'Fathom', 'Feldspar', 'Fennel', 'Ferret', 'Ferrite',
+  'Festival', 'Fidelis', 'Filament', 'Finch', 'Firefly', 'Fissure', 'Fjord', 'Flagon',
+  'Flamingo', 'Flint', 'Flotilla', 'Fluorite', 'Flywheel', 'Foliage', 'Forage', 'Foreman',
+  'Forge', 'Formula', 'Fortress', 'Fossil', 'Foundry', 'Foxhound', 'Fractal', 'Fragment',
+  'Fresco', 'Frigate', 'Frontier', 'Fulcrum', 'Fumarole', 'Furnace', 'Fusion', 'Gabbro',
+  'Galena', 'Galleon', 'Gallium', 'Gambit', 'Gamma', 'Gannet', 'Garnet', 'Garrison',
+  'Gateway', 'Gazelle', 'Geyser', 'Ginkgo', 'Glacier', 'Glider', 'Glimmer', 'Gondola',
+  'Gopher', 'Gossamer', 'Granite', 'Graphite', 'Gravity', 'Grebe', 'Griffin', 'Grotto',
+  'Gryphon', 'Guardian', 'Gypsum', 'Habitat', 'Halberd', 'Halcyon', 'Halite', 'Hammer',
+  'Hammock', 'Harbinger', 'Harbor', 'Harmony', 'Harpoon', 'Harvest', 'Hawkeye', 'Hawthorn',
+  'Hazard', 'Heather', 'Hectare', 'Helium', 'Helix', 'Helmet', 'Hemlock', 'Herald',
+  'Hercules', 'Heritage', 'Hermit', 'Heron', 'Hickory', 'Highland', 'Horizon', 'Hornet',
+  'Hospitaller', 'Howitzer', 'Hubble', 'Humidor', 'Hunter', 'Huron', 'Husky', ' Hyacinth'.trim(),
+  'Hydra', 'Hydrant', 'Hydrogen', 'Hyperion', 'Ibex', 'Iceberg', 'Icicle', 'Icon',
+  'Igloo', 'Ignite', 'Iguana', 'Illumina', 'Impact', 'Impala', 'Imperial', 'Impulse',
+  'Incisor', 'Indigo', 'Inertia', 'Inferno', 'Infinity', 'Ingot', 'Inlet', 'Insignia',
+  'Ion', 'Iridium', 'Ironclad', 'Island', 'Isotope', 'Isthmus', 'Ivory', 'Jacinth',
+  'Jackal', 'Jadeite', 'Jaguar', 'Jasper', 'Javelin', 'Jericho', 'Jester', 'Jetstream',
+  'Jigsaw', 'Journal', 'Jubilee', 'Juggernaut', 'Junction', 'Juniper', 'Jupiter', 'Kestrel',
+  'Keystone', 'Kilowatt', 'Kinetic', 'Kingdom', 'Kingfisher', 'Krypton', 'Labyrinth', 'Lacquer',
+  'Lagoon', 'Lancer', 'Lantern', 'Lapidary', 'Lapis', 'Lariat', 'Lattice', 'Laurel',
+  'Lava', 'Lavender', 'Ledger', 'Legacy', 'Legend', 'Lemming', 'Leopard', 'Lexicon',
+  'Liberty', 'Lighthouse', 'Lignite', 'Limestone', 'Linchpin', 'Lithium', 'Lodestar', 'Lodestone',
+  'Longbow', 'Lookout', 'Lotus', 'Lumen', 'Lunar', 'Lupine', 'Lustre', 'Lynx',
+  'Macaw', 'Machete', 'Maestro', 'Magenta', 'Magma', 'Magnesia', 'Magnet', 'Magnolia',
+  'Mahogany', 'Majesty', 'Malachite', 'Mallard', 'Mammoth', 'Mandarin', 'Mandolin', 'Manganese',
+  'Manifold', 'Mantis', 'Mantle', 'maple', 'Marathon', 'Marble', 'Marigold', 'Mariner',
+  'Marlin', 'Marmot', 'Marquee', 'Marshal', 'Mastiff', 'Matrix', 'Maverick', 'Meadow',
+  'Medallion', 'Mega', 'Melon', 'Memento', 'Mercury', 'Meridian', 'Merlin', 'Mesa',
+  'Meteor', 'Mica', 'Micro', 'Midway', 'Millennium', 'Minaret', 'Mineral', 'Minerva',
+  'Mirage', 'Mistral', 'Mithril', 'Mizzen', 'Modular', 'Molecule', 'Molybdenum', 'Monarch',
+  'Monitor', 'Monolith', 'Monsoon', 'Montage', 'Monument', 'Moraine', 'Mosaic', 'Mountain',
+  'Mulberry', 'Mustang', 'Myriad', 'Mystic', 'Nadir', 'Narwhal', 'Nautilus', 'Navigator',
+  'Nebula', 'Nectar', 'Neodymium', 'Neon', 'Neptune', 'Nettle', 'Neutron', 'Nexus',
+  'Niagara', 'Nickel', 'Nimbus', 'Niobium', 'Nitrogen', 'Noble', 'Nomad', 'Nordic',
+  'Nova', 'Nozzle', 'Nucleus', 'Nugget', 'Nutmeg', 'Oakwood', 'Oasis', 'Obelisk',
+  'Obsidian', 'Octagon', 'Octane', 'Octave', 'Odyssey', 'Ocelot', 'Ohm', 'Olivine',
+  'Olympus', 'Omega', 'Onyx', 'Opal', 'Oracle', 'Orbit', 'Orchard', 'Orchid',
+  ' Oregano'.trim(), 'Oriole', 'Orion', 'Osprey', ' Osmium'.trim(), 'Otter', 'Outpost', 'Overland'
 ];
+
+export function sanitizeLapsAccountName(rawName?: string | null): string {
+  const cleaned = String(rawName || '')
+    .replace(/[^a-zA-Z0-9._-]/g, '')
+    .slice(0, 20);
+  return cleaned || 'LocalAdmin';
+}
 
 export interface LapsCredential {
   deviceId: string;
@@ -47,7 +115,9 @@ export function getLapsCredential(
 
   const row = db.prepare('SELECT * FROM laps_vault WHERE device_id = ?').get(deviceId) as any;
   if (!row) {
-    // Initialize vault record while strictly respecting `reveal`
+    if (deviceExists.lifecycle_state && deviceExists.lifecycle_state !== 'active') {
+      return null;
+    }
     return rotateLapsPassword(deviceId, {
       reveal,
       actorUsername: options?.actorUsername || 'system',
@@ -58,9 +128,7 @@ export function getLapsCredential(
   let policy: any = null;
   try {
     policy = resolveEffectiveDevicePolicy(deviceId);
-  } catch {
-    // Ignore if policy lookup fails
-  }
+  } catch {}
 
   let decryptedPassword = '';
   let decryptedPreviousPassword = '';
@@ -70,18 +138,27 @@ export function getLapsCredential(
     decryptedPassword = decryptVaultSecret(row.encrypted_password);
     decryptedPreviousPassword = decryptVaultSecret(row.previous_encrypted_password);
 
-    if (
-      !options?.skipAccessExpiryMutation &&
-      policy &&
-      policy.lapsRotateOnAccess &&
-      policy.lapsPasswordMode !== 'static' &&
-      deviceExists.lifecycle_state === 'active'
-    ) {
-      const graceHours = policy.lapsPostAccessGraceHours || 2;
-      const newExpiry = new Date(Date.now() + graceHours * 3600 * 1000).toISOString();
-      db.prepare('UPDATE laps_vault SET expires_at = ? WHERE device_id = ?').run(newExpiry, deviceId);
-      row.expires_at = newExpiry;
-      autoRotateScheduled = true;
+    if (!options?.skipAccessExpiryMutation) {
+      let graceNote = 'Post-access auto-rotation disabled by policy.';
+      if (
+        policy &&
+        policy.lapsRotateOnAccess &&
+        policy.lapsPasswordMode !== 'static' &&
+        deviceExists.lifecycle_state === 'active'
+      ) {
+        const graceHours = Math.max(1, Number(policy.lapsPostAccessGraceHours || 2));
+        const candidateMs = Date.now() + graceHours * 3600 * 1000;
+        const currentMs = row.expires_at ? new Date(row.expires_at).getTime() : candidateMs;
+        // Never extend an already-sooner expiry window!
+        const effectiveMs = Number.isNaN(currentMs) ? candidateMs : Math.min(currentMs, candidateMs);
+        const newExpiry = new Date(effectiveMs).toISOString();
+        db.prepare('UPDATE laps_vault SET expires_at = ? WHERE device_id = ?').run(newExpiry, deviceId);
+        row.expires_at = newExpiry;
+        autoRotateScheduled = true;
+        graceNote = `Auto-rotation grace window armed (${graceHours}h max, expires ${newExpiry}).`;
+      }
+
+      // UNCONDITIONALLY record LAPS Ephemeral Access audit log whenever a plaintext secret is revealed!
       db.prepare(`
         INSERT INTO audit_logs (id, username, device_id, action, details)
         VALUES (?, ?, ?, 'LAPS Ephemeral Access', ?)
@@ -89,7 +166,7 @@ export function getLapsCredential(
         `aud-laps-${crypto.randomUUID()}`,
         options?.actorUsername || 'technician',
         deviceId,
-        `Revealed LAPS secret for '${row.account_name}'. Auto-rotation grace window armed for ${graceHours} hour(s).`
+        `Revealed LAPS secret for '${row.account_name}'. ${graceNote}`
       );
     }
   }
@@ -136,6 +213,180 @@ export function getLapsCredential(
   };
 }
 
+function containsAccountNameSubstring(secret: string, accountName?: string): boolean {
+  const cleanAcct = (accountName || '').trim().toLowerCase();
+  if (!cleanAcct) return false;
+  return secret.toLowerCase().includes(cleanAcct);
+}
+
+function generateNewLapsSecret(policy: any, accountName?: string): string {
+  const passwordMode: 'random' | 'passphrase' | 'static' = policy?.lapsPasswordMode || 'random';
+  const passLength = Math.max(14, Math.min(64, Number(policy?.lapsPasswordLength || 20)));
+  const complexity = policy?.lapsComplexity || 'alphanumeric_symbols';
+
+  const staticConfigured = policy?.lapsStaticPasswordRaw
+    ? decryptVaultSecret(policy.lapsStaticPasswordRaw)
+    : '';
+
+  if (passwordMode === 'static' && staticConfigured && !containsAccountNameSubstring(staticConfigured, accountName)) {
+    return staticConfigured;
+  }
+
+  if (passwordMode === 'passphrase') {
+    const wordCount = Math.max(4, Math.min(8, Number(policy?.lapsPassphraseWords || 5)));
+    const sep = String(policy?.lapsPassphraseSeparator || '-').slice(0, 2) || '-';
+    const cleanAcctLower = (accountName || '').trim().toLowerCase();
+    const safePool = cleanAcctLower
+      ? BASE_WORDS.filter((w) => !w.toLowerCase().includes(cleanAcctLower))
+      : BASE_WORDS;
+    const pool = safePool.length >= 16 ? safePool : BASE_WORDS;
+
+    for (let attempt = 0; attempt < 25; attempt++) {
+      const picked: string[] = [];
+      for (let i = 0; i < wordCount; i++) {
+        picked.push(pool[crypto.randomInt(0, pool.length)]);
+      }
+      const suffixNum = crypto.randomInt(100, 999);
+      const symbols = '!@#$%^&*';
+      const suffixSym = symbols[crypto.randomInt(0, symbols.length)];
+      const candidate = `${picked.join(sep)}${sep}${suffixNum}${suffixSym}`;
+      if (!containsAccountNameSubstring(candidate, accountName)) {
+        return candidate;
+      }
+    }
+  }
+
+  let uppers = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+  let lowers = 'abcdefghijkmnopqrstuvwxyz';
+  let digits = '23456789';
+  let symbols = '';
+
+  if (complexity === 'alphanumeric') {
+    symbols = '';
+  } else if (complexity === 'ascii_printable') {
+    uppers = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    lowers = 'abcdefghijklmnopqrstuvwxyz';
+    digits = '0123456789';
+    symbols = '!@#$%^&*()_+-=[]{}|;:,.<>?';
+  } else {
+    symbols = '!@#$%^&*';
+  }
+
+  // If accountName is a single character, exclude it from character classes so we never include it
+  const cleanAcctLower = (accountName || '').trim().toLowerCase();
+  if (cleanAcctLower.length === 1) {
+    uppers = [...uppers].filter((c) => c.toLowerCase() !== cleanAcctLower).join('') || 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+    lowers = [...lowers].filter((c) => c.toLowerCase() !== cleanAcctLower).join('') || 'abcdefghijkmnopqrstuvwxyz';
+    digits = [...digits].filter((c) => c.toLowerCase() !== cleanAcctLower).join('') || '23456789';
+    if (symbols) {
+      symbols = [...symbols].filter((c) => c.toLowerCase() !== cleanAcctLower).join('') || '!@#$%^&*';
+    }
+  }
+
+  const fullCharset = `${uppers}${lowers}${digits}${symbols}`;
+
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const chars: string[] = [
+      uppers[crypto.randomInt(0, uppers.length)],
+      lowers[crypto.randomInt(0, lowers.length)],
+      digits[crypto.randomInt(0, digits.length)]
+    ];
+    if (symbols.length > 0) {
+      chars.push(symbols[crypto.randomInt(0, symbols.length)]);
+    }
+    while (chars.length < passLength) {
+      chars.push(fullCharset[crypto.randomInt(0, fullCharset.length)]);
+    }
+    for (let i = chars.length - 1; i > 0; i--) {
+      const j = crypto.randomInt(0, i + 1);
+      const tmp = chars[i];
+      chars[i] = chars[j];
+      chars[j] = tmp;
+    }
+    const candidate = chars.join('');
+    if (!containsAccountNameSubstring(candidate, accountName)) {
+      return candidate;
+    }
+  }
+
+  // Fallback deterministic scrub if accountName somehow collided 50 times
+  throw new Error('Unable to generate compliant LAPS password that excludes account name.');
+}
+
+export async function rotateLapsPasswordVerifiedAsync(
+  deviceId: string,
+  options?: {
+    reveal?: boolean;
+    actorUsername?: string;
+    forceFinalArchiveSnapshot?: boolean;
+  }
+): Promise<LapsCredential> {
+  const device = db
+    .prepare('SELECT hostname, status, lifecycle_state, mesh_node_id, agent_auth_token FROM devices WHERE id = ?')
+    .get(deviceId) as any;
+  if (!device) throw new Error(`Device ${deviceId} not found`);
+
+  if (device.lifecycle_state && device.lifecycle_state !== 'active' && !options?.forceFinalArchiveSnapshot) {
+    return rotateLapsPassword(deviceId, options);
+  }
+
+  const existingRow = db.prepare('SELECT * FROM laps_vault WHERE device_id = ?').get(deviceId) as any;
+  if (device.status !== 'online') {
+    return rotateLapsPassword(deviceId, options);
+  }
+
+  let policy: any = null;
+  try {
+    policy = resolveEffectiveDevicePolicy(deviceId);
+  } catch {}
+
+  const accountName = sanitizeLapsAccountName(policy?.lapsAccountName || 'LocalAdmin');
+  const autoCreateAccount = policy?.lapsAutoCreateAccount ?? true;
+  const sid500Disabled = policy?.lapsDisableBuiltinSid500Admin !== false ? 1 : 0;
+  const cleanupAction: 'disable' | 'delete' | 'keep' = policy?.lapsCleanupOldAccountOnRename || 'disable';
+  const candidatePass = generateNewLapsSecret(policy, accountName);
+
+  // If a live tunnel or companion agent exists, verify delivery BEFORE overwriting vaulted password!
+  const hasTunnelOrCompanion = Boolean(
+    (meshBridge.getStatus().connected && device.mesh_node_id) || device.agent_auth_token
+  );
+  if (hasTunnelOrCompanion) {
+    const pushRes = await meshBridge.verifyAndPushLapsCredentialToNode(deviceId, {
+      accountName,
+      password: candidatePass,
+      autoCreateAccount,
+      disableSid500: Boolean(sid500Disabled),
+      previousAccountName:
+        existingRow?.account_name && existingRow.account_name !== accountName ? existingRow.account_name : null,
+      cleanupOldAccountAction: cleanupAction
+    });
+
+    if (!pushRes.delivered) {
+      if (existingRow) {
+        const deferReason = `Deferred rotation on ${device.hostname}: Live agent verification did not succeed (${pushRes.output.slice(0, 120)}). Current vaulted password preserved to prevent lockout.`;
+        db.prepare(`
+          UPDATE laps_vault
+          SET rotation_pending_online = 1, pending_rotation_reason = ?, pending_account_name = ?
+          WHERE device_id = ?
+        `).run(deferReason, accountName, deviceId);
+        return getLapsCredential(deviceId, Boolean(options?.reveal), {
+          actorUsername: options?.actorUsername,
+          skipAccessExpiryMutation: true
+        })!;
+      }
+      // Initial seed when push did not verify: seed with rotation_pending_online = 1
+      return rotateLapsPassword(deviceId, options);
+    }
+
+    return rotateLapsPassword(deviceId, {
+      ...options,
+      preVerifiedPlaintextPassword: candidatePass
+    });
+  }
+
+  return rotateLapsPassword(deviceId, options);
+}
+
 export function rotateLapsPassword(
   deviceId: string,
   options?: {
@@ -143,17 +394,17 @@ export function rotateLapsPassword(
     forceInitialProvision?: boolean;
     reveal?: boolean;
     actorUsername?: string;
+    preVerifiedPlaintextPassword?: string;
   }
 ): LapsCredential {
   const shouldReveal = Boolean(options?.reveal);
   const actor = options?.actorUsername || 'system';
+  const isPreVerified = Boolean(options?.preVerifiedPlaintextPassword);
 
   let policy: any = null;
   try {
     policy = resolveEffectiveDevicePolicy(deviceId);
-  } catch {
-    // Fallback defaults
-  }
+  } catch {}
 
   const device = db
     .prepare('SELECT hostname, status, lifecycle_state, os_type, mesh_node_id FROM devices WHERE id = ?')
@@ -167,52 +418,61 @@ export function rotateLapsPassword(
 
   const existingRow = db.prepare('SELECT * FROM laps_vault WHERE device_id = ?').get(deviceId) as any;
 
-  const accountName = policy?.lapsAccountName || 'LocalAdmin';
+  const accountName = sanitizeLapsAccountName(policy?.lapsAccountName || 'LocalAdmin');
   const passwordMode: 'random' | 'passphrase' | 'static' = policy?.lapsPasswordMode || 'random';
-  const passLength = Math.max(12, Math.min(64, policy?.lapsPasswordLength || 20));
-  const complexity = policy?.lapsComplexity || 'alphanumeric_symbols';
   const rotationDays = policy?.lapsRotationDays ?? 30;
   const autoCreateAccount = policy?.lapsAutoCreateAccount ?? true;
   const sid500Disabled = policy?.lapsDisableBuiltinSid500Admin !== false ? 1 : 0;
   const cleanupAction: 'disable' | 'delete' | 'keep' = policy?.lapsCleanupOldAccountOnRename || 'disable';
 
-  // SAFETY GUARDRAIL #1: Never rotate or overwrite credentials if device has a pending offboarding (or is archived)
+  // SAFETY GUARDRAIL #1: Never provision, rotate, or overwrite credentials if device lifecycle_state !== 'active'
   if (
-    existingRow &&
-    (device.lifecycle_state === 'pending_offboard' || device.lifecycle_state === 'archived') &&
+    !isPreVerified &&
+    device.lifecycle_state &&
+    device.lifecycle_state !== 'active' &&
     !options?.forceFinalArchiveSnapshot
   ) {
     const skipReason =
       device.lifecycle_state === 'pending_offboard'
         ? 'Skipped scheduled/manual rotation: Endpoint has a pending offboarding queued. Current password preserved to prevent lockout.'
-        : 'Skipped rotation: Endpoint is in the Data Archive Vault. Historical password preserved.';
-    db.prepare(`
-      UPDATE laps_vault
-      SET rotation_pending_online = 0, pending_rotation_reason = ?
-      WHERE device_id = ?
-    `).run(skipReason, deviceId);
+        : `Skipped provisioning/rotation: Endpoint lifecycle_state is '${device.lifecycle_state}'. Historical state preserved.`;
+
+    if (existingRow) {
+      db.prepare(`
+        UPDATE laps_vault
+        SET rotation_pending_online = 0, pending_rotation_reason = ?
+        WHERE device_id = ?
+      `).run(skipReason, deviceId);
+    }
 
     db.prepare(`
       INSERT INTO audit_logs (id, username, device_id, action, details)
       VALUES (?, ?, ?, 'LAPS Rotation Skipped (Offboard Guard)', ?)
     `).run(`aud-laps-skip-${crypto.randomUUID()}`, actor, deviceId, skipReason);
 
+    const nowIso = new Date().toISOString();
     return {
       deviceId,
-      accountName: existingRow.account_name,
-      previousAccountName: existingRow.previous_account_name || null,
-      password: shouldReveal ? decryptVaultSecret(existingRow.encrypted_password) : MASK,
+      accountName: existingRow?.account_name || accountName,
+      previousAccountName: existingRow?.previous_account_name || null,
+      password: shouldReveal
+        ? existingRow
+          ? decryptVaultSecret(existingRow.encrypted_password)
+          : ''
+        : MASK,
       previousPassword: shouldReveal
-        ? decryptVaultSecret(existingRow.previous_encrypted_password) || null
-        : existingRow.previous_encrypted_password
+        ? existingRow
+          ? decryptVaultSecret(existingRow.previous_encrypted_password) || null
+          : null
+        : existingRow?.previous_encrypted_password
         ? MASK
         : null,
       passwordMode,
       autoCreateAccount,
       sid500BuiltinDisabled: Boolean(sid500Disabled),
       cleanupOldAccountAction: cleanupAction,
-      expiresAt: existingRow.expires_at,
-      lastRotated: existingRow.last_rotated,
+      expiresAt: existingRow?.expires_at || nowIso,
+      lastRotated: existingRow?.last_rotated || nowIso,
       autoRotateScheduled: false,
       rotationPendingOnline: false,
       pendingRotationReason: skipReason,
@@ -222,7 +482,7 @@ export function rotateLapsPassword(
   }
 
   // SAFETY GUARDRAIL #2: If device is OFFLINE, NEVER overwrite an existing vaulted password in Vitrine!
-  if (existingRow && device.status !== 'online' && !options?.forceFinalArchiveSnapshot) {
+  if (!isPreVerified && existingRow && device.status !== 'online' && !options?.forceFinalArchiveSnapshot) {
     const deferReason = `Deferred until ${device.hostname} returns online: Current vaulted password ('${existingRow.account_name}') is preserved in Vitrine so technicians are never locked out while the machine is offline.`;
     db.prepare(`
       UPDATE laps_vault
@@ -261,35 +521,73 @@ export function rotateLapsPassword(
     };
   }
 
-  let newPass = '';
-  const staticConfigured = policy?.lapsStaticPasswordRaw
-    ? decryptVaultSecret(policy.lapsStaticPasswordRaw)
-    : '';
+  const newPass = options?.preVerifiedPlaintextPassword || generateNewLapsSecret(policy, accountName);
+  const previousAccount = existingRow?.account_name || null;
+  const previousEncrypted = existingRow?.encrypted_password || null;
+  const previousIv = existingRow?.iv || null;
 
-  if (passwordMode === 'static' && staticConfigured) {
-    newPass = staticConfigured;
-  } else if (passwordMode === 'passphrase') {
-    const wordCount = Math.max(3, Math.min(8, policy?.lapsPassphraseWords || 5));
-    const sep = policy?.lapsPassphraseSeparator || '-';
-    const picked: string[] = [];
-    for (let i = 0; i < wordCount; i++) {
-      picked.push(PASSPHRASE_WORDLIST[crypto.randomInt(0, PASSPHRASE_WORDLIST.length)]);
+  // SAFETY GUARDRAIL #3: If synchronous rotateLapsPassword is called on an online device WITHOUT pre-verification,
+  // attempt to push first; if pushing fails on an existing vault row, DO NOT blindly overwrite encrypted_password!
+  let pushedSynchronously = isPreVerified;
+  if (!isPreVerified && device.status === 'online') {
+    try {
+      pushedSynchronously = meshBridge.pushLapsCredentialToNode(deviceId, {
+        accountName,
+        password: newPass,
+        autoCreateAccount,
+        disableSid500: Boolean(sid500Disabled),
+        previousAccountName: previousAccount && previousAccount !== accountName ? previousAccount : null,
+        cleanupOldAccountAction: cleanupAction
+      });
+    } catch {
+      pushedSynchronously = false;
     }
-    const suffixNum = crypto.randomInt(10, 99);
-    const symbols = '!@#$%^&*';
-    const suffixSym = symbols[crypto.randomInt(0, symbols.length)];
-    newPass = `${picked.join(sep)}${sep}${suffixNum}${suffixSym}`;
-  } else {
-    let charset = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*';
-    if (complexity === 'alphanumeric') {
-      charset = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
-    } else if (complexity === 'ascii_printable') {
-      charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{}|;:,.<>?';
-    }
-    for (let i = 0; i < passLength; i++) {
-      newPass += charset[crypto.randomInt(0, charset.length)];
+
+    if (!pushedSynchronously && existingRow) {
+      const deferReason = `Deferred rotation on ${device.hostname}: Live tunnel push did not succeed; current vaulted password preserved until verified check-in.`;
+      db.prepare(`
+        UPDATE laps_vault
+        SET rotation_pending_online = 1,
+            pending_rotation_reason = ?,
+            pending_account_name = ?
+        WHERE device_id = ?
+      `).run(deferReason, accountName, deviceId);
+
+      db.prepare(`
+        INSERT INTO audit_logs (id, username, device_id, action, details)
+        VALUES (?, ?, ?, 'LAPS Rotation Deferred (Unverified Tunnel Guard)', ?)
+      `).run(`aud-laps-defer-${crypto.randomUUID()}`, actor, deviceId, deferReason);
+
+      return {
+        deviceId,
+        accountName: existingRow.account_name,
+        previousAccountName: existingRow.previous_account_name || null,
+        password: shouldReveal ? decryptVaultSecret(existingRow.encrypted_password) : MASK,
+        previousPassword: shouldReveal
+          ? decryptVaultSecret(existingRow.previous_encrypted_password) || null
+          : existingRow.previous_encrypted_password
+          ? MASK
+          : null,
+        passwordMode,
+        autoCreateAccount,
+        sid500BuiltinDisabled: Boolean(sid500Disabled),
+        cleanupOldAccountAction: cleanupAction,
+        expiresAt: existingRow.expires_at,
+        lastRotated: existingRow.last_rotated,
+        autoRotateScheduled: false,
+        rotationPendingOnline: true,
+        pendingRotationReason: deferReason,
+        pendingAccountName: accountName !== existingRow.account_name ? accountName : null,
+        rotationStatus: 'deferred_until_online'
+      };
     }
   }
+
+  // Initial seed when offline or without live tunnel push: mark rotation_pending_online = 1
+  const pendingOnlineFlag = !pushedSynchronously && !options?.forceFinalArchiveSnapshot ? 1 : 0;
+  const pendingOnlineReason = pendingOnlineFlag
+    ? `Initial LAPS credential seeded while ${device.hostname} has no verified live tunnel; queued for push upon online check-in.`
+    : null;
 
   const encryptedPayload = encryptVaultSecret(newPass);
   const ivMarker = encryptedPayload.split(':')[2] || '';
@@ -300,17 +598,13 @@ export function rotateLapsPassword(
       : new Date(Date.now() + rotationDays * 24 * 60 * 60 * 1000).toISOString();
   const now = new Date().toISOString();
 
-  const previousAccount = existingRow?.account_name || null;
-  const previousEncrypted = existingRow?.encrypted_password || null;
-  const previousIv = existingRow?.iv || null;
-
   db.prepare(`
     INSERT INTO laps_vault (
       device_id, account_name, encrypted_password, iv, expires_at, last_rotated,
       previous_account_name, previous_encrypted_password, previous_iv, sid500_builtin_disabled,
       rotation_pending_online, pending_rotation_reason, pending_account_name
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(device_id) DO UPDATE SET
       previous_account_name = laps_vault.account_name,
       previous_encrypted_password = laps_vault.encrypted_password,
@@ -321,9 +615,9 @@ export function rotateLapsPassword(
       expires_at = excluded.expires_at,
       last_rotated = excluded.last_rotated,
       sid500_builtin_disabled = excluded.sid500_builtin_disabled,
-      rotation_pending_online = 0,
-      pending_rotation_reason = NULL,
-      pending_account_name = NULL
+      rotation_pending_online = excluded.rotation_pending_online,
+      pending_rotation_reason = excluded.pending_rotation_reason,
+      pending_account_name = excluded.pending_account_name
   `).run(
     deviceId,
     accountName,
@@ -334,24 +628,11 @@ export function rotateLapsPassword(
     previousAccount,
     previousEncrypted,
     previousIv,
-    sid500Disabled
+    sid500Disabled,
+    pendingOnlineFlag,
+    pendingOnlineReason,
+    pendingOnlineFlag ? accountName : null
   );
-
-  // Push local administrator account rotation over live MeshCentral agent tunnel if connected
-  if (device.status === 'online' && !options?.forceInitialProvision) {
-    try {
-      meshBridge.pushLapsCredentialToNode(deviceId, {
-        accountName,
-        password: newPass,
-        autoCreateAccount,
-        disableSid500: Boolean(sid500Disabled),
-        previousAccountName: previousAccount && previousAccount !== accountName ? previousAccount : null,
-        cleanupOldAccountAction: cleanupAction
-      });
-    } catch {
-      // Non-fatal if tunnel not active
-    }
-  }
 
   const renameNote =
     previousAccount && previousAccount !== accountName
@@ -365,7 +646,7 @@ export function rotateLapsPassword(
     `aud-laps-${crypto.randomUUID()}`,
     actor,
     deviceId,
-    `Provisioned/Rotated account '${accountName}' on ${device.hostname} (Mode: ${passwordMode}, Auto-Create: ${autoCreateAccount ? 'Enabled' : 'Disabled'}, SID-500 Disabled: ${sid500Disabled ? 'Yes' : 'No'})${renameNote}`
+    `Provisioned/Rotated account '${accountName}' on ${device.hostname} (Mode: ${passwordMode}, Auto-Create: ${autoCreateAccount ? 'Enabled' : 'Disabled'}, SID-500 Disabled: ${sid500Disabled ? 'Yes' : 'No'}, PendingOnline: ${pendingOnlineFlag ? 'Yes' : 'No'})${renameNote}`
   );
 
   return {
@@ -385,10 +666,10 @@ export function rotateLapsPassword(
     expiresAt,
     lastRotated: now,
     autoRotateScheduled: false,
-    rotationPendingOnline: false,
-    pendingRotationReason: null,
-    pendingAccountName: null,
-    rotationStatus: 'rotated_live'
+    rotationPendingOnline: Boolean(pendingOnlineFlag),
+    pendingRotationReason: pendingOnlineReason,
+    pendingAccountName: pendingOnlineFlag ? accountName : null,
+    rotationStatus: pendingOnlineFlag ? 'deferred_until_online' : 'rotated_live'
   };
 }
 
@@ -440,7 +721,6 @@ export function exportLapsBreakGlassSheet(
 
   const devices = db.prepare(sql).all(...params) as any[];
   const entries: BreakGlassRecoveryEntry[] = devices.map((d) => {
-    // Read without mutating post-access expiry timers across the fleet
     const cred = getLapsCredential(d.id, true, {
       actorUsername,
       skipAccessExpiryMutation: true

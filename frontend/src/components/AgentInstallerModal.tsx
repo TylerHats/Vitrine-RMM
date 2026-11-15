@@ -1,7 +1,8 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { Download, X, Shield, Copy, Check, Ticket, ExternalLink, Sparkles } from 'lucide-react';
 import { Tenant, Settings, SigningStageReport, AuthUser } from '../types/index.js';
 import { generateInstaller } from '../services/api.js';
+import { copyToClipboard } from '../utils/clipboard.js';
 
 interface AgentInstallerModalProps {
   isOpen?: boolean;
@@ -50,6 +51,16 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const timersRef = useRef<Array<ReturnType<typeof setTimeout>>>([]);
+
+  const clearTimers = () => {
+    timersRef.current.forEach(clearTimeout);
+    timersRef.current = [];
+  };
+
+  useEffect(() => {
+    return () => clearTimers();
+  }, []);
 
   if (!isOpen) return null;
 
@@ -66,13 +77,14 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
       return;
     }
 
+    clearTimers();
     setGenerating(true);
     setError(null);
     setResult(null);
     setSigningStepProgress(1);
 
-    setTimeout(() => setSigningStepProgress(2), 250);
-    setTimeout(() => setSigningStepProgress(3), 500);
+    timersRef.current.push(setTimeout(() => setSigningStepProgress(2), 250));
+    timersRef.current.push(setTimeout(() => setSigningStepProgress(3), 500));
 
     try {
       const res = await generateInstaller({
@@ -84,26 +96,34 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
         technician: currentUser?.username || undefined
       });
 
-      setTimeout(() => {
+      if (!res.success) {
+        clearTimers();
         setGenerating(false);
-        setSigningStepProgress(4);
-        if (res.success) {
+        setSigningStepProgress(0);
+        setError(res.error || 'Failed to generate installer.');
+        return;
+      }
+
+      timersRef.current.push(
+        setTimeout(() => {
+          setGenerating(false);
+          setSigningStepProgress(4);
           setResult(res);
-        } else {
-          setError(res.error || 'Failed to generate installer.');
-        }
-      }, 700);
+        }, 400)
+      );
     } catch (err: any) {
+      clearTimers();
       setGenerating(false);
+      setSigningStepProgress(0);
       setError(err?.message || 'Communication error with installer provisioning & signing engine.');
     }
   };
 
-  const handleCopy = () => {
+  const handleCopy = async () => {
     if (result?.downloadCommand) {
-      navigator.clipboard.writeText(result.downloadCommand);
+      await copyToClipboard(result.downloadCommand);
       setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+      timersRef.current.push(setTimeout(() => setCopied(false), 2000));
     }
   };
 

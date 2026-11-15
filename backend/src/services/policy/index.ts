@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import { db } from '../../db/index.js';
-import { maskSecretValue, decryptVaultSecret, validateOutboundHostSafety } from '../vault/index.js';
+import { maskSecretValue, decryptVaultSecret, safeOutboundFetch } from '../vault/index.js';
 import { sendAlertEmailUsingStoredSettings } from '../smtp/index.js';
 
 export interface ConditionAlertRule {
@@ -286,6 +286,12 @@ export interface PolicyRule {
   selfHealingAlertPsa: boolean;
   psaFlapGraceMinutes: number;
   autoPatchCveMinCvss: number;
+  osPatchApprovalJson?: string;
+  thirdPartyPatchApprovalJson?: string;
+  requiredSoftwareJson?: string;
+  defenderPolicyJson?: string;
+  backupPolicyId?: string | null;
+  mdmProfileId?: string | null;
   alertRules: ConditionAlertRule[];
 }
 
@@ -353,6 +359,12 @@ export function resolveEffectiveDevicePolicy(deviceId: string): EffectiveDeviceP
     selfHealingAlertPsa: Boolean(globalRow?.self_healing_alert_psa ?? 1),
     psaFlapGraceMinutes: globalRow?.psa_flap_grace_minutes ?? 15,
     autoPatchCveMinCvss: Number(globalRow?.auto_patch_cve_min_cvss ?? 8.0),
+    osPatchApprovalJson: globalRow?.os_patch_approval_json || '{}',
+    thirdPartyPatchApprovalJson: globalRow?.third_party_patch_approval_json || '{}',
+    requiredSoftwareJson: globalRow?.required_software_json || '[]',
+    defenderPolicyJson: globalRow?.defender_policy_json || '{}',
+    backupPolicyId: globalRow?.backup_policy_id || null,
+    mdmProfileId: globalRow?.mdm_profile_id || null,
     alertRules: parsePolicyAlertRules(globalRow?.alert_rules_json, 'global', null),
     inheritanceChain: [{ tier: 'global', name: globalRow?.name || 'Global MSP Baseline' }]
   };
@@ -392,7 +404,7 @@ export function resolveEffectiveDevicePolicy(deviceId: string): EffectiveDeviceP
     }
   }
 
-  // 5. Resolve dynamic template tokens in lapsAccountName ({ClientSlug}, {SiteSlug}, {Role})
+  // 5. Resolve dynamic template tokens in lapsAccountName and enforce SAM <= 20-char cap!
   const tenantRow = device.tenant_id
     ? (db.prepare('SELECT name, slug FROM tenants WHERE id = ?').get(device.tenant_id) as
         | { name?: string; slug?: string }
@@ -401,15 +413,18 @@ export function resolveEffectiveDevicePolicy(deviceId: string): EffectiveDeviceP
   const siteRow = device.site_id
     ? (db.prepare('SELECT name FROM sites WHERE id = ?').get(device.site_id) as { name?: string } | undefined)
     : undefined;
-  const clientSlugClean = (tenantRow?.slug || tenantRow?.name || 'Client').replace(/[^a-zA-Z0-9]/g, '');
-  const siteSlugClean = (siteRow?.name || 'Site').replace(/[^a-zA-Z0-9]/g, '').slice(0, 12);
-  const roleClean = (device.device_role || 'Endpoint').replace(/[^a-zA-Z0-9]/g, '').slice(0, 10);
+  const clientSlugClean = (tenantRow?.slug || tenantRow?.name || 'Client').replace(/[^a-zA-Z0-9]/g, '').slice(0, 10);
+  const siteSlugClean = (siteRow?.name || 'Site').replace(/[^a-zA-Z0-9]/g, '').slice(0, 8);
+  const roleClean = (device.device_role || 'Endpoint').replace(/[^a-zA-Z0-9]/g, '').slice(0, 8);
 
-  effective.lapsAccountName = (effective.lapsAccountName || 'LocalAdmin')
-    .replace(/\{ClientSlug\}/gi, clientSlugClean)
-    .replace(/\{ClientName\}/gi, clientSlugClean)
-    .replace(/\{SiteSlug\}/gi, siteSlugClean)
-    .replace(/\{Role\}/gi, roleClean);
+  effective.lapsAccountName =
+    (effective.lapsAccountName || 'LocalAdmin')
+      .replace(/\{ClientSlug\}/gi, clientSlugClean)
+      .replace(/\{ClientName\}/gi, clientSlugClean)
+      .replace(/\{SiteSlug\}/gi, siteSlugClean)
+      .replace(/\{Role\}/gi, roleClean)
+      .replace(/[^a-zA-Z0-9._-]/g, '')
+      .slice(0, 20) || 'LocalAdmin';
 
   return effective;
 }
@@ -451,7 +466,13 @@ const SQLITE_POLICY_DEFAULTS: Record<string, unknown> = {
   self_healing_max_hourly_runs: 3,
   self_healing_alert_psa: 1,
   psa_flap_grace_minutes: 15,
-  auto_patch_cve_min_cvss: 8.0
+  auto_patch_cve_min_cvss: 8.0,
+  os_patch_approval_json: '{}',
+  third_party_patch_approval_json: '{}',
+  required_software_json: '[]',
+  defender_policy_json: '{}',
+  backup_policy_id: null,
+  mdm_profile_id: null
 };
 
 function applyOverrides(target: EffectiveDevicePolicy, source: any, _globalRow?: any) {
@@ -469,8 +490,6 @@ function applyOverrides(target: EffectiveDevicePolicy, source: any, _globalRow?:
     }
   }
 
-  // Only override a column if explicitly marked in overrides_json, OR (for legacy rows without overrides_json)
-  // if the child column differs from the SQLite schema default!
   const shouldApply = (col: string): boolean => {
     if (source[col] == null) return false;
     if (explicitKeys) return explicitKeys.has(col);
@@ -497,7 +516,7 @@ function applyOverrides(target: EffectiveDevicePolicy, source: any, _globalRow?:
   if (shouldApply('laps_complexity')) target.lapsComplexity = source.laps_complexity;
   if (shouldApply('laps_passphrase_words')) target.lapsPassphraseWords = Number(source.laps_passphrase_words);
   if (shouldApply('laps_passphrase_separator')) target.lapsPassphraseSeparator = source.laps_passphrase_separator;
-  if (source.laps_static_password != null && source.laps_static_password !== '') {
+  if (shouldApply('laps_static_password') && source.laps_static_password !== '') {
     target.lapsStaticPasswordRaw = source.laps_static_password;
     target.lapsStaticPassword = maskSecretValue(source.laps_static_password);
   }
@@ -531,14 +550,36 @@ function applyOverrides(target: EffectiveDevicePolicy, source: any, _globalRow?:
   if (shouldApply('self_healing_alert_psa')) target.selfHealingAlertPsa = Boolean(source.self_healing_alert_psa);
   if (shouldApply('psa_flap_grace_minutes')) target.psaFlapGraceMinutes = Number(source.psa_flap_grace_minutes);
   if (shouldApply('auto_patch_cve_min_cvss')) target.autoPatchCveMinCvss = Number(source.auto_patch_cve_min_cvss);
+  if (shouldApply('os_patch_approval_json')) target.osPatchApprovalJson = source.os_patch_approval_json;
+  if (shouldApply('third_party_patch_approval_json'))
+    target.thirdPartyPatchApprovalJson = source.third_party_patch_approval_json;
+  if (shouldApply('required_software_json')) target.requiredSoftwareJson = source.required_software_json;
+  if (shouldApply('defender_policy_json')) target.defenderPolicyJson = source.defender_policy_json;
+  if (shouldApply('backup_policy_id')) target.backupPolicyId = source.backup_policy_id;
+  if (shouldApply('mdm_profile_id')) target.mdmProfileId = source.mdm_profile_id;
   if (source.alert_rules_json) {
     target.alertRules = mergeAlertRules(target.alertRules, source.alert_rules_json);
   }
 }
 
-function isEntityInMaintenanceSuppression(deviceId?: string | null, tenantId?: string | null, maintenanceUntil?: string | null): boolean {
+function parseSqlTimestampMs(raw?: string | null): number {
+  if (!raw) return NaN;
+  const str = String(raw).trim();
+  const normalized = str.includes('T') ? str : str.replace(' ', 'T') + (str.endsWith('Z') ? '' : 'Z');
+  return new Date(normalized).getTime();
+}
+
+function escapeSqlLikePrefix(input: string): string {
+  return input.replace(/[\\%_]/g, (m) => `\\${m}`);
+}
+
+export function isEntityInMaintenanceSuppression(
+  deviceId?: string | null,
+  tenantId?: string | null,
+  maintenanceUntil?: string | null
+): boolean {
   const nowIso = new Date().toISOString();
-  if (maintenanceUntil && new Date(maintenanceUntil).getTime() > Date.now()) {
+  if (maintenanceUntil && parseSqlTimestampMs(maintenanceUntil) > Date.now()) {
     return true;
   }
   const activeWin = db
@@ -546,8 +587,8 @@ function isEntityInMaintenanceSuppression(deviceId?: string | null, tenantId?: s
       SELECT id FROM maintenance_windows
       WHERE is_active = 1
         AND suppress_alerts = 1
-        AND start_time <= ?
-        AND end_time >= ?
+        AND datetime(start_time) <= datetime(?)
+        AND datetime(end_time) >= datetime(?)
         AND (
           (device_id IS NOT NULL AND device_id = ?)
           OR (device_id IS NULL AND tenant_id IS NOT NULL AND tenant_id = ?)
@@ -560,31 +601,331 @@ function isEntityInMaintenanceSuppression(deviceId?: string | null, tenantId?: s
   return Boolean(activeWin);
 }
 
-async function syncTicketWithItflowIfConfigured(ticket: {
+// ============================================================================
+// Multi-Channel Webhook Dispatcher (Slack / MS Teams / Discord / PagerDuty / Generic HMAC)
+// ============================================================================
+export async function dispatchAlertToNotificationChannels(alert: {
+  incidentId?: string;
+  tenantId?: string | null;
+  entityName: string;
+  clientName: string;
+  conditionId: string;
+  label: string;
+  detail: string;
+  severity: 'info' | 'warning' | 'critical';
+  eventAction?: 'trigger' | 'resolve';
+}): Promise<string[]> {
+  const rows = db
+    .prepare(
+      'SELECT * FROM notification_channels WHERE enabled = 1 AND (tenant_id IS NULL OR tenant_id = ?)'
+    )
+    .all(alert.tenantId || '') as any[];
+
+  const dispatchedNames: string[] = [];
+  const sevRank = { info: 1, warning: 2, critical: 3 };
+
+  for (const ch of rows) {
+    const minRank = sevRank[(ch.min_severity as 'info' | 'warning' | 'critical') || 'warning'] || 2;
+    if (alert.eventAction !== 'resolve' && sevRank[alert.severity] < minRank) continue;
+
+    const type = String(ch.channel_type || 'webhook').toLowerCase();
+    const targetUrl = decryptVaultSecret(ch.webhook_url_encrypted) || '';
+    const secret =
+      decryptVaultSecret(ch.secret_encrypted) || decryptVaultSecret(ch.signing_secret_encrypted) || '';
+    const routingKey = decryptVaultSecret(ch.routing_key_encrypted) || '';
+    if (!targetUrl && !(type === 'pagerduty' && (routingKey || secret))) continue;
+
+    const colorHex = alert.severity === 'critical' ? '#ef4444' : alert.severity === 'warning' ? '#f59e0b' : '#06b6d4';
+    const colorInt = alert.severity === 'critical' ? 0xef4444 : alert.severity === 'warning' ? 0xf59e0b : 0x06b6d4;
+    const titleText =
+      alert.eventAction === 'resolve'
+        ? `[RESOLVED] ${alert.label}: ${alert.entityName}`
+        : `[${alert.severity.toUpperCase()}] ${alert.label}: ${alert.entityName}`;
+
+    let bodyObj: any;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+
+    if (type === 'slack') {
+      bodyObj = {
+        text: `${titleText} — ${alert.detail}`,
+        blocks: [
+          {
+            type: 'header',
+            text: { type: 'plain_text', text: titleText.slice(0, 140) }
+          },
+          {
+            type: 'section',
+            fields: [
+              { type: 'mrkdwn', text: `*Endpoint:*\n${alert.entityName}` },
+              { type: 'mrkdwn', text: `*Client:*\n${alert.clientName}` },
+              { type: 'mrkdwn', text: `*Condition:*\n${alert.label}` },
+              { type: 'mrkdwn', text: `*Severity:*\n${alert.severity.toUpperCase()}` }
+            ]
+          },
+          {
+            type: 'section',
+            text: { type: 'mrkdwn', text: alert.detail }
+          }
+        ]
+      };
+    } else if (type === 'teams') {
+      bodyObj = {
+        '@type': 'MessageCard',
+        '@context': 'http://schema.org/extensions',
+        themeColor: colorHex.replace('#', ''),
+        summary: titleText,
+        sections: [
+          {
+            activityTitle: titleText,
+            activitySubtitle: `Client: ${alert.clientName}`,
+            facts: [
+              { name: 'Endpoint', value: alert.entityName },
+              { name: 'Severity', value: alert.severity.toUpperCase() },
+              { name: 'Details', value: alert.detail }
+            ],
+            markdown: true
+          }
+        ]
+      };
+    } else if (type === 'discord') {
+      bodyObj = {
+        embeds: [
+          {
+            title: titleText,
+            description: alert.detail,
+            color: colorInt,
+            fields: [
+              { name: 'Client', value: alert.clientName, inline: true },
+              { name: 'Severity', value: alert.severity.toUpperCase(), inline: true }
+            ],
+            timestamp: new Date().toISOString()
+          }
+        ]
+      };
+    } else if (type === 'pagerduty') {
+      bodyObj = {
+        routing_key: routingKey || secret || targetUrl,
+        event_action: alert.eventAction === 'resolve' ? 'resolve' : 'trigger',
+        dedup_key: `vitrine-${alert.conditionId}-${alert.entityName}`,
+        payload: {
+          summary: `${titleText} — ${alert.detail}`.slice(0, 1000),
+          source: alert.entityName,
+          severity: alert.severity === 'critical' ? 'critical' : alert.severity === 'warning' ? 'warning' : 'info',
+          custom_details: {
+            client: alert.clientName,
+            conditionId: alert.conditionId,
+            incidentId: alert.incidentId
+          }
+        }
+      };
+    } else {
+      bodyObj = {
+        event: alert.eventAction === 'resolve' ? 'alert.resolved' : 'alert.triggered',
+        incidentId: alert.incidentId || null,
+        timestamp: new Date().toISOString(),
+        severity: alert.severity,
+        conditionId: alert.conditionId,
+        label: alert.label,
+        entityName: alert.entityName,
+        clientName: alert.clientName,
+        detail: alert.detail
+      };
+    }
+
+    const rawBody = JSON.stringify(bodyObj);
+    if (secret && type !== 'pagerduty') {
+      const sig = crypto.createHmac('sha256', secret).update(rawBody, 'utf8').digest('hex');
+      headers['X-Vitrine-Signature-256'] = `sha256=${sig}`;
+    }
+
+    try {
+      const targetEndpoint =
+        type === 'pagerduty' && !targetUrl.startsWith('http')
+          ? 'https://events.pagerduty.com/v2/enqueue'
+          : targetUrl;
+      const res = await safeOutboundFetch(targetEndpoint, {
+        method: 'POST',
+        headers,
+        body: rawBody,
+        timeoutMs: 6000,
+        safety: { allowLoopback: true, allowPrivateLan: true }
+      });
+      const nowIso = new Date().toISOString();
+      if (res.status >= 200 && res.status < 300) {
+        dispatchedNames.push(`${ch.name} (${type})`);
+        try {
+          db.prepare('UPDATE notification_channels SET last_triggered_at = ?, last_status = ? WHERE id = ?').run(
+            nowIso,
+            'OK',
+            ch.id
+          );
+        } catch {}
+      } else {
+        try {
+          db.prepare('UPDATE notification_channels SET last_triggered_at = ?, last_status = ? WHERE id = ?').run(
+            nowIso,
+            `HTTP ${res.status}`,
+            ch.id
+          );
+        } catch {}
+      }
+    } catch (err: any) {
+      try {
+        db.prepare('UPDATE notification_channels SET last_triggered_at = ?, last_status = ? WHERE id = ?').run(
+          new Date().toISOString(),
+          String(err?.message || 'Webhook delivery failed').slice(0, 180),
+          ch.id
+        );
+      } catch {}
+    }
+  }
+
+  return dispatchedNames;
+}
+
+// ============================================================================
+// Multi-PSA Connector Ticket Dispatcher (ITFlow, HaloPSA, ConnectWise, Autotask, Syncro, Zammad)
+// ============================================================================
+export async function syncTicketWithExternalPsas(ticket: {
+  localTicketId?: string;
   ticketNumber: string;
   title: string;
   clientName: string;
   priority: string;
+  details?: string;
 }): Promise<void> {
+  const detailsText =
+    ticket.details ||
+    `Created automatically by Vitrine RMM Condition Engine (${ticket.ticketNumber}) for client ${ticket.clientName}.`;
+
+  // 1. Legacy Settings ITFlow Connector
   try {
     const settings = db.prepare('SELECT itflow_url, itflow_api_key FROM settings WHERE id = 1').get() as any;
     const apiKey = decryptVaultSecret(settings?.itflow_api_key);
-    if (!settings?.itflow_url || !apiKey || settings.itflow_url.includes('itflow.internal')) return;
-    const hostCheck = await validateOutboundHostSafety(settings.itflow_url, { allowLoopback: true });
-    if (!hostCheck.safe) return;
-    await fetch(`${settings.itflow_url.replace(/\/$/, '')}/tickets/create.php`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        api_key: apiKey,
-        ticket_subject: ticket.title,
-        ticket_priority: ticket.priority,
-        ticket_details: `Created automatically by Vitrine RMM Condition Engine (${ticket.ticketNumber}) for client ${ticket.clientName}.`
-      }),
-      signal: AbortSignal.timeout(5000)
-    });
+    if (settings?.itflow_url && apiKey && !settings.itflow_url.includes('itflow.internal')) {
+      await safeOutboundFetch(`${settings.itflow_url.replace(/\/$/, '')}/tickets/create.php`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          api_key: apiKey,
+          ticket_subject: ticket.title,
+          ticket_priority: ticket.priority,
+          ticket_details: detailsText
+        }),
+        timeoutMs: 5000,
+        safety: { allowLoopback: true, allowPrivateLan: true }
+      });
+    }
+  } catch {}
+
+  // 2. Multi-PSA Integrations Table (`psa_integrations`)
+  let integrations: any[] = [];
+  try {
+    integrations = db.prepare('SELECT * FROM psa_integrations WHERE enabled = 1').all() as any[];
   } catch {
-    // Non-fatal external PSA sync error
+    return;
+  }
+  for (const psa of integrations) {
+    const baseUrl = String(psa.base_url || '').trim().replace(/\/$/, '');
+    const apiKey =
+      decryptVaultSecret(psa.api_key_encrypted) || decryptVaultSecret(psa.api_secret_encrypted) || '';
+    const clientSecret = decryptVaultSecret(psa.client_secret_encrypted) || '';
+    if (!baseUrl || (!apiKey && !clientSecret)) continue;
+
+    const provider = String(psa.provider || '').toLowerCase();
+    try {
+      let endpoint = `${baseUrl}/api/tickets`;
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      let payload: any = { subject: ticket.title, body: detailsText, priority: ticket.priority };
+
+      if (provider === 'halopsa') {
+        endpoint = `${baseUrl}/api/Tickets`;
+        headers.Authorization = `Bearer ${apiKey}`;
+        payload = [{ summary: ticket.title, details: detailsText, priority_id: ticket.priority === 'Critical' ? 1 : 2 }];
+      } else if (provider === 'connectwise') {
+        endpoint = `${baseUrl}/v4_6_release/apis/3.0/service/tickets`;
+        headers.Authorization = `Basic ${Buffer.from(`${psa.client_id || ''}:${apiKey}`).toString('base64')}`;
+        if (clientSecret) headers.clientId = clientSecret;
+        payload = { summary: ticket.title.slice(0, 100), initialDescription: detailsText };
+      } else if (provider === 'autotask') {
+        endpoint = `${baseUrl}/ATServicesRest/V1.0/Tickets`;
+        headers.ApiIntegrationCode = psa.client_id || '';
+        headers.UserName = psa.default_board || '';
+        headers.Secret = apiKey;
+        payload = { title: ticket.title, description: detailsText, status: 1, priority: 1 };
+      } else if (provider === 'syncro') {
+        endpoint = `${baseUrl}/api/v1/tickets`;
+        headers.Authorization = `Bearer ${apiKey}`;
+        payload = { subject: ticket.title, problem_type: 'RMM Alert', status: 'New', comment_body: detailsText };
+      } else if (provider === 'zammad') {
+        endpoint = `${baseUrl}/api/v1/tickets`;
+        headers.Authorization = `Token token=${apiKey}`;
+        payload = {
+          title: ticket.title,
+          group: psa.default_board || 'Users',
+          article: { subject: ticket.title, body: detailsText, type: 'note', internal: false }
+        };
+      } else if (provider === 'itflow') {
+        endpoint = `${baseUrl}/tickets/create.php`;
+        payload = {
+          api_key: apiKey,
+          ticket_subject: ticket.title,
+          ticket_priority: ticket.priority,
+          ticket_details: detailsText
+        };
+      } else {
+        headers.Authorization = `Bearer ${apiKey}`;
+      }
+
+      const res = await safeOutboundFetch(endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+        timeoutMs: 6000,
+        safety: { allowLoopback: true, allowPrivateLan: true }
+      });
+      const syncIso = new Date().toISOString();
+      if (res.status >= 200 && res.status < 300) {
+        try {
+          db.prepare(
+            "UPDATE psa_integrations SET last_synced_at = ?, last_status = 'OK', last_error = NULL WHERE id = ?"
+          ).run(syncIso, psa.id);
+        } catch {
+          try {
+            db.prepare("UPDATE psa_integrations SET last_synced_at = ?, last_status = 'OK' WHERE id = ?").run(
+              syncIso,
+              psa.id
+            );
+          } catch {}
+        }
+      } else {
+        const errMsg = `HTTP ${res.status}`;
+        try {
+          db.prepare('UPDATE psa_integrations SET last_status = ?, last_error = ? WHERE id = ?').run(
+            errMsg,
+            errMsg,
+            psa.id
+          );
+        } catch {
+          try {
+            db.prepare('UPDATE psa_integrations SET last_status = ? WHERE id = ?').run(errMsg, psa.id);
+          } catch {}
+        }
+      }
+    } catch (err: any) {
+      const errMsg = String(err?.message || 'PSA sync error').slice(0, 180);
+      try {
+        db.prepare('UPDATE psa_integrations SET last_status = ?, last_error = ? WHERE id = ?').run(
+          errMsg,
+          errMsg,
+          psa.id
+        );
+      } catch {
+        try {
+          db.prepare('UPDATE psa_integrations SET last_status = ? WHERE id = ?').run(errMsg, psa.id);
+        } catch {}
+      }
+    }
   }
 }
 
@@ -630,16 +971,53 @@ export async function evaluateFleetAlertConditions(): Promise<{
   let suppressedByMaintenance = 0;
   let autoResolvedTickets = 0;
 
-  const autoResolveConditionTickets = (entityName: string, rule: ConditionAlertRule) => {
+  const autoResolveConditionState = async (
+    entityId: string,
+    entityName: string,
+    clientName: string,
+    rule: ConditionAlertRule,
+    isAppliance = false,
+    tenantId?: string | null
+  ) => {
+    // 1. Resolve open alert_incidents row if present
+    const openInc = db
+      .prepare(
+        "SELECT id FROM alert_incidents WHERE condition_id = ? AND ((? = 0 AND device_id = ?) OR (? = 1 AND appliance_id = ?)) AND status != 'resolved' LIMIT 1"
+      )
+      .get(rule.conditionId, isAppliance ? 1 : 0, entityId, isAppliance ? 1 : 0, entityId) as { id?: string } | undefined;
+
+    if (openInc?.id) {
+      db.prepare("UPDATE alert_incidents SET status = 'resolved', resolved_at = ? WHERE id = ?").run(
+        new Date().toISOString(),
+        openInc.id
+      );
+      await dispatchAlertToNotificationChannels({
+        incidentId: openInc.id,
+        tenantId,
+        entityName,
+        clientName,
+        conditionId: rule.conditionId,
+        label: rule.label,
+        detail: 'Condition cleared automatically on endpoint telemetry recovery.',
+        severity: rule.severity,
+        eventAction: 'resolve'
+      });
+    }
+
+    // 2. Scoped PSA ticket auto-resolution (strictly scoped by device_id or client_name + escaped LIKE!)
     if (!rule.autoResolveTicket) return;
-    const res = db
-      .prepare(`
-        UPDATE psa_tickets
-        SET status = 'Resolved'
-        WHERE status != 'Resolved'
-          AND title LIKE ?
-      `)
-      .run(`[${rule.label}] ${entityName}:%`);
+    const escapedPrefix = escapeSqlLikePrefix(`[${rule.label}] ${entityName}:`);
+    const res = isAppliance
+      ? db
+          .prepare(
+            "UPDATE psa_tickets SET status = 'Resolved' WHERE status != 'Resolved' AND client_name = ? AND title LIKE ? ESCAPE '\\'"
+          )
+          .run(clientName || 'Global MSP', `${escapedPrefix}%`)
+      : db
+          .prepare(
+            "UPDATE psa_tickets SET status = 'Resolved' WHERE status != 'Resolved' AND device_id = ? AND title LIKE ? ESCAPE '\\'"
+          )
+          .run(entityId, `${escapedPrefix}%`);
     if (res.changes > 0) {
       autoResolvedTickets += res.changes;
     }
@@ -652,28 +1030,77 @@ export async function evaluateFleetAlertConditions(): Promise<{
     rule: ConditionAlertRule,
     detail: string,
     flapGraceMinutes = 15,
-    tenantId?: string | null
+    tenantId?: string | null,
+    isAppliance = false
   ) => {
     if (!rule.enabled) return;
 
     const resolvedTenantId =
       tenantId !== undefined
         ? tenantId
-        : ((db.prepare('SELECT tenant_id FROM devices WHERE id = ?').get(entityId) as { tenant_id?: string } | undefined)
-            ?.tenant_id ??
-          (
-            db.prepare('SELECT tenant_id FROM network_appliances WHERE id = ?').get(entityId) as
-              | { tenant_id?: string }
-              | undefined
-          )?.tenant_id ??
-          null);
+        : isAppliance
+        ? ((db.prepare('SELECT tenant_id FROM network_appliances WHERE id = ?').get(entityId) as any)?.tenant_id ?? null)
+        : ((db.prepare('SELECT tenant_id FROM devices WHERE id = ?').get(entityId) as any)?.tenant_id ?? null);
 
-    // Deduplicate recent notifications within flapGraceMinutes so repeated runs don't spam duplicates
+    const nowIso = new Date().toISOString();
+
+    // Upsert stateful alert_incidents record (respecting snoozed & acknowledged states!)
+    const existingInc = db
+      .prepare(
+        "SELECT * FROM alert_incidents WHERE condition_id = ? AND ((? = 0 AND device_id = ?) OR (? = 1 AND appliance_id = ?)) AND status != 'resolved' LIMIT 1"
+      )
+      .get(rule.conditionId, isAppliance ? 1 : 0, entityId, isAppliance ? 1 : 0, entityId) as any;
+
+    let incidentId = existingInc?.id as string | undefined;
+    let suppressedBySnoozeOrAck = false;
+
+    if (existingInc) {
+      if (existingInc.status === 'snoozed' && existingInc.snoozed_until && parseSqlTimestampMs(existingInc.snoozed_until) > Date.now()) {
+        suppressedBySnoozeOrAck = true;
+      } else if (existingInc.status === 'snoozed') {
+        db.prepare("UPDATE alert_incidents SET status = 'open', snoozed_until = NULL WHERE id = ?").run(existingInc.id);
+      }
+      if (existingInc.status === 'acknowledged') {
+        suppressedBySnoozeOrAck = true;
+      }
+      db.prepare(`
+        UPDATE alert_incidents
+        SET detail = ?, severity = ?, last_seen_at = ?, occurrence_count = COALESCE(occurrence_count, 1) + 1
+        WHERE id = ?
+      `).run(detail, rule.severity, nowIso, existingInc.id);
+    } else {
+      incidentId = `inc-${crypto.randomUUID()}`;
+      db.prepare(`
+        INSERT INTO alert_incidents (
+          id, tenant_id, device_id, appliance_id, entity_name, condition_id, title, detail, severity, status, first_seen_at, last_seen_at, occurrence_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, 1)
+      `).run(
+        incidentId,
+        resolvedTenantId,
+        isAppliance ? null : entityId,
+        isAppliance ? entityId : null,
+        entityName,
+        rule.conditionId,
+        `${rule.label}: ${entityName}`,
+        detail,
+        rule.severity,
+        nowIso,
+        nowIso
+      );
+    }
+
+    if (suppressedBySnoozeOrAck) {
+      return;
+    }
+
+    // Deduplicate recent notifications within flapGraceMinutes using SQLite `datetime()` normalization!
     const graceCutoffIso = new Date(Date.now() - Math.max(1, flapGraceMinutes) * 60 * 1000).toISOString();
     const expectedTitlePrefix = `[${rule.severity.toUpperCase()}] ${rule.label}: ${entityName}`;
     const recentNotif = db
-      .prepare('SELECT id FROM notifications WHERE type = ? AND title = ? AND created_at >= ? LIMIT 1')
-      .get(rule.conditionId, expectedTitlePrefix, graceCutoffIso) as { id?: string } | undefined;
+      .prepare(
+        'SELECT id FROM notifications WHERE type = ? AND title = ? AND COALESCE(tenant_id, \'\') = COALESCE(?, \'\') AND datetime(created_at) >= datetime(?) LIMIT 1'
+      )
+      .get(rule.conditionId, expectedTitlePrefix, resolvedTenantId || '', graceCutoffIso) as { id?: string } | undefined;
 
     const channels: string[] = [];
 
@@ -707,11 +1134,35 @@ export async function evaluateFleetAlertConditions(): Promise<{
       }
     }
 
+    if (!recentNotif) {
+      const webhookSent = await dispatchAlertToNotificationChannels({
+        incidentId,
+        tenantId: resolvedTenantId,
+        entityName,
+        clientName: clientName || 'Global MSP',
+        conditionId: rule.conditionId,
+        label: rule.label,
+        detail,
+        severity: rule.severity,
+        eventAction: 'trigger'
+      });
+      channels.push(...webhookSent);
+    }
+
     if (rule.createPsaTicket) {
       const ticketPrefix = `[${rule.label}] ${entityName}:`;
-      const existingOpenTicket = db
-        .prepare("SELECT id FROM psa_tickets WHERE status != 'Resolved' AND title LIKE ? LIMIT 1")
-        .get(`${ticketPrefix}%`) as { id?: string } | undefined;
+      const escapedPrefix = escapeSqlLikePrefix(ticketPrefix);
+      const existingOpenTicket = isAppliance
+        ? (db
+            .prepare(
+              "SELECT id FROM psa_tickets WHERE status != 'Resolved' AND client_name = ? AND title LIKE ? ESCAPE '\\' LIMIT 1"
+            )
+            .get(clientName || 'Global MSP', `${escapedPrefix}%`) as { id?: string } | undefined)
+        : (db
+            .prepare(
+              "SELECT id FROM psa_tickets WHERE status != 'Resolved' AND device_id = ? AND title LIKE ? ESCAPE '\\' LIMIT 1"
+            )
+            .get(entityId, `${escapedPrefix}%`) as { id?: string } | undefined);
 
       if (!existingOpenTicket) {
         channels.push('Direct PSA Ticket');
@@ -719,20 +1170,26 @@ export async function evaluateFleetAlertConditions(): Promise<{
         const ticketNum = `INC-${crypto.randomInt(10000, 99999)}`;
         const priority = rule.severity === 'critical' ? 'Critical' : rule.severity === 'warning' ? 'High' : 'Medium';
         const fullTitle = `${ticketPrefix} ${detail}`;
+        const localTicketId = `tkt-cond-${crypto.randomUUID()}`;
 
         db.prepare(`
           INSERT INTO psa_tickets (id, ticket_number, title, client_name, device_id, status, priority)
           VALUES (?, ?, ?, ?, ?, 'Open', ?)
         `).run(
-          `tkt-cond-${crypto.randomUUID()}`,
+          localTicketId,
           ticketNum,
           fullTitle,
           clientName || 'Global MSP',
-          entityId.startsWith('app-') ? null : entityId,
+          isAppliance ? null : entityId,
           priority
         );
 
-        await syncTicketWithItflowIfConfigured({
+        if (incidentId) {
+          db.prepare('UPDATE alert_incidents SET psa_ticket_id = ? WHERE id = ?').run(localTicketId, incidentId);
+        }
+
+        await syncTicketWithExternalPsas({
+          localTicketId,
           ticketNumber: ticketNum,
           title: fullTitle,
           clientName: clientName || 'Global MSP',
@@ -768,12 +1225,12 @@ export async function evaluateFleetAlertConditions(): Promise<{
     const graceMin = eff.psaFlapGraceMinutes || 15;
     const findRule = (id: string) => eff.alertRules.find((r) => r.conditionId === id);
 
-    // 1. Endpoint Offline > X Duration (Strictly enforces thresholdHours!)
+    // 1. Endpoint Offline > X Duration
     const offlineRule = findRule('endpoint_offline');
     if (offlineRule && offlineRule.enabled) {
       if (d.status !== 'online') {
-        const lastSeenMs = d.last_seen ? new Date(d.last_seen).getTime() : Date.now();
-        const offlineHours = Math.max(0, (Date.now() - lastSeenMs) / (1000 * 3600));
+        const lastSeenMs = parseSqlTimestampMs(d.last_seen);
+        const offlineHours = Number.isNaN(lastSeenMs) ? 0 : Math.max(0, (Date.now() - lastSeenMs) / (1000 * 3600));
         const thresholdHours =
           offlineRule.thresholdUnit === 'days' ? offlineRule.thresholdValue * 24 : offlineRule.thresholdValue;
         if (offlineHours >= thresholdHours) {
@@ -783,11 +1240,12 @@ export async function evaluateFleetAlertConditions(): Promise<{
             clientLabel,
             offlineRule,
             `Endpoint has been offline for ${offlineHours.toFixed(1)}h (threshold: > ${offlineRule.thresholdValue} ${offlineRule.thresholdUnit})`,
-            graceMin
+            graceMin,
+            d.tenant_id
           );
         }
       } else {
-        autoResolveConditionTickets(d.hostname, offlineRule);
+        await autoResolveConditionState(d.id, d.hostname, clientLabel, offlineRule, false, d.tenant_id);
       }
     }
 
@@ -802,10 +1260,11 @@ export async function evaluateFleetAlertConditions(): Promise<{
           clientLabel,
           diskRule,
           `System disk free space is ${diskPct.toFixed(1)}% (< ${diskRule.thresholdValue}% policy threshold)`,
-          graceMin
+          graceMin,
+          d.tenant_id
         );
       } else {
-        autoResolveConditionTickets(d.hostname, diskRule);
+        await autoResolveConditionState(d.id, d.hostname, clientLabel, diskRule, false, d.tenant_id);
       }
     }
 
@@ -819,10 +1278,11 @@ export async function evaluateFleetAlertConditions(): Promise<{
           clientLabel,
           smartRule,
           `SMART disk telemetry reported status: ${d.smart_status}`,
-          graceMin
+          graceMin,
+          d.tenant_id
         );
       } else {
-        autoResolveConditionTickets(d.hostname, smartRule);
+        await autoResolveConditionState(d.id, d.hostname, clientLabel, smartRule, false, d.tenant_id);
       }
     }
 
@@ -837,10 +1297,11 @@ export async function evaluateFleetAlertConditions(): Promise<{
           clientLabel,
           loadRule,
           `Resource utilization exceeded ${loadRule.thresholdValue}% (CPU: ${Number(d.cpu_usage).toFixed(1)}%, RAM: ${ramPct.toFixed(1)}%)`,
-          graceMin
+          graceMin,
+          d.tenant_id
         );
       } else {
-        autoResolveConditionTickets(d.hostname, loadRule);
+        await autoResolveConditionState(d.id, d.hostname, clientLabel, loadRule, false, d.tenant_id);
       }
     }
 
@@ -856,10 +1317,11 @@ export async function evaluateFleetAlertConditions(): Promise<{
           clientLabel,
           edrRule,
           `EDR/AV sensor (${d.edr_name || 'Endpoint Protection'}) status: '${d.edr_status}'`,
-          graceMin
+          graceMin,
+          d.tenant_id
         );
       } else if (!edrBad) {
-        autoResolveConditionTickets(d.hostname, edrRule);
+        await autoResolveConditionState(d.id, d.hostname, clientLabel, edrRule, false, d.tenant_id);
       }
     }
 
@@ -878,19 +1340,25 @@ export async function evaluateFleetAlertConditions(): Promise<{
           clientLabel,
           bitRule,
           `Disk encryption state is '${d.bitlocker_status}'`,
-          graceMin
+          graceMin,
+          d.tenant_id
         );
-      } else if (d.bitlocker_status && /encrypted/i.test(d.bitlocker_status)) {
-        autoResolveConditionTickets(d.hostname, bitRule);
+      } else if (
+        d.bitlocker_status &&
+        /encrypted|on|active|protectionon/i.test(d.bitlocker_status) &&
+        !/unencrypted|suspended|decrypted|off/i.test(d.bitlocker_status)
+      ) {
+        await autoResolveConditionState(d.id, d.hostname, clientLabel, bitRule, false, d.tenant_id);
       }
     }
 
     // 7. Pending Reboot Overdue > X Days
     const rebRule = findRule('pending_reboot_overdue');
     if (rebRule && rebRule.enabled) {
-      if (d.pending_reboot === 1) {
+      if (Boolean(d.pending_reboot || d.reboot_required)) {
         const sinceIso = d.pending_reboot_since || d.enrolled_at || d.created_at;
-        const pendingDays = sinceIso ? (Date.now() - new Date(sinceIso).getTime()) / (1000 * 86400) : rebRule.thresholdValue;
+        const sinceMs = parseSqlTimestampMs(sinceIso);
+        const pendingDays = !Number.isNaN(sinceMs) ? (Date.now() - sinceMs) / (1000 * 86400) : rebRule.thresholdValue;
         if (pendingDays >= rebRule.thresholdValue) {
           await dispatchConditionAlert(
             d.id,
@@ -898,11 +1366,12 @@ export async function evaluateFleetAlertConditions(): Promise<{
             clientLabel,
             rebRule,
             `Pending reboot overdue for ${pendingDays.toFixed(1)} days (threshold: > ${rebRule.thresholdValue} days)`,
-            graceMin
+            graceMin,
+            d.tenant_id
           );
         }
       } else {
-        autoResolveConditionTickets(d.hostname, rebRule);
+        await autoResolveConditionState(d.id, d.hostname, clientLabel, rebRule, false, d.tenant_id);
       }
     }
 
@@ -911,7 +1380,7 @@ export async function evaluateFleetAlertConditions(): Promise<{
     if (cveRule && cveRule.enabled) {
       const critPatch = db
         .prepare(
-          "SELECT kb_id, cve_id, cvss_score FROM patches WHERE device_id = ? AND status != 'Installed' AND COALESCE(cvss_score, 0) >= ? ORDER BY cvss_score DESC LIMIT 1"
+          "SELECT kb_id, cve_id, cvss_score FROM patches WHERE device_id = ? AND status != 'Installed' AND COALESCE(is_blacklisted, 0) = 0 AND COALESCE(cvss_score, 0) >= ? ORDER BY cvss_score DESC LIMIT 1"
         )
         .get(d.id, cveRule.thresholdValue) as { kb_id?: string; cve_id?: string; cvss_score?: number } | undefined;
       const critSoft = db
@@ -924,9 +1393,9 @@ export async function evaluateFleetAlertConditions(): Promise<{
         const desc = critPatch
           ? `Unpatched ${critPatch.cve_id || critPatch.kb_id} (CVSS ${critPatch.cvss_score})`
           : `Vulnerable package ${critSoft?.name} (CVSS ${critSoft?.highest_cvss})`;
-        await dispatchConditionAlert(d.id, d.hostname, clientLabel, cveRule, desc, graceMin);
+        await dispatchConditionAlert(d.id, d.hostname, clientLabel, cveRule, desc, graceMin, d.tenant_id);
       } else {
-        autoResolveConditionTickets(d.hostname, cveRule);
+        await autoResolveConditionState(d.id, d.hostname, clientLabel, cveRule, false, d.tenant_id);
       }
     }
 
@@ -945,8 +1414,11 @@ export async function evaluateFleetAlertConditions(): Promise<{
           clientLabel,
           hwRule,
           `Hardware change detected (${unackHw.change_type}): ${unackHw.description}`,
-          graceMin
+          graceMin,
+          d.tenant_id
         );
+      } else {
+        await autoResolveConditionState(d.id, d.hostname, clientLabel, hwRule, false, d.tenant_id);
       }
     }
 
@@ -965,10 +1437,11 @@ export async function evaluateFleetAlertConditions(): Promise<{
           clientLabel,
           netRule,
           `Connected to untrusted network (${driftNet.ssid || driftNet.subnet || driftNet.gateway_ip})`,
-          graceMin
+          graceMin,
+          d.tenant_id
         );
       } else {
-        autoResolveConditionTickets(d.hostname, netRule);
+        await autoResolveConditionState(d.id, d.hostname, clientLabel, netRule, false, d.tenant_id);
       }
     }
 
@@ -990,19 +1463,22 @@ export async function evaluateFleetAlertConditions(): Promise<{
             daysLeft < 0
               ? `OEM warranty expired ${Math.abs(Math.round(daysLeft))} days ago (${expDateStr})`
               : `OEM warranty expires in ${Math.round(daysLeft)} days (${expDateStr})`,
-            graceMin
+            graceMin,
+            d.tenant_id
           );
+        } else {
+          await autoResolveConditionState(d.id, d.hostname, clientLabel, warRule, false, d.tenant_id);
         }
       }
     }
 
-    // 12. LAPS Admin Secret Access / Break-Glass Audit Event (within last 15m)
+    // 12. LAPS Admin Secret Access / Break-Glass Audit Event (within last 15m — SQLite datetime() normalized!)
     const lapsRule = findRule('laps_secret_access');
     if (lapsRule && lapsRule.enabled) {
       const recentCutoff = new Date(Date.now() - 15 * 60 * 1000).toISOString();
       const lapsAudit = db
         .prepare(
-          "SELECT username, action FROM audit_logs WHERE device_id = ? AND action = 'LAPS Ephemeral Access' AND timestamp >= ? ORDER BY timestamp DESC LIMIT 1"
+          "SELECT username, action FROM audit_logs WHERE device_id = ? AND action = 'LAPS Ephemeral Access' AND datetime(timestamp) >= datetime(?) ORDER BY timestamp DESC LIMIT 1"
         )
         .get(d.id, recentCutoff) as { username?: string; action?: string } | undefined;
       if (lapsAudit) {
@@ -1012,8 +1488,11 @@ export async function evaluateFleetAlertConditions(): Promise<{
           clientLabel,
           lapsRule,
           `LAPS administrator credential accessed by '${lapsAudit.username}'`,
-          graceMin
+          graceMin,
+          d.tenant_id
         );
+      } else {
+        await autoResolveConditionState(d.id, d.hostname, clientLabel, lapsRule, false, d.tenant_id);
       }
     }
   }
@@ -1046,17 +1525,31 @@ export async function evaluateFleetAlertConditions(): Promise<{
     if (!appRule || !appRule.enabled) continue;
 
     const isHealthy = /^(healthy|online|up|normal)$/i.test(String(app.status || '').trim());
+    const vendorModel =
+      [app.manufacturer || app.vendor, app.model].filter(Boolean).join(' ') ||
+      app.vendor_model ||
+      app.appliance_type ||
+      'Appliance';
     if (!isHealthy) {
       await dispatchConditionAlert(
         app.id,
         app.name,
         app.tenant_name || 'Unassigned Client',
         appRule,
-        app.alert_summary || `Specialty appliance (${app.vendor_model}) reported status: ${app.status}`,
-        15
+        `Specialty appliance (${vendorModel}) reported status: ${app.status}`,
+        15,
+        app.tenant_id,
+        true
       );
     } else {
-      autoResolveConditionTickets(app.name, appRule);
+      await autoResolveConditionState(
+        app.id,
+        app.name,
+        app.tenant_name || 'Unassigned Client',
+        appRule,
+        true,
+        app.tenant_id
+      );
     }
   }
 

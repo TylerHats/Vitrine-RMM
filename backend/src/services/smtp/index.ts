@@ -1,7 +1,8 @@
 import nodemailer from 'nodemailer';
+import dns from 'dns';
 import net from 'net';
 import { db, APP_VERSION } from '../../db/index.js';
-import { decryptVaultSecret } from '../vault/index.js';
+import { decryptVaultSecret, validateOutboundHostSafety } from '../vault/index.js';
 
 export interface SmtpConfig {
   host: string;
@@ -10,6 +11,7 @@ export interface SmtpConfig {
   pass?: string;
   from: string;
   secure?: boolean;
+  tls?: boolean;
   allowSelfSignedTls?: boolean;
 }
 
@@ -38,18 +40,20 @@ function sanitizeHeaderValue(input?: string | null): string {
 }
 
 export function validateSmtpTargetHost(host: string): { valid: boolean; reason?: string } {
-  const trimmed = (host || '').trim().toLowerCase();
+  const trimmed = (host || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
   if (!trimmed) return { valid: false, reason: 'SMTP host is empty.' };
   // Block cloud metadata and link-local SSRF targets
   if (
     trimmed === '169.254.169.254' ||
     trimmed.startsWith('169.254.') ||
     trimmed === 'metadata.google.internal' ||
+    trimmed === '100.100.100.200' ||
     trimmed.startsWith('fe80:')
   ) {
     return { valid: false, reason: 'Link-local / cloud metadata addresses are not permitted for SMTP.' };
   }
-  if (net.isIP(trimmed) === 0 && !/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(trimmed) && trimmed !== 'localhost') {
+  // Support public FQDNs, IPv4/IPv6 literals, localhost, AND single-label Docker service hostnames (e.g. mailpit, postfix)
+  if (net.isIP(trimmed) === 0 && !/^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$/i.test(trimmed)) {
     return { valid: false, reason: 'Invalid SMTP hostname format.' };
   }
   return { valid: true };
@@ -103,6 +107,28 @@ export function createGlassmorphicEmailHtml(brandName: string, payload: EmailPay
 </html>`;
 }
 
+function formatSafeSenderHeader(rawFrom: string | undefined, fallbackBrand: string): { valid: boolean; formatted?: string; error?: string } {
+  const sanitized = sanitizeHeaderValue(rawFrom || 'alerts@vitrine.local');
+  const emailRegex = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
+
+  const angleMatch = sanitized.match(/^(.*?)<\s*([^<>"]+)\s*>$/);
+  if (angleMatch) {
+    const rawDisplay = angleMatch[1].trim().replace(/^"+|"+$/g, '').replace(/[<>"]/g, '').trim();
+    const addr = angleMatch[2].trim();
+    if (!emailRegex.test(addr)) {
+      return { valid: false, error: 'Invalid sender email address in From header.' };
+    }
+    const display = rawDisplay || `${fallbackBrand} Alerts`;
+    return { valid: true, formatted: `"${display}" <${addr}>` };
+  }
+
+  const bareAddr = sanitized.replace(/^"+|"+$/g, '').trim();
+  if (!emailRegex.test(bareAddr)) {
+    return { valid: false, error: 'Invalid sender email address format.' };
+  }
+  return { valid: true, formatted: `"${fallbackBrand} Alerts" <${bareAddr}>` };
+}
+
 export async function sendAlertEmail(
   config: SmtpConfig,
   payload: EmailPayload
@@ -117,22 +143,61 @@ export async function sendAlertEmail(
       return { success: false, error: 'Invalid SMTP port.' };
     }
 
-    const transporter = nodemailer.createTransport({
-      host: config.host.trim(),
+    const cleanHost = config.host.trim().replace(/^\[|\]$/g, '');
+    const dnsSafety = await validateOutboundHostSafety(`http://${config.host.trim()}:${port}`, {
+      allowLoopback: true,
+      allowPrivateLan: true
+    });
+    if (!dnsSafety.safe) {
+      return { success: false, error: dnsSafety.reason || 'SMTP host blocked by outbound safety policy.' };
+    }
+
+    const pinnedIp = dnsSafety.resolvedAddresses?.[0];
+    const pinnedFamily: 4 | 6 = pinnedIp && net.isIP(pinnedIp) === 6 ? 6 : 4;
+    const pinnedLookup: net.LookupFunction | undefined = pinnedIp
+      ? (_hostname, opts: any, cb: any) => {
+          const callback = typeof opts === 'function' ? opts : cb;
+          if (opts && typeof opts === 'object' && opts.all) {
+            callback(null, [{ address: pinnedIp, family: pinnedFamily }]);
+          } else {
+            callback(null, pinnedIp, pinnedFamily);
+          }
+        }
+      : undefined;
+
+    const settings = db.prepare('SELECT brand_name FROM settings WHERE id = 1').get() as any;
+    const brandName = sanitizeHeaderValue(settings?.brand_name || 'Vitrine RMM').replace(/"/g, '');
+    const fromParsed = formatSafeSenderHeader(config.from, brandName);
+    if (!fromParsed.valid || !fromParsed.formatted) {
+      return { success: false, error: fromParsed.error || 'Invalid SMTP From address.' };
+    }
+
+    const isImplicitTls = config.secure ?? port === 465;
+    const requireStartTls = Boolean(config.tls && port !== 465);
+
+    const transportOpts: any = {
+      host: pinnedIp || cleanHost,
       port,
-      secure: config.secure ?? port === 465,
+      secure: isImplicitTls,
+      requireTLS: requireStartTls,
+      lookup: pinnedLookup,
       connectionTimeout: 7000,
       greetingTimeout: 7000,
       socketTimeout: 10000,
       auth: config.user && config.pass ? { user: config.user, pass: config.pass } : undefined,
       tls: {
-        rejectUnauthorized: config.allowSelfSignedTls ? false : process.env.SMTP_ALLOW_SELF_SIGNED === 'true' ? false : true
+        servername: net.isIP(cleanHost) === 0 ? cleanHost : undefined,
+        lookup: pinnedLookup,
+        rejectUnauthorized: config.allowSelfSignedTls
+          ? false
+          : process.env.SMTP_ALLOW_SELF_SIGNED === 'true'
+          ? false
+          : true
       }
-    });
+    };
 
-    const settings = db.prepare('SELECT brand_name FROM settings WHERE id = 1').get() as any;
-    const brandName = sanitizeHeaderValue(settings?.brand_name || 'Vitrine RMM').replace(/"/g, '');
-    const cleanFrom = sanitizeHeaderValue(config.from || 'alerts@vitrine.local').replace(/[<>"]/g, '');
+    const transporter = nodemailer.createTransport(transportOpts);
+
     const cleanTo = sanitizeHeaderValue(payload.to);
     const cleanSubject = sanitizeHeaderValue(payload.subject);
 
@@ -142,7 +207,7 @@ export async function sendAlertEmail(
     }-- Sent by ${brandName}`;
 
     const info = await transporter.sendMail({
-      from: `"${brandName} Alerts" <${cleanFrom}>`,
+      from: fromParsed.formatted,
       to: cleanTo,
       subject: cleanSubject,
       text: plainText,
@@ -170,7 +235,11 @@ export async function sendAlertEmailUsingStoredSettings(payload: {
 }): Promise<{ dispatched: boolean; error?: string }> {
   try {
     const settings = db.prepare('SELECT * FROM settings WHERE id = 1').get() as any;
-    if (!settings || !settings.smtp_host || settings.smtp_host === 'smtp.mailgun.org') {
+    const decryptedPass = decryptVaultSecret(settings?.smtp_pass);
+    // Only skip if smtp_host is empty OR still sitting at initial unauthenticated seed default (`smtp.mailgun.org` with blank user & pass)
+    const isUnconfiguredSeed =
+      settings?.smtp_host === 'smtp.mailgun.org' && !settings?.smtp_user && !decryptedPass;
+    if (!settings || !settings.smtp_host || isUnconfiguredSeed) {
       return { dispatched: false, error: 'SMTP server not configured' };
     }
     const adminRow = db
@@ -181,14 +250,16 @@ export async function sendAlertEmailUsingStoredSettings(payload: {
       return { dispatched: false, error: 'No recipient email configured' };
     }
 
+    const smtpPort = Number(settings.smtp_port || 587);
     const res = await sendAlertEmail(
       {
         host: settings.smtp_host,
-        port: Number(settings.smtp_port || 587),
+        port: smtpPort,
         user: settings.smtp_user || undefined,
-        pass: decryptVaultSecret(settings.smtp_pass) || undefined,
+        pass: decryptedPass || undefined,
         from: settings.smtp_from || 'alerts@vitrine.local',
-        secure: Number(settings.smtp_port) === 465
+        secure: smtpPort === 465,
+        tls: Boolean(settings.smtp_tls ?? 1)
       },
       {
         to: recipient,

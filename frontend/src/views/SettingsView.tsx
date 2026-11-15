@@ -28,7 +28,13 @@ import {
   Webhook,
   Copy,
   Check,
-  Globe
+  Globe,
+  Edit3,
+  Activity,
+  Laptop,
+  HardDrive,
+  BellRing,
+  LogOut
 } from 'lucide-react';
 import {
   Settings,
@@ -39,7 +45,12 @@ import {
   UpdaterStatus,
   MeshDiscoveryResult,
   CustomFieldDefinition,
-  MaintenanceWindow
+  MaintenanceWindow,
+  CustomRole,
+  ScopedApiKey,
+  ActiveAuthSession,
+  BackupPolicy,
+  MdmProfile
 } from '../types/index.js';
 import {
   updateSettings,
@@ -48,7 +59,14 @@ import {
   syncMeshCentral,
   fetchUsers,
   createUser,
+  updateUser,
+  resetUserMfa,
   deleteUser,
+  fetchActiveSessions,
+  revokeActiveSession,
+  verifyMfa,
+  getLocalQrSvgUrl,
+  fetchSystemHealth,
   fetchTenants,
   createTenant,
   createSite,
@@ -56,6 +74,7 @@ import {
   reactivateTenant,
   fetchMeshServers,
   createMeshServer,
+  updateMeshServer,
   deleteMeshServer,
   testDiscoverMeshServer,
   importFromMeshServer,
@@ -66,9 +85,12 @@ import {
   restoreSystemBackup,
   deleteSystemBackup,
   syncOffsiteBackups,
+  fetchOffsiteVaultObjects,
+  pullOffsiteVaultObject,
   fetchUpdaterStatus,
   setUpdaterChannel,
   executeSystemUpdate,
+  notifyAdminsOfUpdate,
   fetchMfaEnrollment,
   regenerateMfaRecoveryCodes,
   fetchCustomFields,
@@ -79,9 +101,30 @@ import {
   deleteMaintenanceWindow,
   testOidcDiscovery,
   revealBackupRecoveryKey,
-  acknowledgeBackupRecoveryKey
+  acknowledgeBackupRecoveryKey,
+  fetchCustomRoles,
+  createCustomRole,
+  deleteCustomRole,
+  fetchScopedApiKeys,
+  createScopedApiKey,
+  revokeScopedApiKey,
+  fetchBackupPolicies,
+  createBackupPolicy,
+  deleteBackupPolicy,
+  fetchMdmProfiles,
+  createMdmProfile,
+  deleteMdmProfile
 } from '../services/api.js';
+import { ALL_GRANULAR_PERMISSIONS } from '../utils/permissions.js';
+import { copyToClipboard } from '../utils/clipboard.js';
 import { MfaChallengeModal } from '../components/MfaChallengeModal.js';
+
+function isErrorMessage(msg?: string | null): boolean {
+  if (!msg) return false;
+  return /^(error|failed|unable|cannot|invalid|rejected|offsite|upload rejected|restore (blocked|error)|sync (encountered|failed)|oidc discovery failed|verification failed|update (did not|error)|⚠️)/i.test(
+    msg.trim()
+  );
+}
 
 interface SettingsViewProps {
   settings: Settings;
@@ -99,7 +142,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [formData, setFormData] = useState<Settings>({ ...settings });
   const [saving, setSaving] = useState(false);
   const [saveBanner, setSaveBanner] = useState<string | null>(null);
+  const [saveBannerIsError, setSaveBannerIsError] = useState(false);
   const [smtpTestResult, setSmtpTestResult] = useState<string | null>(null);
+  const [smtpTestSuccess, setSmtpTestSuccess] = useState(true);
   const [testingSmtp, setTestingSmtp] = useState(false);
   const [syncingMesh, setSyncingMesh] = useState(false);
   const [meshSyncResult, setMeshSyncResult] = useState<string | null>(null);
@@ -116,9 +161,64 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [newUserEmail, setNewUserEmail] = useState('');
   const [newUserName, setNewUserName] = useState('');
   const [newUserPassword, setNewUserPassword] = useState('');
-  const [newUserRole, setNewUserRole] = useState<'super_admin' | 'technician' | 'client_admin'>('technician');
+  const [newUserRole, setNewUserRole] = useState<'super_admin' | 'technician' | 'client_admin' | 'auditor'>('technician');
+  const [newUserCustomRoleId, setNewUserCustomRoleId] = useState('');
   const [newUserTenantId, setNewUserTenantId] = useState('');
   const [userNotice, setUserNotice] = useState<string | null>(null);
+  const [editingUserId, setEditingUserId] = useState<string | null>(null);
+  const [editUserRole, setEditUserRole] = useState<string>('technician');
+  const [editUserCustomRoleId, setEditUserCustomRoleId] = useState<string>('');
+  const [editUserTenantId, setEditUserTenantId] = useState<string>('');
+  const [editUserPassword, setEditUserPassword] = useState<string>('');
+  const [activeSessions, setActiveSessions] = useState<ActiveAuthSession[]>([]);
+  const [currentSessionPrefix, setCurrentSessionPrefix] = useState<string | null>(null);
+  const [showSessionsDrawer, setShowSessionsDrawer] = useState(false);
+
+  // Custom RBAC Roles, Scoped API Keys, Backup Policies, MDM Profiles & Health
+  const [customRoles, setCustomRoles] = useState<CustomRole[]>([]);
+  const [availablePermissions, setAvailablePermissions] = useState<string[]>([]);
+  const [newRoleName, setNewRoleName] = useState('');
+  const [newRoleDesc, setNewRoleDesc] = useState('');
+  const [newRolePerms, setNewRolePerms] = useState<string[]>(['devices:read', 'alerts:triage', 'docs:write']);
+  const [roleNotice, setRoleNotice] = useState<string | null>(null);
+
+  const [apiKeys, setApiKeys] = useState<ScopedApiKey[]>([]);
+  const [newKeyName, setNewKeyName] = useState('');
+  const [newKeyRole, setNewKeyRole] = useState<'technician' | 'auditor' | 'super_admin'>('technician');
+  const [newKeyScopes, setNewKeyScopes] = useState<string[]>(['devices:read', 'alerts:triage', 'scripts:run']);
+  const [newKeyTenantId, setNewKeyTenantId] = useState('');
+  const [newKeyExpiresDays, setNewKeyExpiresDays] = useState(90);
+  const [mintedRawApiKey, setMintedRawApiKey] = useState<string | null>(null);
+  const [copiedApiKey, setCopiedApiKey] = useState(false);
+  const [apiKeyNotice, setApiKeyNotice] = useState<string | null>(null);
+
+  const [backupPolicies, setBackupPolicies] = useState<BackupPolicy[]>([]);
+  const [newBpName, setNewBpName] = useState('');
+  const [newBpEngine, setNewBpEngine] = useState('restic');
+  const [newBpRepo, setNewBpRepo] = useState('');
+  const [newBpCron, setNewBpCron] = useState('0 2 * * *');
+  const [newBpRetention, setNewBpRetention] = useState(30);
+  const [bpNotice, setBpNotice] = useState<string | null>(null);
+
+  const [mdmProfiles, setMdmProfiles] = useState<MdmProfile[]>([]);
+  const [newMdmName, setNewMdmName] = useState('');
+  const [newMdmPlatform, setNewMdmPlatform] = useState<'macos' | 'windows' | 'linux'>('macos');
+  const [newMdmType, setNewMdmType] = useState('security_baseline');
+  const [newMdmPayload, setNewMdmPayload] = useState('');
+  const [mdmNotice, setMdmNotice] = useState<string | null>(null);
+  const [schemaFieldNotice, setSchemaFieldNotice] = useState<string | null>(null);
+
+  const [systemHealth, setSystemHealth] = useState<{
+    status: string;
+    version: string;
+    uptime: number;
+    meshBridge: { connected: boolean; configured: boolean; activeTunnels: number };
+  } | null>(null);
+  const [pendingMfaAction, setPendingMfaAction] = useState<{
+    title: string;
+    secretType: string;
+    onVerified: () => void;
+  } | null>(null);
 
   const [newTenantName, setNewTenantName] = useState('');
   const [newTenantContact, setNewTenantContact] = useState('');
@@ -127,15 +227,21 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [newSiteSubnet, setNewSiteSubnet] = useState('');
   const [clientActionNotice, setClientActionNotice] = useState<string | null>(null);
   const [syncingOffsite, setSyncingOffsite] = useState(false);
+  const [offsiteObjects, setOffsiteObjects] = useState<Array<{ key: string; sizeBytes: number; lastModified: string }> | null>(null);
+  const [browsingOffsite, setBrowsingOffsite] = useState(false);
 
   // MFA Enrollment & Recovery Codes state
   const [mfaInfo, setMfaInfo] = useState<{
     totpEnabled: boolean;
-    secretBase32: string;
-    otpAuthUri: string;
+    confirmed?: boolean;
+    secretRedacted?: boolean;
+    secretBase32: string | null;
+    otpAuthUri: string | null;
+    qrSvg?: string | null;
     remainingRecoveryCodes: number;
   } | null>(null);
   const [showMfaSecret, setShowMfaSecret] = useState(false);
+  const [confirmTotpCode, setConfirmTotpCode] = useState('');
   const [regenTotpCode, setRegenTotpCode] = useState('');
   const [regeneratedCodes, setRegeneratedCodes] = useState<string[] | null>(null);
   const [mfaNotice, setMfaNotice] = useState<string | null>(null);
@@ -149,6 +255,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   const [maintenanceWindows, setMaintenanceWindows] = useState<MaintenanceWindow[]>([]);
   const [newWinTitle, setNewWinTitle] = useState('');
+  const [newWinStartTime, setNewWinStartTime] = useState('');
   const [newWinDuration, setNewWinDuration] = useState(120);
   const [newWinTenantId, setNewWinTenantId] = useState('');
 
@@ -157,6 +264,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [newMeshName, setNewMeshName] = useState('');
   const [newMeshUrl, setNewMeshUrl] = useState('');
   const [newMeshToken, setNewMeshToken] = useState('');
+  const [editingMeshId, setEditingMeshId] = useState<string | null>(null);
+  const [editMeshName, setEditMeshName] = useState('');
+  const [editMeshUrl, setEditMeshUrl] = useState('');
+  const [editMeshToken, setEditMeshToken] = useState('');
+  const [editMeshAutoPush, setEditMeshAutoPush] = useState(true);
   const [discoveringServerId, setDiscoveringServerId] = useState<string | null>(null);
   const [discoveryPreview, setDiscoveryPreview] = useState<(MeshDiscoveryResult & { serverId?: string }) | null>(null);
   const [importingServerId, setImportingServerId] = useState<string | null>(null);
@@ -214,6 +326,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     fetchCustomFields().then(setCustomFieldDefs).catch(() => {});
     fetchMaintenanceWindows().then(setMaintenanceWindows).catch(() => {});
     fetchMfaEnrollment().then(setMfaInfo).catch(() => {});
+    fetchActiveSessions()
+      .then((res) => {
+        if (res.sessions) setActiveSessions(res.sessions);
+        if (res.currentSessionPrefix !== undefined) setCurrentSessionPrefix(res.currentSessionPrefix || null);
+      })
+      .catch(() => {});
+    fetchCustomRoles()
+      .then((res) => {
+        if (res.roles) setCustomRoles(res.roles);
+        if (res.availablePermissions) setAvailablePermissions(res.availablePermissions);
+      })
+      .catch(() => {});
+    fetchScopedApiKeys().then(setApiKeys).catch(() => {});
+    fetchBackupPolicies().then(setBackupPolicies).catch(() => {});
+    fetchMdmProfiles().then(setMdmProfiles).catch(() => {});
+    fetchSystemHealth().then(setSystemHealth).catch(() => {});
     fetchSystemBackups()
       .then((res) => {
         if (res.backups) setBackups(res.backups);
@@ -233,21 +361,38 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   useEffect(() => {
     loadAllAdminData();
   }, [loadAllAdminData]);
-  const handleSave = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const performSave = async () => {
     setSaving(true);
     try {
       const res = await updateSettings(formData);
+      if (res.mfaRequired) {
+        setPendingMfaAction({
+          title: 'Step-Up MFA: Save Global RMM Configuration',
+          secretType: 'system_settings',
+          onVerified: () => performSave()
+        });
+        return;
+      }
       if (res.success) {
         onUpdated(res.settings);
+        setSaveBannerIsError(false);
         setSaveBanner('Settings, White-Labeling, Vaulted Secrets & Compliance Policies saved successfully.');
         setTimeout(() => setSaveBanner(null), 4000);
       } else {
+        setSaveBannerIsError(true);
         setSaveBanner(`Error saving settings: ${res.error || 'Unknown error'}`);
       }
+    } catch (err: any) {
+      setSaveBannerIsError(true);
+      setSaveBanner(`Error saving settings: ${err?.message || 'Unknown error'}`);
     } finally {
       setSaving(false);
     }
+  };
+
+  const handleSave = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await performSave();
   };
 
   const handleLogoFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -270,11 +415,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         const next = { ...formData, brand_logo_url: res.brand_logo_url };
         setFormData(next);
         onUpdated(next);
+        setSaveBannerIsError(false);
         setSaveBanner(`Brand logo "${file.name}" uploaded and applied across Web UI & Portals.`);
         setTimeout(() => setSaveBanner(null), 4000);
       } else {
+        setSaveBannerIsError(true);
         setSaveBanner(`Logo upload rejected: ${res.error || 'Unsupported image format'}`);
       }
+    } catch (err: any) {
+      setSaveBannerIsError(true);
+      setSaveBanner(`Logo upload rejected: ${err?.message || 'Unsupported image format'}`);
     } finally {
       setUploadingLogo(false);
       if (logoInputRef.current) logoInputRef.current.value = '';
@@ -349,6 +499,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   const handleTestSmtp = async () => {
     setTestingSmtp(true);
+    setSmtpTestResult(null);
     try {
       const res = await testSmtp({
         host: formData.smtp_host,
@@ -357,7 +508,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         pass: formData.smtp_pass,
         from: formData.smtp_from
       });
-      setSmtpTestResult(res.message);
+      setSmtpTestSuccess(Boolean(res.success));
+      setSmtpTestResult(res.message || (res.success ? 'SMTP test succeeded.' : 'Failed to test SMTP relay.'));
+    } catch (err: any) {
+      setSmtpTestSuccess(false);
+      setSmtpTestResult(`Failed to test SMTP relay: ${err?.message || 'Connection error'}`);
     } finally {
       setTestingSmtp(false);
     }
@@ -430,32 +585,104 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const handleAddUser = async () => {
     setUserNotice(null);
     if (!newUserEmail.trim() || !newUserName.trim()) {
-      setUserNotice('Name and email address are required.');
+      setUserNotice('Error: Name and email address are required.');
       return;
     }
-    if (newUserPassword && newUserPassword.length < 10) {
-      setUserNotice('Initial password must be at least 10 characters.');
+    if (newUserPassword.length < 10) {
+      setUserNotice('Error: Initial password must be at least 10 characters.');
       return;
     }
-    const res = await createUser({
-      username: newUserName.trim(),
-      email: newUserEmail.trim(),
-      password: newUserPassword || undefined,
-      role: newUserRole,
-      tenant_id: newUserRole === 'client_admin' ? newUserTenantId || null : null
-    });
+    try {
+      const res = await createUser({
+        username: newUserName.trim(),
+        email: newUserEmail.trim(),
+        password: newUserPassword,
+        role: newUserRole,
+        custom_role_id: newUserCustomRoleId || null,
+        tenant_id: newUserRole === 'client_admin' ? newUserTenantId || null : null
+      });
+      if (res.mfaRequired) {
+        setPendingMfaAction({
+          title: 'Step-Up MFA: Provision RBAC Account',
+          secretType: 'rbac_user_create',
+          onVerified: () => handleAddUser()
+        });
+        return;
+      }
+      if (res.success) {
+        setNewUserEmail('');
+        setNewUserName('');
+        setNewUserPassword('');
+        setNewUserCustomRoleId('');
+        setUserNotice(
+          res.recoveryCodes?.length
+            ? `✓ Created ${res.user?.email} (${res.user?.role}). Initial MFA Recovery Codes: ${res.recoveryCodes.join(', ')}`
+            : `✓ Created ${res.user?.email} (${res.user?.role}).`
+        );
+        loadAllAdminData();
+      } else {
+        setUserNotice(`Failed to create user: ${res.error || 'Unknown error'}`);
+      }
+    } catch (err: any) {
+      setUserNotice(`Failed to create user: ${err?.message || 'Unknown error'}`);
+    }
+  };
+
+  const handleSaveEditUser = async (userId: string) => {
+    setUserNotice(null);
+    const payload: {
+      role?: string;
+      custom_role_id?: string | null;
+      tenant_id?: string | null;
+      password?: string;
+    } = {
+      role: editUserRole,
+      custom_role_id: editUserCustomRoleId || null,
+      tenant_id: editUserRole === 'client_admin' ? editUserTenantId || null : null
+    };
+    if (editUserPassword.trim()) {
+      if (editUserPassword.trim().length < 10) {
+        setUserNotice('New password must be at least 10 characters.');
+        return;
+      }
+      payload.password = editUserPassword.trim();
+    }
+    const res = await updateUser(userId, payload);
+    if (res.mfaRequired) {
+      setPendingMfaAction({
+        title: 'Step-Up MFA: Modify RBAC User Account',
+        secretType: 'rbac_user_update',
+        onVerified: () => handleSaveEditUser(userId)
+      });
+      return;
+    }
     if (res.success) {
-      setNewUserEmail('');
-      setNewUserName('');
-      setNewUserPassword('');
+      setEditingUserId(null);
+      setEditUserPassword('');
+      setUserNotice(`✓ Updated account role & permissions for ${res.user?.email || userId}.`);
+      loadAllAdminData();
+    } else {
+      setUserNotice(`Failed to update user: ${res.error || 'Unknown error'}`);
+    }
+  };
+
+  const handleResetUserMfa = async (userId: string, username: string) => {
+    const res = await resetUserMfa(userId);
+    if (res.mfaRequired) {
+      setPendingMfaAction({
+        title: `Step-Up MFA: Reset Authenticator for ${username}`,
+        secretType: 'rbac_reset_mfa',
+        onVerified: () => handleResetUserMfa(userId, username)
+      });
+      return;
+    }
+    if (res.success) {
       setUserNotice(
-        res.recoveryCodes?.length
-          ? `✓ Created ${res.user?.email} (${res.user?.role}). Initial MFA Recovery Codes: ${res.recoveryCodes.join(', ')}`
-          : `✓ Created ${res.user?.email} (${res.user?.role}).`
+        `✓ Reset TOTP MFA for ${username}. New Secret: ${res.totpSecret || 'provisioned'} • Recovery Codes: ${(res.recoveryCodes || []).join(', ')}`
       );
       loadAllAdminData();
     } else {
-      setUserNotice(`Failed to create user: ${res.error || 'Unknown error'}`);
+      setUserNotice(`Failed to reset MFA: ${res.error || 'Unknown error'}`);
     }
   };
 
@@ -468,42 +695,257 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     loadAllAdminData();
   };
 
+  const handleCreateCustomRole = async () => {
+    setRoleNotice(null);
+    const validCatalog =
+      availablePermissions.filter((p) => p.includes(':')).length > 0
+        ? availablePermissions.filter((p) => p.includes(':'))
+        : [...ALL_GRANULAR_PERMISSIONS];
+    const validSelectedPerms = newRolePerms.filter(
+      (p) => p.includes(':') && (validCatalog.includes(p) || (ALL_GRANULAR_PERMISSIONS as readonly string[]).includes(p))
+    );
+    if (!newRoleName.trim() || validSelectedPerms.length === 0) {
+      setRoleNotice('Error: Role name and at least one granular colon permission are required.');
+      return;
+    }
+    try {
+      const res = await createCustomRole({
+        name: newRoleName.trim(),
+        description: newRoleDesc.trim(),
+        permissions: validSelectedPerms
+      });
+      if (res.success) {
+        setNewRoleName('');
+        setNewRoleDesc('');
+        setRoleNotice(`✓ Custom RBAC Role "${res.role?.name}" created.`);
+        loadAllAdminData();
+      } else {
+        setRoleNotice(`Failed to create role: ${res.error || 'Unknown error'}`);
+      }
+    } catch (err: any) {
+      setRoleNotice(`Failed to create role: ${err?.message || 'Unknown error'}`);
+    }
+  };
+
+  const handleMintScopedApiKey = async () => {
+    setApiKeyNotice(null);
+    const validScopes = newKeyScopes.filter((s) =>
+      (ALL_GRANULAR_PERMISSIONS as readonly string[]).includes(s)
+    );
+    if (!newKeyName.trim() || validScopes.length === 0) {
+      setApiKeyNotice('Error: API Key label and at least one permission scope are required.');
+      return;
+    }
+    try {
+      const res = await createScopedApiKey({
+        name: newKeyName.trim(),
+        role: newKeyRole,
+        scopes: validScopes,
+        tenant_id: newKeyTenantId || null,
+        expiresInDays: newKeyExpiresDays > 0 ? newKeyExpiresDays : null
+      });
+      if (res.mfaRequired) {
+        setPendingMfaAction({
+          title: 'Step-Up MFA: Mint Scoped Public REST API Key',
+          secretType: 'mint_api_key',
+          onVerified: () => handleMintScopedApiKey()
+        });
+        return;
+      }
+      if (res.success && res.rawKey) {
+        setMintedRawApiKey(res.rawKey);
+        setNewKeyName('');
+        setApiKeyNotice('✓ Scoped REST API Key minted. Copy it now — the raw token is never stored or shown again.');
+        loadAllAdminData();
+      } else {
+        setApiKeyNotice(`Failed to mint API key: ${res.error || 'Unknown error'}`);
+      }
+    } catch (err: any) {
+      setApiKeyNotice(`Failed to mint API key: ${err?.message || 'Unknown error'}`);
+    }
+  };
+
+  const handleCreateBackupPolicy = async () => {
+    setBpNotice(null);
+    if (!newBpName.trim() || !newBpRepo.trim()) {
+      setBpNotice('Error: Policy name and repository URL are required.');
+      return;
+    }
+    try {
+      const res = await createBackupPolicy({
+        name: newBpName.trim(),
+        engine: newBpEngine,
+        repository_url: newBpRepo.trim(),
+        schedule_cron: newBpCron.trim() || '0 2 * * *',
+        retention_days: newBpRetention
+      });
+      if (res.success) {
+        setNewBpName('');
+        setNewBpRepo('');
+        setBpNotice('✓ Endpoint backup vault policy created.');
+        loadAllAdminData();
+      } else {
+        setBpNotice(`Failed to create backup policy: ${(res as any).error || 'Unknown error'}`);
+      }
+    } catch (err: any) {
+      setBpNotice(`Failed to create backup policy: ${err?.message || 'Unknown error'}`);
+    }
+  };
+
+  const handleCreateMdmProfile = async () => {
+    setMdmNotice(null);
+    if (!newMdmName.trim()) {
+      setMdmNotice('Error: MDM profile name is required.');
+      return;
+    }
+    try {
+      const res = await createMdmProfile({
+        name: newMdmName.trim(),
+        platform: newMdmPlatform,
+        profile_type: newMdmType,
+        payload_xml: newMdmPayload.trim() || undefined
+      });
+      if (res.success) {
+        setNewMdmName('');
+        setNewMdmPayload('');
+        setMdmNotice('✓ MDM configuration profile created.');
+        loadAllAdminData();
+      } else {
+        setMdmNotice(`Failed to create MDM profile: ${(res as any).error || 'Unknown error'}`);
+      }
+    } catch (err: any) {
+      setMdmNotice(`Failed to create MDM profile: ${err?.message || 'Unknown error'}`);
+    }
+  };
+
+  const handleSaveMeshServerEdit = async (id: string) => {
+    setMeshSyncResult(null);
+    try {
+      const res = await updateMeshServer(id, {
+        name: editMeshName.trim(),
+        url: editMeshUrl.trim(),
+        api_token: editMeshToken.trim() || undefined,
+        auto_push_companion: editMeshAutoPush ? 1 : 0
+      });
+      if (res && (res as any).success === false) {
+        setMeshSyncResult(`Failed to update MS2 instance: ${(res as any).error || 'Unknown error'}`);
+        return;
+      }
+      setEditingMeshId(null);
+      setEditMeshToken('');
+      setMeshSyncResult('✓ Updated federated MeshCentral 2 instance configuration.');
+      loadAllAdminData();
+    } catch (err: any) {
+      setMeshSyncResult(`Failed to update MS2 instance: ${err?.message || 'Unknown error'}`);
+    }
+  };
+
+  const handleBrowseOffsiteVault = async () => {
+    setBrowsingOffsite(true);
+    setBackupNotice(null);
+    try {
+      const res = await fetchOffsiteVaultObjects();
+      if (res.success) {
+        setOffsiteObjects(res.objects || []);
+      } else {
+        setBackupNotice(`Offsite browse failed: ${res.error || 'Verify S3/SMB vault settings'}`);
+      }
+    } finally {
+      setBrowsingOffsite(false);
+    }
+  };
+
+  const handlePullOffsiteObject = async (key: string) => {
+    setBackupNotice(null);
+    const res = await pullOffsiteVaultObject(
+      key,
+      formData.backup_encryption_passphrase && !formData.backup_encryption_passphrase.includes('••••')
+        ? formData.backup_encryption_passphrase
+        : undefined
+    );
+    if (res.success) {
+      setBackupNotice(`✓ Pulled "${key}" from Offsite Vault and registered in local restore table.`);
+      loadAllAdminData();
+    } else {
+      setBackupNotice(`Failed to pull offsite archive: ${res.error || 'Unknown error'}`);
+    }
+  };
+
   const handleAddTenant = async () => {
-    if (!newTenantName.trim()) return;
-    await createTenant({
-      name: newTenantName.trim(),
-      contact_email:
-        newTenantContact.trim() || `it@${newTenantName.trim().toLowerCase().replace(/[^a-z0-9]/g, '')}.com`
-    });
-    setNewTenantName('');
-    setNewTenantContact('');
-    loadAllAdminData();
+    setClientActionNotice(null);
+    if (!newTenantName.trim()) {
+      setClientActionNotice('Error: Client organization name is required.');
+      return;
+    }
+    try {
+      const res = await createTenant({
+        name: newTenantName.trim(),
+        contact_email:
+          newTenantContact.trim() || `it@${newTenantName.trim().toLowerCase().replace(/[^a-z0-9]/g, '')}.com`
+      });
+      if (res && (res as any).success === false) {
+        setClientActionNotice(`Failed to create client: ${(res as any).error || 'Unknown error'}`);
+        return;
+      }
+      setNewTenantName('');
+      setNewTenantContact('');
+      setClientActionNotice('✓ Client organization created.');
+      loadAllAdminData();
+    } catch (err: any) {
+      setClientActionNotice(`Failed to create client: ${err?.message || 'Unknown error'}`);
+    }
   };
 
   const handleAddSite = async () => {
-    if (!newSiteName.trim() || !newSiteTenantId) return;
-    await createSite({
-      tenant_id: newSiteTenantId,
-      name: newSiteName.trim(),
-      subnet: newSiteSubnet.trim() || '10.50.0.0/24'
-    });
-    setNewSiteName('');
-    setNewSiteSubnet('');
-    loadAllAdminData();
+    setClientActionNotice(null);
+    if (!newSiteName.trim() || !newSiteTenantId) {
+      setClientActionNotice('Error: Select a client organization and enter a site name.');
+      return;
+    }
+    try {
+      const res = await createSite({
+        tenant_id: newSiteTenantId,
+        name: newSiteName.trim(),
+        subnet: newSiteSubnet.trim() || '10.50.0.0/24'
+      });
+      if (res && (res as any).success === false) {
+        setClientActionNotice(`Failed to create site: ${(res as any).error || 'Unknown error'}`);
+        return;
+      }
+      setNewSiteName('');
+      setNewSiteSubnet('');
+      setClientActionNotice('✓ Branch site created.');
+      loadAllAdminData();
+    } catch (err: any) {
+      setClientActionNotice(`Failed to create site: ${err?.message || 'Unknown error'}`);
+    }
   };
 
   const handleAddMeshServer = async () => {
-    if (!newMeshName.trim() || !newMeshUrl.trim()) return;
-    await createMeshServer({
-      name: newMeshName.trim(),
-      url: newMeshUrl.trim(),
-      api_token: newMeshToken.trim(),
-      auto_push_companion: 1
-    });
-    setNewMeshName('');
-    setNewMeshUrl('');
-    setNewMeshToken('');
-    loadAllAdminData();
+    setMeshSyncResult(null);
+    if (!newMeshName.trim() || !newMeshUrl.trim()) {
+      setMeshSyncResult('Error: Instance label and MeshCentral URL are required.');
+      return;
+    }
+    try {
+      const res = await createMeshServer({
+        name: newMeshName.trim(),
+        url: newMeshUrl.trim(),
+        api_token: newMeshToken.trim(),
+        auto_push_companion: 1
+      });
+      if (res && (res as any).success === false) {
+        setMeshSyncResult(`Failed to add MS2 instance: ${(res as any).error || 'Unknown error'}`);
+        return;
+      }
+      setNewMeshName('');
+      setNewMeshUrl('');
+      setNewMeshToken('');
+      setMeshSyncResult('✓ Federated MeshCentral 2 instance registered.');
+      loadAllAdminData();
+    } catch (err: any) {
+      setMeshSyncResult(`Failed to add MS2 instance: ${err?.message || 'Unknown error'}`);
+    }
   };
 
   const handleDiscoverMesh = async (server: MeshServer) => {
@@ -627,7 +1069,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
     setRestoringBackupId(backupId);
     try {
-      const res = await restoreSystemBackup(backupId, resolutionOption);
+      const customPassphrase =
+        formData.backup_encryption_passphrase &&
+        formData.backup_encryption_passphrase.trim() !== '' &&
+        formData.backup_encryption_passphrase !== '••••••••••••' &&
+        !formData.backup_encryption_passphrase.includes('••••')
+          ? formData.backup_encryption_passphrase
+          : undefined;
+      const res = await restoreSystemBackup(backupId, resolutionOption, customPassphrase);
+      if (res.mfaRequired) {
+        setPendingMfaAction({
+          title: 'Step-Up MFA: Full System Backup Restoration',
+          secretType: 'system_backup_restore',
+          onVerified: () => executeRestore(backupId, resolutionOption)
+        });
+        return;
+      }
       if (res.requiresResolution && res.compatibility) {
         const b = backups.find((item) => item.id === backupId);
         if (b) {
@@ -700,6 +1157,30 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   };
 
+  const handleNotifyAdminsOfUpdate = async () => {
+    setUpdaterNotice(null);
+    const res = await notifyAdminsOfUpdate();
+    if (res.success) {
+      setUpdaterNotice(
+        `✓ Dispatched update alert for ${res.targetLabel} (WebUI: ${res.notifCreated ? 'Sent' : 'Skipped'}, Email: ${res.emailDispatched ? 'Sent' : 'Skipped'}, PSA Ticket: ${res.ticketCreated || 'None'}).`
+      );
+    }
+  };
+
+  const handleConfirmMfaEnrollment = async () => {
+    if (!confirmTotpCode.trim()) return;
+    setMfaNotice(null);
+    const res = await verifyMfa(confirmTotpCode.trim(), 'mfa_enrollment_confirm');
+    if (res.success) {
+      setConfirmTotpCode('');
+      setShowMfaSecret(false);
+      setMfaNotice('✓ Authenticator verified & locked! Plaintext TOTP secret is now permanently redacted.');
+      fetchMfaEnrollment().then(setMfaInfo).catch(() => {});
+    } else {
+      setMfaNotice(`Verification failed: ${res.error || 'Invalid 6-digit TOTP code'}`);
+    }
+  };
+
   const handleRegenerateRecoveryCodes = async () => {
     if (!regenTotpCode.trim()) return;
     setMfaNotice(null);
@@ -715,7 +1196,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   };
 
   const handleAddCustomField = async () => {
-    if (!newFieldLabel.trim()) return;
+    setSchemaFieldNotice(null);
+    if (!newFieldLabel.trim()) {
+      setSchemaFieldNotice('Error: Custom field label is required.');
+      return;
+    }
     const key = newFieldLabel
       .trim()
       .toLowerCase()
@@ -730,36 +1215,56 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               .filter(Boolean)
           )
         : undefined;
-    const res = await saveCustomField({
-      key,
-      label: newFieldLabel.trim(),
-      category: newFieldCategory.trim() || 'Operations',
-      field_type: newFieldType,
-      scope: 'device',
-      options: opts
-    });
-    if (res.success) {
-      setNewFieldLabel('');
-      setNewFieldOptions('');
-      fetchCustomFields().then(setCustomFieldDefs).catch(() => {});
+    try {
+      const res = await saveCustomField({
+        key,
+        label: newFieldLabel.trim(),
+        category: newFieldCategory.trim() || 'Operations',
+        field_type: newFieldType,
+        scope: 'device',
+        options: opts
+      });
+      if (res.success) {
+        setNewFieldLabel('');
+        setNewFieldOptions('');
+        setSchemaFieldNotice('✓ Custom attribute definition saved.');
+        fetchCustomFields().then(setCustomFieldDefs).catch(() => {});
+      } else {
+        setSchemaFieldNotice(`Failed to save custom field: ${(res as any).error || 'Unknown error'}`);
+      }
+    } catch (err: any) {
+      setSchemaFieldNotice(`Failed to save custom field: ${err?.message || 'Unknown error'}`);
     }
   };
 
   const handleAddMaintenanceWindow = async () => {
-    if (!newWinTitle.trim()) return;
-    const now = new Date();
-    const end = new Date(now.getTime() + newWinDuration * 60 * 1000);
-    const res = await createMaintenanceWindow({
-      title: newWinTitle.trim(),
-      tenant_id: newWinTenantId || null,
-      start_time: now.toISOString(),
-      end_time: end.toISOString(),
-      suppress_alerts: 1,
-      durationMinutes: newWinDuration
-    });
-    if (res.success) {
-      setNewWinTitle('');
-      fetchMaintenanceWindows().then(setMaintenanceWindows).catch(() => {});
+    setSchemaFieldNotice(null);
+    if (!newWinTitle.trim()) {
+      setSchemaFieldNotice('Error: Maintenance window title is required.');
+      return;
+    }
+    const baseStart = newWinStartTime ? new Date(newWinStartTime) : new Date();
+    const validStart = Number.isNaN(baseStart.getTime()) ? new Date() : baseStart;
+    const end = new Date(validStart.getTime() + newWinDuration * 60 * 1000);
+    try {
+      const res = await createMaintenanceWindow({
+        title: newWinTitle.trim(),
+        tenant_id: newWinTenantId || null,
+        start_time: validStart.toISOString(),
+        end_time: end.toISOString(),
+        suppress_alerts: 1,
+        durationMinutes: newWinDuration
+      });
+      if (res.success) {
+        setNewWinTitle('');
+        setNewWinStartTime('');
+        setSchemaFieldNotice('✓ Maintenance window scheduled.');
+        fetchMaintenanceWindows().then(setMaintenanceWindows).catch(() => {});
+      } else {
+        setSchemaFieldNotice(`Failed to create maintenance window: ${(res as any).error || 'Unknown error'}`);
+      }
+    } catch (err: any) {
+      setSchemaFieldNotice(`Failed to create maintenance window: ${err?.message || 'Unknown error'}`);
     }
   };
   return (
@@ -783,14 +1288,21 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           className="glass-card"
           style={{
             padding: '0.85rem 1.25rem',
-            background: 'rgba(16, 185, 129, 0.12)',
-            borderColor: 'rgba(16, 185, 129, 0.35)',
-            color: 'var(--text-main)',
+            background:
+              saveBannerIsError || isErrorMessage(saveBanner)
+                ? 'rgba(239, 68, 68, 0.14)'
+                : 'rgba(16, 185, 129, 0.12)',
+            borderColor:
+              saveBannerIsError || isErrorMessage(saveBanner)
+                ? 'rgba(239, 68, 68, 0.35)'
+                : 'rgba(16, 185, 129, 0.35)',
+            color: saveBannerIsError || isErrorMessage(saveBanner) ? '#f87171' : '#34d399',
             fontSize: '0.85rem',
             fontWeight: 500
           }}
         >
-          ✓ {saveBanner}
+          {saveBannerIsError || isErrorMessage(saveBanner) ? '⚠ ' : '✓ '}
+          {saveBanner}
         </div>
       )}
 
@@ -845,12 +1357,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem' }}>
         {/* RBAC Technicians */}
         <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
-            <Users size={20} color="var(--primary)" />
-            <div>
-              <h3 style={{ fontSize: '1.05rem', fontWeight: 600, margin: 0 }}>Role-Based Access Control (RBAC)</h3>
-              <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Manage Super Admins, Technicians, and Scoped Client Admins</span>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.65rem', flexWrap: 'wrap' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+              <Users size={20} color="var(--primary)" />
+              <div>
+                <h3 style={{ fontSize: '1.05rem', fontWeight: 600, margin: 0 }}>Role-Based Access Control (RBAC)</h3>
+                <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Manage Super Admins, Technicians, Auditors &amp; Custom Roles</span>
+              </div>
             </div>
+            <button
+              type="button"
+              className="btn-glass"
+              style={{ fontSize: '0.73rem', padding: '0.28rem 0.65rem' }}
+              onClick={() => setShowSessionsDrawer(!showSessionsDrawer)}
+            >
+              <LogOut size={13} /> Active Sessions ({activeSessions.length})
+            </button>
           </div>
 
           <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
@@ -882,12 +1404,28 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               className="glass-select"
               style={{ width: 'auto', fontSize: '0.78rem' }}
               value={newUserRole}
-              onChange={(e) => setNewUserRole(e.target.value as 'super_admin' | 'technician' | 'client_admin')}
+              onChange={(e) => setNewUserRole(e.target.value as 'super_admin' | 'technician' | 'client_admin' | 'auditor')}
             >
               <option value="technician">Technician</option>
               <option value="super_admin">MSP Super Admin</option>
+              <option value="auditor">Read-Only Auditor</option>
               <option value="client_admin">Client Admin (Tenant Scoped)</option>
             </select>
+            {customRoles.length > 0 && (
+              <select
+                className="glass-select"
+                style={{ width: 'auto', fontSize: '0.78rem' }}
+                value={newUserCustomRoleId}
+                onChange={(e) => setNewUserCustomRoleId(e.target.value)}
+              >
+                <option value="">Default Role Permissions</option>
+                {customRoles.map((cr) => (
+                  <option key={cr.id} value={cr.id}>
+                    Custom: {cr.name}
+                  </option>
+                ))}
+              </select>
+            )}
             {newUserRole === 'client_admin' && (
               <select
                 className="glass-select"
@@ -909,8 +1447,46 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
 
           {userNotice && (
-            <div style={{ padding: '0.55rem 0.8rem', borderRadius: '6px', background: 'rgba(56, 189, 248, 0.12)', border: '1px solid rgba(56, 189, 248, 0.35)', fontSize: '0.75rem', color: 'var(--text-main)', wordBreak: 'break-word' }}>
+            <div
+              style={{
+                padding: '0.55rem 0.8rem',
+                borderRadius: '6px',
+                background: isErrorMessage(userNotice) ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+                border: `1px solid ${isErrorMessage(userNotice) ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`,
+                fontSize: '0.75rem',
+                color: isErrorMessage(userNotice) ? '#f87171' : '#34d399',
+                wordBreak: 'break-word'
+              }}
+            >
               {userNotice}
+            </div>
+          )}
+
+          {showSessionsDrawer && (
+            <div style={{ padding: '0.65rem 0.85rem', borderRadius: '8px', background: 'rgba(148, 163, 184, 0.08)', border: '1px solid var(--glass-border)', display: 'flex', flexDirection: 'column', gap: '0.4rem', maxHeight: '160px', overflowY: 'auto' }}>
+              <strong style={{ fontSize: '0.75rem', color: 'var(--primary)' }}>Active Authenticated Sessions</strong>
+              {activeSessions.map((sess) => (
+                <div key={sess.sessionPrefix} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.72rem', gap: '0.5rem' }}>
+                  <span>
+                    <strong>{sess.username}</strong> ({sess.role}) • <code>{sess.sessionPrefix}</code>
+                    {currentSessionPrefix === sess.sessionPrefix && (
+                      <span style={{ color: '#10b981', marginLeft: '0.35rem', fontWeight: 700 }}>(Current)</span>
+                    )}
+                    {sess.ipAddress ? ` • ${sess.ipAddress}` : ''}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn-glass"
+                    style={{ padding: '0.15rem 0.45rem', fontSize: '0.68rem', color: '#ef4444' }}
+                    onClick={async () => {
+                      await revokeActiveSession(sess.sessionPrefix);
+                      loadAllAdminData();
+                    }}
+                  >
+                    Revoke
+                  </button>
+                </div>
+              ))}
             </div>
           )}
 
@@ -926,34 +1502,132 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </thead>
               <tbody>
                 {users.map((u) => (
-                  <tr key={u.id}>
-                    <td>
-                      <div style={{ fontWeight: 600, fontSize: '0.8rem' }}>{u.username}</div>
-                      <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)' }}>{u.email}</div>
-                    </td>
-                    <td>
-                      <span className="status-pill status-reboot" style={{ fontSize: '0.68rem' }}>
-                        {u.role}
-                      </span>
-                    </td>
-                    <td>
-                      <span style={{ fontSize: '0.72rem', color: '#10b981' }}>
-                        {u.tenant_name || 'Global MSP'}
-                      </span>
-                    </td>
-                    <td style={{ textAlign: 'right' }}>
-                      {users.length > 1 && (
-                        <button
-                          type="button"
-                          className="btn-glass btn-icon"
-                          onClick={() => handleDeleteUser(u.id)}
-                          title="Remove Account"
-                        >
-                          <Trash2 size={13} color="#ef4444" />
-                        </button>
-                      )}
-                    </td>
-                  </tr>
+                  <React.Fragment key={u.id}>
+                    <tr>
+                      <td>
+                        <div style={{ fontWeight: 600, fontSize: '0.8rem' }}>{u.username}</div>
+                        <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)' }}>{u.email}</div>
+                      </td>
+                      <td>
+                        <span className="status-pill status-reboot" style={{ fontSize: '0.68rem' }}>
+                          {u.role}
+                        </span>
+                        {u.custom_role_name && (
+                          <div style={{ fontSize: '0.66rem', color: 'var(--primary)', marginTop: '0.15rem' }}>
+                            +{u.custom_role_name}
+                          </div>
+                        )}
+                      </td>
+                      <td>
+                        <span style={{ fontSize: '0.72rem', color: '#10b981' }}>
+                          {u.tenant_name || 'Global MSP'}
+                        </span>
+                      </td>
+                      <td style={{ textAlign: 'right' }}>
+                        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.3rem' }}>
+                          <button
+                            type="button"
+                            className="btn-glass btn-icon"
+                            title="Edit Role / Reset Password"
+                            onClick={() => {
+                              if (editingUserId === u.id) {
+                                setEditingUserId(null);
+                              } else {
+                                setEditingUserId(u.id);
+                                setEditUserRole(u.role);
+                                setEditUserCustomRoleId(u.custom_role_id || '');
+                                setEditUserTenantId(u.tenant_id || '');
+                                setEditUserPassword('');
+                              }
+                            }}
+                          >
+                            <Edit3 size={13} />
+                          </button>
+                          <button
+                            type="button"
+                            className="btn-glass btn-icon"
+                            title="Reset User TOTP MFA"
+                            onClick={() => handleResetUserMfa(u.id, u.username)}
+                          >
+                            <KeyRound size={13} color="#fbbf24" />
+                          </button>
+                          {users.length > 1 && (
+                            <button
+                              type="button"
+                              className="btn-glass btn-icon"
+                              onClick={() => handleDeleteUser(u.id)}
+                              title="Remove Account"
+                            >
+                              <Trash2 size={13} color="#ef4444" />
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                    {editingUserId === u.id && (
+                      <tr>
+                        <td colSpan={4} style={{ background: 'rgba(56, 189, 248, 0.06)' }}>
+                          <div style={{ display: 'flex', gap: '0.45rem', flexWrap: 'wrap', alignItems: 'center' }}>
+                            <select
+                              className="glass-select"
+                              style={{ width: 'auto', fontSize: '0.74rem' }}
+                              value={editUserRole}
+                              onChange={(e) => setEditUserRole(e.target.value)}
+                            >
+                              <option value="technician">Technician</option>
+                              <option value="super_admin">MSP Super Admin</option>
+                              <option value="auditor">Read-Only Auditor</option>
+                              <option value="client_admin">Client Admin</option>
+                            </select>
+                            <select
+                              className="glass-select"
+                              style={{ width: 'auto', fontSize: '0.74rem' }}
+                              value={editUserCustomRoleId}
+                              onChange={(e) => setEditUserCustomRoleId(e.target.value)}
+                            >
+                              <option value="">Default Role Matrix</option>
+                              {customRoles.map((cr) => (
+                                <option key={cr.id} value={cr.id}>
+                                  Custom: {cr.name}
+                                </option>
+                              ))}
+                            </select>
+                            {editUserRole === 'client_admin' && (
+                              <select
+                                className="glass-select"
+                                style={{ width: 'auto', fontSize: '0.74rem' }}
+                                value={editUserTenantId}
+                                onChange={(e) => setEditUserTenantId(e.target.value)}
+                              >
+                                <option value="">-- Client --</option>
+                                {tenants.map((t) => (
+                                  <option key={t.id} value={t.id}>
+                                    {t.name}
+                                  </option>
+                                ))}
+                              </select>
+                            )}
+                            <input
+                              type="password"
+                              className="glass-input"
+                              style={{ flex: 1, minWidth: '140px', fontSize: '0.74rem' }}
+                              placeholder="Optional new password (10+ chars)"
+                              value={editUserPassword}
+                              onChange={(e) => setEditUserPassword(e.target.value)}
+                            />
+                            <button
+                              type="button"
+                              className="btn-glass btn-primary"
+                              style={{ fontSize: '0.73rem', padding: '0.28rem 0.65rem' }}
+                              onClick={() => handleSaveEditUser(u.id)}
+                            >
+                              Save
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
                 ))}
               </tbody>
             </table>
@@ -1028,7 +1702,18 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
 
           {clientActionNotice && (
-            <div style={{ padding: '0.55rem 0.85rem', borderRadius: '6px', background: 'rgba(56, 189, 248, 0.12)', border: '1px solid rgba(56, 189, 248, 0.35)', fontSize: '0.76rem', color: 'var(--text-main)' }}>
+            <div
+              style={{
+                padding: '0.55rem 0.85rem',
+                borderRadius: '6px',
+                background: isErrorMessage(clientActionNotice)
+                  ? 'rgba(239, 68, 68, 0.14)'
+                  : 'rgba(16, 185, 129, 0.12)',
+                border: `1px solid ${isErrorMessage(clientActionNotice) ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`,
+                fontSize: '0.76rem',
+                color: isErrorMessage(clientActionNotice) ? '#f87171' : '#34d399'
+              }}
+            >
               {clientActionNotice}
             </div>
           )}
@@ -1120,18 +1805,61 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.6rem 0.85rem', borderRadius: '6px', background: 'rgba(148, 163, 184, 0.08)', border: '1px solid var(--glass-border)', fontSize: '0.78rem' }}>
                 <div>
-                  <span style={{ color: 'var(--text-dim)', fontSize: '0.7rem', display: 'block' }}>TOTP BASE32 SECRET</span>
+                  <span style={{ color: 'var(--text-dim)', fontSize: '0.7rem', display: 'block' }}>
+                    TOTP BASE32 SECRET {mfaInfo.confirmed || mfaInfo.secretRedacted ? '(CONFIRMED & LOCKED)' : '(UNCONFIRMED SETUP)'}
+                  </span>
                   <code style={{ color: 'var(--primary)', fontWeight: 600 }}>
-                    {showMfaSecret ? mfaInfo.secretBase32 : '••••••••••••••••••••••••••••••••'}
+                    {showMfaSecret
+                      ? mfaInfo.secretBase32 || 'REDACTED_AFTER_CONFIRMATION'
+                      : '••••••••••••••••••••••••••••••••'}
                   </code>
                 </div>
                 <button type="button" className="btn-glass" style={{ fontSize: '0.72rem', padding: '0.25rem 0.6rem' }} onClick={() => setShowMfaSecret(!showMfaSecret)}>
-                  {showMfaSecret ? 'Hide Secret' : 'Show Secret / URI'}
+                  {showMfaSecret ? 'Hide Secret' : 'Show QR / Secret'}
                 </button>
               </div>
               {showMfaSecret && (
-                <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', wordBreak: 'break-all' }}>
-                  URI: <code>{mfaInfo.otpAuthUri}</code>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', fontSize: '0.72rem', color: 'var(--text-muted)', wordBreak: 'break-all' }}>
+                  {mfaInfo.otpAuthUri && !mfaInfo.secretRedacted ? (
+                    <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                      {mfaInfo.qrSvg ? (
+                        <img
+                          src={`data:image/svg+xml;utf8,${encodeURIComponent(mfaInfo.qrSvg)}`}
+                          alt="TOTP QR Code"
+                          style={{ width: '132px', height: '132px', background: '#fff', padding: '6px', borderRadius: '8px' }}
+                        />
+                      ) : (
+                        <img
+                          src={getLocalQrSvgUrl(mfaInfo.otpAuthUri)}
+                          alt="TOTP QR"
+                          style={{ width: '132px', height: '132px', background: '#fff', padding: '6px', borderRadius: '8px' }}
+                        />
+                      )}
+                      <div style={{ flex: 1, minWidth: '180px' }}>
+                        URI: <code>{mfaInfo.otpAuthUri}</code>
+                      </div>
+                    </div>
+                  ) : (
+                    <div>
+                      Plaintext TOTP secret is permanently redacted once confirmed. Use Step-Up MFA verification or Reset MFA in RBAC above to provision a new device.
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {!mfaInfo.confirmed && !mfaInfo.secretRedacted && (
+                <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                  <input
+                    type="text"
+                    className="glass-input"
+                    style={{ flex: 1, fontSize: '0.78rem' }}
+                    placeholder="Enter 6-digit TOTP code to confirm & lock secret"
+                    value={confirmTotpCode}
+                    onChange={(e) => setConfirmTotpCode(e.target.value)}
+                  />
+                  <button type="button" className="btn-glass" style={{ fontSize: '0.76rem', borderColor: 'rgba(16, 185, 129, 0.5)', color: '#34d399' }} onClick={handleConfirmMfaEnrollment}>
+                    Confirm Enrollment
+                  </button>
                 </div>
               )}
 
@@ -1150,7 +1878,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </div>
 
               {mfaNotice && (
-                <div style={{ fontSize: '0.76rem', color: 'var(--text-main)', padding: '0.5rem 0.75rem', borderRadius: '6px', background: 'rgba(16, 185, 129, 0.12)', border: '1px solid rgba(16, 185, 129, 0.35)' }}>
+                <div
+                  style={{
+                    fontSize: '0.76rem',
+                    color: isErrorMessage(mfaNotice) ? '#f87171' : '#34d399',
+                    padding: '0.5rem 0.75rem',
+                    borderRadius: '6px',
+                    background: isErrorMessage(mfaNotice) ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+                    border: `1px solid ${isErrorMessage(mfaNotice) ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`
+                  }}
+                >
                   {mfaNotice}
                 </div>
               )}
@@ -1238,10 +1975,18 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <input
               type="text"
               className="glass-input"
-              style={{ flex: 1.2, fontSize: '0.76rem' }}
+              style={{ flex: 1.2, minWidth: '130px', fontSize: '0.76rem' }}
               placeholder="Maintenance Window Title"
               value={newWinTitle}
               onChange={(e) => setNewWinTitle(e.target.value)}
+            />
+            <input
+              type="datetime-local"
+              className="glass-input"
+              style={{ width: 'auto', fontSize: '0.74rem' }}
+              title="Optional scheduled start time (defaults to Now)"
+              value={newWinStartTime}
+              onChange={(e) => setNewWinStartTime(e.target.value)}
             />
             <select
               className="glass-select"
@@ -1272,12 +2017,27 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </button>
           </div>
 
+          {schemaFieldNotice && (
+            <div
+              style={{
+                fontSize: '0.74rem',
+                padding: '0.45rem 0.7rem',
+                borderRadius: '6px',
+                background: isErrorMessage(schemaFieldNotice) ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+                border: `1px solid ${isErrorMessage(schemaFieldNotice) ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`,
+                color: isErrorMessage(schemaFieldNotice) ? '#f87171' : '#34d399'
+              }}
+            >
+              {schemaFieldNotice}
+            </div>
+          )}
+
           {maintenanceWindows.length > 0 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', maxHeight: '72px', overflowY: 'auto' }}>
               {maintenanceWindows.map((mw) => (
                 <div key={mw.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.72rem', padding: '0.25rem 0.5rem', borderRadius: '5px', background: 'rgba(245, 158, 11, 0.08)' }}>
                   <span>
-                    <strong>{mw.title}</strong> ({mw.tenant_id ? 'Tenant' : 'Global'}) — until {new Date(mw.end_time).toLocaleString()}
+                    <strong>{mw.title}</strong> ({mw.tenant_id ? 'Tenant' : 'Global'}) — {new Date(mw.start_time).toLocaleString()} &rarr; {new Date(mw.end_time).toLocaleString()}
                   </span>
                   <button
                     type="button"
@@ -1293,6 +2053,438 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               ))}
             </div>
           )}
+        </div>
+      </div>
+
+      {/* Custom Granular RBAC Roles & Scoped Public REST API Keys */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem' }}>
+        <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+            <Shield size={20} color="#a78bfa" />
+            <div>
+              <h3 style={{ fontSize: '1.05rem', fontWeight: 600, margin: 0 }}>Custom Granular RBAC Role Matrix</h3>
+              <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                Define fine-grained permission profiles ({customRoles.length} custom roles)
+              </span>
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+            <input
+              type="text"
+              className="glass-input"
+              style={{ flex: 1, fontSize: '0.76rem' }}
+              placeholder="Role Name (e.g. Tier-1 NOC Analyst)"
+              value={newRoleName}
+              onChange={(e) => setNewRoleName(e.target.value)}
+            />
+            <input
+              type="text"
+              className="glass-input"
+              style={{ flex: 1.2, fontSize: '0.76rem' }}
+              placeholder="Description"
+              value={newRoleDesc}
+              onChange={(e) => setNewRoleDesc(e.target.value)}
+            />
+            <button type="button" className="btn-glass btn-primary" style={{ fontSize: '0.76rem' }} onClick={handleCreateCustomRole}>
+              <Plus size={13} /> Create Role
+            </button>
+          </div>
+
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.35rem', maxHeight: '95px', overflowY: 'auto', padding: '0.45rem', borderRadius: '6px', background: 'rgba(148, 163, 184, 0.05)', border: '1px solid var(--glass-border)' }}>
+            {(availablePermissions.filter((p) => p.includes(':')).length > 0
+              ? availablePermissions.filter((p) => p.includes(':'))
+              : [...ALL_GRANULAR_PERMISSIONS]
+            ).map((perm) => {
+              const checked = newRolePerms.includes(perm);
+              return (
+                <label key={perm} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.7rem', padding: '0.15rem 0.45rem', borderRadius: '4px', background: checked ? 'rgba(167, 139, 250, 0.18)' : 'transparent', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={(e) =>
+                      setNewRolePerms((prev) =>
+                        e.target.checked ? [...prev, perm] : prev.filter((p) => p !== perm)
+                      )
+                    }
+                  />
+                  <code>{perm}</code>
+                </label>
+              );
+            })}
+          </div>
+
+          {roleNotice && (
+            <div
+              style={{
+                fontSize: '0.74rem',
+                color: isErrorMessage(roleNotice) ? '#f87171' : '#34d399',
+                padding: '0.45rem 0.7rem',
+                borderRadius: '6px',
+                background: isErrorMessage(roleNotice) ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+                border: `1px solid ${isErrorMessage(roleNotice) ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`
+              }}
+            >
+              {roleNotice}
+            </div>
+          )}
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', maxHeight: '115px', overflowY: 'auto' }}>
+            {customRoles.map((cr) => (
+              <div key={cr.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.4rem 0.65rem', borderRadius: '6px', background: 'rgba(148, 163, 184, 0.06)', border: '1px solid var(--glass-border)', fontSize: '0.74rem' }}>
+                <div>
+                  <strong>{cr.name}</strong>{' '}
+                  <span style={{ color: 'var(--text-dim)' }}>({cr.permissions.length} perms)</span>
+                </div>
+                {!cr.is_system && (
+                  <button
+                    type="button"
+                    className="btn-glass btn-icon"
+                    onClick={async () => {
+                      await deleteCustomRole(cr.id);
+                      loadAllAdminData();
+                    }}
+                  >
+                    <Trash2 size={12} color="#ef4444" />
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Scoped Public REST API Keys */}
+        <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+            <KeyRound size={20} color="#38bdf8" />
+            <div>
+              <h3 style={{ fontSize: '1.05rem', fontWeight: 600, margin: 0 }}>Scoped Public REST API Keys (<code>vrmm_live_...</code>)</h3>
+              <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                SHA-256 hashed bearer keys for CI/CD, SIEM &amp; external automation ({apiKeys.filter((k) => !k.revoked).length} active)
+              </span>
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', gap: '0.45rem', flexWrap: 'wrap' }}>
+            <input
+              type="text"
+              className="glass-input"
+              style={{ flex: 1.2, minWidth: '130px', fontSize: '0.76rem' }}
+              placeholder="Key Label (e.g. HaloPSA Sync Bot)"
+              value={newKeyName}
+              onChange={(e) => setNewKeyName(e.target.value)}
+            />
+            <select
+              className="glass-select"
+              style={{ width: 'auto', fontSize: '0.76rem' }}
+              value={newKeyRole}
+              onChange={(e) => setNewKeyRole(e.target.value as 'technician' | 'auditor' | 'super_admin')}
+            >
+              <option value="technician">Technician Ceiling</option>
+              <option value="auditor">Read-Only Ceiling</option>
+              <option value="super_admin">Super Admin Ceiling</option>
+            </select>
+            <select
+              className="glass-select"
+              style={{ width: 'auto', fontSize: '0.76rem' }}
+              value={newKeyTenantId}
+              onChange={(e) => setNewKeyTenantId(e.target.value)}
+            >
+              <option value="">All Tenants</option>
+              {tenants.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name}
+                </option>
+              ))}
+            </select>
+            <select
+              className="glass-select"
+              style={{ width: 'auto', fontSize: '0.76rem' }}
+              value={newKeyExpiresDays}
+              onChange={(e) => setNewKeyExpiresDays(Number(e.target.value))}
+            >
+              <option value={30}>30d</option>
+              <option value={90}>90d</option>
+              <option value={365}>365d</option>
+            </select>
+            <button type="button" className="btn-glass btn-primary" style={{ fontSize: '0.76rem' }} onClick={handleMintScopedApiKey}>
+              <Plus size={13} /> Mint Key
+            </button>
+          </div>
+
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.35rem', padding: '0.4rem', borderRadius: '6px', background: 'rgba(148, 163, 184, 0.05)', border: '1px solid var(--glass-border)' }}>
+            {ALL_GRANULAR_PERMISSIONS.map((sc) => {
+              const checked = newKeyScopes.includes(sc);
+              return (
+                <label key={sc} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.7rem', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={(e) =>
+                      setNewKeyScopes((prev) =>
+                        e.target.checked ? [...prev, sc] : prev.filter((s) => s !== sc)
+                      )
+                    }
+                  />
+                  <code>{sc}</code>
+                </label>
+              );
+            })}
+          </div>
+
+          {mintedRawApiKey && (
+            <div style={{ padding: '0.6rem 0.8rem', borderRadius: '6px', background: 'rgba(16, 185, 129, 0.14)', border: '1px solid rgba(16, 185, 129, 0.4)', display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+              <code style={{ flex: 1, fontSize: '0.74rem', color: '#34d399', wordBreak: 'break-all' }}>{mintedRawApiKey}</code>
+              <button
+                type="button"
+                className="btn-glass"
+                style={{ fontSize: '0.72rem', padding: '0.2rem 0.55rem' }}
+                onClick={async () => {
+                  const ok = await copyToClipboard(mintedRawApiKey);
+                  if (ok) {
+                    setCopiedApiKey(true);
+                    setTimeout(() => setCopiedApiKey(false), 2000);
+                  }
+                }}
+              >
+                {copiedApiKey ? 'Copied!' : 'Copy'}
+              </button>
+              <button type="button" className="btn-glass" style={{ fontSize: '0.72rem', padding: '0.2rem 0.5rem' }} onClick={() => setMintedRawApiKey(null)}>
+                Dismiss
+              </button>
+            </div>
+          )}
+
+          {apiKeyNotice && (
+            <div
+              style={{
+                fontSize: '0.74rem',
+                padding: '0.45rem 0.7rem',
+                borderRadius: '6px',
+                background: isErrorMessage(apiKeyNotice) ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+                border: `1px solid ${isErrorMessage(apiKeyNotice) ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`,
+                color: isErrorMessage(apiKeyNotice) ? '#f87171' : '#34d399'
+              }}
+            >
+              {apiKeyNotice}
+            </div>
+          )}
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', maxHeight: '115px', overflowY: 'auto' }}>
+            {apiKeys.map((ak) => (
+              <div key={ak.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.4rem 0.65rem', borderRadius: '6px', background: 'rgba(148, 163, 184, 0.06)', border: '1px solid var(--glass-border)', fontSize: '0.73rem', opacity: ak.revoked ? 0.55 : 1 }}>
+                <div>
+                  <strong>{ak.name}</strong> • <code>{ak.key_prefix}...</code> ({ak.role})
+                </div>
+                {!ak.revoked ? (
+                  <button
+                    type="button"
+                    className="btn-glass"
+                    style={{ padding: '0.15rem 0.5rem', fontSize: '0.68rem', color: '#ef4444' }}
+                    onClick={async () => {
+                      await revokeScopedApiKey(ak.id);
+                      loadAllAdminData();
+                    }}
+                  >
+                    Revoke
+                  </button>
+                ) : (
+                  <span style={{ fontSize: '0.68rem', color: '#ef4444' }}>Revoked</span>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Endpoint Backup Policies & Cross-Platform MDM Configuration Profiles */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem' }}>
+        <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+            <HardDrive size={20} color="#10b981" />
+            <div>
+              <h3 style={{ fontSize: '1.05rem', fontWeight: 600, margin: 0 }}>Endpoint Backup Vault Policies</h3>
+              <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                Restic, Borg, Windows VSS &amp; Time Machine repositories ({backupPolicies.length})
+              </span>
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', gap: '0.45rem', flexWrap: 'wrap' }}>
+            <input
+              type="text"
+              className="glass-input"
+              style={{ flex: 1, fontSize: '0.76rem' }}
+              placeholder="Policy Name (e.g. Daily Restic S3)"
+              value={newBpName}
+              onChange={(e) => setNewBpName(e.target.value)}
+            />
+            <select
+              className="glass-select"
+              style={{ width: 'auto', fontSize: '0.76rem' }}
+              value={newBpEngine}
+              onChange={(e) => setNewBpEngine(e.target.value)}
+            >
+              <option value="restic">Restic (Cross-OS)</option>
+              <option value="vss_wbadmin">Windows VSS / wbadmin</option>
+              <option value="borg">BorgBackup (Linux)</option>
+              <option value="timemachine">macOS Time Machine</option>
+            </select>
+            <input
+              type="text"
+              className="glass-input"
+              style={{ flex: 1.3, fontSize: '0.76rem' }}
+              placeholder="Repo Target (s3:https://.../bucket or \\nas\backups)"
+              value={newBpRepo}
+              onChange={(e) => setNewBpRepo(e.target.value)}
+            />
+            <input
+              type="text"
+              className="glass-input"
+              style={{ width: '95px', fontSize: '0.76rem' }}
+              placeholder="Cron"
+              value={newBpCron}
+              onChange={(e) => setNewBpCron(e.target.value)}
+            />
+            <input
+              type="number"
+              className="glass-input"
+              style={{ width: '75px', fontSize: '0.76rem' }}
+              title="Retention Days"
+              value={newBpRetention}
+              onChange={(e) => setNewBpRetention(Number(e.target.value) || 30)}
+            />
+            <button type="button" className="btn-glass btn-primary" style={{ fontSize: '0.76rem' }} onClick={handleCreateBackupPolicy}>
+              <Plus size={13} /> Add
+            </button>
+          </div>
+
+          {bpNotice && (
+            <div
+              style={{
+                fontSize: '0.74rem',
+                padding: '0.45rem 0.7rem',
+                borderRadius: '6px',
+                background: isErrorMessage(bpNotice) ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+                border: `1px solid ${isErrorMessage(bpNotice) ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`,
+                color: isErrorMessage(bpNotice) ? '#f87171' : '#34d399'
+              }}
+            >
+              {bpNotice}
+            </div>
+          )}
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', maxHeight: '115px', overflowY: 'auto' }}>
+            {backupPolicies.map((bp) => (
+              <div key={bp.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.4rem 0.65rem', borderRadius: '6px', background: 'rgba(148, 163, 184, 0.06)', border: '1px solid var(--glass-border)', fontSize: '0.73rem' }}>
+                <div>
+                  <strong>{bp.name}</strong> ({bp.engine}) • <code>{bp.schedule_cron}</code> • {bp.retention_days}d
+                </div>
+                <button
+                  type="button"
+                  className="btn-glass btn-icon"
+                  onClick={async () => {
+                    await deleteBackupPolicy(bp.id);
+                    loadAllAdminData();
+                  }}
+                >
+                  <Trash2 size={12} color="#ef4444" />
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Cross-Platform MDM Profiles */}
+        <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+            <Laptop size={20} color="#f59e0b" />
+            <div>
+              <h3 style={{ fontSize: '1.05rem', fontWeight: 600, margin: 0 }}>MDM &amp; OS Configuration Profiles</h3>
+              <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                macOS <code>.mobileconfig</code>, Windows CSP &amp; Linux sysctl baselines ({mdmProfiles.length})
+              </span>
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', gap: '0.45rem', flexWrap: 'wrap' }}>
+            <input
+              type="text"
+              className="glass-input"
+              style={{ flex: 1, fontSize: '0.76rem' }}
+              placeholder="Profile Name (e.g. macOS FileVault & Firewall)"
+              value={newMdmName}
+              onChange={(e) => setNewMdmName(e.target.value)}
+            />
+            <select
+              className="glass-select"
+              style={{ width: 'auto', fontSize: '0.76rem' }}
+              value={newMdmPlatform}
+              onChange={(e) => setNewMdmPlatform(e.target.value as 'macos' | 'windows' | 'linux')}
+            >
+              <option value="macos">macOS (.mobileconfig)</option>
+              <option value="windows">Windows (CSP / Policy)</option>
+              <option value="linux">Linux (sysctl / systemd)</option>
+            </select>
+            <select
+              className="glass-select"
+              style={{ width: 'auto', fontSize: '0.76rem' }}
+              value={newMdmType}
+              onChange={(e) => setNewMdmType(e.target.value)}
+            >
+              <option value="security_baseline">Security Baseline</option>
+              <option value="wifi_vpn">Wi-Fi / VPN Payload</option>
+              <option value="disk_encryption">Disk Encryption</option>
+              <option value="pppc_kiosk">PPPC / Kiosk Restrictions</option>
+            </select>
+            <button type="button" className="btn-glass btn-primary" style={{ fontSize: '0.76rem' }} onClick={handleCreateMdmProfile}>
+              <Plus size={13} /> Profile
+            </button>
+          </div>
+
+          <input
+            type="text"
+            className="glass-input"
+            style={{ fontSize: '0.74rem' }}
+            placeholder="Optional XML / plist / SyncML / JSON payload override"
+            value={newMdmPayload}
+            onChange={(e) => setNewMdmPayload(e.target.value)}
+          />
+
+          {mdmNotice && (
+            <div
+              style={{
+                fontSize: '0.74rem',
+                padding: '0.45rem 0.7rem',
+                borderRadius: '6px',
+                background: isErrorMessage(mdmNotice) ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+                border: `1px solid ${isErrorMessage(mdmNotice) ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`,
+                color: isErrorMessage(mdmNotice) ? '#f87171' : '#34d399'
+              }}
+            >
+              {mdmNotice}
+            </div>
+          )}
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', maxHeight: '115px', overflowY: 'auto' }}>
+            {mdmProfiles.map((mp) => (
+              <div key={mp.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.4rem 0.65rem', borderRadius: '6px', background: 'rgba(148, 163, 184, 0.06)', border: '1px solid var(--glass-border)', fontSize: '0.73rem' }}>
+                <div>
+                  <strong>{mp.name}</strong> ({mp.platform.toUpperCase()} • {mp.profile_type})
+                </div>
+                <button
+                  type="button"
+                  className="btn-glass btn-icon"
+                  onClick={async () => {
+                    await deleteMdmProfile(mp.id);
+                    loadAllAdminData();
+                  }}
+                >
+                  <Trash2 size={12} color="#ef4444" />
+                </button>
+              </div>
+            ))}
+          </div>
         </div>
       </div>
       <form onSubmit={handleSave} style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
@@ -1314,7 +2506,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <input
                 ref={logoInputRef}
                 type="file"
-                accept="image/png,image/jpeg,image/webp,image/gif"
+                accept="image/png,image/jpeg,image/webp,image/x-icon,.ico"
                 style={{ display: 'none' }}
                 onChange={handleLogoFileSelect}
               />
@@ -1409,15 +2601,21 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   value={formData.quicksupport_custom_domain ?? ''}
                   onChange={(e) => setFormData({ ...formData, quicksupport_custom_domain: e.target.value })}
                 />
-                <a
-                  href={formData.quicksupport_url_path || '/remote'}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="btn-glass"
-                  style={{ whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: '0.35rem', textDecoration: 'none' }}
-                >
-                  <ExternalLink size={14} /> {formData.quicksupport_url_path || '/remote'}
-                </a>
+                {(() => {
+                  const rawQsPath = (formData.quicksupport_url_path || '/remote').trim();
+                  const safeQsHref = /^(\/(?!\/)|https?:\/\/)/i.test(rawQsPath) ? rawQsPath : '/remote';
+                  return (
+                    <a
+                      href={safeQsHref}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="btn-glass"
+                      style={{ whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: '0.35rem', textDecoration: 'none' }}
+                    >
+                      <ExternalLink size={14} /> {safeQsHref}
+                    </a>
+                  );
+                })()}
               </div>
             </div>
           </div>
@@ -1563,11 +2761,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <label className="form-label">Minimum Role to Download Installers</label>
               <select
                 className="glass-select"
-                value={formData.installer_download_role ?? 'technician'}
+                value={
+                  formData.installer_download_role === 'admin'
+                    ? 'super_admin'
+                    : formData.installer_download_role ?? 'technician'
+                }
                 onChange={(e) => setFormData({ ...formData, installer_download_role: e.target.value })}
               >
                 <option value="technician">Technician+ (All Staff)</option>
-                <option value="admin">MSP Super Admin Only</option>
+                <option value="super_admin">MSP Super Admin Only</option>
               </select>
             </div>
 
@@ -1697,7 +2899,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
 
           {meshSyncResult && (
-            <div style={{ background: 'rgba(0, 242, 254, 0.1)', border: '1px solid rgba(0, 242, 254, 0.3)', padding: '0.75rem 1rem', borderRadius: '6px', fontSize: '0.8rem', color: 'var(--text-main)', marginTop: '1rem' }}>
+            <div
+              style={{
+                background: isErrorMessage(meshSyncResult) ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+                border: `1px solid ${isErrorMessage(meshSyncResult) ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`,
+                padding: '0.75rem 1rem',
+                borderRadius: '6px',
+                fontSize: '0.8rem',
+                color: isErrorMessage(meshSyncResult) ? '#f87171' : '#34d399',
+                marginTop: '1rem'
+              }}
+            >
               {meshSyncResult}
             </div>
           )}
@@ -1749,50 +2961,140 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     background: 'rgba(148, 163, 184, 0.06)',
                     border: '1px solid var(--glass-border)',
                     display: 'flex',
-                    justifyContent: 'space-between',
-                    alignItems: 'center',
-                    flexWrap: 'wrap',
-                    gap: '0.65rem'
+                    flexDirection: 'column',
+                    gap: '0.55rem'
                   }}
                 >
-                  <div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontWeight: 600, fontSize: '0.84rem' }}>
-                      <span>{srv.name}</span>
-                      {srv.is_primary === 1 && <span className="status-pill status-online" style={{ fontSize: '0.65rem' }}>Primary</span>}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.65rem' }}>
+                    <div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontWeight: 600, fontSize: '0.84rem' }}>
+                        <span>{srv.name}</span>
+                        {Boolean(srv.is_primary) && <span className="status-pill status-online" style={{ fontSize: '0.65rem' }}>Primary</span>}
+                      </div>
+                      <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>
+                        {srv.url} • Auto-Push Signed Vitrine Companion: {srv.auto_push_companion ? 'Enabled' : 'Disabled'}
+                      </div>
                     </div>
-                    <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>
-                      {srv.url} • Auto-Push Signed Vitrine Companion: {srv.auto_push_companion ? 'Enabled' : 'Disabled'}
-                    </div>
-                  </div>
-                  <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-                    <button
-                      type="button"
-                      className="btn-glass"
-                      style={{ fontSize: '0.75rem', padding: '0.3rem 0.65rem' }}
-                      disabled={discoveringServerId === srv.id}
-                      onClick={() => handleDiscoverMesh(srv)}
-                    >
-                      <RefreshCw size={12} className={discoveringServerId === srv.id ? 'spin' : ''} />
-                      <span>{discoveringServerId === srv.id ? 'Scanning...' : 'Test & Discover Fleet'}</span>
-                    </button>
-                    {srv.is_primary !== 1 && (
+                    <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                      <button
+                        type="button"
+                        className="btn-glass"
+                        style={{ fontSize: '0.75rem', padding: '0.3rem 0.65rem' }}
+                        disabled={discoveringServerId === srv.id}
+                        onClick={() => handleDiscoverMesh(srv)}
+                      >
+                        <RefreshCw size={12} className={discoveringServerId === srv.id ? 'spin' : ''} />
+                        <span>{discoveringServerId === srv.id ? 'Scanning...' : 'Test & Discover Fleet'}</span>
+                      </button>
                       <button
                         type="button"
                         className="btn-glass btn-icon"
-                        onClick={async () => {
-                          await deleteMeshServer(srv.id);
-                          loadAllAdminData();
+                        title="Edit MS2 Instance"
+                        onClick={() => {
+                          if (editingMeshId === srv.id) {
+                            setEditingMeshId(null);
+                          } else {
+                            setEditingMeshId(srv.id);
+                            setEditMeshName(srv.name);
+                            setEditMeshUrl(srv.url);
+                            setEditMeshToken('');
+                            setEditMeshAutoPush(Boolean(srv.auto_push_companion));
+                          }
                         }}
                       >
-                        <Trash2 size={13} color="#ef4444" />
+                        <Edit3 size={13} />
                       </button>
-                    )}
+                      {!srv.is_primary && (
+                        <button
+                          type="button"
+                          className="btn-glass btn-icon"
+                          onClick={async () => {
+                            await deleteMeshServer(srv.id);
+                            loadAllAdminData();
+                          }}
+                        >
+                          <Trash2 size={13} color="#ef4444" />
+                        </button>
+                      )}
+                    </div>
                   </div>
+                  {editingMeshId === srv.id && (
+                    <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center', paddingTop: '0.45rem', borderTop: '1px solid var(--glass-border)' }}>
+                      <input
+                        type="text"
+                        className="glass-input"
+                        style={{ flex: 1, fontSize: '0.76rem' }}
+                        value={editMeshName}
+                        onChange={(e) => setEditMeshName(e.target.value)}
+                      />
+                      <input
+                        type="text"
+                        className="glass-input"
+                        style={{ flex: 1.4, fontSize: '0.76rem' }}
+                        value={editMeshUrl}
+                        onChange={(e) => setEditMeshUrl(e.target.value)}
+                      />
+                      <input
+                        type="password"
+                        className="glass-input"
+                        style={{ flex: 1, fontSize: '0.76rem' }}
+                        placeholder="New API Token (leave blank to keep)"
+                        value={editMeshToken}
+                        onChange={(e) => setEditMeshToken(e.target.value)}
+                      />
+                      <label style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.75rem', cursor: 'pointer' }}>
+                        <input
+                          type="checkbox"
+                          checked={editMeshAutoPush}
+                          onChange={(e) => setEditMeshAutoPush(e.target.checked)}
+                        />
+                        <span>Auto-Push Companion</span>
+                      </label>
+                      <button
+                        type="button"
+                        className="btn-glass btn-primary"
+                        style={{ fontSize: '0.75rem', padding: '0.28rem 0.65rem' }}
+                        onClick={() => handleSaveMeshServerEdit(srv.id)}
+                      >
+                        Save MS2
+                      </button>
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
 
-            {discoveryPreview && (
+            {discoveryPreview && !discoveryPreview.reachable && (
+              <div
+                style={{
+                  marginTop: '0.85rem',
+                  padding: '0.9rem 1.1rem',
+                  borderRadius: '8px',
+                  background: 'rgba(239, 68, 68, 0.14)',
+                  border: '1px solid rgba(239, 68, 68, 0.35)',
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  flexWrap: 'wrap',
+                  gap: '0.75rem'
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.55rem', fontSize: '0.82rem', color: '#f87171', fontWeight: 600 }}>
+                  <AlertTriangle size={16} style={{ flexShrink: 0 }} />
+                  <span>{discoveryPreview.error || discoveryPreview.summary || 'MeshCentral server unreachable'}</span>
+                </div>
+                <button
+                  type="button"
+                  className="btn-glass"
+                  style={{ fontSize: '0.75rem', padding: '0.3rem 0.55rem' }}
+                  onClick={() => setDiscoveryPreview(null)}
+                >
+                  Close
+                </button>
+              </div>
+            )}
+
+            {discoveryPreview && discoveryPreview.reachable && (
               <div style={{ marginTop: '0.85rem', padding: '0.9rem 1.1rem', borderRadius: '8px', background: 'rgba(16, 185, 129, 0.08)', border: '1px solid rgba(16, 185, 129, 0.35)' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem', flexWrap: 'wrap', gap: '0.5rem' }}>
                   <strong style={{ fontSize: '0.84rem', color: '#34d399' }}>
@@ -1831,7 +3133,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   Self-Update Engine (Stable Releases vs. Alpha Commits) &amp; Watchdog Auto-Rollback
                 </h3>
                 <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', margin: '0.2rem 0 0 0' }}>
-                  Installed Version: <strong>v{updaterStatus?.installedVersion || formData.installed_version || '2.5.1'}</strong> • Installed Commit:{' '}
+                  Installed Version: <strong>v{updaterStatus?.installedVersion || formData.installed_version || '2.6.0'}</strong> • Installed Commit:{' '}
                   <code>{updaterStatus?.installedCommit || formData.installed_commit || 'HEAD'}</code> • DB Schema:{' '}
                   <code>v{backupStorage.currentAppSchemaVersion}</code> • Mode:{' '}
                   <strong>{updaterStatus?.deploymentMode === 'docker' ? 'Docker Container' : 'Bare-Metal Systemd'}</strong>
@@ -1953,7 +3255,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </label>
               </div>
 
-              <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
+              <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', alignItems: 'center' }}>
                 <button
                   type="button"
                   className="btn-glass btn-primary"
@@ -1969,10 +3271,33 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       : `Install Target Update (${updaterStatus.channel === 'stable' ? updaterStatus.latestStable.version : updaterStatus.latestAlpha.sha})`}
                   </span>
                 </button>
+                <button
+                  type="button"
+                  className="btn-glass"
+                  style={{ fontSize: '0.78rem' }}
+                  onClick={handleNotifyAdminsOfUpdate}
+                >
+                  <BellRing size={14} /> Notify Admins &amp; Dispatch Change Alert
+                </button>
+                {systemHealth && (
+                  <span style={{ fontSize: '0.74rem', color: 'var(--text-muted)', display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                    <Activity size={13} color="#10b981" />
+                    Control Plane {systemHealth.status.toUpperCase()} • Uptime {Math.floor(systemHealth.uptime / 60)}m • Active Tunnels: {systemHealth.meshBridge?.activeTunnels ?? 0}
+                  </span>
+                )}
               </div>
 
               {updaterNotice && (
-                <div style={{ padding: '0.75rem 1rem', borderRadius: '8px', background: 'rgba(0, 242, 254, 0.1)', border: '1px solid rgba(0, 242, 254, 0.35)', fontSize: '0.8rem', color: 'var(--text-main)' }}>
+                <div
+                  style={{
+                    padding: '0.75rem 1rem',
+                    borderRadius: '8px',
+                    background: isErrorMessage(updaterNotice) ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+                    border: `1px solid ${isErrorMessage(updaterNotice) ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`,
+                    fontSize: '0.8rem',
+                    color: isErrorMessage(updaterNotice) ? '#f87171' : '#34d399'
+                  }}
+                >
                   {updaterNotice}
                 </div>
               )}
@@ -2104,8 +3429,50 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <CloudUpload size={13} />
                   <span>{syncingOffsite ? 'Replicating to Offsite Vault...' : 'Test & Sync Offsite Vault Now'}</span>
                 </button>
+                <button
+                  type="button"
+                  className="btn-glass"
+                  style={{ fontSize: '0.76rem', padding: '0.35rem 0.75rem' }}
+                  disabled={browsingOffsite}
+                  onClick={handleBrowseOffsiteVault}
+                >
+                  <Download size={13} />
+                  <span>{browsingOffsite ? 'Listing Vault...' : 'Browse & Pull Offsite Vault'}</span>
+                </button>
               </div>
             </div>
+
+            {offsiteObjects && (
+              <div style={{ padding: '0.65rem 0.85rem', borderRadius: '8px', background: 'rgba(56, 189, 248, 0.08)', border: '1px solid rgba(56, 189, 248, 0.3)', display: 'flex', flexDirection: 'column', gap: '0.4rem', maxHeight: '140px', overflowY: 'auto' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <strong style={{ fontSize: '0.76rem', color: '#38bdf8' }}>
+                    Offsite Vault Objects ({offsiteObjects.length})
+                  </strong>
+                  <button type="button" className="btn-glass" style={{ padding: '0.15rem 0.45rem', fontSize: '0.68rem' }} onClick={() => setOffsiteObjects(null)}>
+                    Close
+                  </button>
+                </div>
+                {offsiteObjects.length === 0 ? (
+                  <div style={{ fontSize: '0.74rem', color: 'var(--text-dim)' }}>No remote archives found in configured offsite bucket/path.</div>
+                ) : (
+                  offsiteObjects.map((obj) => (
+                    <div key={obj.key} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.73rem', gap: '0.5rem' }}>
+                      <span>
+                        <code>{obj.key}</code> ({(obj.sizeBytes / (1024 * 1024)).toFixed(2)} MB)
+                      </span>
+                      <button
+                        type="button"
+                        className="btn-glass btn-primary"
+                        style={{ padding: '0.18rem 0.55rem', fontSize: '0.7rem' }}
+                        onClick={() => handlePullOffsiteObject(obj.key)}
+                      >
+                        Pull to Local Vault
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
 
             {revealedBackupKey && (
               <div
@@ -2134,10 +3501,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   type="button"
                   className="btn-glass"
                   style={{ fontSize: '0.74rem', padding: '0.3rem 0.65rem' }}
-                  onClick={() => {
-                    navigator.clipboard.writeText(revealedBackupKey);
-                    setCopiedBackupKey(true);
-                    setTimeout(() => setCopiedBackupKey(false), 2000);
+                  onClick={async () => {
+                    const ok = await copyToClipboard(revealedBackupKey);
+                    if (ok) {
+                      setCopiedBackupKey(true);
+                      setTimeout(() => setCopiedBackupKey(false), 2000);
+                    }
                   }}
                 >
                   {copiedBackupKey ? <Check size={13} color="#10b981" /> : <Copy size={13} />}
@@ -2241,7 +3610,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
 
           {backupNotice && (
-            <div style={{ marginBottom: '1rem', padding: '0.75rem 1rem', borderRadius: '8px', background: 'rgba(16, 185, 129, 0.12)', border: '1px solid rgba(16, 185, 129, 0.35)', fontSize: '0.8rem', color: 'var(--text-main)' }}>
+            <div
+              style={{
+                marginBottom: '1rem',
+                padding: '0.75rem 1rem',
+                borderRadius: '8px',
+                background: isErrorMessage(backupNotice) ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+                border: `1px solid ${isErrorMessage(backupNotice) ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`,
+                fontSize: '0.8rem',
+                color: isErrorMessage(backupNotice) ? '#f87171' : '#34d399'
+              }}
+            >
               {backupNotice}
             </div>
           )}
@@ -2448,7 +3827,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
 
           {oidcTestResult && (
-            <div style={{ marginTop: '0.85rem', padding: '0.7rem 0.95rem', borderRadius: '8px', background: 'rgba(0, 242, 254, 0.1)', border: '1px solid rgba(0, 242, 254, 0.35)', fontSize: '0.78rem', color: 'var(--text-main)' }}>
+            <div
+              style={{
+                marginTop: '0.85rem',
+                padding: '0.7rem 0.95rem',
+                borderRadius: '8px',
+                background: isErrorMessage(oidcTestResult) ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+                border: `1px solid ${isErrorMessage(oidcTestResult) ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`,
+                fontSize: '0.78rem',
+                color: isErrorMessage(oidcTestResult) ? '#f87171' : '#34d399'
+              }}
+            >
               {oidcTestResult}
             </div>
           )}
@@ -2521,7 +3910,23 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
 
           {smtpTestResult && (
-            <div style={{ background: 'rgba(16, 185, 129, 0.12)', border: '1px solid rgba(16, 185, 129, 0.3)', padding: '0.75rem 1rem', borderRadius: '6px', fontSize: '0.8rem', color: 'var(--text-main)' }}>
+            <div
+              style={{
+                background:
+                  !smtpTestSuccess || isErrorMessage(smtpTestResult)
+                    ? 'rgba(239, 68, 68, 0.14)'
+                    : 'rgba(16, 185, 129, 0.12)',
+                border: `1px solid ${
+                  !smtpTestSuccess || isErrorMessage(smtpTestResult)
+                    ? 'rgba(239, 68, 68, 0.35)'
+                    : 'rgba(16, 185, 129, 0.35)'
+                }`,
+                padding: '0.75rem 1rem',
+                borderRadius: '6px',
+                fontSize: '0.8rem',
+                color: !smtpTestSuccess || isErrorMessage(smtpTestResult) ? '#f87171' : '#34d399'
+              }}
+            >
               {smtpTestResult}
             </div>
           )}
@@ -2562,7 +3967,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <div style={{ padding: '0.75rem', borderRadius: '8px', background: 'var(--glass-bg)', border: '1px solid var(--glass-border)' }}>
                   <div style={{ fontSize: '0.73rem', color: 'var(--text-muted)' }}>Installed Software Target</div>
                   <div style={{ fontSize: '1.05rem', fontWeight: 700, color: '#38bdf8' }}>
-                    Schema v{schemaMismatchModal.appSchemaVersion} (App v{updaterStatus?.installedVersion || '2.5.1'})
+                    Schema v{schemaMismatchModal.appSchemaVersion} (App v{updaterStatus?.installedVersion || '2.6.0'})
                   </div>
                 </div>
               </div>
@@ -2626,6 +4031,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         title="Step-Up MFA: Reveal Backup Encryption Key"
         description="Verify your 6-digit TOTP authenticator or single-use recovery code to view and export the Disaster Recovery Backup Encryption Passphrase."
         secretType="backup_recovery_key"
+      />
+
+      <MfaChallengeModal
+        isOpen={Boolean(pendingMfaAction)}
+        onClose={() => setPendingMfaAction(null)}
+        onSuccess={() => {
+          const action = pendingMfaAction;
+          setPendingMfaAction(null);
+          if (action) action.onVerified();
+        }}
+        title={pendingMfaAction?.title || 'Step-Up MFA Verification'}
+        description="Verify your 6-digit TOTP authenticator or single-use recovery code to authorize this administrative security operation."
+        secretType={pendingMfaAction?.secretType || 'admin_security_action'}
       />
     </div>
   );

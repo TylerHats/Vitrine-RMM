@@ -37,7 +37,23 @@ import {
   BreakGlassRecoveryEntry,
   AuthStatusResponse,
   AuthUser,
-  PublicPortalConfig
+  PublicPortalConfig,
+  ScheduledAutomation,
+  SoftwarePackage,
+  SoftwareDeployment,
+  KbBlacklistEntry,
+  AlertIncident,
+  NotificationChannel,
+  DocumentationArticle,
+  PsaIntegration,
+  PsaTimeEntry,
+  BackupPolicy,
+  DeviceBackupJob,
+  MdmProfile,
+  CustomRole,
+  ScopedApiKey,
+  ActiveAuthSession,
+  AuditLogRecord
 } from '../types/index.js';
 
 const API_BASE = '/api';
@@ -56,27 +72,25 @@ export class ApiError extends Error {
   }
 }
 
+// Cookie-only session auth (`HttpOnly` `vitrine_session` cookie).
+// Never persist raw session bearer tokens in DOM Web Storage (XSS exfiltration mitigation).
 export function getStoredSessionToken(): string | null {
-  try {
-    return sessionStorage.getItem('vitrine_session_token');
-  } catch {
-    return null;
-  }
+  return null;
 }
 
-export function setStoredSessionToken(token: string | null): void {
+export function setStoredSessionToken(_token: string | null): void {
   try {
-    if (token) {
-      sessionStorage.setItem('vitrine_session_token', token);
-    } else {
-      sessionStorage.removeItem('vitrine_session_token');
-    }
+    sessionStorage.removeItem('vitrine_session_token');
   } catch {
     // Ignore storage errors
   }
 }
 
+const guestMemoryTokens = new Map<string, string>();
+
 export function getStoredGuestToken(grantId: string): string | null {
+  const mem = guestMemoryTokens.get(grantId);
+  if (mem) return mem;
   try {
     return sessionStorage.getItem(`vitrine_guest_token_${grantId}`);
   } catch {
@@ -85,6 +99,11 @@ export function getStoredGuestToken(grantId: string): string | null {
 }
 
 export function setStoredGuestToken(grantId: string, token: string | null): void {
+  if (token) {
+    guestMemoryTokens.set(grantId, token);
+  } else {
+    guestMemoryTokens.delete(grantId);
+  }
   try {
     if (token) {
       sessionStorage.setItem(`vitrine_guest_token_${grantId}`, token);
@@ -105,17 +124,17 @@ async function requestJson<T>(
   } = {}
 ): Promise<T> {
   const { returnErrorPayload, guestGrantId, suppressAuthEvent, headers: customHeaders, ...fetchOpts } = options;
+  const method = String(fetchOpts.method || 'GET').toUpperCase();
   const headers: Record<string, string> = {
     ...(customHeaders as Record<string, string>)
   };
 
-  if (fetchOpts.body && !headers['Content-Type']) {
-    headers['Content-Type'] = 'application/json';
+  if (method !== 'GET' && method !== 'HEAD') {
+    headers['X-Vitrine-CSRF'] = '1';
   }
 
-  const sessionToken = getStoredSessionToken();
-  if (sessionToken && !headers.Authorization) {
-    headers.Authorization = `Bearer ${sessionToken}`;
+  if (fetchOpts.body && !headers['Content-Type']) {
+    headers['Content-Type'] = 'application/json';
   }
 
   if (guestGrantId) {
@@ -188,6 +207,7 @@ export async function setupInitialSuperAdmin(data: {
   expiresAt?: string;
   totpSecret?: string;
   otpAuthUri?: string;
+  qrSvg?: string | null;
   recoveryCodes?: string[];
   error?: string;
 }> {
@@ -197,9 +217,7 @@ export async function setupInitialSuperAdmin(data: {
     returnErrorPayload: true,
     suppressAuthEvent: true
   });
-  if (res.success && res.token) {
-    setStoredSessionToken(res.token);
-  }
+  setStoredSessionToken(null);
   return res;
 }
 
@@ -220,9 +238,7 @@ export async function loginWithPassword(data: {
     returnErrorPayload: true,
     suppressAuthEvent: true
   });
-  if (res.success && res.token) {
-    setStoredSessionToken(res.token);
-  }
+  setStoredSessionToken(null);
   return res;
 }
 
@@ -240,11 +256,34 @@ export async function logoutSession(): Promise<{ success: boolean }> {
 
 export async function fetchMfaEnrollment(): Promise<{
   totpEnabled: boolean;
-  secretBase32: string;
-  otpAuthUri: string;
+  confirmed?: boolean;
+  secretRedacted?: boolean;
+  secretBase32: string | null;
+  otpAuthUri: string | null;
+  qrSvg?: string | null;
+  qrCodeSvg?: string | null;
   remainingRecoveryCodes: number;
 }> {
   return requestJson('/auth/mfa/enroll');
+}
+
+export async function fetchWsTicket(): Promise<{ success: boolean; ticket?: string; expiresInSeconds?: number }> {
+  return requestJson('/auth/ws-ticket', { returnErrorPayload: true, suppressAuthEvent: true });
+}
+
+export async function fetchActiveSessions(): Promise<{
+  success: boolean;
+  sessions: ActiveAuthSession[];
+  currentSessionPrefix?: string | null;
+}> {
+  return requestJson('/auth/sessions');
+}
+
+export async function revokeActiveSession(prefix: string): Promise<{ success: boolean }> {
+  return requestJson(`/auth/sessions/${encodeURIComponent(prefix)}`, {
+    method: 'DELETE',
+    returnErrorPayload: true
+  });
 }
 
 export async function regenerateMfaRecoveryCodes(code: string): Promise<{
@@ -311,7 +350,7 @@ export async function fetchSettings(): Promise<Settings> {
 
 export async function updateSettings(
   settings: Partial<Settings>
-): Promise<{ success: boolean; settings: Settings; error?: string }> {
+): Promise<{ success: boolean; settings: Settings; mfaRequired?: boolean; error?: string }> {
   return requestJson('/settings', {
     method: 'POST',
     body: JSON.stringify(settings),
@@ -357,7 +396,7 @@ export async function createTenant(data: {
 export async function deleteTenant(
   id: string,
   action: 'uninstall' | 'move_to_unassigned' = 'move_to_unassigned'
-): Promise<{ success: boolean; action: string }> {
+): Promise<{ success: boolean; action: string; error?: string }> {
   return requestJson(`/tenants/${encodeURIComponent(id)}?action=${action}`, {
     method: 'DELETE',
     returnErrorPayload: true
@@ -399,7 +438,7 @@ export async function revealDeviceBitlockerKey(id: string): Promise<{
 export async function toggleQuarantine(
   id: string,
   quarantine: boolean
-): Promise<{ success: boolean; quarantined: boolean }> {
+): Promise<{ success: boolean; quarantined: boolean; status?: Device['status']; mfaRequired?: boolean; error?: string }> {
   return requestJson(`/devices/${encodeURIComponent(id)}/quarantine`, {
     method: 'POST',
     body: JSON.stringify({ quarantine }),
@@ -605,7 +644,13 @@ export async function fetchPolicies(): Promise<Policy[]> {
   return requestJson<Policy[]>('/policies');
 }
 
-export async function createPolicy(policy: Partial<Policy>): Promise<{ success: boolean; policy: Policy }> {
+export async function fetchEffectiveDevicePolicy(deviceId: string): Promise<Record<string, any>> {
+  return requestJson<Record<string, any>>(`/policies/effective/${encodeURIComponent(deviceId)}`);
+}
+
+export async function createPolicy(
+  policy: Partial<Policy>
+): Promise<{ success: boolean; policy: Policy; mfaRequired?: boolean; error?: string }> {
   return requestJson('/policies', {
     method: 'POST',
     body: JSON.stringify(policy),
@@ -616,7 +661,7 @@ export async function createPolicy(policy: Partial<Policy>): Promise<{ success: 
 export async function updatePolicy(
   id: string,
   updates: Partial<Policy>
-): Promise<{ success: boolean; policy: Policy }> {
+): Promise<{ success: boolean; policy: Policy; mfaRequired?: boolean; error?: string }> {
   return requestJson(`/policies/${encodeURIComponent(id)}`, {
     method: 'PUT',
     body: JSON.stringify(updates),
@@ -624,7 +669,7 @@ export async function updatePolicy(
   });
 }
 
-export async function deletePolicy(id: string): Promise<{ success: boolean; error?: string }> {
+export async function deletePolicy(id: string): Promise<{ success: boolean; mfaRequired?: boolean; error?: string }> {
   return requestJson(`/policies/${encodeURIComponent(id)}`, {
     method: 'DELETE',
     returnErrorPayload: true
@@ -695,7 +740,7 @@ export async function fetchScripts(tenantId?: string): Promise<ScriptItem[]> {
 
 export async function createScript(
   script: Partial<ScriptItem>
-): Promise<{ success: boolean; id: string; error?: string }> {
+): Promise<{ success: boolean; id: string; mfaRequired?: boolean; error?: string }> {
   return requestJson('/scripts', {
     method: 'POST',
     body: JSON.stringify(script),
@@ -706,7 +751,7 @@ export async function createScript(
 export async function updateScript(
   id: string,
   updates: Partial<ScriptItem>
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; mfaRequired?: boolean; error?: string }> {
   return requestJson(`/scripts/${encodeURIComponent(id)}`, {
     method: 'PUT',
     body: JSON.stringify(updates),
@@ -714,7 +759,7 @@ export async function updateScript(
   });
 }
 
-export async function deleteScript(id: string): Promise<{ success: boolean; error?: string }> {
+export async function deleteScript(id: string): Promise<{ success: boolean; mfaRequired?: boolean; error?: string }> {
   return requestJson(`/scripts/${encodeURIComponent(id)}`, {
     method: 'DELETE',
     returnErrorPayload: true
@@ -724,12 +769,13 @@ export async function deleteScript(id: string): Promise<{ success: boolean; erro
 export async function runScript(
   scriptId: string,
   deviceIds: string[],
-  options?: { params?: Record<string, string>; runAs?: 'system' | 'user' }
+  options?: { params?: Record<string, string>; runAs?: 'system' | 'user'; smartGroupId?: string }
 ): Promise<{
   success: boolean;
   dispatchedCount: number;
   executionId: string;
   results?: Array<{ deviceId: string; hostname: string; status: string; output: string }>;
+  mfaRequired?: boolean;
   error?: string;
 }> {
   return requestJson(`/scripts/${encodeURIComponent(scriptId)}/run`, {
@@ -737,7 +783,8 @@ export async function runScript(
     body: JSON.stringify({
       deviceIds,
       params: options?.params,
-      runAs: options?.runAs
+      runAs: options?.runAs,
+      ...(options?.smartGroupId ? { smartGroupId: options.smartGroupId } : {})
     }),
     returnErrorPayload: true
   });
@@ -745,7 +792,11 @@ export async function runScript(
 
 export async function fetchScriptExecutions(scriptId?: string): Promise<any[]> {
   const q = scriptId ? `?scriptId=${encodeURIComponent(scriptId)}` : '';
-  return requestJson(`/scripts/executions${q}`);
+  const rows = await requestJson<any[]>(`/scripts/executions${q}`);
+  if (!Array.isArray(rows)) return [];
+  return scriptId
+    ? rows.filter((r) => r.script_id === scriptId || r.scriptId === scriptId)
+    : rows;
 }
 
 export async function fetchSelfHealing(): Promise<SelfHealingMonitor[]> {
@@ -1075,7 +1126,7 @@ export async function executeNotificationAction(
   id: string,
   action: string,
   tenantId?: string
-): Promise<{ success: boolean; message?: string }> {
+): Promise<{ success: boolean; message?: string; mfaRequired?: boolean; error?: string }> {
   return requestJson(`/notifications/${encodeURIComponent(id)}/action`, {
     method: 'POST',
     body: JSON.stringify({ action, tenantId }),
@@ -1098,6 +1149,16 @@ export async function fetchHardwareHistory(deviceId: string): Promise<HardwareHi
   return requestJson<HardwareHistoryItem[]>(`/devices/${encodeURIComponent(deviceId)}/hardware-history`);
 }
 
+export async function acknowledgeHardwareDrift(
+  deviceId: string,
+  histId: string
+): Promise<{ success: boolean; error?: string }> {
+  return requestJson(
+    `/devices/${encodeURIComponent(deviceId)}/hardware-history/${encodeURIComponent(histId)}/ack`,
+    { method: 'POST', body: JSON.stringify({}), returnErrorPayload: true }
+  );
+}
+
 export async function fetchNetworkHistory(deviceId: string): Promise<NetworkHistoryItem[]> {
   return requestJson<NetworkHistoryItem[]>(`/devices/${encodeURIComponent(deviceId)}/network-history`);
 }
@@ -1108,12 +1169,27 @@ export async function fetchSmartGroups(): Promise<SmartGroup[]> {
 
 export async function createSmartGroup(
   group: Partial<SmartGroup>
-): Promise<{ success: boolean; id: string }> {
+): Promise<{ success: boolean; id: string; matchedCount?: number; matchedDeviceIds?: string[] }> {
   return requestJson('/smart-groups', {
     method: 'POST',
     body: JSON.stringify(group),
     returnErrorPayload: true
   });
+}
+
+export async function updateSmartGroup(
+  id: string,
+  group: Partial<SmartGroup>
+): Promise<{ success: boolean; id: string; matchedCount?: number; matchedDeviceIds?: string[] }> {
+  return requestJson(`/smart-groups/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    body: JSON.stringify(group),
+    returnErrorPayload: true
+  });
+}
+
+export async function fetchSmartGroupDevices(id: string): Promise<Device[]> {
+  return requestJson<Device[]>(`/smart-groups/${encodeURIComponent(id)}/devices`);
 }
 
 export async function deleteSmartGroup(id: string): Promise<{ success: boolean }> {
@@ -1312,6 +1388,8 @@ export async function wakeDeviceOnLan(
     targetDeviceId: res.deviceId || deviceId,
     targetHostname: res.hostname || '',
     targetMac: res.macAddress || '',
+    newStatus: res.newStatus,
+    verifiedOnline: Boolean(res.verifiedOnline || res.newStatus === 'online'),
     dispatchedRelays: res.peerRelayHost ? [res.peerRelayHost] : [],
     tieredStrategy: {
       tier1_current_subnet_relays: res.peerRelayHost ? 1 : 0,
@@ -1330,7 +1408,7 @@ export async function wakeDeviceOnLan(
           : t.status === 'offline' || t.status === 'no_online_peer'
             ? 'escalated'
             : 'skipped',
-      latencyMs: 12,
+      latencyMs: typeof t.latencyMs === 'number' ? t.latencyMs : 0,
       detail: t.detail
     })),
     confirmationWindowSec: 45,
@@ -1371,7 +1449,7 @@ export async function provisionDeviceAmt(id: string): Promise<{
   });
   return {
     success: Boolean(res.success),
-    amtSupported: true,
+    amtSupported: Boolean(res.amt_provisioned ?? res.amtSupported),
     provisioningMode: res.amt_version || 'CCM TLS',
     nodeDeduplication: 'Merged by SMBIOS UUID & Primary MAC',
     unlockedCapabilities: ['Hardware Power Up/Cycle', 'BIOS/UEFI KVM Redirection'],
@@ -1603,7 +1681,14 @@ export async function startGuestPortalRemoteSession(
   grantId: string,
   deviceId: string,
   mode: 'interactive' | 'view_only' | 'ghost'
-): Promise<{ success: boolean; sessionId?: string; hostname?: string; error?: string }> {
+): Promise<{
+  success: boolean;
+  sessionId?: string;
+  hostname?: string;
+  osType?: string;
+  meshRelayUrl?: string | null;
+  error?: string;
+}> {
   return requestJson(`/guest-portal/${encodeURIComponent(grantId)}/remote-session`, {
     method: 'POST',
     body: JSON.stringify({ deviceId, mode }),
@@ -1642,20 +1727,24 @@ export async function generateInstaller(data: {
 }> {
   const res = await requestJson<any>('/installers/generate', {
     method: 'POST',
-    body: JSON.stringify(data),
+    body: JSON.stringify({ ...data, mode: data.mode || 'permanent' }),
     returnErrorPayload: true
   });
   if (!res.success) return res;
+  const resolvedMode: 'permanent' | 'quicksupport' = res.mode || data.mode || 'permanent';
   const deployUrl = res.deployUrl || `${window.location.origin}${res.downloadUrl}`;
   const isWin = (data.platform || 'windows') === 'windows';
+  const isQuickSupport = resolvedMode === 'quicksupport';
   const oneLiner = isWin
     ? `powershell -NoProfile -ExecutionPolicy Bypass -Command "irm '${deployUrl}' | iex"`
-    : `curl -fsSL '${deployUrl}' | sudo bash`;
+    : isQuickSupport
+      ? `curl -fsSL '${deployUrl}' | bash`
+      : `curl -fsSL '${deployUrl}' | sudo bash`;
   return {
     success: true,
     tokenId: res.token,
     platform: data.platform || 'windows',
-    mode: data.mode || 'permanent',
+    mode: resolvedMode,
     ticketBound: data.ticket_number || null,
     codeSigned: Boolean(res.signingPipeline?.allSigned),
     signingPipeline: res.signingPipeline,
@@ -1674,8 +1763,9 @@ export async function createUser(data: {
   email: string;
   password?: string;
   role: string;
+  custom_role_id?: string | null;
   tenant_id?: string | null;
-}): Promise<{ success: boolean; user?: RbacUser; recoveryCodes?: string[]; error?: string }> {
+}): Promise<{ success: boolean; user?: RbacUser; recoveryCodes?: string[]; mfaRequired?: boolean; error?: string }> {
   return requestJson('/users', {
     method: 'POST',
     body: JSON.stringify(data),
@@ -1685,11 +1775,32 @@ export async function createUser(data: {
 
 export async function updateUser(
   id: string,
-  data: { role?: string; tenant_id?: string | null; email?: string; password?: string }
-): Promise<{ success: boolean; user?: RbacUser; error?: string }> {
+  data: {
+    role?: string;
+    custom_role_id?: string | null;
+    tenant_id?: string | null;
+    email?: string;
+    password?: string;
+  }
+): Promise<{ success: boolean; user?: RbacUser; mfaRequired?: boolean; error?: string }> {
   return requestJson(`/users/${encodeURIComponent(id)}`, {
     method: 'PUT',
     body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
+export async function resetUserMfa(id: string): Promise<{
+  success: boolean;
+  totpSecret?: string | null;
+  qrSvg?: string | null;
+  recoveryCodes?: string[];
+  mfaRequired?: boolean;
+  error?: string;
+}> {
+  return requestJson(`/users/${encodeURIComponent(id)}/reset-mfa`, {
+    method: 'POST',
+    body: JSON.stringify({}),
     returnErrorPayload: true
   });
 }
@@ -1912,8 +2023,8 @@ export async function elevateRemoteAgent(
   });
   return {
     ...res,
-    newPrivilegeLevel: res.privilege_level || 'elevated_admin',
-    promotedToPermanentService: data.elevationAction === 'promote_permanent_service'
+    newPrivilegeLevel: res.newPrivilegeLevel || res.privilege_level || (res.success ? 'elevated_admin' : undefined),
+    promotedToPermanentService: Boolean(res.promotedToPermanentService)
   };
 }
 
@@ -1987,6 +2098,7 @@ export async function restoreSystemBackup(
   passphrase?: string
 ): Promise<{
   success: boolean;
+  mfaRequired?: boolean;
   requiresResolution?: boolean;
   requiresSoftwareUpgrade?: boolean;
   compatibility?: BackupCompatibilityReport;
@@ -2192,4 +2304,548 @@ export async function reactivateTenant(
     method: 'POST',
     returnErrorPayload: true
   });
+}
+
+// ============================================================================
+// NinjaOne Feature Parity API Helpers
+// ============================================================================
+
+// 1. Scheduled Automations (Cron Engine)
+export async function fetchAutomations(): Promise<ScheduledAutomation[]> {
+  return requestJson<ScheduledAutomation[]>('/automations');
+}
+
+export async function createAutomation(data: {
+  name: string;
+  description?: string;
+  script_id: string;
+  target_type?: string;
+  target_id?: string | null;
+  cron_expr: string;
+  run_as?: 'system' | 'user';
+  params?: Record<string, string>;
+  missed_run_catchup?: boolean;
+  enabled?: boolean;
+}): Promise<{ success: boolean; automation?: ScheduledAutomation; error?: string }> {
+  return requestJson('/automations', {
+    method: 'POST',
+    body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
+export async function updateAutomation(
+  id: string,
+  updates: Record<string, any>
+): Promise<{ success: boolean; automation?: ScheduledAutomation; error?: string }> {
+  return requestJson(`/automations/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    body: JSON.stringify(updates),
+    returnErrorPayload: true
+  });
+}
+
+export async function deleteAutomation(id: string): Promise<{ success: boolean }> {
+  return requestJson(`/automations/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    returnErrorPayload: true
+  });
+}
+
+export async function runAutomationNow(id: string): Promise<{
+  success: boolean;
+  targetedDevices?: number;
+  succeededCount?: number;
+  failedCount?: number;
+  error?: string;
+}> {
+  return requestJson(`/automations/${encodeURIComponent(id)}/run`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+    returnErrorPayload: true
+  });
+}
+
+// 2. Software Package Catalog, Deployments & KB Blocklist
+export async function fetchSoftwarePackages(): Promise<SoftwarePackage[]> {
+  return requestJson<SoftwarePackage[]>('/software-packages');
+}
+
+export async function createSoftwarePackage(data: {
+  name: string;
+  vendor?: string;
+  version?: string;
+  os_type?: string;
+  package_manager?: string;
+  package_identifier?: string;
+  install_args?: string;
+  uninstall_args?: string;
+  installer_url?: string;
+  sha256_hash?: string;
+  category?: string;
+  fileBase64?: string;
+  filename?: string;
+}): Promise<{ success: boolean; package?: SoftwarePackage; error?: string }> {
+  return requestJson('/software-packages', {
+    method: 'POST',
+    body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
+export async function deleteSoftwarePackage(id: string): Promise<{ success: boolean }> {
+  return requestJson(`/software-packages/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    returnErrorPayload: true
+  });
+}
+
+export async function deploySoftwarePackage(
+  id: string,
+  data: { deviceIds?: string[]; smartGroupId?: string; action?: 'install' | 'upgrade' | 'uninstall' }
+): Promise<{ success: boolean; deployedCount?: number; results?: any[]; error?: string }> {
+  return requestJson(`/software-packages/${encodeURIComponent(id)}/deploy`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
+export async function fetchSoftwareDeployments(deviceId?: string): Promise<SoftwareDeployment[]> {
+  const q = deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : '';
+  return requestJson<SoftwareDeployment[]>(`/software-deployments${q}`);
+}
+
+export async function fetchPatchBlacklist(): Promise<KbBlacklistEntry[]> {
+  return requestJson<KbBlacklistEntry[]>('/patches/blacklist');
+}
+
+export async function addPatchBlacklist(data: {
+  kb_or_pkg_id: string;
+  platform?: string;
+  reason?: string;
+  tenant_id?: string | null;
+}): Promise<{ success: boolean; entry?: KbBlacklistEntry; error?: string }> {
+  return requestJson('/patches/blacklist', {
+    method: 'POST',
+    body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
+export async function removePatchBlacklist(id: string): Promise<{ success: boolean }> {
+  return requestJson(`/patches/blacklist/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    returnErrorPayload: true
+  });
+}
+
+// 3. Stateful Alert Incident Center & Notification Channels
+export async function fetchAlertIncidents(filters?: {
+  status?: string;
+  severity?: string;
+  tenant_id?: string;
+}): Promise<AlertIncident[]> {
+  const params = new URLSearchParams();
+  if (filters?.status) params.set('status', filters.status);
+  if (filters?.severity) params.set('severity', filters.severity);
+  if (filters?.tenant_id) params.set('tenant_id', filters.tenant_id);
+  const qs = params.toString() ? `?${params.toString()}` : '';
+  return requestJson<AlertIncident[]>(`/alerts${qs}`);
+}
+
+export async function acknowledgeAlertIncident(id: string): Promise<{ success: boolean }> {
+  return requestJson(`/alerts/${encodeURIComponent(id)}/acknowledge`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+    returnErrorPayload: true
+  });
+}
+
+export async function snoozeAlertIncident(id: string, minutes = 60): Promise<{ success: boolean }> {
+  return requestJson(`/alerts/${encodeURIComponent(id)}/snooze`, {
+    method: 'POST',
+    body: JSON.stringify({ minutes }),
+    returnErrorPayload: true
+  });
+}
+
+export async function resolveAlertIncident(id: string): Promise<{ success: boolean }> {
+  return requestJson(`/alerts/${encodeURIComponent(id)}/resolve`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+    returnErrorPayload: true
+  });
+}
+
+export async function assignAlertIncident(id: string, assignee: string): Promise<{ success: boolean }> {
+  return requestJson(`/alerts/${encodeURIComponent(id)}/assign`, {
+    method: 'POST',
+    body: JSON.stringify({ assignee }),
+    returnErrorPayload: true
+  });
+}
+
+export async function fetchNotificationChannels(): Promise<NotificationChannel[]> {
+  return requestJson<NotificationChannel[]>('/notification-channels');
+}
+
+export async function createNotificationChannel(data: {
+  name: string;
+  channel_type: 'slack' | 'teams' | 'discord' | 'pagerduty' | 'webhook';
+  webhook_url?: string;
+  signing_secret?: string;
+  routing_key?: string;
+  min_severity?: string;
+  tenant_id?: string | null;
+  enabled?: boolean;
+}): Promise<{ success: boolean; channel?: NotificationChannel; error?: string }> {
+  return requestJson('/notification-channels', {
+    method: 'POST',
+    body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
+export async function deleteNotificationChannel(id: string): Promise<{ success: boolean }> {
+  return requestJson(`/notification-channels/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    returnErrorPayload: true
+  });
+}
+
+export async function testNotificationChannel(id: string): Promise<{ success: boolean; dispatched?: string[]; error?: string }> {
+  return requestJson(`/notification-channels/${encodeURIComponent(id)}/test`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+    returnErrorPayload: true
+  });
+}
+
+// 4. MSP Documentation & Runbooks Knowledge Base
+export async function fetchDocumentation(filters?: {
+  tenant_id?: string;
+  category?: string;
+  search?: string;
+}): Promise<DocumentationArticle[]> {
+  const params = new URLSearchParams();
+  if (filters?.tenant_id) params.set('tenant_id', filters.tenant_id);
+  if (filters?.category) params.set('category', filters.category);
+  if (filters?.search) params.set('search', filters.search);
+  const qs = params.toString() ? `?${params.toString()}` : '';
+  return requestJson<DocumentationArticle[]>(`/documentation${qs}`);
+}
+
+export async function createDocumentationArticle(data: {
+  tenant_id?: string | null;
+  category?: string;
+  title: string;
+  content_markdown: string;
+  tags?: string[];
+  is_pinned?: boolean;
+  linked_script_id?: string | null;
+  secrets?: Array<{ label: string; value: string }>;
+}): Promise<{ success: boolean; article?: DocumentationArticle; mfaRequired?: boolean; error?: string }> {
+  return requestJson('/documentation', {
+    method: 'POST',
+    body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
+export async function updateDocumentationArticle(
+  id: string,
+  updates: Record<string, any>
+): Promise<{ success: boolean; article?: DocumentationArticle; mfaRequired?: boolean; error?: string }> {
+  return requestJson(`/documentation/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    body: JSON.stringify(updates),
+    returnErrorPayload: true
+  });
+}
+
+export async function deleteDocumentationArticle(id: string): Promise<{ success: boolean }> {
+  return requestJson(`/documentation/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    returnErrorPayload: true
+  });
+}
+
+export async function revealDocumentationSecrets(
+  id: string
+): Promise<{ success: boolean; secrets?: Array<{ label: string; value: string }>; error?: string; mfaRequired?: boolean }> {
+  return requestJson(`/documentation/${encodeURIComponent(id)}/secrets`, {
+    returnErrorPayload: true
+  });
+}
+
+// 5. Multi-PSA Integrations & Technician Time Entries
+export async function fetchPsaIntegrations(): Promise<PsaIntegration[]> {
+  return requestJson<PsaIntegration[]>('/psa/integrations');
+}
+
+export async function createPsaIntegration(data: {
+  provider: 'itflow' | 'halopsa' | 'connectwise' | 'autotask' | 'syncro' | 'zammad' | 'generic_webhook';
+  name: string;
+  base_url: string;
+  client_id?: string;
+  api_key?: string;
+  client_secret?: string;
+  default_board?: string;
+  auto_sync_tickets?: boolean;
+  auto_sync_assets?: boolean;
+  enabled?: boolean;
+}): Promise<{ success: boolean; integration?: PsaIntegration; error?: string }> {
+  return requestJson('/psa/integrations', {
+    method: 'POST',
+    body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
+export async function testPsaIntegration(id: string): Promise<{
+  success: boolean;
+  status?: number;
+  message?: string;
+  error?: string;
+}> {
+  return requestJson(`/psa/integrations/${encodeURIComponent(id)}/test`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+    returnErrorPayload: true
+  });
+}
+
+export async function deletePsaIntegration(id: string): Promise<{ success: boolean }> {
+  return requestJson(`/psa/integrations/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    returnErrorPayload: true
+  });
+}
+
+export async function fetchTicketTimeEntries(ticketId: string): Promise<PsaTimeEntry[]> {
+  return requestJson<PsaTimeEntry[]>(`/psa/tickets/${encodeURIComponent(ticketId)}/time-entries`);
+}
+
+export async function addTicketTimeEntry(
+  ticketId: string,
+  data: { minutes_spent: number; billable?: boolean; work_type?: string; notes?: string }
+): Promise<{ success: boolean; entry?: PsaTimeEntry; error?: string }> {
+  return requestJson(`/psa/tickets/${encodeURIComponent(ticketId)}/time-entries`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
+export async function deleteTicketTimeEntry(entryId: string): Promise<{ success: boolean }> {
+  return requestJson(`/psa/time-entries/${encodeURIComponent(entryId)}`, {
+    method: 'DELETE',
+    returnErrorPayload: true
+  });
+}
+
+// 6. Managed Endpoint Security, Backups & MDM Profiles
+export async function triggerDeviceSecurityAction(
+  deviceId: string,
+  action: 'av_quick_scan' | 'av_full_scan' | 'av_update_signatures' | 'enable_disk_encryption' | 'enable_encryption' | 'verify_encryption'
+): Promise<{ success: boolean; action: string; live: boolean; output: string; error?: string }> {
+  return requestJson(`/devices/${encodeURIComponent(deviceId)}/security/action`, {
+    method: 'POST',
+    body: JSON.stringify({ action }),
+    returnErrorPayload: true
+  });
+}
+
+export const runEndpointSecurityAction = triggerDeviceSecurityAction;
+
+export async function fetchBackupPolicies(): Promise<BackupPolicy[]> {
+  return requestJson<BackupPolicy[]>('/backup-policies');
+}
+
+export async function createBackupPolicy(data: {
+  name: string;
+  tenant_id?: string | null;
+  engine?: string;
+  repository_url: string;
+  repository_password?: string;
+  schedule_cron?: string;
+  retention_days?: number;
+}): Promise<{ success: boolean; policy?: BackupPolicy; error?: string }> {
+  return requestJson('/backup-policies', {
+    method: 'POST',
+    body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
+export async function deleteBackupPolicy(id: string): Promise<{ success: boolean }> {
+  return requestJson(`/backup-policies/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    returnErrorPayload: true
+  });
+}
+
+export async function fetchDeviceBackupJobs(deviceId?: string): Promise<DeviceBackupJob[]> {
+  const q = deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : '';
+  return requestJson<DeviceBackupJob[]>(`/backup-jobs${q}`);
+}
+
+export async function runDeviceBackupNow(
+  deviceId: string,
+  policyId?: string
+): Promise<{ success: boolean; job?: DeviceBackupJob; error?: string }> {
+  return requestJson(`/devices/${encodeURIComponent(deviceId)}/backup/run`, {
+    method: 'POST',
+    body: JSON.stringify(policyId ? { policy_id: policyId } : {}),
+    returnErrorPayload: true
+  });
+}
+
+export async function fetchMdmProfiles(): Promise<MdmProfile[]> {
+  return requestJson<MdmProfile[]>('/mdm-profiles');
+}
+
+export async function createMdmProfile(data: {
+  name: string;
+  platform: 'macos' | 'windows' | 'linux';
+  profile_type: string;
+  tenant_id?: string | null;
+  payload_xml?: string;
+  settings?: Record<string, any>;
+}): Promise<{ success: boolean; profile?: MdmProfile; error?: string }> {
+  return requestJson('/mdm-profiles', {
+    method: 'POST',
+    body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
+export async function deleteMdmProfile(id: string): Promise<{ success: boolean }> {
+  return requestJson(`/mdm-profiles/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    returnErrorPayload: true
+  });
+}
+
+// 7. Custom RBAC Roles, Scoped REST API Keys, Offsite S3 Pull & Audit Explorer
+export async function fetchCustomRoles(): Promise<{
+  availablePermissions: string[];
+  roles: CustomRole[];
+}> {
+  return requestJson('/roles');
+}
+
+export async function createCustomRole(data: {
+  name: string;
+  description?: string;
+  permissions: string[];
+}): Promise<{ success: boolean; role?: CustomRole; error?: string }> {
+  return requestJson('/roles', {
+    method: 'POST',
+    body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
+export async function updateCustomRole(
+  id: string,
+  data: { name?: string; description?: string; permissions?: string[] }
+): Promise<{ success: boolean; role?: CustomRole; error?: string }> {
+  return requestJson(`/roles/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
+export async function deleteCustomRole(id: string): Promise<{ success: boolean; error?: string }> {
+  return requestJson(`/roles/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    returnErrorPayload: true
+  });
+}
+
+export async function fetchScopedApiKeys(): Promise<ScopedApiKey[]> {
+  return requestJson<ScopedApiKey[]>('/api-keys');
+}
+
+export async function createScopedApiKey(data: {
+  name: string;
+  role?: string;
+  scopes: string[];
+  tenant_id?: string | null;
+  expiresInDays?: number | null;
+}): Promise<{
+  success: boolean;
+  id?: string;
+  rawKey?: string;
+  keyPrefix?: string;
+  expiresAt?: string | null;
+  mfaRequired?: boolean;
+  error?: string;
+}> {
+  return requestJson('/api-keys', {
+    method: 'POST',
+    body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
+export async function revokeScopedApiKey(id: string): Promise<{ success: boolean }> {
+  return requestJson(`/api-keys/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    returnErrorPayload: true
+  });
+}
+
+export async function fetchOffsiteVaultObjects(): Promise<{
+  success: boolean;
+  objects?: Array<{ key: string; sizeBytes: number; lastModified: string }>;
+  error?: string;
+}> {
+  return requestJson('/backups/offsite', { returnErrorPayload: true });
+}
+
+export async function pullOffsiteVaultObject(
+  key: string,
+  passphrase?: string
+): Promise<{ success: boolean; backupId?: string; message?: string; error?: string }> {
+  return requestJson('/backups/offsite/pull', {
+    method: 'POST',
+    body: JSON.stringify({ key, passphrase }),
+    returnErrorPayload: true
+  });
+}
+
+export async function fetchAuditLogs(filters?: {
+  search?: string;
+  username?: string;
+  action?: string;
+  limit?: number;
+}): Promise<AuditLogRecord[]> {
+  const params = new URLSearchParams();
+  params.set('format', 'json');
+  if (filters?.search) params.set('search', filters.search);
+  if (filters?.username) params.set('username', filters.username);
+  if (filters?.action) params.set('action', filters.action);
+  if (filters?.limit) params.set('limit', String(filters.limit));
+  const res = await requestJson<any>(`/audit-logs/export?${params.toString()}`);
+  return Array.isArray(res) ? res : Array.isArray(res?.logs) ? res.logs : [];
+}
+
+export function getAuditExportUrl(
+  format: 'csv' | 'json',
+  filters?: { search?: string; username?: string; action?: string }
+): string {
+  const params = new URLSearchParams();
+  params.set('format', format);
+  if (filters?.search) params.set('search', filters.search);
+  if (filters?.username) params.set('username', filters.username);
+  if (filters?.action) params.set('action', filters.action);
+  return `${API_BASE}/audit-logs/export?${params.toString()}`;
+}
+
+export function getLocalQrSvgUrl(data: string): string {
+  return `${API_BASE}/utils/qr.svg?data=${encodeURIComponent(data)}`;
 }

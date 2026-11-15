@@ -34,7 +34,7 @@ import {
   manageRemoteFile,
   getRemoteFileDownloadUrl,
   fetchEventLogs,
-  getStoredSessionToken
+  fetchWsTicket
 } from '../services/api.js';
 
 // eslint-disable-next-line no-control-regex
@@ -64,7 +64,14 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
   const [shellType, setShellType] = useState<string>(
     osType === 'macos' ? 'zsh' : osType === 'linux' ? 'bash' : 'powershell'
   );
+  const runAsContextRef = useRef<'system' | 'user'>(runAsContext);
+  const shellTypeRef = useRef<string>(shellType);
+  runAsContextRef.current = runAsContext;
+  shellTypeRef.current = shellType;
   const [ws, setWs] = useState<WebSocket | null>(null);
+  const [wsState, setWsState] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
+  const [reconnectSeq, setReconnectSeq] = useState(0);
+  const [toolError, setToolError] = useState<string | null>(null);
 
   // Process state
   const [processes, setProcesses] = useState<ProcessItem[]>([]);
@@ -106,36 +113,93 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
   const terminalWindowRef = useRef<HTMLDivElement | null>(null);
   const fileUploadInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Connect WebSocket for terminal only when on terminal tab, passing auth token
+  // Connect WebSocket for terminal only when on terminal tab, using HttpOnly cookie + single-use WS ticket
   useEffect(() => {
     if (activeTab !== 'terminal') return;
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const host = window.location.host;
-    const token = getStoredSessionToken() || '';
-    const socket = new WebSocket(
-      `${protocol}//${host}/ws/terminal?deviceId=${encodeURIComponent(device.id)}&runAs=${runAsContext}&shell=${encodeURIComponent(shellType)}${token ? `&token=${encodeURIComponent(token)}` : ''}`
-    );
+    let cancelled = false;
+    let activeSocket: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-    socket.onmessage = (event) => {
+    const connectSocket = async () => {
+      setWsState('connecting');
+      let ticketParam = '';
       try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'output') {
-          const clean = stripAnsi(msg.data);
-          setTerminalOutput((prev) => [...prev, clean]);
+        const tRes = await fetchWsTicket();
+        if (tRes?.ticket) {
+          ticketParam = `&ticket=${encodeURIComponent(tRes.ticket)}`;
         }
       } catch {
-        setTerminalOutput((prev) => [...prev, stripAnsi(String(event.data))]);
+        // Same-origin HttpOnly cookie still authenticates WS upgrade
       }
+      if (cancelled) return;
+
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const host = window.location.host;
+      const socket = new WebSocket(
+        `${protocol}//${host}/ws/terminal?deviceId=${encodeURIComponent(device.id)}&runAs=${runAsContextRef.current}&shell=${encodeURIComponent(shellTypeRef.current)}${ticketParam}`
+      );
+      activeSocket = socket;
+
+      socket.onopen = () => {
+        if (!cancelled) {
+          setWsState('connected');
+          try {
+            socket.send(
+              JSON.stringify({
+                type: 'switch_context',
+                deviceId: device.id,
+                runAs: runAsContextRef.current,
+                shell: shellTypeRef.current
+              })
+            );
+          } catch {}
+        }
+      };
+
+      socket.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'output') {
+            const clean = stripAnsi(msg.data);
+            setTerminalOutput((prev) => [...prev, clean]);
+          }
+        } catch {
+          setTerminalOutput((prev) => [...prev, stripAnsi(String(event.data))]);
+        }
+      };
+
+      socket.onclose = (ev) => {
+        if (cancelled) return;
+        setWsState('disconnected');
+        setWs(null);
+        if (ev.code !== 1000 && ev.code !== 1008) {
+          reconnectTimer = setTimeout(() => {
+            if (!cancelled) setReconnectSeq((n) => n + 1);
+          }, 2500);
+        }
+      };
+
+      socket.onerror = () => {
+        if (!cancelled) setWsState('disconnected');
+      };
+
+      setWs(socket);
     };
 
-    setWs(socket);
+    connectSocket();
 
     return () => {
-      socket.close();
+      cancelled = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (activeSocket) {
+        try {
+          activeSocket.close(1000, 'Modal closed');
+        } catch {}
+      }
       setWs(null);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [device.id, activeTab]);
+  }, [device.id, activeTab, reconnectSeq]);
 
   useEffect(() => {
     if (terminalWindowRef.current) {
@@ -161,9 +225,12 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
   // Load processes
   const loadProcesses = async () => {
     setLoadingProcs(true);
+    setToolError(null);
     try {
       const data = await fetchProcesses(device.id);
-      setProcesses(data);
+      setProcesses(Array.isArray(data) ? data : []);
+    } catch (err: any) {
+      setToolError(err?.message || 'Failed to query remote processes.');
     } finally {
       setLoadingProcs(false);
     }
@@ -172,9 +239,12 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
   // Load services
   const loadServices = async () => {
     setLoadingSvcs(true);
+    setToolError(null);
     try {
       const data = await fetchServices(device.id);
-      setServices(data);
+      setServices(Array.isArray(data) ? data : []);
+    } catch (err: any) {
+      setToolError(err?.message || 'Failed to query remote services.');
     } finally {
       setLoadingSvcs(false);
     }
@@ -182,30 +252,51 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
 
   // Load registry
   const loadRegistry = async (path: string) => {
-    const data = await fetchRegistry(device.id, path);
-    setRegData(data);
-    setRegPath(path);
+    setToolError(null);
+    try {
+      const data = await fetchRegistry(device.id, path);
+      setRegData({
+        subkeys: Array.isArray(data?.subkeys) ? data.subkeys : [],
+        values: Array.isArray(data?.values) ? data.values : []
+      });
+      setRegPath(path);
+    } catch (err: any) {
+      setToolError(err?.message || 'Failed to read remote registry/configuration path.');
+    }
   };
 
   // Load tasks
   const loadTasks = async () => {
-    const data = await fetchScheduledTasks(device.id);
-    setTasks(data);
+    setToolError(null);
+    try {
+      const data = await fetchScheduledTasks(device.id);
+      setTasks(Array.isArray(data) ? data : []);
+    } catch (err: any) {
+      setToolError(err?.message || 'Failed to load scheduled tasks.');
+    }
   };
 
   // Load files
   const loadFiles = async (path: string) => {
-    const data = await fetchFiles(device.id, path);
-    setFiles(data);
-    setCurrentPath(path);
+    setToolError(null);
+    try {
+      const data = await fetchFiles(device.id, path);
+      setFiles(Array.isArray(data) ? data : []);
+      setCurrentPath(path);
+    } catch (err: any) {
+      setToolError(err?.message || 'Failed to list remote directory.');
+    }
   };
 
   // Load event logs
   const loadEvents = async (channel = eventChannel, level = eventLevel) => {
     setLoadingEvents(true);
+    setToolError(null);
     try {
       const data = await fetchEventLogs(device.id, channel, level, 100);
-      setEventLogs(data);
+      setEventLogs(Array.isArray(data) ? data : []);
+    } catch (err: any) {
+      setToolError(err?.message || 'Failed to load endpoint event logs.');
     } finally {
       setLoadingEvents(false);
     }
@@ -229,6 +320,7 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
   };
 
   useEffect(() => {
+    setToolError(null);
     if (activeTab === 'processes') loadProcesses();
     if (activeTab === 'services') loadServices();
     if (activeTab === 'registry') loadRegistry(regPath);
@@ -289,14 +381,32 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
 
   const handleKillProcess = async (pid: number) => {
     if (confirm(`Are you sure you want to silently terminate PID ${pid}?`)) {
-      await killProcess(device.id, pid);
-      setProcesses(processes.filter((p) => p.pid !== pid));
+      setToolError(null);
+      try {
+        const res = await killProcess(device.id, pid);
+        if (!res.success) {
+          setToolError(res.error || `Failed to terminate PID ${pid}.`);
+          return;
+        }
+        setProcesses(processes.filter((p) => p.pid !== pid));
+      } catch (err: any) {
+        setToolError(err?.message || `Failed to terminate PID ${pid}.`);
+      }
     }
   };
 
   const handleManageService = async (name: string, action: 'start' | 'stop' | 'restart') => {
-    await manageService(device.id, name, action);
-    loadServices();
+    setToolError(null);
+    try {
+      const res = await manageService(device.id, name, action);
+      if (!res.success) {
+        setToolError(res.error || `Failed to ${action} service ${name}.`);
+        return;
+      }
+      await loadServices();
+    } catch (err: any) {
+      setToolError(err?.message || `Failed to ${action} service ${name}.`);
+    }
   };
 
   const handleDownloadFile = (filePath: string) => {
@@ -308,19 +418,27 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
     if (!file) return;
     const reader = new FileReader();
     reader.onload = async () => {
-      const dataUrl = String(reader.result || '');
-      const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
-      const res = await manageRemoteFile(device.id, {
-        path: currentPath,
-        action: 'upload',
-        name: file.name,
-        size: file.size,
-        contentBase64: base64
-      });
-      if (res.success) {
-        setFiles(res.files);
+      setToolError(null);
+      try {
+        const dataUrl = String(reader.result || '');
+        const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+        const res = await manageRemoteFile(device.id, {
+          path: currentPath,
+          action: 'upload',
+          name: file.name,
+          size: file.size,
+          contentBase64: base64
+        });
+        if (res.success) {
+          setFiles(res.files);
+        } else {
+          setToolError(res.error || 'Failed to upload file.');
+        }
+      } catch (err: any) {
+        setToolError(err?.message || 'Failed to upload file.');
+      } finally {
+        if (fileUploadInputRef.current) fileUploadInputRef.current.value = '';
       }
-      if (fileUploadInputRef.current) fileUploadInputRef.current.value = '';
     };
     reader.readAsDataURL(file);
   };
@@ -328,47 +446,82 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
   const handleSaveRegValue = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newRegName.trim()) return;
-    const res = await setRegistryValue(device.id, {
-      path: regPath,
-      name: newRegName.trim(),
-      type: newRegType,
-      value: newRegVal
-    });
-    if (res.success) {
-      setRegData({ subkeys: res.subkeys, values: res.values });
-      setNewRegName('');
-      setNewRegVal('');
+    setToolError(null);
+    try {
+      const res = await setRegistryValue(device.id, {
+        path: regPath,
+        name: newRegName.trim(),
+        type: newRegType,
+        value: newRegVal
+      });
+      if (res.success) {
+        setRegData({ subkeys: res.subkeys, values: res.values });
+        setNewRegName('');
+        setNewRegVal('');
+      } else {
+        setToolError((res as any).error || 'Failed to set registry value.');
+      }
+    } catch (err: any) {
+      setToolError(err?.message || 'Failed to set registry value.');
     }
   };
 
   const handleDeleteRegValue = async (name: string) => {
-    const res = await deleteRegistryValue(device.id, regPath, name);
-    if (res.success) {
-      setRegData({ subkeys: res.subkeys, values: res.values });
+    setToolError(null);
+    try {
+      const res = await deleteRegistryValue(device.id, regPath, name);
+      if (res.success) {
+        setRegData({ subkeys: res.subkeys, values: res.values });
+      } else {
+        setToolError((res as any).error || 'Failed to delete registry value.');
+      }
+    } catch (err: any) {
+      setToolError(err?.message || 'Failed to delete registry value.');
     }
   };
 
   const handleCreateFolder = async () => {
     if (!newFolderName.trim()) return;
-    const res = await manageRemoteFile(device.id, { path: currentPath, action: 'mkdir', name: newFolderName.trim() });
-    if (res.success) {
-      setFiles(res.files);
-      setNewFolderName('');
+    setToolError(null);
+    try {
+      const res = await manageRemoteFile(device.id, { path: currentPath, action: 'mkdir', name: newFolderName.trim() });
+      if (res.success) {
+        setFiles(res.files);
+        setNewFolderName('');
+      } else {
+        setToolError(res.error || 'Failed to create folder.');
+      }
+    } catch (err: any) {
+      setToolError(err?.message || 'Failed to create folder.');
     }
   };
 
   const handleDeleteFile = async (name: string) => {
     if (!confirm(`Delete ${name} from ${currentPath}?`)) return;
-    const res = await manageRemoteFile(device.id, { path: currentPath, action: 'delete', name });
-    if (res.success) {
-      setFiles(res.files);
+    setToolError(null);
+    try {
+      const res = await manageRemoteFile(device.id, { path: currentPath, action: 'delete', name });
+      if (res.success) {
+        setFiles(res.files);
+      } else {
+        setToolError(res.error || 'Failed to delete remote file.');
+      }
+    } catch (err: any) {
+      setToolError(err?.message || 'Failed to delete remote file.');
     }
   };
 
   const handleTaskAction = async (name: string, action: 'run' | 'enable' | 'disable') => {
-    const res = await manageScheduledTask(device.id, name, action);
-    if (res.success) {
-      setTasks(res.tasks);
+    setToolError(null);
+    try {
+      const res = await manageScheduledTask(device.id, name, action);
+      if (res.success) {
+        setTasks(res.tasks);
+      } else {
+        setToolError((res as any).error || `Failed to ${action} task ${name}.`);
+      }
+    } catch (err: any) {
+      setToolError(err?.message || `Failed to ${action} task ${name}.`);
     }
   };
 
@@ -389,6 +542,43 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
             <span className="status-pill status-isolated" style={{ fontSize: '0.7rem', background: 'rgba(56, 189, 248, 0.15)', color: '#38bdf8' }}>
               {osType.toUpperCase()} Parity Engine
             </span>
+            {activeTab === 'terminal' && (
+              <span
+                className={`status-pill ${
+                  wsState === 'connected'
+                    ? 'status-online'
+                    : wsState === 'connecting'
+                      ? 'status-reboot'
+                      : 'status-offline'
+                }`}
+                style={{ fontSize: '0.7rem', display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}
+              >
+                <span>
+                  {wsState === 'connected'
+                    ? 'WS Connected'
+                    : wsState === 'connecting'
+                      ? 'WS Connecting...'
+                      : 'WS Disconnected'}
+                </span>
+                {wsState === 'disconnected' && (
+                  <button
+                    type="button"
+                    onClick={() => setReconnectSeq((n) => n + 1)}
+                    style={{
+                      background: 'transparent',
+                      border: 'none',
+                      color: 'inherit',
+                      textDecoration: 'underline',
+                      cursor: 'pointer',
+                      fontSize: '0.7rem',
+                      padding: 0
+                    }}
+                  >
+                    Reconnect
+                  </button>
+                )}
+              </span>
+            )}
           </div>
           <button className="btn-glass btn-icon" onClick={onClose} id="close-bg-tools-btn">
             <X size={18} />
@@ -483,6 +673,34 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
 
         {/* Modal Body */}
         <div className="modal-body" style={{ padding: '1.25rem' }}>
+          {toolError && (
+            <div
+              style={{
+                marginBottom: '1rem',
+                padding: '0.65rem 0.9rem',
+                borderRadius: '8px',
+                background: 'rgba(239, 68, 68, 0.14)',
+                border: '1px solid rgba(239, 68, 68, 0.35)',
+                color: '#f87171',
+                fontSize: '0.8rem',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: '0.75rem'
+              }}
+            >
+              <span>⚠ {toolError}</span>
+              <button
+                type="button"
+                className="btn-glass btn-icon"
+                style={{ padding: '0.2rem' }}
+                onClick={() => setToolError(null)}
+              >
+                <X size={13} />
+              </button>
+            </div>
+          )}
+
           {/* TAB 1: TERMINAL */}
           {activeTab === 'terminal' && (
             <div style={{ display: 'flex', flexDirection: 'column', height: '100%', gap: '0.85rem' }}>
@@ -958,7 +1176,11 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                         key={sub}
                         className="btn-glass"
                         style={{ textAlign: 'left', justifyContent: 'flex-start', padding: '0.4rem 0.65rem', fontSize: '0.78rem' }}
-                        onClick={() => loadRegistry(sub.startsWith('/') ? sub : `${regPath}\\${sub}`)}
+                        onClick={() =>
+                          loadRegistry(
+                            sub.startsWith('/') ? sub : `${regPath.replace(/\\+$/, '')}\\${sub}`
+                          )
+                        }
                       >
                         <Folder size={14} color="#00f2fe" />
                         <span>{sub}</span>

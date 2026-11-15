@@ -8,6 +8,7 @@ data
 backups
 scratch
 dev-meshcentral
+meshcentral
 .git
 .github
 *.db

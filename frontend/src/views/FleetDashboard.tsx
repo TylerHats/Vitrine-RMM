@@ -19,7 +19,7 @@ import {
   Zap,
   FileSpreadsheet
 } from 'lucide-react';
-import { Device, SmartGroup, BreakGlassRecoveryEntry, AuthUser } from '../types/index.js';
+import { Device, SmartGroup, SmartGroupRule, BreakGlassRecoveryEntry, AuthUser } from '../types/index.js';
 import {
   fetchSmartGroups,
   createSmartGroup,
@@ -29,9 +29,12 @@ import {
   simulateDeviceCheckin,
   purgeArchivedDevice,
   exportBreakGlassSheet,
-  seedDemoLabData
+  seedDemoLabData,
+  deleteTenant,
+  offboardTenant
 } from '../services/api.js';
 import { MfaChallengeModal } from '../components/MfaChallengeModal.js';
+import { isSuperAdmin, canMutateFleet } from '../utils/permissions.js';
 
 function sanitizeCsvCell(val: unknown): string {
   const raw = String(val ?? '');
@@ -74,12 +77,16 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [showNewGroupModal, setShowNewGroupModal] = useState(false);
   const [newGroupName, setNewGroupName] = useState('');
-  const [newGroupRule, setNewGroupRule] = useState('cpu_usage > 70');
+  const [newGroupLogic, setNewGroupLogic] = useState<'AND' | 'OR'>('AND');
+  const [newGroupRules, setNewGroupRules] = useState<SmartGroupRule[]>([
+    { field: 'cpu_usage', op: '>', value: '70' }
+  ]);
   const [newGroupDesc, setNewGroupDesc] = useState('');
   const [bulkStatusMsg, setBulkStatusMsg] = useState<string | null>(null);
   const [localDevices, setLocalDevices] = useState<Device[]>(devices);
   const [showBreakGlassMfa, setShowBreakGlassMfa] = useState(false);
   const [breakGlassRows, setBreakGlassRows] = useState<BreakGlassRecoveryEntry[] | null>(null);
+  const canMutate = canMutateFleet(currentUser);
 
   useEffect(() => {
     setLocalDevices(devices);
@@ -91,8 +98,51 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
       .catch(() => {});
   }, []);
 
-  const evaluateCustomRule = (d: Device, rule: string): boolean => {
-    const r = rule.toLowerCase();
+  const evaluateSingleRule = (d: Device, rule: SmartGroupRule): boolean => {
+    const fieldVal = (d as any)[rule.field];
+    const targetStr = String(rule.value ?? '').toLowerCase();
+    const actualStr = String(fieldVal ?? '').toLowerCase();
+    const actualNum = Number(fieldVal ?? 0);
+    const targetNum = Number(rule.value ?? 0);
+    switch (rule.op) {
+      case '=':
+        return actualStr === targetStr;
+      case '!=':
+        return actualStr !== targetStr;
+      case '>':
+        return actualNum > targetNum;
+      case '<':
+        return actualNum < targetNum;
+      case '>=':
+        return actualNum >= targetNum;
+      case '<=':
+        return actualNum <= targetNum;
+      case 'contains':
+        return actualStr.includes(targetStr);
+      case 'not_contains':
+        return !actualStr.includes(targetStr);
+      default:
+        return true;
+    }
+  };
+
+  const evaluateCustomRule = (d: Device, grp: SmartGroup): boolean => {
+    if (Array.isArray(grp.matchedDeviceIds)) {
+      return grp.matchedDeviceIds.includes(d.id);
+    }
+    const raw = grp.criteria_json || '';
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && Array.isArray(parsed.rules)) {
+        const logic = parsed.logic === 'OR' ? 'OR' : 'AND';
+        return logic === 'OR'
+          ? parsed.rules.some((rl: SmartGroupRule) => evaluateSingleRule(d, rl))
+          : parsed.rules.every((rl: SmartGroupRule) => evaluateSingleRule(d, rl));
+      }
+    } catch {
+      // Legacy string expression fallback
+    }
+    const r = raw.toLowerCase();
     if (r.includes('pending_reboot = 1')) return d.pending_reboot === 1;
     if (r.includes('edr_status != active')) return d.edr_status !== 'Active';
     if (r.includes('bitlocker_status not like')) return !d.bitlocker_status.includes('Encrypted');
@@ -106,9 +156,11 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
     );
   };
 
-  const activeLifecycleCount = localDevices.filter((d) => (d.lifecycle_state || 'active') === 'active').length;
-  const pendingOffboardCount = localDevices.filter((d) => d.lifecycle_state === 'pending_offboard').length;
-  const archivedVaultCount = localDevices.filter((d) => d.lifecycle_state === 'archived').length;
+  const tenantScopedDevices =
+    selectedTenantId === 'all' ? localDevices : localDevices.filter((d) => d.tenant_id === selectedTenantId);
+  const activeLifecycleCount = tenantScopedDevices.filter((d) => (d.lifecycle_state || 'active') === 'active').length;
+  const pendingOffboardCount = tenantScopedDevices.filter((d) => d.lifecycle_state === 'pending_offboard').length;
+  const archivedVaultCount = tenantScopedDevices.filter((d) => d.lifecycle_state === 'archived').length;
 
   // Filter devices based on lifecycle, tenant, search, and dynamic smart groups
   const filteredDevices = localDevices.filter((d) => {
@@ -148,19 +200,19 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
 
     const customGrp = customGroups.find((cg) => cg.id === smartGroup);
     if (customGrp) {
-      return evaluateCustomRule(d, customGrp.criteria_json || '');
+      return evaluateCustomRule(d, customGrp);
     }
 
     return true;
   });
 
-  // Aggregate metrics (Active Fleet + Archive awareness)
-  const activeDevices = localDevices.filter((d) => (d.lifecycle_state || 'active') === 'active');
+  // Aggregate metrics (Tenant-scoped Active Fleet + Archive awareness)
+  const activeDevices = tenantScopedDevices.filter((d) => (d.lifecycle_state || 'active') === 'active');
   const totalCount = activeDevices.length;
   const onlineCount = activeDevices.filter((d) => d.status === 'online').length;
   const rebootCount = activeDevices.filter((d) => d.pending_reboot === 1).length;
   const isolatedCount = activeDevices.filter((d) => d.quarantined === 1).length;
-  const bitlockerCount = localDevices.filter((d) => d.bitlocker_status.includes('Encrypted')).length;
+  const bitlockerCount = tenantScopedDevices.filter((d) => d.bitlocker_status.includes('Encrypted')).length;
 
   const handleForceArchive = async (d: Device) => {
     const res = await forceArchiveDevice(d.id);
@@ -309,11 +361,16 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
 
   const handleCreateSmartGroup = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newGroupName.trim()) return;
+    if (!newGroupName.trim() || newGroupRules.length === 0) return;
+    const criteriaPayload = JSON.stringify({
+      logic: newGroupLogic,
+      rules: newGroupRules
+    });
+    const summaryStr = newGroupRules.map((r) => `${r.field} ${r.op} ${r.value}`).join(` ${newGroupLogic} `);
     const res = await createSmartGroup({
       name: newGroupName.trim(),
-      criteria_json: newGroupRule.trim(),
-      description: newGroupDesc.trim() || `Dynamic query: ${newGroupRule.trim()}`
+      criteria_json: criteriaPayload,
+      description: newGroupDesc.trim() || `Dynamic query: ${summaryStr}`
     });
     if (res.success && res.id) {
       const updated = await fetchSmartGroups();
@@ -322,6 +379,29 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
       setShowNewGroupModal(false);
       setNewGroupName('');
       setNewGroupDesc('');
+      setNewGroupRules([{ field: 'cpu_usage', op: '>', value: '70' }]);
+    }
+  };
+
+  const handleOffboardCurrentClient = async () => {
+    if (selectedTenantId === 'all') return;
+    if (!confirm('Archive this client organization and queue clean offboarding across its endpoints?')) return;
+    const res = await offboardTenant(selectedTenantId, { mode: 'archive_client', reason: 'Client archived by Super Admin' });
+    if (res.success) {
+      setBulkStatusMsg(res.message);
+      onRefreshFleet?.();
+    }
+  };
+
+  const handleDeleteEmptyClient = async () => {
+    if (selectedTenantId === 'all') return;
+    if (!confirm('Delete this client organization? (Active/archived devices must be offboarded or purged first.)')) return;
+    const res = await deleteTenant(selectedTenantId);
+    if (res.success) {
+      setBulkStatusMsg('Client organization removed.');
+      onRefreshFleet?.();
+    } else {
+      setBulkStatusMsg(res.error || 'Cannot delete client while endpoints remain attached.');
     }
   };
 
@@ -389,7 +469,7 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
               <HardDrive size={18} />
             </div>
           </div>
-          <div className="metric-value">{bitlockerCount} / {localDevices.length}</div>
+          <div className="metric-value">{bitlockerCount} / {tenantScopedDevices.length}</div>
           <div className="metric-subtext">BitLocker / LUKS / FileVault Escrowed (Incl. Archive)</div>
         </div>
       </div>
@@ -428,14 +508,40 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
           </button>
         </div>
 
-        <button
-          className="btn-glass"
-          style={{ fontSize: '0.78rem', padding: '0.4rem 0.85rem', borderColor: 'rgba(245, 158, 11, 0.45)', color: '#fbbf24' }}
-          onClick={() => setShowBreakGlassMfa(true)}
-          title="Step-Up MFA-gated emergency offline Break-Glass export containing current + N-1 LAPS passwords and BitLocker recovery keys across Active & Archived endpoints"
-        >
-          <FileSpreadsheet size={14} /> Export Break-Glass Sheet (LAPS + BitLocker)
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+          {selectedTenantId !== 'all' && isSuperAdmin(currentUser) && (
+            <>
+              <button
+                className="btn-glass"
+                style={{ fontSize: '0.76rem', padding: '0.35rem 0.7rem' }}
+                onClick={handleOffboardCurrentClient}
+                title="Archive selected client organization and offboard its endpoints"
+              >
+                <Archive size={13} /> Archive Client
+              </button>
+              {localDevices.filter((d) => d.tenant_id === selectedTenantId).length === 0 && (
+                <button
+                  className="btn-glass btn-danger"
+                  style={{ fontSize: '0.76rem', padding: '0.35rem 0.7rem' }}
+                  onClick={handleDeleteEmptyClient}
+                  title="Delete empty client tenant"
+                >
+                  <Trash2 size={13} /> Delete Empty Client
+                </button>
+              )}
+            </>
+          )}
+          {isSuperAdmin(currentUser) && (
+            <button
+              className="btn-glass"
+              style={{ fontSize: '0.78rem', padding: '0.4rem 0.85rem', borderColor: 'rgba(245, 158, 11, 0.45)', color: '#fbbf24' }}
+              onClick={() => setShowBreakGlassMfa(true)}
+              title="Step-Up MFA-gated emergency offline Break-Glass export containing current + N-1 LAPS passwords and BitLocker recovery keys across Active & Archived endpoints"
+            >
+              <FileSpreadsheet size={14} /> Export Break-Glass Sheet (LAPS + BitLocker)
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Dynamic Smart Device Groups (Feature 27) */}
@@ -470,39 +576,49 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
             onClick={() => setSmartGroup(cg.id)}
             title={`${cg.description || ''} (${cg.criteria_json})`}
           >
-            <span>⚡ {cg.name}</span>
-            <Trash2
-              size={12}
-              style={{ opacity: 0.7 }}
-              onClick={(e) => handleDeleteCustomGroup(cg.id, e)}
-            />
+            <span>
+              ⚡ {cg.name}
+              {typeof cg.matchedCount === 'number' ? ` (${cg.matchedCount})` : ''}
+            </span>
+            {canMutate && (
+              <Trash2
+                size={12}
+                style={{ opacity: 0.7 }}
+                onClick={(e) => handleDeleteCustomGroup(cg.id, e)}
+              />
+            )}
           </button>
         ))}
 
-        <button
-          className="btn-glass"
-          style={{ padding: '0.35rem 0.75rem', fontSize: '0.78rem', borderStyle: 'dashed' }}
-          onClick={() => setShowNewGroupModal(true)}
-        >
-          <Plus size={13} /> New Smart Group
-        </button>
+        {canMutate && (
+          <button
+            className="btn-glass"
+            style={{ padding: '0.35rem 0.75rem', fontSize: '0.78rem', borderStyle: 'dashed' }}
+            onClick={() => setShowNewGroupModal(true)}
+          >
+            <Plus size={13} /> New Smart Group
+          </button>
+        )}
       </div>
 
-      {bulkStatusMsg && (
-        <div
-          className="glass-card"
-          style={{
-            padding: '0.75rem 1.25rem',
-            background: 'rgba(16, 185, 129, 0.12)',
-            borderColor: 'rgba(16, 185, 129, 0.35)',
-            color: '#34d399',
-            fontSize: '0.85rem',
-            fontWeight: 500
-          }}
-        >
-          ✓ {bulkStatusMsg}
-        </div>
-      )}
+      {bulkStatusMsg && (() => {
+        const isBulkErr = /^(cannot|error|failed|⚠)/i.test(bulkStatusMsg.trim());
+        return (
+          <div
+            className="glass-card"
+            style={{
+              padding: '0.75rem 1.25rem',
+              background: isBulkErr ? 'rgba(239, 68, 68, 0.12)' : 'rgba(16, 185, 129, 0.12)',
+              borderColor: isBulkErr ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)',
+              color: isBulkErr ? '#fca5a5' : '#34d399',
+              fontSize: '0.85rem',
+              fontWeight: 500
+            }}
+          >
+            {isBulkErr ? '⚠ ' : '✓ '}{bulkStatusMsg}
+          </div>
+        );
+      })()}
 
       {/* Fleet Table */}
       <div className="glass-card" style={{ padding: 0 }}>
@@ -518,7 +634,7 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
-            {selectedIds.length > 0 && (
+            {canMutate && selectedIds.length > 0 && (
               <button
                 className="btn-glass btn-primary"
                 style={{ fontSize: '0.78rem', padding: '0.4rem 0.85rem' }}
@@ -664,95 +780,99 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
                   </td>
 
                   <td style={{ textAlign: 'right' }}>
-                    <div className="action-group" style={{ justifyContent: 'flex-end' }}>
-                      {d.lifecycle_state === 'pending_offboard' && (
-                        <button
-                          className="btn-glass"
-                          style={{ padding: '0.25rem 0.55rem', fontSize: '0.72rem', borderColor: 'rgba(245, 158, 11, 0.45)', color: '#fbbf24' }}
-                          title="Force move this offline pending-offboard endpoint directly into the Data Archive Vault now"
-                          onClick={() => handleForceArchive(d)}
-                        >
-                          <Archive size={13} /> Force Archive
-                        </button>
-                      )}
+                    {canMutate ? (
+                      <div className="action-group" style={{ justifyContent: 'flex-end' }}>
+                        {d.lifecycle_state === 'pending_offboard' && (
+                          <button
+                            className="btn-glass"
+                            style={{ padding: '0.25rem 0.55rem', fontSize: '0.72rem', borderColor: 'rgba(245, 158, 11, 0.45)', color: '#fbbf24' }}
+                            title="Force move this offline pending-offboard endpoint directly into the Data Archive Vault now"
+                            onClick={() => handleForceArchive(d)}
+                          >
+                            <Archive size={13} /> Force Archive
+                          </button>
+                        )}
 
-                      {(d.lifecycle_state === 'pending_offboard' || d.lifecycle_state === 'archived') && (
-                        <button
-                          className="btn-glass"
-                          style={{ padding: '0.25rem 0.55rem', fontSize: '0.72rem', borderColor: 'rgba(56, 189, 248, 0.45)', color: '#38bdf8' }}
-                          title="Simulate this endpoint waking up or re-installing: resurrects to Active if Archived & parent client is Active; executes queued/quiet offboard if Pending Offboard or parent client is Archived/Deleted"
-                          onClick={() => handleSimulateWakeCheckIn(d)}
-                        >
-                          <Zap size={13} /> Simulate Wake / Check-In
-                        </button>
-                      )}
+                        {(d.lifecycle_state === 'pending_offboard' || d.lifecycle_state === 'archived') && (
+                          <button
+                            className="btn-glass"
+                            style={{ padding: '0.25rem 0.55rem', fontSize: '0.72rem', borderColor: 'rgba(56, 189, 248, 0.45)', color: '#38bdf8' }}
+                            title="Simulate this endpoint waking up or re-installing: resurrects to Active if Archived & parent client is Active; executes queued/quiet offboard if Pending Offboard or parent client is Archived/Deleted"
+                            onClick={() => handleSimulateWakeCheckIn(d)}
+                          >
+                            <Zap size={13} /> Simulate Wake / Check-In
+                          </button>
+                        )}
 
-                      {d.lifecycle_state === 'archived' && (
+                        {d.lifecycle_state === 'archived' && (
+                          <button
+                            className="btn-glass btn-icon"
+                            title="Explicitly & permanently purge this archived endpoint (deletes preserved BitLocker & LAPS keys)"
+                            onClick={() => handlePurgeArchived(d)}
+                          >
+                            <Trash2 size={14} color="#ef4444" />
+                          </button>
+                        )}
+
+                        {/* Feature 7: Interactive Screen Control */}
+                        {(!d.lifecycle_state || d.lifecycle_state === 'active') && (
+                          <>
+                            <button
+                              className="btn-glass btn-icon"
+                              title="Low-Latency Screen Control (KVM)"
+                              onClick={() => onOpenRemote(d, false)}
+                              id={`btn-remote-${d.id}`}
+                            >
+                              <Monitor size={15} color="#00f2fe" />
+                            </button>
+
+                            {/* Feature 8: Ghost Session (Headless / Background Remote Desktop) */}
+                            <button
+                              className="btn-glass btn-icon"
+                              title="Ghost Session (Headless Remote Desktop)"
+                              onClick={() => onOpenRemote(d, true)}
+                              id={`btn-ghost-${d.id}`}
+                            >
+                              <EyeOff size={15} color="#c084fc" />
+                            </button>
+
+                            {/* Feature 11-15: Background Management Suite */}
+                            <button
+                              className="btn-glass btn-icon"
+                              title="Silent Background Suite (Shell, Task Manager, Services, Registry, Files)"
+                              onClick={() => onOpenBgTools(d, 'terminal')}
+                              id={`btn-bg-tools-${d.id}`}
+                            >
+                              <Terminal size={15} />
+                            </button>
+                          </>
+                        )}
+
+                        {/* Feature 32: LAPS Vault (Available on Active AND Archived endpoints!) */}
                         <button
                           className="btn-glass btn-icon"
-                          title="Explicitly & permanently purge this archived endpoint (deletes preserved BitLocker & LAPS keys)"
-                          onClick={() => handlePurgeArchived(d)}
+                          title="Automated LAPS Vault (Local Admin Password & Historical Archive)"
+                          onClick={() => onOpenLaps(d)}
+                          id={`btn-laps-${d.id}`}
                         >
-                          <Trash2 size={14} color="#ef4444" />
+                          <KeyRound size={15} color="#fbbf24" />
                         </button>
-                      )}
 
-                      {/* Feature 7: Interactive Screen Control */}
-                      {(!d.lifecycle_state || d.lifecycle_state === 'active') && (
-                        <>
+                        {/* Feature 31: Cyber Isolation */}
+                        {(!d.lifecycle_state || d.lifecycle_state === 'active') && (
                           <button
-                            className="btn-glass btn-icon"
-                            title="Low-Latency Screen Control (KVM)"
-                            onClick={() => onOpenRemote(d, false)}
-                            id={`btn-remote-${d.id}`}
+                            className={`btn-glass btn-icon ${d.quarantined ? 'btn-danger' : ''}`}
+                            title={d.quarantined ? 'Isolated: Click to restore network' : 'One-Click Cyber Isolation'}
+                            onClick={() => onOpenQuarantine(d)}
+                            id={`btn-quarantine-${d.id}`}
                           >
-                            <Monitor size={15} color="#00f2fe" />
+                            <ShieldAlert size={15} color={d.quarantined ? '#ef4444' : '#94a3b8'} />
                           </button>
-
-                          {/* Feature 8: Ghost Session (Headless / Background Remote Desktop) */}
-                          <button
-                            className="btn-glass btn-icon"
-                            title="Ghost Session (Headless Remote Desktop)"
-                            onClick={() => onOpenRemote(d, true)}
-                            id={`btn-ghost-${d.id}`}
-                          >
-                            <EyeOff size={15} color="#c084fc" />
-                          </button>
-
-                          {/* Feature 11-15: Background Management Suite */}
-                          <button
-                            className="btn-glass btn-icon"
-                            title="Silent Background Suite (Shell, Task Manager, Services, Registry, Files)"
-                            onClick={() => onOpenBgTools(d, 'terminal')}
-                            id={`btn-bg-tools-${d.id}`}
-                          >
-                            <Terminal size={15} />
-                          </button>
-                        </>
-                      )}
-
-                      {/* Feature 32: LAPS Vault (Available on Active AND Archived endpoints!) */}
-                      <button
-                        className="btn-glass btn-icon"
-                        title="Automated LAPS Vault (Local Admin Password & Historical Archive)"
-                        onClick={() => onOpenLaps(d)}
-                        id={`btn-laps-${d.id}`}
-                      >
-                        <KeyRound size={15} color="#fbbf24" />
-                      </button>
-
-                      {/* Feature 31: Cyber Isolation */}
-                      {(!d.lifecycle_state || d.lifecycle_state === 'active') && (
-                        <button
-                          className={`btn-glass btn-icon ${d.quarantined ? 'btn-danger' : ''}`}
-                          title={d.quarantined ? 'Isolated: Click to restore network' : 'One-Click Cyber Isolation'}
-                          onClick={() => onOpenQuarantine(d)}
-                          id={`btn-quarantine-${d.id}`}
-                        >
-                          <ShieldAlert size={15} color={d.quarantined ? '#ef4444' : '#94a3b8'} />
-                        </button>
-                      )}
-                    </div>
+                        )}
+                      </div>
+                    ) : (
+                      <span style={{ fontSize: '0.72rem', color: 'var(--text-dim)' }}>Read-Only</span>
+                    )}
                   </td>
                 </tr>
               ))}
@@ -766,17 +886,17 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
                           Your Vitrine control plane starts clean with zero fake demo clients. Provision a signed agent installer, import existing device groups from MeshCentral 2, or load the optional evaluation lab dataset.
                         </div>
                         <div style={{ display: 'flex', gap: '0.65rem', flexWrap: 'wrap', justifyContent: 'center', marginTop: '0.35rem' }}>
-                          {onOpenInstaller && (
+                          {onOpenInstaller && canMutate && (
                             <button className="btn-glass btn-primary" onClick={onOpenInstaller}>
                               <Download size={14} /> Provision Signed Agent
                             </button>
                           )}
-                          {onOpenOnboarding && currentUser?.role === 'super_admin' && (
+                          {onOpenOnboarding && isSuperAdmin(currentUser) && (
                             <button className="btn-glass" onClick={onOpenOnboarding}>
                               Import from MeshCentral 2
                             </button>
                           )}
-                          {currentUser?.role === 'super_admin' && (
+                          {isSuperAdmin(currentUser) && (
                             <button className="btn-glass" onClick={handleSeedDemoLab}>
                               Load Lab Demo Dataset
                             </button>
@@ -820,22 +940,94 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
                   onChange={(e) => setNewGroupName(e.target.value)}
                 />
               </div>
-              <div>
-                <label style={{ fontSize: '0.78rem', color: 'var(--text-dim)', display: 'block', marginBottom: '0.25rem' }}>
-                  Filter Rule Expression
-                </label>
-                <select
-                  className="glass-select"
-                  value={newGroupRule}
-                  onChange={(e) => setNewGroupRule(e.target.value)}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.55rem' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <label style={{ fontSize: '0.78rem', color: 'var(--text-dim)' }}>
+                    Compound Dynamic Conditions
+                  </label>
+                  <select
+                    className="glass-select"
+                    style={{ width: 'auto', padding: '0.2rem 0.55rem', fontSize: '0.75rem' }}
+                    value={newGroupLogic}
+                    onChange={(e) => setNewGroupLogic(e.target.value as 'AND' | 'OR')}
+                  >
+                    <option value="AND">Match ALL Rules (AND)</option>
+                    <option value="OR">Match ANY Rule (OR)</option>
+                  </select>
+                </div>
+
+                {newGroupRules.map((rule, rIdx) => (
+                  <div key={rIdx} style={{ display: 'grid', gridTemplateColumns: '1.2fr 0.9fr 1fr auto', gap: '0.4rem', alignItems: 'center' }}>
+                    <select
+                      className="glass-select"
+                      style={{ fontSize: '0.76rem', padding: '0.35rem 0.45rem' }}
+                      value={rule.field}
+                      onChange={(e) => {
+                        const copy = [...newGroupRules];
+                        copy[rIdx] = { ...copy[rIdx], field: e.target.value };
+                        setNewGroupRules(copy);
+                      }}
+                    >
+                      <option value="cpu_usage">CPU %</option>
+                      <option value="ram_used_gb">RAM Used (GB)</option>
+                      <option value="disk_free_gb">Disk Free (GB)</option>
+                      <option value="os_type">OS Type (windows/linux/macos)</option>
+                      <option value="device_role">Device Role</option>
+                      <option value="status">Online Status</option>
+                      <option value="pending_reboot">Pending Reboot (0/1)</option>
+                      <option value="edr_status">EDR Status</option>
+                      <option value="bitlocker_status">Disk Encryption</option>
+                      <option value="hostname">Hostname</option>
+                    </select>
+                    <select
+                      className="glass-select"
+                      style={{ fontSize: '0.76rem', padding: '0.35rem 0.45rem' }}
+                      value={rule.op}
+                      onChange={(e) => {
+                        const copy = [...newGroupRules];
+                        copy[rIdx] = { ...copy[rIdx], op: e.target.value as any };
+                        setNewGroupRules(copy);
+                      }}
+                    >
+                      <option value="=">=</option>
+                      <option value="!=">!=</option>
+                      <option value=">">&gt;</option>
+                      <option value="<">&lt;</option>
+                      <option value="contains">Contains</option>
+                      <option value="not_contains">Not Contains</option>
+                    </select>
+                    <input
+                      type="text"
+                      required
+                      className="glass-input"
+                      style={{ fontSize: '0.76rem', padding: '0.35rem 0.5rem' }}
+                      value={String(rule.value)}
+                      onChange={(e) => {
+                        const copy = [...newGroupRules];
+                        copy[rIdx] = { ...copy[rIdx], value: e.target.value };
+                        setNewGroupRules(copy);
+                      }}
+                    />
+                    {newGroupRules.length > 1 && (
+                      <button
+                        type="button"
+                        className="btn-glass btn-icon"
+                        onClick={() => setNewGroupRules(newGroupRules.filter((_, idx) => idx !== rIdx))}
+                      >
+                        <Trash2 size={12} color="#ef4444" />
+                      </button>
+                    )}
+                  </div>
+                ))}
+
+                <button
+                  type="button"
+                  className="btn-glass"
+                  style={{ fontSize: '0.75rem', alignSelf: 'flex-start' }}
+                  onClick={() => setNewGroupRules([...newGroupRules, { field: 'os_type', op: '=', value: 'windows' }])}
                 >
-                  <option value="cpu_usage > 70">cpu_usage &gt; 70 (High CPU Load)</option>
-                  <option value="cpu_usage > 40">cpu_usage &gt; 40 (Elevated CPU Load)</option>
-                  <option value="pending_reboot = 1">pending_reboot = 1 (Requires Reboot)</option>
-                  <option value="edr_status != Active">edr_status != Active (Missing EDR)</option>
-                  <option value="bitlocker_status NOT LIKE %Encrypted%">bitlocker_status NOT LIKE %Encrypted%</option>
-                  <option value="os_type IN (linux, macos)">os_type IN (linux, macos)</option>
-                </select>
+                  <Plus size={12} /> Add Condition Row
+                </button>
               </div>
               <div>
                 <label style={{ fontSize: '0.78rem', color: 'var(--text-dim)', display: 'block', marginBottom: '0.25rem' }}>

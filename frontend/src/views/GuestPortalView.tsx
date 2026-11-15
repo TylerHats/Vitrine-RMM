@@ -168,6 +168,34 @@ export const GuestPortalView: React.FC<GuestPortalViewProps> = ({ grantId }) => 
     return () => clearInterval(interval);
   }, [grant, meta]);
 
+  useEffect(() => {
+    if (!grant || authRequired || isExpired || error) return;
+    const pollInterval = setInterval(async () => {
+      try {
+        const res = await fetchGuestPortal(grantId);
+        if (res.authRequired) {
+          setActiveRemote({ open: false, device: null, isGhost: false });
+          setGrant(null);
+          setDevices([]);
+          setAuthRequired(true);
+          return;
+        }
+        if (!res.success || !res.grant) {
+          setActiveRemote({ open: false, device: null, isGhost: false });
+          setIsExpired(true);
+          setError(res.error || 'This temporary vendor access grant has expired or been revoked.');
+          return;
+        }
+        setGrant(res.grant as GuestPortalGrant);
+        setDevices(res.devices || []);
+      } catch {
+        // Ignore transient network hiccups during background poll
+      }
+    }, 20000);
+
+    return () => clearInterval(pollInterval);
+  }, [grant, authRequired, isExpired, error, grantId]);
+
   const handleVerifyVendorCreds = async (e: React.FormEvent) => {
     e.preventDefault();
     setCredError(null);
@@ -551,6 +579,11 @@ export const GuestPortalView: React.FC<GuestPortalViewProps> = ({ grantId }) => 
         <RemoteScreenModal
           device={activeRemote.device}
           isGhostSession={activeRemote.isGhost}
+          guestGrantId={grantId}
+          guestPermissions={{
+            canRemoteScreen: Boolean(perms.can_remote_screen),
+            canGhostSession: Boolean(perms.can_ghost_session)
+          }}
           onClose={() => setActiveRemote({ open: false, device: null, isGhost: false })}
         />
       )}
