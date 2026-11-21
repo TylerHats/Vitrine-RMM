@@ -1,4 +1,4 @@
-# Vitrine RMM — Official Multi-Arch Docker Image (`v2.6.0`)
+# Vitrine RMM — Official Multi-Arch Docker Image (`v2.6.1`)
 
 Vitrine RMM is a modern, glassmorphic, self-hosted Remote Monitoring and Management (RMM) platform engineered for enterprise MSP fleet governance, zero-trust credential vaulting, OpenID Connect (`OIDC` + `S256 PKCE`) SSO, live hypervisor orchestration, and low-latency remote control powered by MeshCentral 2.
 
@@ -6,7 +6,7 @@ Vitrine RMM is a modern, glassmorphic, self-hosted Remote Monitoring and Managem
 
 ## 🏗️ Supported Architectures (`linux/amd64` & `linux/arm64`)
 
-Both `tylerhats/vitrine-rmm:latest` and `tylerhats/vitrine-rmm:2.6.0` are published as **multi-architecture OCI manifests** supporting:
+Both `tylerhats/vitrine-rmm:latest` and `tylerhats/vitrine-rmm:2.6.1` are published as **multi-architecture OCI manifests** supporting:
 *   **`linux/amd64`** — Intel / AMD `x86_64` bare-metal servers, Proxmox VMs, and cloud instances.
 *   **`linux/arm64`** — ARM64 servers, AWS Graviton, Oracle Ampere, Apple Silicon Docker hosts, and Raspberry Pi 5 appliances.
 
@@ -60,8 +60,8 @@ Open `http://localhost:8080` in your browser to create your **Initial MSP Super 
 
 ## 🏷️ Image Tags & Updating
 
-*   `tylerhats/vitrine-rmm:latest` — Latest stable multi-arch production release (`v2.6.0`, `linux/amd64` + `linux/arm64`).
-*   `tylerhats/vitrine-rmm:2.6.0` — Pinned version tag for reproducible deployments (`linux/amd64` + `linux/arm64`).
+*   `tylerhats/vitrine-rmm:latest` — Latest stable multi-arch production release (`v2.6.1`, `linux/amd64` + `linux/arm64`).
+*   `tylerhats/vitrine-rmm:2.6.1` — Pinned version tag for reproducible deployments (`linux/amd64` + `linux/arm64`).
 
 Because containers are immutable, Vitrine RMM automatically detects `VITRINE_DOCKER=true` in **System Settings -> System Updates** and displays update availability alongside exact `docker compose pull && docker compose up -d` upgrade commands:
 

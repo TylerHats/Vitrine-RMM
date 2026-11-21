@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/TylerHats/Vitrine-RMM/releases/latest"><img src="https://img.shields.io/badge/Release-v2.6.0_Stable-00f2fe?style=flat-square&logo=github" alt="v2.6.0 Stable" /></a>
+  <a href="https://github.com/TylerHats/Vitrine-RMM/releases/latest"><img src="https://img.shields.io/badge/Release-v2.6.1_Stable-00f2fe?style=flat-square&logo=github" alt="v2.6.1 Stable" /></a>
   <a href="https://github.com/TylerHats/Vitrine-RMM/wiki"><img src="https://img.shields.io/badge/Documentation-GitHub_Wiki-00f2fe?style=flat-square&logo=github" alt="Wiki Documentation" /></a>
   <a href="https://hub.docker.com/r/tylerhats/vitrine-rmm"><img src="https://img.shields.io/badge/Docker-amd64_%7C_arm64-blue?style=flat-square&logo=docker" alt="Docker Hub Multi-Arch" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0-green?style=flat-square" alt="License" /></a>
@@ -32,7 +32,7 @@ All deep architectural guides, API references, security specifications, and setu
 *   [**Silent Background Management Suite**](https://github.com/TylerHats/Vitrine-RMM/wiki/Background-Management-Suite) — Background PowerShell/Bash PTY shells, Process & Services manager, Remote Registry/Config editor, Dual-Pane File Manager, Event Logs, and Task Scheduler.
 *   [**Patch Management & Deployments**](https://github.com/TylerHats/Vitrine-RMM/wiki/Patch-Management-and-Deployments) — OS & 3rd-party patching, NVD CVE/CVSS v3.1 scoring, OEM driver catalogs, and KB rollback.
 *   [**Self-Healing & Script Orchestration**](https://github.com/TylerHats/Vitrine-RMM/wiki/Self-Healing-and-Automations) — Condition watchdogs with circuit-breaker flap protection, RBAC script library, and `$vitrine.*` runtime token injection.
-*   [**Two-Way PSA & REST API**](https://github.com/TylerHats/Vitrine-RMM/wiki/Two-Way-PSA-and-REST-API) — Bidirectional ITFlow & multi-PSA ticketing, HMAC-SHA256 authenticated webhooks, full `v2.6.0` REST/WebSocket API reference, and Executive QBR reporting.
+*   [**Two-Way PSA & REST API**](https://github.com/TylerHats/Vitrine-RMM/wiki/Two-Way-PSA-and-REST-API) — Bidirectional ITFlow & multi-PSA ticketing, HMAC-SHA256 authenticated webhooks, full `v2.6.1` REST/WebSocket API reference, and Executive QBR reporting.
 
 ---
 
@@ -70,7 +70,7 @@ git clone https://github.com/TylerHats/Vitrine-RMM.git
 cd Vitrine-RMM
 docker compose up -d
 ```
-Or pull the official multi-architecture (`linux/amd64` & `linux/arm64`) image directly from Docker Hub (`tylerhats/vitrine-rmm:2.6.0` / `tylerhats/vitrine-rmm:latest`). See [`DOCKER_README.md`](DOCKER_README.md) for full volume and environment details.
+Or pull the official multi-architecture (`linux/amd64` & `linux/arm64`) image directly from Docker Hub (`tylerhats/vitrine-rmm:2.6.1` / `tylerhats/vitrine-rmm:latest`). See [`DOCKER_README.md`](DOCKER_README.md) for full volume and environment details.
 
 ### 3. Automated Bare-Metal Installation (`systemd`)
 ```bash
@@ -87,7 +87,7 @@ Open `http://localhost:8080/` in your browser:
 
 ---
 
-## 🛡️ Comprehensive Feature Matrix (v2.6.0 Stable)
+## 🛡️ Comprehensive Feature Matrix (v2.6.1 Stable)
 
 1. **Zero-Trust Auth, Enterprise OIDC PKCE SSO, Strict RBAC & AES-256-GCM Vault**:
    * **Scrypt Local Auth + OpenID Connect (`S256 PKCE`) SSO**: Memory-hard scrypt (`N=16384`) local authentication alongside full Authorization Code + `S256 PKCE` SSO (`Authentik`, `Keycloak`, `Pocket ID`, `Okta`, `Entra ID`) with live discovery testing, cryptographic `state`/`nonce` validation, and optional JIT technician provisioning.

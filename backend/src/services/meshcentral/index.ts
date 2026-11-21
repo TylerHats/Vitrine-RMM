@@ -5,6 +5,7 @@ import net from 'net';
 import os from 'os';
 import path from 'path';
 import { execFile } from 'child_process';
+import { fileURLToPath } from 'url';
 import { db } from '../../db/index.js';
 import {
   decryptVaultSecret,
@@ -184,7 +185,7 @@ function validateMeshServerUrl(rawUrl: string): {
   }
 }
 
-function buildMeshWsAuthParams(
+export function buildMeshWsAuthParams(
   normalizedOrigin: string,
   apiToken: string,
   loginKey?: string
@@ -196,18 +197,31 @@ function buildMeshWsAuthParams(
     queryParts.push(`key=${encodeURIComponent(loginKey)}`);
   }
 
-  // Support both MeshCentral `x-meshauth` (username:password or base64,base64) and `--logintoken` cookies
-  if (apiToken.includes(':') && !apiToken.startsWith('c=')) {
-    const idx = apiToken.indexOf(':');
-    const userPart = apiToken.slice(0, idx);
-    const passPart = apiToken.slice(idx + 1);
+  const trimmed = String(apiToken || '').trim();
+  if (trimmed.startsWith('~t:')) {
+    // MeshCentral Login Token (~t:TokenUser:TokenPass or ~t:TokenUser TokenPass)
+    const rest = trimmed.slice(3);
+    const sepIdx = rest.search(/[:,\s]/);
+    if (sepIdx > 0) {
+      const userPart = trimmed.slice(0, 3 + sepIdx);
+      const passPart = rest.slice(sepIdx + 1).trim();
+      headers['x-meshauth'] =
+        `${Buffer.from(userPart, 'utf8').toString('base64')},${Buffer.from(passPart, 'utf8').toString('base64')}`;
+    } else {
+      headers['x-meshauth'] = trimmed;
+    }
+  } else if (trimmed.includes(':') && !trimmed.startsWith('c=')) {
+    // Support standard username:password (split on first ':' so passwords may contain ':')
+    const idx = trimmed.indexOf(':');
+    const userPart = trimmed.slice(0, idx);
+    const passPart = trimmed.slice(idx + 1);
     headers['x-meshauth'] =
       `${Buffer.from(userPart, 'utf8').toString('base64')},${Buffer.from(passPart, 'utf8').toString('base64')}`;
-  } else if (/^[A-Za-z0-9+/=]+,[A-Za-z0-9+/=]+$/.test(apiToken)) {
-    headers['x-meshauth'] = apiToken;
-  } else {
-    headers['x-meshauth'] = apiToken;
-    queryParts.push(`auth=${encodeURIComponent(apiToken)}`);
+  } else if (/^[A-Za-z0-9+/=]+,[A-Za-z0-9+/=]+(,[A-Za-z0-9+/=]+)?$/.test(trimmed)) {
+    headers['x-meshauth'] = trimmed;
+  } else if (trimmed) {
+    // Encrypted MeshCentral cookie token (`auth=` query param, e.g. from `--logintoken`)
+    queryParts.push(`auth=${encodeURIComponent(trimmed)}`);
   }
 
   const qs = queryParts.length > 0 ? `?${queryParts.join('&')}` : '';
@@ -452,6 +466,21 @@ export class MeshCentralBridge {
     try {
       const msg = JSON.parse(raw.toString());
       if (!msg || typeof msg !== 'object') return;
+
+      if (
+        msg.action === 'close' &&
+        (msg.cause === 'noauth' || msg.cause === 'notools' || msg.cause === 'emailvalidation')
+      ) {
+        const errMsg =
+          msg.msg === 'tokenrequired'
+            ? 'MeshCentral requires 2FA/TOTP for this account. Create a MeshCentral Login Token (~t:TokenUser:TokenPass) via My Account -> Login Tokens or meshctrl.js LoginTokens --add "Vitrine RMM" --token <6-digit-TOTP>.'
+            : `MeshCentral rejected WebSocket authentication (${msg.msg || msg.cause}).`;
+        if (serverId === 'primary') {
+          this.isConnected = false;
+          this.lastConnectionError = errMsg;
+        }
+        return;
+      }
 
       // Track node -> server mapping and online status transitions live!
       if (msg.action === 'nodes' && msg.nodes && typeof msg.nodes === 'object') {
@@ -849,7 +878,7 @@ export class MeshCentralBridge {
       serverUrl: this.connectedServerUrl,
       lastError: this.lastConnectionError,
       engine: 'MeshCentral 2 Micro-Agent Relay + Vitrine Companion',
-      version: '2.6.0',
+      version: '2.6.1',
       activeTunnels,
       federatedServers
     };
@@ -2150,6 +2179,7 @@ export class MeshCentralBridge {
     }
 
     const cleanToken = params.apiToken ? decryptVaultSecret(params.apiToken) || params.apiToken : '';
+    let wsAuthError = '';
 
     // 1. Live WebSocket control.ashx probe
     if (cleanToken) {
@@ -2172,6 +2202,8 @@ export class MeshCentralBridge {
           const meshNameById = new Map<string, string>();
           let gotMeshes = false;
           let gotNodes = false;
+          let timer: ReturnType<typeof setTimeout> | null = null;
+          let openTimer: ReturnType<typeof setTimeout> | null = null;
 
           const ws = new WebSocket(wsUrl, {
             headers,
@@ -2182,6 +2214,8 @@ export class MeshCentralBridge {
           const finish = (res: { ok: boolean; meshes: MeshGroup[]; nodes: DiscoveredMeshAgent[]; error?: string }) => {
             if (settled) return;
             settled = true;
+            if (timer) clearTimeout(timer);
+            if (openTimer) clearTimeout(openTimer);
             try {
               ws.removeAllListeners();
               ws.close();
@@ -2189,7 +2223,7 @@ export class MeshCentralBridge {
             resolve(res);
           };
 
-          const timer = setTimeout(() => {
+          timer = setTimeout(() => {
             finish({ ok: ws.readyState === WebSocket.OPEN, meshes, nodes });
           }, 3500);
 
@@ -2198,8 +2232,7 @@ export class MeshCentralBridge {
               ws.send(JSON.stringify({ action: 'meshes' }));
               ws.send(JSON.stringify({ action: 'nodes' }));
             } catch {}
-            setTimeout(() => {
-              clearTimeout(timer);
+            openTimer = setTimeout(() => {
               finish({ ok: true, meshes, nodes });
             }, 1000);
           });
@@ -2207,6 +2240,16 @@ export class MeshCentralBridge {
           ws.on('message', (raw) => {
             try {
               const msg = JSON.parse(raw.toString());
+              if (msg.action === 'close') {
+                const authErr =
+                  msg.msg === 'tokenrequired'
+                    ? 'MeshCentral requires 2FA/TOTP for this account. Create a persistent MeshCentral Login Token (~t:TokenUser:TokenPass) via My Account → Login Tokens or meshctrl.js LoginTokens --add "Vitrine RMM" --token <6-digit-TOTP>.'
+                    : msg.cause === 'notools'
+                      ? 'This MeshCentral account has "notools" enabled and cannot access the control WebSocket API.'
+                      : `MeshCentral rejected authentication (${msg.msg || msg.cause || 'noauth'}).`;
+                finish({ ok: false, meshes: [], nodes: [], error: authErr });
+                return;
+              }
               if (msg.action === 'meshes' && msg.meshes) {
                 gotMeshes = true;
                 const list = Array.isArray(msg.meshes) ? msg.meshes : Object.values(msg.meshes);
@@ -2248,21 +2291,26 @@ export class MeshCentralBridge {
                 }
               }
               if (gotMeshes && gotNodes) {
-                clearTimeout(timer);
                 finish({ ok: true, meshes, nodes });
               }
             } catch {}
           });
 
           ws.on('error', (err) => {
-            clearTimeout(timer);
             finish({ ok: false, meshes: [], nodes: [], error: err.message });
           });
 
           ws.on('close', (code) => {
-            if (!settled && code >= 4000) {
-              clearTimeout(timer);
-              finish({ ok: false, meshes: [], nodes: [], error: `MeshCentral rejected auth credentials (code ${code})` });
+            if (!settled) {
+              finish({
+                ok: false,
+                meshes: [],
+                nodes: [],
+                error:
+                  code >= 4000
+                    ? `MeshCentral rejected auth credentials (code ${code})`
+                    : 'MeshCentral closed the WebSocket connection before authentication succeeded.'
+              });
             }
           });
         });
@@ -2277,6 +2325,9 @@ export class MeshCentralBridge {
             groups: wsReport.meshes,
             agents: wsReport.nodes
           };
+        }
+        if (wsReport.error) {
+          wsAuthError = wsReport.error;
         }
       } catch {}
     }
@@ -2391,7 +2442,8 @@ export class MeshCentralBridge {
       latencyMs: Date.now() - startMs,
       error: httpReachable
         ? cleanToken
-          ? 'MeshCentral HTTP server responded, but WebSocket API authentication failed. Provide username:password or a valid `node meshcentral --logintoken` token.'
+          ? wsAuthError ||
+            'MeshCentral HTTP server responded, but WebSocket API authentication failed. Provide a MeshCentral Login Token (~t:TokenUser:TokenPass) or username:password (for accounts without 2FA).'
           : 'MeshCentral HTTP server is reachable. Provide API credentials to enumerate groups and agents.'
         : `Could not reach MeshCentral server at ${normalizedUrl}: ${httpError || 'Connection failed'}`,
       groups: [],
@@ -2715,6 +2767,505 @@ export class MeshCentralBridge {
     db.prepare('DELETE FROM tenants WHERE id = ?').run(tenantId);
 
     return { affectedDevices, action };
+  }
+}
+
+export interface LocalMeshCentralDetection {
+  detected: boolean;
+  deploymentMode: 'docker' | 'bare_metal_standalone' | 'bare_metal_coexistent';
+  installDir: string | null;
+  meshctrlPath: string | null;
+  configPath: string | null;
+  serviceName: string | null;
+  detectedPort: number | null;
+  detectedUrl: string | null;
+  configWritable: boolean;
+  configJsonValid: boolean;
+  allowFraming: boolean | null;
+  disableAgentUpdate: boolean | null;
+}
+
+const MESHCENTRAL_SERVICE_FILENAME = path.dirname(fileURLToPath(import.meta.url));
+const VITRINE_REPO_ROOT = (() => {
+  const rel = path.resolve(MESHCENTRAL_SERVICE_FILENAME, '../../../..');
+  try {
+    return fs.realpathSync(rel);
+  } catch {
+    return rel;
+  }
+})();
+
+function isPathInsideVitrineRepo(candidatePath: string): boolean {
+  try {
+    const resolved = fs.existsSync(candidatePath) ? fs.realpathSync(candidatePath) : path.resolve(candidatePath);
+    return resolved === VITRINE_REPO_ROOT || resolved.startsWith(VITRINE_REPO_ROOT + path.sep);
+  } catch {
+    return false;
+  }
+}
+
+export function detectLocalMeshCentralInstallation(extraCandidateDirs?: string[]): LocalMeshCentralDetection {
+  const emptyBase = (
+    deploymentMode: 'docker' | 'bare_metal_standalone' | 'bare_metal_coexistent'
+  ): LocalMeshCentralDetection => ({
+    detected: false,
+    deploymentMode,
+    installDir: null,
+    meshctrlPath: null,
+    configPath: null,
+    serviceName: null,
+    detectedPort: null,
+    detectedUrl: null,
+    configWritable: false,
+    configJsonValid: false,
+    allowFraming: null,
+    disableAgentUpdate: null
+  });
+
+  const hasExplicitOverrides = Boolean(extraCandidateDirs && extraCandidateDirs.length > 0);
+  if (process.env.VITRINE_DOCKER === 'true' && !hasExplicitOverrides) {
+    return emptyBase('docker');
+  }
+
+  const candidates: Array<{ dir: string; serviceName?: string; explicit: boolean }> = [];
+  let detectedServiceName: string | null = null;
+
+  if (extraCandidateDirs) {
+    for (const d of extraCandidateDirs) {
+      if (d && typeof d === 'string') {
+        candidates.push({ dir: d, explicit: true });
+      }
+    }
+  }
+
+  // 1. Inspect local systemd service units referencing MeshCentral
+  if (!hasExplicitOverrides) {
+    for (const unitDir of ['/etc/systemd/system', '/lib/systemd/system', '/usr/lib/systemd/system']) {
+      try {
+        if (!fs.existsSync(unitDir)) continue;
+        for (const entry of fs.readdirSync(unitDir)) {
+          if (!/meshcentral.*\.service$/i.test(entry) || entry === 'vitrine-rmm.service') continue;
+          if (!detectedServiceName) detectedServiceName = entry;
+          const unitContent = fs.readFileSync(path.join(unitDir, entry), 'utf8');
+          const wdMatch = unitContent.match(/^\s*WorkingDirectory=(.+)$/m);
+          if (wdMatch?.[1]) {
+            const rawWd = wdMatch[1].trim().replace(/^"(.*)"$/, '$1');
+            if (rawWd) candidates.push({ dir: rawWd, serviceName: entry, explicit: false });
+          }
+          const execMatch = unitContent.match(/^\s*ExecStart=(.+)$/m);
+          if (execMatch?.[1]) {
+            const nmMatch = execMatch[1].match(/(\/[^\s"']+?)\/node_modules\/meshcentral\b/);
+            if (nmMatch?.[1]) {
+              candidates.push({ dir: nmMatch[1], serviceName: entry, explicit: false });
+            }
+          }
+        }
+      } catch {
+        // Ignore inaccessible unit directories
+      }
+    }
+
+    // 2. Inspect running MeshCentral processes via /proc on Linux
+    try {
+      if (fs.existsSync('/proc')) {
+        for (const entry of fs.readdirSync('/proc')) {
+          if (!/^\d+$/.test(entry)) continue;
+          try {
+            const cmdRaw = fs.readFileSync(`/proc/${entry}/cmdline`, 'utf8').replace(/\0/g, ' ').trim();
+            if (!cmdRaw || !/meshcentral/i.test(cmdRaw) || /vitrine/i.test(cmdRaw)) continue;
+            const nmMatch = cmdRaw.match(/(\/[^\s"']+?)\/node_modules\/meshcentral\b/);
+            if (nmMatch?.[1]) {
+              candidates.push({ dir: nmMatch[1], explicit: false });
+            }
+            const cwd = fs.readlinkSync(`/proc/${entry}/cwd`);
+            if (cwd) {
+              candidates.push({ dir: cwd, explicit: false });
+            }
+          } catch {
+            // Process may belong to another user or exited
+          }
+        }
+      }
+    } catch {
+      // Ignore /proc scan failures on non-Linux hosts
+    }
+
+    // 3. Scan standard filesystem locations & /home/* directories
+    const fsPaths = [
+      '/opt/meshcentral',
+      '/var/lib/meshcentral',
+      '/srv/meshcentral',
+      '/usr/local/meshcentral',
+      '/root/meshcentral',
+      '/root'
+    ];
+    try {
+      if (fs.existsSync('/home')) {
+        for (const userEntry of fs.readdirSync('/home')) {
+          const homeDir = path.join('/home', userEntry);
+          fsPaths.push(homeDir, path.join(homeDir, 'meshcentral'));
+        }
+      }
+    } catch {
+      // Ignore inaccessible /home
+    }
+    for (const p of fsPaths) {
+      candidates.push({ dir: p, explicit: false });
+    }
+  }
+
+  const seenDirs = new Set<string>();
+  for (const cand of candidates) {
+    try {
+      if (!fs.existsSync(cand.dir)) continue;
+      let resolvedDir = fs.realpathSync(cand.dir);
+      if (
+        path.basename(resolvedDir) === 'meshcentral-data' &&
+        fs.existsSync(path.join(resolvedDir, 'config.json'))
+      ) {
+        resolvedDir = path.dirname(resolvedDir);
+      }
+      if (seenDirs.has(resolvedDir)) continue;
+      seenDirs.add(resolvedDir);
+
+      if (!cand.explicit && isPathInsideVitrineRepo(resolvedDir)) {
+        continue;
+      }
+
+      const meshctrlCandidate = path.join(resolvedDir, 'node_modules', 'meshcentral', 'meshctrl.js');
+      const configCandidate = path.join(resolvedDir, 'meshcentral-data', 'config.json');
+      const hasMeshctrl = fs.existsSync(meshctrlCandidate);
+      const hasConfig = fs.existsSync(configCandidate);
+      if (!hasMeshctrl && !hasConfig) continue;
+
+      let configPath: string | null = null;
+      let configWritable = false;
+      let configJsonValid = false;
+      let detectedPort: number | null = null;
+      let detectedUrl: string | null = null;
+      let allowFraming: boolean | null = null;
+      let disableAgentUpdate: boolean | null = null;
+
+      if (hasConfig) {
+        try {
+          const st = fs.lstatSync(configCandidate);
+          if (!st.isSymbolicLink() && st.isFile() && st.size <= 2 * 1024 * 1024) {
+            configPath = configCandidate;
+            try {
+              fs.accessSync(configCandidate, fs.constants.R_OK | fs.constants.W_OK);
+              configWritable = true;
+            } catch {
+              configWritable = false;
+            }
+            try {
+              const cfg = JSON.parse(fs.readFileSync(configCandidate, 'utf8'));
+              configJsonValid = Boolean(cfg && typeof cfg === 'object');
+              const portVal = Number(cfg?.settings?.port || cfg?.settings?.Port || 443);
+              detectedPort = Number.isFinite(portVal) && portVal > 0 ? portVal : 443;
+              if (cfg?.settings?.allowFraming !== undefined) {
+                allowFraming = Boolean(cfg.settings.allowFraming);
+              }
+              if (cfg?.settings?.disableAgentUpdate !== undefined) {
+                disableAgentUpdate = Boolean(cfg.settings.disableAgentUpdate);
+              }
+              const domainObj =
+                cfg?.domains?.[''] ||
+                (cfg?.domains && typeof cfg.domains === 'object' ? Object.values(cfg.domains)[0] : null);
+              const loginKey = (domainObj as any)?.loginKey || (domainObj as any)?.loginkey || '';
+              detectedUrl = `https://127.0.0.1:${detectedPort}${loginKey ? `?key=${encodeURIComponent(String(loginKey))}` : ''}`;
+            } catch {
+              configJsonValid = false;
+            }
+          }
+        } catch {
+          // Ignore unreadable config.json
+        }
+      }
+
+      return {
+        detected: true,
+        deploymentMode: 'bare_metal_coexistent',
+        installDir: resolvedDir,
+        meshctrlPath: hasMeshctrl ? meshctrlCandidate : null,
+        configPath,
+        serviceName: cand.serviceName || detectedServiceName,
+        detectedPort,
+        detectedUrl,
+        configWritable,
+        configJsonValid,
+        allowFraming,
+        disableAgentUpdate
+      };
+    } catch {
+      // Ignore candidate error
+    }
+  }
+
+  return emptyBase('bare_metal_standalone');
+}
+
+export async function generateMeshLoginToken(params: {
+  url: string;
+  username: string;
+  password: string;
+  totp?: string;
+  tokenName?: string;
+  allowSelfSigned?: boolean;
+}): Promise<{
+  success: boolean;
+  tokenName?: string;
+  tokenUser?: string;
+  tokenPass?: string;
+  combinedToken?: string;
+  totpRequired?: boolean;
+  error?: string;
+}> {
+  const urlCheck = validateMeshServerUrl(params.url);
+  if (!urlCheck.ok || !urlCheck.normalized) {
+    return { success: false, error: urlCheck.error || 'Invalid MeshCentral server URL.' };
+  }
+
+  const normalizedUrl = urlCheck.normalized;
+  const dnsSafety = await validateOutboundHostSafety(normalizedUrl, {
+    allowLoopback: true,
+    allowPrivateLan: true
+  });
+  if (!dnsSafety.safe) {
+    return { success: false, error: dnsSafety.reason || 'MeshCentral URL blocked by outbound safety policy.' };
+  }
+
+  const username = String(params.username || '').trim();
+  const password = String(params.password || '');
+  if (!username || !password) {
+    return { success: false, error: 'MeshCentral username and password are required.' };
+  }
+
+  const authParts = [
+    Buffer.from(username, 'utf8').toString('base64'),
+    Buffer.from(password, 'utf8').toString('base64')
+  ];
+  const totp = String(params.totp || '').trim();
+  if (totp) {
+    authParts.push(Buffer.from(totp, 'utf8').toString('base64'));
+  }
+
+  const baseWs = normalizedUrl.replace(/^http/i, 'ws');
+  const wsUrl = `${baseWs}/control.ashx${urlCheck.loginKey ? `?key=${encodeURIComponent(urlCheck.loginKey)}` : ''}`;
+  const allowInsecure =
+    Boolean(params.allowSelfSigned) ||
+    process.env.MESHCENTRAL_ALLOW_SELF_SIGNED === 'true' ||
+    isLoopbackExactHostname(normalizedUrl);
+  const desiredTokenName = String(params.tokenName || 'Vitrine RMM').trim().slice(0, 64) || 'Vitrine RMM';
+
+  return await new Promise((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const ws = new WebSocket(wsUrl, {
+      headers: { 'x-meshauth': authParts.join(',') },
+      rejectUnauthorized: !allowInsecure,
+      handshakeTimeout: 5000
+    });
+
+    const finish = (res: {
+      success: boolean;
+      tokenName?: string;
+      tokenUser?: string;
+      tokenPass?: string;
+      combinedToken?: string;
+      totpRequired?: boolean;
+      error?: string;
+    }) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      try {
+        ws.removeAllListeners();
+        ws.close();
+      } catch {}
+      resolve(res);
+    };
+
+    timer = setTimeout(() => {
+      finish({ success: false, error: 'Timed out waiting for MeshCentral Login Token response.' });
+    }, 8000);
+
+    ws.on('open', () => {
+      try {
+        ws.send(
+          JSON.stringify({
+            action: 'createLoginToken',
+            name: desiredTokenName,
+            expire: 0,
+            responseid: 'vitrine-tok'
+          })
+        );
+      } catch (err: any) {
+        finish({ success: false, error: err?.message || 'Failed to send createLoginToken command.' });
+      }
+    });
+
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (!msg || typeof msg !== 'object') return;
+
+        if (msg.action === 'close') {
+          if (msg.msg === 'tokenrequired') {
+            finish({
+              success: false,
+              totpRequired: true,
+              error: '2FA / TOTP verification required. Enter your current 6-digit authenticator code and try again.'
+            });
+            return;
+          }
+          if (msg.cause === 'notools') {
+            finish({
+              success: false,
+              error: 'This MeshCentral account has "notools" restricted and cannot generate Login Tokens.'
+            });
+            return;
+          }
+          finish({
+            success: false,
+            error: `MeshCentral rejected login (${msg.msg || msg.cause || 'invalid credentials'}).`
+          });
+          return;
+        }
+
+        if (msg.action === 'createLoginToken') {
+          if (msg.result) {
+            finish({
+              success: false,
+              error: `MeshCentral declined Login Token creation: ${String(msg.result)}`
+            });
+            return;
+          }
+          if (msg.tokenUser && msg.tokenPass) {
+            const tokenUser = String(msg.tokenUser);
+            const tokenPass = String(msg.tokenPass);
+            finish({
+              success: true,
+              tokenName: String(msg.name || desiredTokenName),
+              tokenUser,
+              tokenPass,
+              combinedToken: `${tokenUser}:${tokenPass}`
+            });
+          }
+        }
+      } catch {
+        // Ignore non-JSON frames
+      }
+    });
+
+    ws.on('error', (err) => {
+      finish({ success: false, error: err?.message || 'Failed to connect to MeshCentral server.' });
+    });
+
+    ws.on('close', (code) => {
+      if (!settled) {
+        finish({
+          success: false,
+          error:
+            code >= 4000
+              ? `MeshCentral closed connection with auth error code ${code}.`
+              : 'MeshCentral closed the WebSocket connection before generating a Login Token.'
+        });
+      }
+    });
+  });
+}
+
+export function applyLocalMeshCentralConfig(options: {
+  allowFraming?: boolean;
+  disableAgentUpdate?: boolean;
+  overrideConfigPathForTest?: string;
+  overrideServiceNameForTest?: string;
+}): {
+  success: boolean;
+  configPath?: string;
+  backupPath?: string;
+  applied?: { allowFraming: boolean; disableAgentUpdate: boolean };
+  restartHint?: string;
+  error?: string;
+} {
+  let configPath = options.overrideConfigPathForTest || '';
+  let serviceName = options.overrideServiceNameForTest || null;
+
+  if (!configPath) {
+    const detected = detectLocalMeshCentralInstallation();
+    if (!detected.detected || !detected.configPath) {
+      return {
+        success: false,
+        error: 'No local MeshCentral config.json installation was detected on this host.'
+      };
+    }
+    configPath = detected.configPath;
+    serviceName = detected.serviceName;
+  }
+
+  try {
+    if (!fs.existsSync(configPath)) {
+      return { success: false, error: `MeshCentral config file not found at ${configPath}.` };
+    }
+    const stat = fs.lstatSync(configPath);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      return { success: false, error: 'Refusing to modify config.json because it is a symbolic link or non-regular file.' };
+    }
+
+    const rawText = fs.readFileSync(configPath, 'utf8');
+    let cfg: any;
+    try {
+      cfg = JSON.parse(rawText);
+    } catch {
+      return {
+        success: false,
+        error:
+          'config.json contains comments or non-standard JSON syntax. Please add "allowFraming": true and/or "disableAgentUpdate": true under "settings" manually.'
+      };
+    }
+    if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) {
+      return { success: false, error: 'Unexpected config.json structure.' };
+    }
+
+    const mode = stat.mode & 0o777;
+    const backupPath = `${configPath}.vitrine-bak-${Date.now()}`;
+    fs.writeFileSync(backupPath, rawText, { encoding: 'utf8', mode });
+    try {
+      fs.chmodSync(backupPath, mode);
+    } catch {}
+
+    if (!cfg.settings || typeof cfg.settings !== 'object' || Array.isArray(cfg.settings)) {
+      cfg.settings = {};
+    }
+    if (options.allowFraming === true) {
+      cfg.settings.allowFraming = true;
+    }
+    if (options.disableAgentUpdate === true) {
+      cfg.settings.disableAgentUpdate = true;
+    }
+
+    fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2) + '\n', { encoding: 'utf8', mode });
+    try {
+      fs.chmodSync(configPath, mode);
+    } catch {}
+
+    return {
+      success: true,
+      configPath,
+      backupPath,
+      applied: {
+        allowFraming: Boolean(cfg.settings.allowFraming),
+        disableAgentUpdate: Boolean(cfg.settings.disableAgentUpdate)
+      },
+      restartHint: serviceName
+        ? `sudo systemctl restart ${serviceName}`
+        : 'Restart your MeshCentral 2 process for changes to take effect.'
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      error: err?.message || 'Unable to update local MeshCentral config.json.'
+    };
   }
 }
 

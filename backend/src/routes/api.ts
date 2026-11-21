@@ -11,7 +11,12 @@ import {
   APP_VERSION,
   seedDemoDataset
 } from '../db/index.js';
-import { meshBridge } from '../services/meshcentral/index.js';
+import {
+  meshBridge,
+  detectLocalMeshCentralInstallation,
+  generateMeshLoginToken,
+  applyLocalMeshCentralConfig
+} from '../services/meshcentral/index.js';
 import {
   getLapsCredential,
   rotateLapsPasswordVerifiedAsync,
@@ -564,6 +569,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
       pathname === '/api/signing/sign' ||
       pathname === '/api/code-signing/test' ||
       pathname === '/api/proxy-tls/test' ||
+      pathname === '/api/mesh-servers/local-detect' ||
       (pathname.startsWith('/api/mesh-servers') && !isSafeMethod) ||
       (pathname.startsWith('/api/psa/integrations') && !isSafeMethod) ||
       (pathname.startsWith('/api/notification-channels') && !isSafeMethod) ||
@@ -6537,11 +6543,112 @@ export async function registerApiRoutes(server: FastifyInstance) {
     return { success: true };
   });
 
+  server.get('/api/mesh-servers/local-detect', async () => {
+    return detectLocalMeshCentralInstallation();
+  });
+
+  server.post('/api/mesh-servers/generate-token', async (request, reply) => {
+    const rate = checkRateLimit(`mesh-gen-tok:${request.ip}:${getActorUsername(request)}`, 10, 5 * 60_000);
+    if (!rate.allowed) {
+      return reply.status(429).send({
+        success: false,
+        error: `Too many token generation attempts. Try again in ${rate.retryAfterSec}s.`,
+        retryAfterSec: rate.retryAfterSec
+      });
+    }
+
+    const body = (request.body || {}) as {
+      url?: string;
+      username?: string;
+      password?: string;
+      totp?: string;
+      tokenName?: string;
+      allowSelfSigned?: boolean;
+    };
+
+    const settings = (db.prepare('SELECT * FROM settings WHERE id = 1').get() || {}) as any;
+    const targetUrl = String(body.url || settings.meshcentral_url || '').trim();
+    const username = String(body.username || '').trim();
+    const password = String(body.password || '');
+
+    if (!targetUrl || !username || !password) {
+      return reply.status(400).send({
+        success: false,
+        error: 'MeshCentral URL, admin username, and password are required to generate a Login Token.'
+      });
+    }
+
+    const res = await generateMeshLoginToken({
+      url: targetUrl,
+      username,
+      password,
+      totp: body.totp,
+      tokenName: body.tokenName || 'Vitrine RMM',
+      allowSelfSigned: body.allowSelfSigned ?? Boolean(settings.meshcentral_allow_self_signed)
+    });
+
+    if (!res.success) {
+      return reply.status(400).send(res);
+    }
+
+    db.prepare(`
+      INSERT INTO audit_logs (id, username, action, details)
+      VALUES (?, ?, 'MeshCentral Login Token Generated', ?)
+    `).run(
+      `aud-mstok-${crypto.randomUUID()}`,
+      getActorUsername(request),
+      `Generated persistent MeshCentral Login Token '${res.tokenName || 'Vitrine RMM'}' on ${targetUrl}`
+    );
+
+    return res;
+  });
+
+  server.post('/api/mesh-servers/local-apply-config', async (request, reply) => {
+    const settings = (db.prepare('SELECT * FROM settings WHERE id = 1').get() || {}) as any;
+    if (Boolean(settings.is_onboarded) && !requireStepUpMfaIfEnforced(request, reply, null)) {
+      return;
+    }
+
+    const body = (request.body || {}) as {
+      allowFraming?: boolean;
+      disableAgentUpdate?: boolean;
+    };
+
+    if (!body.allowFraming && !body.disableAgentUpdate) {
+      return reply.status(400).send({
+        success: false,
+        error: 'Select at least one setting (allowFraming or disableAgentUpdate) to apply.'
+      });
+    }
+
+    const result = applyLocalMeshCentralConfig({
+      allowFraming: Boolean(body.allowFraming),
+      disableAgentUpdate: Boolean(body.disableAgentUpdate)
+    });
+
+    if (!result.success) {
+      return reply.status(400).send(result);
+    }
+
+    db.prepare(`
+      INSERT INTO audit_logs (id, username, action, details)
+      VALUES (?, ?, 'Local MeshCentral Config Updated', ?)
+    `).run(
+      `aud-mscfg-${crypto.randomUUID()}`,
+      getActorUsername(request),
+      `Updated ${result.configPath} (backup: ${result.backupPath}; allowFraming=${result.applied?.allowFraming}, disableAgentUpdate=${result.applied?.disableAgentUpdate})`
+    );
+
+    return result;
+  });
+
   server.post('/api/mesh-servers/test-discover', async (request) => {
     const body = (request.body || {}) as {
       id?: string;
       url?: string;
       api_token?: string;
+      api_username?: string;
+      api_password?: string;
       local_config_path?: string;
       allowSelfSigned?: boolean;
     };
@@ -6555,6 +6662,8 @@ export async function registerApiRoutes(server: FastifyInstance) {
     let rawToken = '';
     if (body.api_token && !isMaskedSecret(body.api_token)) {
       rawToken = body.api_token.trim();
+    } else if (body.api_username?.trim() && body.api_password) {
+      rawToken = `${body.api_username.trim()}:${body.api_password}`;
     } else if (storedServer?.api_token) {
       rawToken = decryptVaultSecret(storedServer.api_token);
     } else if (settings.meshcentral_api_token) {
@@ -6565,7 +6674,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
       url: targetUrl,
       apiToken: rawToken,
       localConfigPath: body.local_config_path || storedServer?.local_config_path,
-      allowSelfSigned: body.allowSelfSigned
+      allowSelfSigned: body.allowSelfSigned ?? Boolean(settings.meshcentral_allow_self_signed)
     });
 
     if (storedServer) {
@@ -6595,12 +6704,15 @@ export async function registerApiRoutes(server: FastifyInstance) {
       mesh_server_id?: string;
       url?: string;
       api_token?: string;
+      api_username?: string;
+      api_password?: string;
       local_config_path?: string;
       group_mapping_mode?: 'groups_as_clients' | 'single_client_sites';
       target_tenant_id?: string;
       selected_group_ids?: string[];
       import_agents?: boolean;
       deploy_vitrine_addons?: boolean;
+      allowSelfSigned?: boolean;
     };
 
     const storedServer = body.mesh_server_id
@@ -6611,12 +6723,15 @@ export async function registerApiRoutes(server: FastifyInstance) {
     const rawToken =
       body.api_token && !isMaskedSecret(body.api_token)
         ? body.api_token.trim()
-        : decryptVaultSecret(storedServer?.api_token || settings.meshcentral_api_token);
+        : body.api_username?.trim() && body.api_password
+          ? `${body.api_username.trim()}:${body.api_password}`
+          : decryptVaultSecret(storedServer?.api_token || settings.meshcentral_api_token);
 
     const discovered = await meshBridge.discoverServerResources({
       url: targetUrl,
       apiToken: rawToken,
-      localConfigPath: body.local_config_path || storedServer?.local_config_path
+      localConfigPath: body.local_config_path || storedServer?.local_config_path,
+      allowSelfSigned: body.allowSelfSigned ?? Boolean(settings.meshcentral_allow_self_signed)
     });
 
     const selectedSet =

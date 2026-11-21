@@ -14,16 +14,6 @@ export interface SigningResult {
   durationMs?: number;
 }
 
-function isLoopbackSigningHost(rawHost: string): boolean {
-  const clean = rawHost.trim().toLowerCase().replace(/^\[|\]$/g, '');
-  return (
-    clean === 'localhost' ||
-    clean === '::1' ||
-    clean === '127.0.0.1' ||
-    clean.startsWith('127.')
-  );
-}
-
 function normalizePs1ScriptContent(raw: string): string {
   return raw
     .replace(/^\uFEFF/, '')
@@ -57,12 +47,6 @@ export function validateSigningEndpointUrl(rawUrl: string): { valid: boolean; no
       isBlockedOutboundIp(cleanHost, { allowLoopback: true, allowPrivateLan: true }))
   ) {
     return { valid: false, error: 'Cloud metadata / link-local endpoints are blocked.' };
-  }
-  if (process.env.NODE_ENV === 'production' && parsed.protocol !== 'https:' && !isLoopbackSigningHost(cleanHost)) {
-    return {
-      valid: false,
-      error: 'Code signing URL must use https:// in production for non-loopback endpoints.'
-    };
   }
   return { valid: true, normalizedUrl: parsed.toString().replace(/\/$/, '') };
 }
@@ -138,7 +122,8 @@ export class CodeSigningService {
     const authHeaders: Record<string, string> = apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
 
     try {
-      const res = await safeOutboundFetch(`${check.normalizedUrl}/health`, {
+      const healthBase = check.normalizedUrl.replace(/\/sign$/i, '');
+      const res = await safeOutboundFetch(`${healthBase}/health`, {
         method: 'GET',
         headers: authHeaders,
         timeoutMs: 5000,
@@ -208,7 +193,11 @@ export class CodeSigningService {
         reqHeaders.Authorization = `Bearer ${apiKey}`;
       }
 
-      const res = await safeOutboundFetch(`${urlCheck.normalizedUrl}/sign`, {
+      const signTargetUrl = /\/sign$/i.test(urlCheck.normalizedUrl)
+        ? urlCheck.normalizedUrl
+        : `${urlCheck.normalizedUrl}/sign`;
+
+      const res = await safeOutboundFetch(signTargetUrl, {
         method: 'POST',
         headers: reqHeaders,
         body,

@@ -1,4 +1,4 @@
-# Multi-stage Docker build for Vitrine RMM v2.6.0 (linux/amd64 & linux/arm64)
+# Multi-stage Docker build for Vitrine RMM v2.6.1 (linux/amd64 & linux/arm64)
 # Stage 1: Build Frontend and Backend (with native better-sqlite3 toolchain)
 FROM node:22-slim AS builder
 
@@ -33,7 +33,7 @@ FROM node:22-slim AS runner
 
 WORKDIR /app
 
-ARG VITRINE_GIT_COMMIT=v2.6.0
+ARG VITRINE_GIT_COMMIT=v2.6.1
 ENV NODE_ENV=production
 ENV PORT=8080
 ENV DATA_DIR=/app/data

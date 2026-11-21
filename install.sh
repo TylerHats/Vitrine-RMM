@@ -20,13 +20,96 @@ if ! command -v node &> /dev/null; then
     exit 1
 fi
 
-APP_VERSION="$(node -p "try { require('./package.json').version || require('./backend/package.json').version } catch { '2.6.0' }" 2>/dev/null || echo "2.6.0")"
+APP_VERSION="$(node -p "try { require('./package.json').version || require('./backend/package.json').version } catch { '2.6.1' }" 2>/dev/null || echo "2.6.1")"
+
+LOCAL_MS2_FOUND=0
+LOCAL_MS2_DIR=""
+LOCAL_MS2_SERVICE=""
+
+# Strictly read-only detection of any local MeshCentral 2 instance on this host (never touches files outside $PROJ_ROOT)
+detect_local_meshcentral() {
+    LOCAL_MS2_FOUND=0
+    LOCAL_MS2_DIR=""
+    LOCAL_MS2_SERVICE=""
+
+    local canon_proj
+    canon_proj="$(cd "$PROJ_ROOT" 2>/dev/null && pwd -P || printf '%s' "$PROJ_ROOT")"
+
+    if command -v systemctl &> /dev/null; then
+        local unit_files line unit_name unit_cfg wd
+        unit_files="$(systemctl list-unit-files --no-pager 2>/dev/null || true)"
+        while IFS= read -r line; do
+            unit_name="${line%%[[:space:]]*}"
+            if [[ -n "$unit_name" && "$unit_name" != "vitrine-rmm.service" && "$unit_name" == *meshcentral*.service ]]; then
+                LOCAL_MS2_FOUND=1
+                LOCAL_MS2_SERVICE="$unit_name"
+                unit_cfg="$(systemctl cat "$unit_name" 2>/dev/null || true)"
+                wd="$(printf '%s\n' "$unit_cfg" | sed -n 's/^WorkingDirectory=//p' | head -n 1 | sed 's/^"//; s/"$//')"
+                if [ -n "$wd" ] && [ -d "$wd" ]; then
+                    LOCAL_MS2_DIR="$wd"
+                fi
+                break
+            fi
+        done <<< "$unit_files"
+    fi
+
+    if [ "$LOCAL_MS2_FOUND" -eq 0 ] && command -v pgrep &> /dev/null; then
+        local proc_lines pline
+        proc_lines="$(pgrep -af "node.*meshcentral" 2>/dev/null || true)"
+        while IFS= read -r pline; do
+            if [ -n "$pline" ] && [[ "$pline" != *"$canon_proj"* ]] && [[ "$pline" != *"dev-meshcentral"* ]]; then
+                LOCAL_MS2_FOUND=1
+                break
+            fi
+        done <<< "$proc_lines"
+    fi
+
+    if [ "$LOCAL_MS2_FOUND" -eq 0 ] || [ -z "$LOCAL_MS2_DIR" ]; then
+        local candidates=(
+            "/opt/meshcentral"
+            "/var/lib/meshcentral"
+            "/srv/meshcentral"
+            "/usr/local/meshcentral"
+            "/root/meshcentral"
+            "/root"
+        )
+        local hdir
+        for hdir in /home/*; do
+            if [ -d "$hdir" ]; then
+                candidates+=("$hdir" "$hdir/meshcentral")
+            fi
+        done
+
+        local cand resolved_cand
+        for cand in "${candidates[@]}"; do
+            [ -d "$cand" ] || continue
+            resolved_cand="$(cd "$cand" 2>/dev/null && pwd -P || true)"
+            [ -n "$resolved_cand" ] || continue
+            if [ "$resolved_cand" = "$canon_proj" ] || [[ "$resolved_cand" == "$canon_proj/"* ]]; then
+                continue
+            fi
+            if [ -f "$resolved_cand/node_modules/meshcentral/meshctrl.js" ] || [ -f "$resolved_cand/meshcentral-data/config.json" ]; then
+                LOCAL_MS2_FOUND=1
+                if [ -z "$LOCAL_MS2_DIR" ]; then
+                    LOCAL_MS2_DIR="$resolved_cand"
+                fi
+                break
+            fi
+        done
+    fi
+}
+
+detect_local_meshcentral
 
 echo "=========================================================="
 echo "             Vitrine RMM Installation Script              "
 echo "=========================================================="
 echo "Modern, Glassmorphic Self-Hosted RMM (v${APP_VERSION})"
-echo "Powered by MeshCentral 2 Remote Engine (Co-Existence Safe)"
+if [ "$LOCAL_MS2_FOUND" -eq 1 ]; then
+    echo "Powered by MeshCentral 2 Remote Engine (Co-Existence Safe)"
+else
+    echo "Powered by MeshCentral 2 Remote Engine"
+fi
 echo "=========================================================="
 
 NODE_VER=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
@@ -39,16 +122,16 @@ fi
 
 echo "--> Node.js $(node -v) and npm $(npm -v) detected."
 
-# 2. Strictly Read-Only MeshCentral 2 Co-Existence Check (ZERO writes outside $PROJ_ROOT, SIGPIPE-safe)
-echo "--> Checking for neighboring MeshCentral 2 services (strictly read-only)..."
-if command -v systemctl &> /dev/null; then
-    UNIT_FILES="$(systemctl list-unit-files --no-pager 2>/dev/null || true)"
-    if [[ "$UNIT_FILES" == *"meshcentral.service"* ]]; then
-        echo "    [✓] Detected neighboring systemd unit: meshcentral.service (Isolated — never modified or restarted)."
-    fi
+# 2. Host Environment & Local MeshCentral 2 Check (ZERO writes outside $PROJ_ROOT)
+echo "--> Checking host environment for local MeshCentral 2 services (strictly read-only)..."
+if [ "$LOCAL_MS2_FOUND" -eq 1 ]; then
+    LOCAL_MS2_LOC="${LOCAL_MS2_DIR:-$LOCAL_MS2_SERVICE}"
+    echo "    [✓] Detected local MeshCentral 2 installation (${LOCAL_MS2_LOC:-detected}) — running in isolated co-existence mode (never modified or stopped)."
+else
+    echo "    [i] Standalone host detected (no local MeshCentral 2 instance found on this host)."
 fi
 
-# 3. Port Collision Check (Never collide with MeshCentral 443, 80, 4430, 4433; scan 8080..8090 SIGPIPE-safely)
+# 3. Port Collision Check (scan 8080..8090 SIGPIPE-safely)
 is_port_in_use() {
     local check_port="$1"
     if command -v ss &> /dev/null; then
@@ -68,7 +151,11 @@ if [ -n "$DEFAULT_PORT" ]; then
         echo "    [!] Requested PORT=${DEFAULT_PORT} is currently in use; scanning 8080..8090 for an open port..."
         DEFAULT_PORT=""
     else
-        echo "    [✓] Port ${DEFAULT_PORT} is available and isolated from MeshCentral ports."
+        if [ "$LOCAL_MS2_FOUND" -eq 1 ]; then
+            echo "    [✓] Port ${DEFAULT_PORT} is available and isolated from local MeshCentral ports."
+        else
+            echo "    [✓] Port ${DEFAULT_PORT} is available."
+        fi
     fi
 fi
 
@@ -77,7 +164,11 @@ if [ -z "$DEFAULT_PORT" ]; then
         if ! is_port_in_use "$candidate_port"; then
             DEFAULT_PORT="$candidate_port"
             if [ "$candidate_port" -eq 8080 ]; then
-                echo "    [✓] Port ${DEFAULT_PORT} is available and isolated from MeshCentral ports."
+                if [ "$LOCAL_MS2_FOUND" -eq 1 ]; then
+                    echo "    [✓] Port ${DEFAULT_PORT} is available and isolated from local MeshCentral ports."
+                else
+                    echo "    [✓] Port ${DEFAULT_PORT} is available."
+                fi
             else
                 echo "    [✓] Auto-selected available non-conflicting port: ${DEFAULT_PORT}"
             fi
@@ -170,10 +261,15 @@ if [[ "$SETUP_SERVICE" =~ ^[Yy]$ ]]; then
         fi
     }
 
+    SERVICE_DESC="Vitrine RMM Fleet Orchestration Engine"
+    if [ "$LOCAL_MS2_FOUND" -eq 1 ]; then
+        SERVICE_DESC="Vitrine RMM Fleet Orchestration Engine (Isolated from MeshCentral)"
+    fi
+
     echo "--> Generating isolated vitrine-rmm.service unit..."
     cat <<EOF > "$TMP_UNIT"
 [Unit]
-Description=Vitrine RMM Fleet Orchestration Engine (Isolated from MeshCentral)
+Description=$SERVICE_DESC
 After=network.target
 
 [Service]
@@ -214,7 +310,11 @@ fi
 echo ""
 echo "=========================================================="
 echo "Vitrine RMM v${APP_VERSION} setup completed successfully!"
-echo "Neighboring MeshCentral 2 installations were left untouched."
+if [ "$LOCAL_MS2_FOUND" -eq 1 ]; then
+    echo "Local MeshCentral 2 installation was left untouched."
+else
+    echo "Connect your remote MeshCentral 2 server in Step 2 of the OOBE Wizard."
+fi
 echo ""
 echo "Open http://localhost:${DEFAULT_PORT}/ in your browser to create"
 echo "your initial Super Admin account and launch the OOBE Wizard."

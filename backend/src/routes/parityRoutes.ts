@@ -291,7 +291,7 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
         last_seen = CURRENT_TIMESTAMP
       WHERE id = ?
     `).run(
-      body.companionVersion || '2.6.0',
+      body.companionVersion || '2.6.1',
       body.osVersion ?? null,
       safeCheckinIp,
       body.cpuUsage != null && Number.isFinite(Number(body.cpuUsage)) ? Number(body.cpuUsage) : null,

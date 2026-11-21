@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Sparkles,
   Globe,
@@ -19,9 +19,12 @@ import {
   AlertTriangle,
   AlertCircle
 } from 'lucide-react';
-import { Settings, MeshDiscoveryResult } from '../types/index.js';
+import { Settings, MeshDiscoveryResult, LocalMeshCentralDetection } from '../types/index.js';
 import {
   updateSettings,
+  fetchLocalMeshCentralStatus,
+  generateMeshCentralLoginToken,
+  applyLocalMeshCentralConfig,
   testDiscoverMeshServer,
   importFromMeshServer,
   testCodeSigningPipeline,
@@ -33,6 +36,40 @@ import {
 } from '../services/api.js';
 import { copyToClipboard } from '../utils/clipboard.js';
 import { MfaChallengeModal } from './MfaChallengeModal.js';
+
+function parseMeshTokenPair(raw?: string | null): {
+  user: string;
+  pass: string;
+  isMasked: boolean;
+  isCombinedOnly: boolean;
+} {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) return { user: '', pass: '', isMasked: false, isCombinedOnly: false };
+  if (/^[•*]{4,}$/.test(trimmed)) return { user: '', pass: '', isMasked: true, isCombinedOnly: false };
+  if (trimmed.startsWith('~t:')) {
+    const rest = trimmed.slice(3);
+    const sepIdx = rest.search(/[:,\s]/);
+    if (sepIdx > 0) {
+      return {
+        user: trimmed.slice(0, 3 + sepIdx),
+        pass: rest.slice(sepIdx + 1).trim(),
+        isMasked: false,
+        isCombinedOnly: false
+      };
+    }
+    return { user: trimmed, pass: '', isMasked: false, isCombinedOnly: false };
+  }
+  if (trimmed.includes(':') && !trimmed.startsWith('c=')) {
+    const idx = trimmed.indexOf(':');
+    return {
+      user: trimmed.slice(0, idx),
+      pass: trimmed.slice(idx + 1),
+      isMasked: false,
+      isCombinedOnly: false
+    };
+  }
+  return { user: '', pass: '', isMasked: false, isCombinedOnly: true };
+}
 
 interface OnboardingWizardModalProps {
   settings: Settings;
@@ -57,19 +94,25 @@ remote.yourdomain.com.  300  IN  CNAME  rmm.yourdomain.com.
 # Accessible at: https://remote.yourdomain.com/remote or https://rmm.yourdomain.com/temporarysession`
   },
   2: {
-    title: 'Walkthrough: Generating Your MeshCentral 2 API Token & Safe Co-Existence',
-    subtitle: 'Connecting to a local bare-metal or remote MeshCentral 2 instance without disrupting existing agents',
+    title: 'Walkthrough: Connecting MeshCentral 2 & Login Token Setup',
+    subtitle: 'Connecting to a remote MeshCentral 2 server or an isolated co-resident instance on the same host',
     bullets: [
-      'Bare-Metal Co-Existence: Vitrine runs on an isolated port (8080) and systemd unit (vitrine-rmm.service). It never overwrites or stops your neighboring meshcentral.service.',
-      'Step 1: On your MeshCentral 2 server, generate a Login Token Key or API Token using meshctrl.js (shown below).',
-      'Step 2: Paste the URL and Token into Step 2 and click "Test Connection & Discover Fleet".',
-      'Step 3: Select how existing MS2 Device Groups and Agents should be imported. Vitrine will automatically push the Vitrine Tray Companion & LAPS policies over the existing MS2 channel as soon as each imported agent is online—no manual re-install needed!'
+      'Remote or Co-Resident Deployment: Vitrine connects over MeshCentral 2 WebSockets whether MeshCentral runs in another container/VM or locally on the same host. If MeshCentral is detected locally on this host, Vitrine keeps itself isolated and offers an optional config helper.',
+      'Option A (Web UI — Easiest with 2FA/TOTP): Sign into MeshCentral -> My Account -> Account Security -> Login Tokens -> Create ("Vitrine RMM"), then paste the generated Token Username (~t:...) and Token Password into the two fields.',
+      'Option B (Auto-Generate in Vitrine): Use the "Auto-Generate in Vitrine" tab with your MeshCentral admin username/password (+ 6-digit TOTP if 2FA is active) to mint a persistent Login Token over TLS without saving your admin password.',
+      'Option C (CLI via meshctrl.js): Run meshctrl.js LoginTokens --add "Vitrine RMM" from your MeshCentral installation folder (include --token <6-digit-TOTP> if 2FA is enabled). Login Tokens bypass 2FA permanently so your admin account can keep MFA enabled.'
     ],
-    codeSnippet: `# 1. Generate a persistent API Login Token on your MeshCentral 2 server:
-cd /opt/meshcentral
-node node_modules/meshcentral/meshctrl.js --url wss://127.0.0.1:4430 --loginuser admin --loginpass 'YourPass' Token
+    codeSnippet: `# Option A (MeshCentral Web UI — Recommended):
+# My Account -> Account Security -> Login Tokens -> Create -> Name: "Vitrine RMM"
+# Paste the returned Username (~t:...) and Password into Vitrine's two Token fields.
 
-# 2. (Optional) In meshcentral-data/config.json under "settings":
+# Option C (CLI on your MeshCentral 2 host — replace path if not in /opt/meshcentral):
+cd /path/to/meshcentral   # e.g. /opt/meshcentral or /home/<user>/meshcentral
+node node_modules/meshcentral/meshctrl.js --url wss://127.0.0.1:4430 \\
+  --loginuser admin --loginpass 'YourPass' --token 123456 \\
+  LoginTokens --add "Vitrine RMM"
+
+# Optional settings inside meshcentral-data/config.json under "settings":
 "allowFraming": true,
 "disableAgentUpdate": true  # Lets Vitrine keep MS2 agent binaries Authenticode-signed!`
   },
@@ -153,10 +196,34 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [showSaveMfa, setShowSaveMfa] = useState(false);
+  const [pendingMfaAction, setPendingMfaAction] = useState<'save' | 'local_cfg'>('save');
   const [guideOpenForStep, setGuideOpenForStep] = useState<number | null>(null);
   const [copiedProxyConfig, setCopiedProxyConfig] = useState(false);
 
-  // Step 2: Live MS2 Discovery & Import State
+  // Step 2: Local Detection, Two-Field Token, Auto-Generate, & Live MS2 Discovery State
+  const initialTokenPair = parseMeshTokenPair(settings.meshcentral_api_token);
+  const [localMesh, setLocalMesh] = useState<LocalMeshCentralDetection | null>(null);
+  const [meshTokenUser, setMeshTokenUser] = useState(initialTokenPair.user);
+  const [meshTokenPass, setMeshTokenPass] = useState(initialTokenPair.pass);
+  const [meshTokenInitiallyMasked] = useState(initialTokenPair.isMasked);
+  const [useCombinedTokenMode, setUseCombinedTokenMode] = useState(initialTokenPair.isCombinedOnly);
+  const [tokenGuideTab, setTokenGuideTab] = useState<'webui' | 'auto' | 'cli'>('webui');
+  const [copiedCliCmd, setCopiedCliCmd] = useState(false);
+
+  const [autoMs2User, setAutoMs2User] = useState('admin');
+  const [autoMs2Pass, setAutoMs2Pass] = useState('');
+  const [autoMs2Totp, setAutoMs2Totp] = useState('');
+  const [autoMs2TotpRequired, setAutoMs2TotpRequired] = useState(false);
+  const [generatingToken, setGeneratingToken] = useState(false);
+  const [autoTokenMsg, setAutoTokenMsg] = useState<string | null>(null);
+  const [autoTokenIsError, setAutoTokenIsError] = useState(false);
+
+  const [optAllowFraming, setOptAllowFraming] = useState(true);
+  const [optDisableAgentUpdate, setOptDisableAgentUpdate] = useState(false);
+  const [applyingLocalCfg, setApplyingLocalCfg] = useState(false);
+  const [localCfgMsg, setLocalCfgMsg] = useState<string | null>(null);
+  const [localCfgIsError, setLocalCfgIsError] = useState(false);
+
   const [discoveringMesh, setDiscoveringMesh] = useState(false);
   const [discoveryResult, setDiscoveryResult] = useState<MeshDiscoveryResult | null>(null);
   const [importNewGroups, setImportNewGroups] = useState(true);
@@ -166,6 +233,150 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
   const [importingMesh, setImportingMesh] = useState(false);
   const [importSummary, setImportSummary] = useState<string | null>(null);
   const [importIsError, setImportIsError] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    fetchLocalMeshCentralStatus()
+      .then((info) => {
+        if (!active) return;
+        setLocalMesh(info);
+        if (info.detected) {
+          if (info.allowFraming === true) setOptAllowFraming(false);
+          if (info.disableAgentUpdate === true) setOptDisableAgentUpdate(false);
+          if (info.detectedUrl) {
+            setFormData((prev) => {
+              const cur = String(prev.meshcentral_url || '').trim();
+              if (!cur || cur === 'https://mesh.vitrine.local' || cur === 'https://mesh.yourdomain.com') {
+                return { ...prev, meshcentral_url: info.detectedUrl || cur };
+              }
+              return prev;
+            });
+          }
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const syncTwoFieldToken = (nextUser: string, nextPass: string) => {
+    const trimmedUser = nextUser.trim();
+    if (trimmedUser && nextPass) {
+      setFormData((prev) => ({ ...prev, meshcentral_api_token: `${trimmedUser}:${nextPass}` }));
+    } else if (!trimmedUser && !nextPass && meshTokenInitiallyMasked) {
+      setFormData((prev) => ({ ...prev, meshcentral_api_token: settings.meshcentral_api_token }));
+    } else {
+      setFormData((prev) => ({ ...prev, meshcentral_api_token: '' }));
+    }
+  };
+
+  const handleMeshTokenUserChange = (rawVal: string) => {
+    // Auto-split if the user pasted a combined ~t:TokenUser:TokenPass string
+    if (rawVal.trim().startsWith('~t:')) {
+      const parsed = parseMeshTokenPair(rawVal);
+      if (parsed.pass) {
+        setMeshTokenUser(parsed.user);
+        setMeshTokenPass(parsed.pass);
+        syncTwoFieldToken(parsed.user, parsed.pass);
+        return;
+      }
+    }
+    setMeshTokenUser(rawVal);
+    syncTwoFieldToken(rawVal, meshTokenPass);
+  };
+
+  const handleMeshTokenPassChange = (rawPass: string) => {
+    setMeshTokenPass(rawPass);
+    syncTwoFieldToken(meshTokenUser, rawPass);
+  };
+
+  const handleAutoGenerateToken = async () => {
+    const targetUrl = String(formData.meshcentral_url || localMesh?.detectedUrl || '').trim();
+    if (!targetUrl) {
+      setAutoTokenIsError(true);
+      setAutoTokenMsg('Enter your MeshCentral 2 Server Endpoint URL above first.');
+      return;
+    }
+    if (!autoMs2User.trim() || !autoMs2Pass) {
+      setAutoTokenIsError(true);
+      setAutoTokenMsg('Enter your MeshCentral admin username and password.');
+      return;
+    }
+    setGeneratingToken(true);
+    setAutoTokenMsg(null);
+    setAutoTokenIsError(false);
+    try {
+      const res = await generateMeshCentralLoginToken({
+        url: targetUrl,
+        username: autoMs2User.trim(),
+        password: autoMs2Pass,
+        totp: autoMs2Totp.trim() || undefined,
+        tokenName: 'Vitrine RMM',
+        allowSelfSigned: Boolean(formData.meshcentral_allow_self_signed)
+      });
+      if (!res.success || !res.tokenUser || !res.tokenPass) {
+        setAutoTokenIsError(true);
+        setAutoTokenMsg(res.error || 'Unable to generate MeshCentral Login Token.');
+        if (res.totpRequired) setAutoMs2TotpRequired(true);
+        return;
+      }
+      setUseCombinedTokenMode(false);
+      setMeshTokenUser(res.tokenUser);
+      setMeshTokenPass(res.tokenPass);
+      const combined = res.combinedToken || `${res.tokenUser}:${res.tokenPass}`;
+      setFormData((prev) => ({
+        ...prev,
+        meshcentral_url: prev.meshcentral_url || targetUrl,
+        meshcentral_api_token: combined
+      }));
+      // Immediately clear ephemeral admin password and TOTP from component memory
+      setAutoMs2Pass('');
+      setAutoMs2Totp('');
+      setAutoMs2TotpRequired(false);
+      setAutoTokenIsError(false);
+      setAutoTokenMsg(
+        `✓ Created Login Token "${res.tokenName || 'Vitrine RMM'}" and populated the Token Username & Password fields above.`
+      );
+    } catch (err: any) {
+      setAutoTokenIsError(true);
+      setAutoTokenMsg(err?.message || 'Failed to contact MeshCentral server.');
+    } finally {
+      setGeneratingToken(false);
+    }
+  };
+
+  const handleApplyLocalConfig = async () => {
+    setApplyingLocalCfg(true);
+    setLocalCfgMsg(null);
+    setLocalCfgIsError(false);
+    try {
+      const res = await applyLocalMeshCentralConfig({
+        allowFraming: optAllowFraming,
+        disableAgentUpdate: optDisableAgentUpdate
+      });
+      if (res.mfaRequired) {
+        setPendingMfaAction('local_cfg');
+        setShowSaveMfa(true);
+        return;
+      }
+      if (!res.success) {
+        setLocalCfgIsError(true);
+        setLocalCfgMsg(res.error || 'Failed to update local config.json.');
+        return;
+      }
+      setLocalCfgIsError(false);
+      setLocalCfgMsg(
+        `✓ Updated ${res.configPath} (backup: ${res.backupPath}). ${res.restartHint || ''}`
+      );
+      fetchLocalMeshCentralStatus().then(setLocalMesh).catch(() => {});
+    } catch (err: any) {
+      setLocalCfgIsError(true);
+      setLocalCfgMsg(err?.message || 'Failed to update local config.json.');
+    } finally {
+      setApplyingLocalCfg(false);
+    }
+  };
 
   // Step 3: Code Signing Test State
   const [testingSigner, setTestingSigner] = useState(false);
@@ -223,7 +434,8 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
     try {
       const res = await testDiscoverMeshServer({
         url: formData.meshcentral_url,
-        api_token: formData.meshcentral_api_token
+        api_token: formData.meshcentral_api_token,
+        allowSelfSigned: Boolean(formData.meshcentral_allow_self_signed)
       });
       setDiscoveryResult(res);
     } finally {
@@ -238,6 +450,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
         mesh_server_id: 'ms2-primary',
         url: formData.meshcentral_url,
         api_token: formData.meshcentral_api_token,
+        allowSelfSigned: Boolean(formData.meshcentral_allow_self_signed),
         import_new_groups: importNewGroups,
         auto_deploy_companion: autoDeployCompanion,
         enforce_laps_on_import: enforceLapsOnImport,
@@ -575,33 +788,32 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
             </div>
           )}
 
-          {/* STEP 2: MESHCENTRAL 2 FEDERATION, CO-EXISTENCE & LIVE DISCOVERY IMPORT */}
+          {/* STEP 2: MESHCENTRAL 2 CONNECTION, LOGIN TOKEN & LIVE DISCOVERY IMPORT */}
           {step === 2 && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-              <div style={{ background: 'rgba(16, 185, 129, 0.1)', border: '1px solid rgba(16, 185, 129, 0.3)', padding: '0.75rem 1rem', borderRadius: '8px', fontSize: '0.78rem' }}>
-                <strong style={{ color: '#34d399' }}>✓ Bare-Metal Co-Existence Isolation Verified:</strong> Vitrine operates in its own isolated directory and service unit. Connecting or later uninstalling Vitrine will never alter or disrupt a neighboring MeshCentral 2 installation.
-              </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.95rem' }}>
+              {localMesh?.detected ? (
+                <div style={{ background: 'rgba(16, 185, 129, 0.1)', border: '1px solid rgba(16, 185, 129, 0.3)', padding: '0.75rem 1rem', borderRadius: '8px', fontSize: '0.78rem' }}>
+                  <strong style={{ color: '#34d399' }}>✓ Local MeshCentral 2 Instance Detected ({localMesh.installDir || localMesh.serviceName}):</strong>{' '}
+                  Vitrine is running in isolated co-existence mode alongside it and will never overwrite or stop your existing MeshCentral service.
+                </div>
+              ) : (
+                <div style={{ background: 'rgba(56, 189, 248, 0.1)', border: '1px solid rgba(56, 189, 248, 0.3)', padding: '0.75rem 1rem', borderRadius: '8px', fontSize: '0.78rem', color: '#bae6fd' }}>
+                  <strong style={{ color: '#38bdf8' }}>
+                    {localMesh?.deploymentMode === 'docker' ? '🐳 Docker Container Mode' : '🖥️ Standalone Host Detected'}:
+                  </strong>{' '}
+                  No local MeshCentral 2 installation was found on this machine. Enter your remote MeshCentral 2 server URL and Login Token below (or auto-generate one over TLS).
+                </div>
+              )}
 
-              <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr auto', gap: '0.85rem', alignItems: 'end' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '1.5fr auto', gap: '0.85rem', alignItems: 'end' }}>
                 <div className="form-group">
                   <label className="form-label">Primary MeshCentral 2 Server Endpoint URL</label>
                   <input
                     type="text"
                     className="glass-input"
-                    placeholder="https://127.0.0.1:4430"
+                    placeholder={localMesh?.detectedUrl || 'https://mesh.yourdomain.com (or https://10.0.0.50:4430)'}
                     value={formData.meshcentral_url || ''}
                     onChange={(e) => setFormData({ ...formData, meshcentral_url: e.target.value })}
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label className="form-label">MeshCentral API Login Key / Token</label>
-                  <input
-                    type="password"
-                    className="glass-input"
-                    placeholder="••••••••••••••••"
-                    value={formData.meshcentral_api_token || ''}
-                    onChange={(e) => setFormData({ ...formData, meshcentral_api_token: e.target.value })}
                   />
                 </div>
 
@@ -617,7 +829,295 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                 </button>
               </div>
 
-              {discoveryResult && !discoveryResult.reachable && (
+              {!useCombinedTokenMode ? (
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.85rem' }}>
+                  <div className="form-group">
+                    <label className="form-label">Login Token Username (from MS2)</label>
+                    <input
+                      type="text"
+                      className="glass-input"
+                      placeholder={meshTokenInitiallyMasked ? 'Saved in vault (leave blank to keep)' : '~t:AbCdEf123456 (or admin)'}
+                      value={meshTokenUser}
+                      onChange={(e) => handleMeshTokenUserChange(e.target.value)}
+                    />
+                  </div>
+
+                  <div className="form-group">
+                    <label className="form-label">Login Token Password (from MS2)</label>
+                    <input
+                      type="password"
+                      className="glass-input"
+                      placeholder={meshTokenInitiallyMasked ? '•••••••••••• (leave blank to keep)' : 'Generated Token Password'}
+                      value={meshTokenPass}
+                      onChange={(e) => handleMeshTokenPassChange(e.target.value)}
+                    />
+                  </div>
+                </div>
+              ) : (
+                <div className="form-group">
+                  <label className="form-label">Combined Login Token / Base64 x-meshauth / Cookie Token</label>
+                  <input
+                    type="password"
+                    className="glass-input"
+                    placeholder="~t:TokenUser:TokenPass or base64(user),base64(pass)"
+                    value={formData.meshcentral_api_token || ''}
+                    onChange={(e) => setFormData({ ...formData, meshcentral_api_token: e.target.value })}
+                  />
+                </div>
+              )}
+
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem', fontSize: '0.74rem', color: 'var(--text-muted)' }}>
+                <button
+                  type="button"
+                  onClick={() => setUseCombinedTokenMode((v) => !v)}
+                  style={{
+                    background: 'none',
+                    border: 'none',
+                    padding: 0,
+                    color: '#38bdf8',
+                    cursor: 'pointer',
+                    textDecoration: 'underline',
+                    fontSize: '0.74rem'
+                  }}
+                >
+                  {useCombinedTokenMode
+                    ? 'Switch to separate Token Username + Password fields'
+                    : 'Paste a raw base64 x-meshauth string or cookie token instead'}
+                </button>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', cursor: 'pointer', color: 'var(--text-primary)' }}>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(formData.meshcentral_allow_self_signed)}
+                    onChange={(e) => setFormData({ ...formData, meshcentral_allow_self_signed: e.target.checked ? 1 : 0 })}
+                  />
+                  <span>Allow self-signed TLS certificate</span>
+                </label>
+              </div>
+
+              {/* 3-Option MeshCentral Login Token Helper */}
+              <div
+                style={{
+                  background: 'rgba(15, 23, 42, 0.45)',
+                  border: '1px solid var(--glass-border)',
+                  borderRadius: '10px',
+                  padding: '0.85rem 1rem',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '0.75rem'
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem' }}>
+                  <div style={{ fontSize: '0.78rem', fontWeight: 700, color: '#e2e8f0', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                    <KeyRound size={14} color="var(--primary)" />
+                    <span>How to Get a 2FA-Safe MeshCentral Login Token</span>
+                  </div>
+                  <div style={{ display: 'flex', gap: '0.35rem', flexWrap: 'wrap' }}>
+                    {(
+                      [
+                        { id: 'webui', label: 'Web UI (Easiest)' },
+                        { id: 'auto', label: 'Auto-Generate in Vitrine' },
+                        { id: 'cli', label: 'CLI (meshctrl.js)' }
+                      ] as const
+                    ).map((t) => (
+                      <button
+                        key={t.id}
+                        type="button"
+                        className={`btn-glass ${tokenGuideTab === t.id ? 'btn-primary' : ''}`}
+                        style={{ fontSize: '0.72rem', padding: '0.28rem 0.65rem' }}
+                        onClick={() => setTokenGuideTab(t.id)}
+                      >
+                        {t.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {tokenGuideTab === 'webui' && (
+                  <ol style={{ margin: 0, paddingLeft: '1.25rem', fontSize: '0.76rem', color: '#cbd5e1', lineHeight: 1.55 }}>
+                    <li>Log into your MeshCentral 2 Web UI and click <strong>My Account</strong> in the left sidebar.</li>
+                    <li>Under <strong>Account Security</strong>, click <strong>Manage...</strong> next to <strong>Login Tokens</strong>, then click <strong>Create</strong>.</li>
+                    <li>Enter a name like <code>Vitrine RMM</code> (set expiration to <em>Never expires</em>) and click <strong>OK</strong>.</li>
+                    <li>Copy both the generated <strong>Username</strong> (<code>~t:...</code>) and <strong>Password</strong> into the two fields above. Login Tokens bypass 2FA/TOTP automatically while keeping MFA enabled on your admin account.</li>
+                  </ol>
+                )}
+
+                {tokenGuideTab === 'auto' && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
+                    <div style={{ fontSize: '0.74rem', color: '#94a3b8' }}>
+                      Enter your MeshCentral admin credentials once to mint a persistent <code>Vitrine RMM</code> Login Token directly over WebSockets (works for both remote and local servers; credentials are cleared immediately after generation and never saved).
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 0.8fr auto', gap: '0.6rem', alignItems: 'end' }}>
+                      <div className="form-group">
+                        <label className="form-label" style={{ fontSize: '0.72rem' }}>MS2 Admin Username</label>
+                        <input
+                          type="text"
+                          className="glass-input"
+                          placeholder="admin"
+                          value={autoMs2User}
+                          onChange={(e) => setAutoMs2User(e.target.value)}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label className="form-label" style={{ fontSize: '0.72rem' }}>MS2 Admin Password</label>
+                        <input
+                          type="password"
+                          className="glass-input"
+                          placeholder="Admin Password (not saved)"
+                          value={autoMs2Pass}
+                          onChange={(e) => setAutoMs2Pass(e.target.value)}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label
+                          className="form-label"
+                          style={{ fontSize: '0.72rem', color: autoMs2TotpRequired ? '#fbbf24' : undefined }}
+                        >
+                          {autoMs2TotpRequired ? '2FA TOTP Required' : '2FA Code (if enabled)'}
+                        </label>
+                        <input
+                          type="text"
+                          className="glass-input"
+                          placeholder="123456"
+                          value={autoMs2Totp}
+                          onChange={(e) => setAutoMs2Totp(e.target.value)}
+                          style={autoMs2TotpRequired ? { borderColor: '#f59e0b' } : undefined}
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        className="btn-glass btn-primary"
+                        onClick={handleAutoGenerateToken}
+                        disabled={generatingToken}
+                        style={{ height: '38px', fontSize: '0.76rem', whiteSpace: 'nowrap' }}
+                      >
+                        <KeyRound size={14} />
+                        <span>{generatingToken ? 'Generating...' : 'Generate Token'}</span>
+                      </button>
+                    </div>
+                    {autoTokenMsg && (
+                      <div style={{ fontSize: '0.76rem', color: autoTokenIsError ? '#f87171' : '#34d399', fontWeight: 600 }}>
+                        {autoTokenMsg}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {tokenGuideTab === 'cli' && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                    <div style={{ fontSize: '0.74rem', color: '#94a3b8' }}>
+                      Run on your MeshCentral 2 server (omit <code>--token 123456</code> if 2FA is disabled on that account):
+                    </div>
+                    {(() => {
+                      const cliDir = localMesh?.detected && localMesh.installDir
+                        ? localMesh.installDir
+                        : '/path/to/meshcentral  # e.g. /opt/meshcentral or /home/<user>/meshcentral';
+                      const wsTarget = (formData.meshcentral_url || localMesh?.detectedUrl || 'https://127.0.0.1:4430').replace(/^http/i, 'ws');
+                      const cliCmd = `cd ${cliDir}\nnode node_modules/meshcentral/meshctrl.js --url ${wsTarget} --loginuser admin --loginpass 'YourPass' --token 123456 LoginTokens --add "Vitrine RMM"`;
+                      return (
+                        <div style={{ position: 'relative' }}>
+                          <pre
+                            style={{
+                              margin: 0,
+                              padding: '0.65rem 0.75rem',
+                              borderRadius: '8px',
+                              background: 'rgba(2, 6, 23, 0.72)',
+                              border: '1px solid rgba(148, 163, 184, 0.2)',
+                              color: '#e2e8f0',
+                              fontSize: '0.72rem',
+                              overflowX: 'auto',
+                              whiteSpace: 'pre-wrap'
+                            }}
+                          >
+                            {cliCmd}
+                          </pre>
+                          <button
+                            type="button"
+                            className="btn-glass"
+                            style={{ position: 'absolute', top: '0.45rem', right: '0.45rem', fontSize: '0.68rem', padding: '0.2rem 0.45rem' }}
+                            onClick={async () => {
+                              await copyToClipboard(cliCmd);
+                              setCopiedCliCmd(true);
+                              setTimeout(() => setCopiedCliCmd(false), 2000);
+                            }}
+                          >
+                            {copiedCliCmd ? <Check size={12} /> : <Copy size={12} />}
+                          </button>
+                        </div>
+                      );
+                    })()}
+                  </div>
+                )}
+              </div>
+
+              {/* Opt-In Local MS2 config.json Helper (strictly shown only when local MS2 is detected) */}
+              {localMesh?.detected && localMesh.configPath && (
+                <div
+                  style={{
+                    background: 'rgba(255, 255, 255, 0.03)',
+                    border: '1px solid rgba(148, 163, 184, 0.22)',
+                    borderRadius: '10px',
+                    padding: '0.85rem 1rem',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '0.6rem'
+                  }}
+                >
+                  <div style={{ fontSize: '0.78rem', fontWeight: 700, color: '#e2e8f0' }}>
+                    Optional Local MeshCentral Config Settings (<code>{localMesh.configPath}</code>)
+                  </div>
+                  <div style={{ fontSize: '0.73rem', color: '#94a3b8' }}>
+                    Status: <code>allowFraming</code> = <strong>{localMesh.allowFraming === true ? 'true' : localMesh.allowFraming === false ? 'false' : 'unset'}</strong>{' '}
+                    • <code>disableAgentUpdate</code> = <strong>{localMesh.disableAgentUpdate === true ? 'true' : localMesh.disableAgentUpdate === false ? 'false' : 'unset'}</strong>
+                  </div>
+                  {localMesh.configJsonValid && localMesh.configWritable ? (
+                    <>
+                      <div style={{ display: 'flex', gap: '1.25rem', flexWrap: 'wrap', fontSize: '0.76rem' }}>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', cursor: 'pointer' }}>
+                          <input
+                            type="checkbox"
+                            checked={optAllowFraming}
+                            onChange={(e) => setOptAllowFraming(e.target.checked)}
+                          />
+                          <span>Set <code>&quot;allowFraming&quot;: true</code> (embedded KVM viewer)</span>
+                        </label>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', cursor: 'pointer' }}>
+                          <input
+                            type="checkbox"
+                            checked={optDisableAgentUpdate}
+                            onChange={(e) => setOptDisableAgentUpdate(e.target.checked)}
+                          />
+                          <span>Set <code>&quot;disableAgentUpdate&quot;: true</code> (preserves code-signed agents)</span>
+                        </label>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+                        <button
+                          type="button"
+                          className="btn-glass"
+                          disabled={applyingLocalCfg || (!optAllowFraming && !optDisableAgentUpdate)}
+                          onClick={handleApplyLocalConfig}
+                          style={{ fontSize: '0.74rem', padding: '0.35rem 0.75rem' }}
+                        >
+                          <Shield size={13} />
+                          <span>{applyingLocalCfg ? 'Backing up & Saving...' : 'Backup & Apply to Local config.json'}</span>
+                        </button>
+                        {localCfgMsg && (
+                          <span style={{ fontSize: '0.74rem', color: localCfgIsError ? '#f87171' : '#34d399', fontWeight: 600 }}>
+                            {localCfgMsg}
+                          </span>
+                        )}
+                      </div>
+                    </>
+                  ) : (
+                    <div style={{ fontSize: '0.73rem', color: '#fbbf24' }}>
+                      {!localMesh.configWritable
+                        ? 'Local config.json is not writable by the Vitrine service user; add "allowFraming": true under "settings" manually if needed.'
+                        : 'Local config.json contains comments/JSONC syntax; edit manually under "settings" to preserve comments.'}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {discoveryResult && (!discoveryResult.reachable || discoveryResult.authenticated === false) && (
                 <div
                   style={{
                     background: 'rgba(239, 68, 68, 0.14)',
@@ -636,7 +1136,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                 </div>
               )}
 
-              {discoveryResult && discoveryResult.reachable && (
+              {discoveryResult && discoveryResult.reachable && discoveryResult.authenticated !== false && (
                 <div
                   style={{
                     background: 'rgba(0, 0, 0, 0.28)',
@@ -1403,13 +1903,22 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
 
       <MfaChallengeModal
         isOpen={showSaveMfa}
-        onClose={() => setShowSaveMfa(false)}
-        onSuccess={() => {
+        onClose={() => {
           setShowSaveMfa(false);
-          handleSave();
+          setPendingMfaAction('save');
         }}
-        title="Step-Up MFA: Complete OOBE Setup"
-        description="Enter your 6-digit TOTP authenticator code or recovery code to authorize saving global RMM & OOBE setup settings."
+        onSuccess={() => {
+          const action = pendingMfaAction;
+          setShowSaveMfa(false);
+          setPendingMfaAction('save');
+          if (action === 'local_cfg') {
+            handleApplyLocalConfig();
+          } else {
+            handleSave();
+          }
+        }}
+        title={pendingMfaAction === 'local_cfg' ? 'Step-Up MFA: Update Local MeshCentral config.json' : 'Step-Up MFA: Complete OOBE Setup'}
+        description="Enter your 6-digit TOTP authenticator code or recovery code to authorize this configuration update."
         secretType="system_settings"
       />
     </div>

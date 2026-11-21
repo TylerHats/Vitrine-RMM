@@ -101,7 +101,7 @@ export const BRANDING_DIR_PATH = BRANDING_DIR;
 export const RECORDINGS_DIR_PATH = RECORDINGS_DIR;
 export const PACKAGES_DIR_PATH = PACKAGES_DIR;
 export const DB_FILE_PATH = DB_PATH;
-export const APP_VERSION = '2.6.0';
+export const APP_VERSION = '2.6.1';
 export const APP_SCHEMA_VERSION = 18;
 
 function detectInstalledCommit(): string {
@@ -1112,7 +1112,7 @@ export function runDatabaseMigrations() {
   safeAddColumn('devices', "mdm_compliance_status TEXT NOT NULL DEFAULT 'Unmanaged'");
   safeAddColumn('devices', "last_backup_status TEXT NOT NULL DEFAULT 'Unconfigured'");
   safeAddColumn('devices', 'last_backup_at TEXT');
-  safeAddColumn('devices', "companion_version TEXT NOT NULL DEFAULT '2.6.0'");
+  safeAddColumn('devices', "companion_version TEXT NOT NULL DEFAULT '2.6.1'");
   safeAddColumn('devices', 'logged_in_user TEXT');
   safeAddColumn('devices', 'reboot_required INTEGER NOT NULL DEFAULT 0');
   safeAddColumn('devices', 'uptime_seconds INTEGER NOT NULL DEFAULT 0');
@@ -1221,8 +1221,8 @@ export function runDatabaseMigrations() {
   safeAddColumn('settings', "reverse_proxy_type TEXT NOT NULL DEFAULT 'nginx'");
   safeAddColumn('settings', "letsencrypt_email TEXT NOT NULL DEFAULT ''");
   safeAddColumn('settings', "update_channel TEXT NOT NULL DEFAULT 'stable'");
-  safeAddColumn('settings', "installed_version TEXT NOT NULL DEFAULT '2.6.0'");
-  safeAddColumn('settings', "installed_commit TEXT NOT NULL DEFAULT 'v2.6.0'");
+  safeAddColumn('settings', "installed_version TEXT NOT NULL DEFAULT '2.6.1'");
+  safeAddColumn('settings', "installed_commit TEXT NOT NULL DEFAULT 'v2.6.1'");
   safeAddColumn('settings', 'db_schema_version INTEGER NOT NULL DEFAULT 18');
   safeAddColumn('settings', 'update_auto_backup INTEGER NOT NULL DEFAULT 1');
   safeAddColumn('settings', 'update_auto_rollback INTEGER NOT NULL DEFAULT 1');

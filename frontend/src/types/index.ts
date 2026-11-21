@@ -282,6 +282,7 @@ export interface Settings {
   custom_domain: string;
   meshcentral_url: string;
   meshcentral_api_token: string;
+  meshcentral_allow_self_signed?: number | boolean;
   meshcentral_connected: number;
   smtp_host: string;
   smtp_port: number;
@@ -641,9 +642,25 @@ export interface MeshServer {
   created_at: string;
 }
 
+export interface LocalMeshCentralDetection {
+  detected: boolean;
+  deploymentMode: 'docker' | 'bare_metal_standalone' | 'bare_metal_coexistent';
+  installDir: string | null;
+  meshctrlPath: string | null;
+  configPath: string | null;
+  serviceName: string | null;
+  detectedPort: number | null;
+  detectedUrl: string | null;
+  configWritable: boolean;
+  configJsonValid: boolean;
+  allowFraming: boolean | null;
+  disableAgentUpdate: boolean | null;
+}
+
 export interface MeshDiscoveryResult {
   success: boolean;
   reachable: boolean;
+  authenticated?: boolean;
   serverUrl: string;
   meshVersion: string;
   coexistenceSafe: boolean;

@@ -534,7 +534,7 @@ export function App() {
         onCloseMobile={() => setIsMobileSidebarOpen(false)}
         currentUser={currentUser}
         meshConnected={Boolean(settings?.meshcentral_connected)}
-        appVersion={updaterStatus?.installedVersion || '2.6.0'}
+        appVersion={updaterStatus?.installedVersion || '2.6.1'}
       />
 
       <div className="main-wrapper">

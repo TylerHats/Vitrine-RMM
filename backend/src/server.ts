@@ -692,7 +692,7 @@ async function startServer() {
 
   try {
     await server.listen({ port: PORT, host: HOST });
-    console.log(`\n🔮 Vitrine RMM v2.6.0 control plane listening on http://${HOST}:${PORT}`);
+    console.log(`\n🔮 Vitrine RMM v2.6.1 control plane listening on http://${HOST}:${PORT}`);
   } catch (err) {
     server.log.error(err);
     process.exit(1);

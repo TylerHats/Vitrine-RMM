@@ -3,17 +3,97 @@
 # Exit immediately on command failure or unset variable errors
 set -euo pipefail
 
+PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$PROJ_ROOT"
+
+LOCAL_MS2_FOUND=0
+LOCAL_MS2_DIR=""
+LOCAL_MS2_SERVICE=""
+
+detect_local_meshcentral() {
+    LOCAL_MS2_FOUND=0
+    LOCAL_MS2_DIR=""
+    LOCAL_MS2_SERVICE=""
+
+    local canon_proj
+    canon_proj="$(cd "$PROJ_ROOT" 2>/dev/null && pwd -P || printf '%s' "$PROJ_ROOT")"
+
+    if command -v systemctl &> /dev/null; then
+        local unit_files line unit_name unit_cfg wd
+        unit_files="$(systemctl list-unit-files --no-pager 2>/dev/null || true)"
+        while IFS= read -r line; do
+            unit_name="${line%%[[:space:]]*}"
+            if [[ -n "$unit_name" && "$unit_name" != "vitrine-rmm.service" && "$unit_name" == *meshcentral*.service ]]; then
+                LOCAL_MS2_FOUND=1
+                LOCAL_MS2_SERVICE="$unit_name"
+                unit_cfg="$(systemctl cat "$unit_name" 2>/dev/null || true)"
+                wd="$(printf '%s\n' "$unit_cfg" | sed -n 's/^WorkingDirectory=//p' | head -n 1 | sed 's/^"//; s/"$//')"
+                if [ -n "$wd" ] && [ -d "$wd" ]; then
+                    LOCAL_MS2_DIR="$wd"
+                fi
+                break
+            fi
+        done <<< "$unit_files"
+    fi
+
+    if [ "$LOCAL_MS2_FOUND" -eq 0 ] && command -v pgrep &> /dev/null; then
+        local proc_lines pline
+        proc_lines="$(pgrep -af "node.*meshcentral" 2>/dev/null || true)"
+        while IFS= read -r pline; do
+            if [ -n "$pline" ] && [[ "$pline" != *"$canon_proj"* ]] && [[ "$pline" != *"dev-meshcentral"* ]]; then
+                LOCAL_MS2_FOUND=1
+                break
+            fi
+        done <<< "$proc_lines"
+    fi
+
+    if [ "$LOCAL_MS2_FOUND" -eq 0 ] || [ -z "$LOCAL_MS2_DIR" ]; then
+        local candidates=(
+            "/opt/meshcentral"
+            "/var/lib/meshcentral"
+            "/srv/meshcentral"
+            "/usr/local/meshcentral"
+            "/root/meshcentral"
+            "/root"
+        )
+        local hdir
+        for hdir in /home/*; do
+            if [ -d "$hdir" ]; then
+                candidates+=("$hdir" "$hdir/meshcentral")
+            fi
+        done
+
+        local cand resolved_cand
+        for cand in "${candidates[@]}"; do
+            [ -d "$cand" ] || continue
+            resolved_cand="$(cd "$cand" 2>/dev/null && pwd -P || true)"
+            [ -n "$resolved_cand" ] || continue
+            if [ "$resolved_cand" = "$canon_proj" ] || [[ "$resolved_cand" == "$canon_proj/"* ]]; then
+                continue
+            fi
+            if [ -f "$resolved_cand/node_modules/meshcentral/meshctrl.js" ] || [ -f "$resolved_cand/meshcentral-data/config.json" ]; then
+                LOCAL_MS2_FOUND=1
+                if [ -z "$LOCAL_MS2_DIR" ]; then
+                    LOCAL_MS2_DIR="$resolved_cand"
+                fi
+                break
+            fi
+        done
+    fi
+}
+
+detect_local_meshcentral
+
 echo "=========================================================="
 echo "             Vitrine RMM Uninstallation Script            "
 echo "=========================================================="
 echo "This script will cleanly remove Vitrine RMM from your system."
-echo "SAFETY GUARANTEE: Neighboring MeshCentral 2 services,"
-echo "databases, certificates, and agents will NOT be touched."
+if [ "$LOCAL_MS2_FOUND" -eq 1 ]; then
+    echo "SAFETY GUARANTEE: Local MeshCentral 2 services (${LOCAL_MS2_DIR:-$LOCAL_MS2_SERVICE}),"
+    echo "databases, certificates, and agents will NOT be touched."
+fi
 echo "=========================================================="
 echo ""
-
-PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$PROJ_ROOT"
 
 run_priv() {
     if [ "$(id -u)" -eq 0 ]; then
@@ -100,7 +180,11 @@ if [ -d "$PROJ_ROOT/data" ] || [ -d "$PROJ_ROOT/branding" ]; then
     fi
 
     if [ -t 0 ]; then
-        read -p "Would you like to delete Vitrine's local data/ and branding/ directories (vitrine.db, LAPS vault & uploaded logos)? Neighboring MeshCentral data will NOT be affected. (y/n): " -n 1 -r
+        if [ "$LOCAL_MS2_FOUND" -eq 1 ]; then
+            read -p "Would you like to delete Vitrine's local data/ and branding/ directories (vitrine.db, LAPS vault & uploaded logos)? Local MeshCentral data will NOT be affected. (y/n): " -n 1 -r
+        else
+            read -p "Would you like to delete Vitrine's local data/ and branding/ directories (vitrine.db, LAPS vault & uploaded logos)? (y/n): " -n 1 -r
+        fi
         echo ""
         DELETE_DATA="$REPLY"
     fi
@@ -162,14 +246,18 @@ fi
         echo ""
         echo "=========================================================="
         echo "Vitrine RMM has been cleanly uninstalled."
-        echo "All neighboring MeshCentral 2 services and files remain intact."
+        if [ "$LOCAL_MS2_FOUND" -eq 1 ]; then
+            echo "All local MeshCentral 2 services and files remain intact."
+        fi
         echo "Note: If your terminal was inside that folder, run 'cd ~' to refresh your working directory."
         echo "=========================================================="
     else
         echo ""
         echo "=========================================================="
         echo "Vitrine RMM has been cleanly uninstalled."
-        echo "All neighboring MeshCentral 2 services and files remain intact."
+        if [ "$LOCAL_MS2_FOUND" -eq 1 ]; then
+            echo "All local MeshCentral 2 services and files remain intact."
+        fi
         echo "=========================================================="
     fi
     exit 0

@@ -29,6 +29,7 @@ import {
   RemoteSessionDescriptor,
   MeshServer,
   MeshDiscoveryResult,
+  LocalMeshCentralDetection,
   SigningStageReport,
   QuickSupportSession,
   SystemBackupItem,
@@ -1847,11 +1848,58 @@ export async function deleteMeshServer(id: string): Promise<{ success: boolean }
   });
 }
 
+export async function fetchLocalMeshCentralStatus(): Promise<LocalMeshCentralDetection> {
+  return requestJson<LocalMeshCentralDetection>('/mesh-servers/local-detect');
+}
+
+export async function generateMeshCentralLoginToken(data: {
+  url: string;
+  username: string;
+  password: string;
+  totp?: string;
+  tokenName?: string;
+  allowSelfSigned?: boolean;
+}): Promise<{
+  success: boolean;
+  tokenName?: string;
+  tokenUser?: string;
+  tokenPass?: string;
+  combinedToken?: string;
+  totpRequired?: boolean;
+  error?: string;
+}> {
+  return requestJson('/mesh-servers/generate-token', {
+    method: 'POST',
+    body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
+export async function applyLocalMeshCentralConfig(data: {
+  allowFraming?: boolean;
+  disableAgentUpdate?: boolean;
+}): Promise<{
+  success: boolean;
+  configPath?: string;
+  backupPath?: string;
+  applied?: { allowFraming: boolean; disableAgentUpdate: boolean };
+  restartHint?: string;
+  error?: string;
+  mfaRequired?: boolean;
+}> {
+  return requestJson('/mesh-servers/local-apply-config', {
+    method: 'POST',
+    body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
 export async function testDiscoverMeshServer(data: {
   url?: string;
   api_token?: string;
   server_id?: string;
   local_config_path?: string;
+  allowSelfSigned?: boolean;
 }): Promise<MeshDiscoveryResult & { error?: string }> {
   const res = await requestJson<any>('/mesh-servers/test-discover', {
     method: 'POST',
@@ -1859,22 +1907,31 @@ export async function testDiscoverMeshServer(data: {
       id: data.server_id,
       url: data.url,
       api_token: data.api_token,
-      local_config_path: data.local_config_path
+      local_config_path: data.local_config_path,
+      allowSelfSigned: data.allowSelfSigned
     }),
     returnErrorPayload: true
   });
   const groups = Array.isArray(res.groups) ? res.groups : [];
   const agents = Array.isArray(res.agents) ? res.agents : [];
+  const authenticated = Boolean(res.authenticated);
+  const reachable = Boolean(res.reachable);
   return {
-    success: Boolean(res.reachable),
-    reachable: Boolean(res.reachable),
+    success: reachable && authenticated,
+    reachable,
+    authenticated,
     serverUrl: res.serverUrl || data.url || '',
-    meshVersion: res.source === 'websocket_control_api' ? 'MeshCentral 2 (WebSocket Verified)' : res.source || 'Probed',
+    meshVersion:
+      res.source === 'websocket_control_api' || res.source === 'live_ws_control'
+        ? 'MeshCentral 2 (WebSocket Verified)'
+        : res.source || 'Probed',
     coexistenceSafe: true,
     tlsVerified: String(res.serverUrl || data.url || '').startsWith('https://'),
-    summary: res.reachable
-      ? `Discovered ${groups.length} device group(s) and ${agents.length} agent(s) via ${res.source} (${res.latencyMs || 0}ms).`
-      : res.error || 'Unable to reach MeshCentral 2 server.',
+    summary: !reachable
+      ? res.error || 'Unable to reach MeshCentral 2 server.'
+      : !authenticated
+        ? res.error || 'MeshCentral server is reachable, but WebSocket API authentication failed.'
+        : `Discovered ${groups.length} device group(s) and ${agents.length} agent(s) via ${res.source} (${res.latencyMs || 0}ms).`,
     discoveredGroups: groups.map((g: any) => ({
       meshGroupId: g.meshid,
       name: g.name,
@@ -1902,6 +1959,7 @@ export async function importFromMeshServer(data: {
   mesh_server_id?: string;
   url?: string;
   api_token?: string;
+  allowSelfSigned?: boolean;
   import_new_groups?: boolean;
   auto_deploy_companion?: boolean;
   enforce_laps_on_import?: boolean;
@@ -1921,6 +1979,7 @@ export async function importFromMeshServer(data: {
       mesh_server_id: data.mesh_server_id,
       url: data.url,
       api_token: data.api_token,
+      allowSelfSigned: data.allowSelfSigned,
       selected_group_ids: data.selected_group_ids,
       import_agents: true,
       deploy_vitrine_addons: data.auto_deploy_companion !== false

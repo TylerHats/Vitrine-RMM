@@ -44,6 +44,7 @@ import {
   SystemBackupItem,
   UpdaterStatus,
   MeshDiscoveryResult,
+  LocalMeshCentralDetection,
   CustomFieldDefinition,
   MaintenanceWindow,
   CustomRole,
@@ -78,6 +79,9 @@ import {
   deleteMeshServer,
   testDiscoverMeshServer,
   importFromMeshServer,
+  fetchLocalMeshCentralStatus,
+  generateMeshCentralLoginToken,
+  applyLocalMeshCentralConfig,
   fetchSystemBackups,
   createSystemBackup,
   getBackupDownloadUrl,
@@ -133,6 +137,40 @@ interface SettingsViewProps {
   tenants?: Tenant[];
 }
 
+function parseMeshTokenPair(raw?: string | null): {
+  user: string;
+  pass: string;
+  isMasked: boolean;
+  isCombinedOnly: boolean;
+} {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) return { user: '', pass: '', isMasked: false, isCombinedOnly: false };
+  if (/^[•*]{4,}$/.test(trimmed)) return { user: '', pass: '', isMasked: true, isCombinedOnly: false };
+  if (trimmed.startsWith('~t:')) {
+    const rest = trimmed.slice(3);
+    const sepIdx = rest.search(/[:,\s]/);
+    if (sepIdx > 0) {
+      return {
+        user: trimmed.slice(0, 3 + sepIdx),
+        pass: rest.slice(sepIdx + 1).trim(),
+        isMasked: false,
+        isCombinedOnly: false
+      };
+    }
+    return { user: trimmed, pass: '', isMasked: false, isCombinedOnly: false };
+  }
+  if (trimmed.includes(':') && !trimmed.startsWith('c=')) {
+    const idx = trimmed.indexOf(':');
+    return {
+      user: trimmed.slice(0, idx),
+      pass: trimmed.slice(idx + 1),
+      isMasked: false,
+      isCombinedOnly: false
+    };
+  }
+  return { user: '', pass: '', isMasked: false, isCombinedOnly: true };
+}
+
 export const SettingsView: React.FC<SettingsViewProps> = ({
   settings,
   onUpdated,
@@ -140,6 +178,26 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   tenants: propTenants
 }) => {
   const [formData, setFormData] = useState<Settings>({ ...settings });
+  const [localMesh, setLocalMesh] = useState<LocalMeshCentralDetection | null>(null);
+  const initialMeshPair = parseMeshTokenPair(settings.meshcentral_api_token);
+  const [meshTokenUser, setMeshTokenUser] = useState(initialMeshPair.user);
+  const [meshTokenPass, setMeshTokenPass] = useState(initialMeshPair.pass);
+  const [meshTokenHasSaved, setMeshTokenHasSaved] = useState(initialMeshPair.isMasked);
+  const [useCombinedTokenMode, setUseCombinedTokenMode] = useState(initialMeshPair.isCombinedOnly);
+  const [showAutoTokenGen, setShowAutoTokenGen] = useState(false);
+  const [autoMs2User, setAutoMs2User] = useState('admin');
+  const [autoMs2Pass, setAutoMs2Pass] = useState('');
+  const [autoMs2Totp, setAutoMs2Totp] = useState('');
+  const [autoMs2TotpRequired, setAutoMs2TotpRequired] = useState(false);
+  const [generatingToken, setGeneratingToken] = useState(false);
+  const [autoTokenMsg, setAutoTokenMsg] = useState<string | null>(null);
+  const [autoTokenIsError, setAutoTokenIsError] = useState(false);
+  const [optAllowFraming, setOptAllowFraming] = useState(true);
+  const [optDisableAgentUpdate, setOptDisableAgentUpdate] = useState(false);
+  const [applyingLocalCfg, setApplyingLocalCfg] = useState(false);
+  const [localCfgMsg, setLocalCfgMsg] = useState<string | null>(null);
+  const [localCfgIsError, setLocalCfgIsError] = useState(false);
+
   const [saving, setSaving] = useState(false);
   const [saveBanner, setSaveBanner] = useState<string | null>(null);
   const [saveBannerIsError, setSaveBannerIsError] = useState(false);
@@ -309,9 +367,23 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   useEffect(() => {
     setFormData({ ...settings });
+    const parsed = parseMeshTokenPair(settings.meshcentral_api_token);
+    setMeshTokenUser(parsed.user);
+    setMeshTokenPass(parsed.pass);
+    setMeshTokenHasSaved(parsed.isMasked);
+    setUseCombinedTokenMode(parsed.isCombinedOnly);
   }, [settings]);
 
   const loadAllAdminData = useCallback(() => {
+    fetchLocalMeshCentralStatus()
+      .then((info) => {
+        setLocalMesh(info);
+        if (info.detected) {
+          if (info.allowFraming === true) setOptAllowFraming(false);
+          if (info.disableAgentUpdate === true) setOptDisableAgentUpdate(false);
+        }
+      })
+      .catch(() => {});
     fetchUsers().then(setUsers).catch(() => {});
     fetchTenants()
       .then((list) => {
@@ -959,6 +1031,97 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setDiscoveryPreview({ ...res, serverId: server.id });
     } finally {
       setDiscoveringServerId(null);
+    }
+  };
+
+  const syncTwoFieldMeshToken = (nextUser: string, nextPass: string) => {
+    const trimmedUser = nextUser.trim();
+    if (trimmedUser && nextPass) {
+      setFormData((prev) => ({ ...prev, meshcentral_api_token: `${trimmedUser}:${nextPass}` }));
+    } else if (!trimmedUser && !nextPass && meshTokenHasSaved) {
+      setFormData((prev) => ({ ...prev, meshcentral_api_token: settings.meshcentral_api_token }));
+    } else {
+      setFormData((prev) => ({ ...prev, meshcentral_api_token: '' }));
+    }
+  };
+
+  const handleAutoGenerateMeshToken = async () => {
+    const targetUrl = String(formData.meshcentral_url || localMesh?.detectedUrl || '').trim();
+    if (!targetUrl || !autoMs2User.trim() || !autoMs2Pass) {
+      setAutoTokenIsError(true);
+      setAutoTokenMsg('Enter MeshCentral Server URL, admin username, and password.');
+      return;
+    }
+    setGeneratingToken(true);
+    setAutoTokenMsg(null);
+    setAutoTokenIsError(false);
+    try {
+      const res = await generateMeshCentralLoginToken({
+        url: targetUrl,
+        username: autoMs2User.trim(),
+        password: autoMs2Pass,
+        totp: autoMs2Totp.trim() || undefined,
+        tokenName: 'Vitrine RMM',
+        allowSelfSigned: Boolean(formData.meshcentral_allow_self_signed)
+      });
+      if (!res.success || !res.tokenUser || !res.tokenPass) {
+        setAutoTokenIsError(true);
+        setAutoTokenMsg(res.error || 'Unable to generate MeshCentral Login Token.');
+        if (res.totpRequired) setAutoMs2TotpRequired(true);
+        return;
+      }
+      setUseCombinedTokenMode(false);
+      setMeshTokenUser(res.tokenUser);
+      setMeshTokenPass(res.tokenPass);
+      const combined = res.combinedToken || `${res.tokenUser}:${res.tokenPass}`;
+      setFormData((prev) => ({
+        ...prev,
+        meshcentral_url: prev.meshcentral_url || targetUrl,
+        meshcentral_api_token: combined
+      }));
+      setAutoMs2Pass('');
+      setAutoMs2Totp('');
+      setAutoMs2TotpRequired(false);
+      setAutoTokenIsError(false);
+      setAutoTokenMsg('✓ Generated persistent Login Token and populated fields above. Click "Save All Settings" (top/bottom) to store it in the vault.');
+    } catch (err: any) {
+      setAutoTokenIsError(true);
+      setAutoTokenMsg(err?.message || 'Failed to generate MeshCentral Login Token.');
+    } finally {
+      setGeneratingToken(false);
+    }
+  };
+
+  const handleApplyLocalMeshConfig = async () => {
+    setApplyingLocalCfg(true);
+    setLocalCfgMsg(null);
+    setLocalCfgIsError(false);
+    try {
+      const res = await applyLocalMeshCentralConfig({
+        allowFraming: optAllowFraming,
+        disableAgentUpdate: optDisableAgentUpdate
+      });
+      if (res.mfaRequired) {
+        setPendingMfaAction({
+          title: 'Step-Up MFA: Update Local MeshCentral config.json',
+          secretType: 'system_settings',
+          onVerified: () => handleApplyLocalMeshConfig()
+        });
+        return;
+      }
+      if (!res.success) {
+        setLocalCfgIsError(true);
+        setLocalCfgMsg(res.error || 'Failed to update local config.json.');
+        return;
+      }
+      setLocalCfgIsError(false);
+      setLocalCfgMsg(`✓ Updated ${res.configPath} (backup: ${res.backupPath}). ${res.restartHint || ''}`);
+      fetchLocalMeshCentralStatus().then(setLocalMesh).catch(() => {});
+    } catch (err: any) {
+      setLocalCfgIsError(true);
+      setLocalCfgMsg(err?.message || 'Failed to update local config.json.');
+    } finally {
+      setApplyingLocalCfg(false);
     }
   };
 
@@ -2811,45 +2974,220 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   MeshCentral 2 Bi-Directional Sync &amp; Multi-Instance Federation
                 </h3>
                 <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', margin: '0.2rem 0 0 0' }}>
-                  Bi-directional mirroring of MeshCentral Device Groups &harr; Vitrine Clients with isolated sidecar safety
+                  {localMesh?.detected
+                    ? `Connected / Co-resident Mode: local MeshCentral 2 detected at ${localMesh.installDir || localMesh.serviceName} (isolated from Vitrine)`
+                    : 'Bi-directional mirroring of MeshCentral Device Groups <-> Vitrine Clients across remote or local MeshCentral 2 instances'}
                 </p>
               </div>
             </div>
 
-            <button
-              type="button"
-              className="btn-glass"
-              onClick={handleSyncMesh}
-              disabled={syncingMesh}
-              style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', fontSize: '0.8rem' }}
-            >
-              <RefreshCw size={14} className={syncingMesh ? 'spin' : ''} />
-              <span>{syncingMesh ? 'Syncing with MeshCentral...' : 'Synchronize MeshCentral Now'}</span>
-            </button>
+            <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+              <button
+                type="button"
+                className="btn-glass"
+                onClick={() => setShowAutoTokenGen((v) => !v)}
+                style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', fontSize: '0.8rem' }}
+              >
+                <KeyRound size={14} />
+                <span>{showAutoTokenGen ? 'Hide Token Generator' : 'Auto-Generate Login Token'}</span>
+              </button>
+              <button
+                type="button"
+                className="btn-glass"
+                onClick={handleSyncMesh}
+                disabled={syncingMesh}
+                style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', fontSize: '0.8rem' }}
+              >
+                <RefreshCw size={14} className={syncingMesh ? 'spin' : ''} />
+                <span>{syncingMesh ? 'Syncing with MeshCentral...' : 'Synchronize MeshCentral Now'}</span>
+              </button>
+            </div>
           </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '1.25rem', marginBottom: '1rem' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: useCombinedTokenMode ? '1.3fr 1fr' : '1.3fr 1fr 1fr', gap: '1rem', marginBottom: '0.65rem' }}>
             <div className="form-group">
               <label className="form-label">Primary MeshCentral Server URL</label>
               <input
                 type="text"
                 className="glass-input"
+                placeholder={localMesh?.detectedUrl || 'https://mesh.yourdomain.com'}
                 value={formData.meshcentral_url ?? ''}
                 onChange={(e) => setFormData({ ...formData, meshcentral_url: e.target.value })}
               />
             </div>
 
-            <div className="form-group">
-              <label className="form-label">API Key / Login Token (Vaulted)</label>
-              <input
-                type="password"
-                className="glass-input"
-                placeholder="••••••••••••••••"
-                value={formData.meshcentral_api_token ?? ''}
-                onChange={(e) => setFormData({ ...formData, meshcentral_api_token: e.target.value })}
-              />
-            </div>
+            {!useCombinedTokenMode ? (
+              <>
+                <div className="form-group">
+                  <label className="form-label">Login Token Username (Vaulted)</label>
+                  <input
+                    type="text"
+                    className="glass-input"
+                    placeholder={meshTokenHasSaved ? 'Saved in vault (leave blank to keep)' : '~t:AbCdEf123456 (or admin)'}
+                    value={meshTokenUser}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      if (val.trim().startsWith('~t:')) {
+                        const parsed = parseMeshTokenPair(val);
+                        if (parsed.pass) {
+                          setMeshTokenUser(parsed.user);
+                          setMeshTokenPass(parsed.pass);
+                          syncTwoFieldMeshToken(parsed.user, parsed.pass);
+                          return;
+                        }
+                      }
+                      setMeshTokenUser(val);
+                      syncTwoFieldMeshToken(val, meshTokenPass);
+                    }}
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">Login Token Password (Vaulted)</label>
+                  <input
+                    type="password"
+                    className="glass-input"
+                    placeholder={meshTokenHasSaved ? '•••••••••••• (leave blank to keep)' : 'Token Password'}
+                    value={meshTokenPass}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setMeshTokenPass(val);
+                      syncTwoFieldMeshToken(meshTokenUser, val);
+                    }}
+                  />
+                </div>
+              </>
+            ) : (
+              <div className="form-group">
+                <label className="form-label">Combined Token / x-meshauth (Vaulted)</label>
+                <input
+                  type="password"
+                  className="glass-input"
+                  placeholder="~t:TokenUser:TokenPass or base64,base64"
+                  value={formData.meshcentral_api_token ?? ''}
+                  onChange={(e) => setFormData({ ...formData, meshcentral_api_token: e.target.value })}
+                />
+              </div>
+            )}
           </div>
+
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem', marginBottom: '1rem', fontSize: '0.74rem', color: 'var(--text-muted)' }}>
+            <span>
+              <button
+                type="button"
+                onClick={() => setUseCombinedTokenMode((v) => !v)}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  padding: 0,
+                  color: '#38bdf8',
+                  cursor: 'pointer',
+                  textDecoration: 'underline',
+                  fontSize: '0.74rem',
+                  marginRight: '0.75rem'
+                }}
+              >
+                {useCombinedTokenMode ? 'Use two-field Token Username + Password' : 'Enter raw base64 / combined token string'}
+              </button>
+              2FA accounts: use <strong>My Account → Login Tokens</strong> in MS2 or click <strong>Auto-Generate Login Token</strong>.
+            </span>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', cursor: 'pointer', color: 'var(--text-primary)' }}>
+              <input
+                type="checkbox"
+                checked={Boolean(formData.meshcentral_allow_self_signed)}
+                onChange={(e) => setFormData({ ...formData, meshcentral_allow_self_signed: e.target.checked ? 1 : 0 })}
+              />
+              <span>Allow self-signed TLS certificate</span>
+            </label>
+          </div>
+
+          {showAutoTokenGen && (
+            <div style={{ background: 'rgba(15, 23, 42, 0.45)', border: '1px solid var(--glass-border)', borderRadius: '8px', padding: '0.9rem 1rem', marginBottom: '1rem', display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
+              <div style={{ fontSize: '0.76rem', color: '#cbd5e1' }}>
+                Mint a permanent 2FA-safe <code>Vitrine RMM</code> Login Token directly from your MeshCentral server (credentials are used once over WebSocket and immediately discarded):
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 0.8fr auto', gap: '0.6rem', alignItems: 'end' }}>
+                <div className="form-group">
+                  <label className="form-label" style={{ fontSize: '0.72rem' }}>MS2 Admin Username</label>
+                  <input type="text" className="glass-input" value={autoMs2User} onChange={(e) => setAutoMs2User(e.target.value)} />
+                </div>
+                <div className="form-group">
+                  <label className="form-label" style={{ fontSize: '0.72rem' }}>MS2 Admin Password</label>
+                  <input type="password" className="glass-input" placeholder="Not stored" value={autoMs2Pass} onChange={(e) => setAutoMs2Pass(e.target.value)} />
+                </div>
+                <div className="form-group">
+                  <label className="form-label" style={{ fontSize: '0.72rem', color: autoMs2TotpRequired ? '#fbbf24' : undefined }}>
+                    {autoMs2TotpRequired ? '2FA TOTP Required' : '2FA Code (optional)'}
+                  </label>
+                  <input
+                    type="text"
+                    className="glass-input"
+                    placeholder="123456"
+                    value={autoMs2Totp}
+                    onChange={(e) => setAutoMs2Totp(e.target.value)}
+                    style={autoMs2TotpRequired ? { borderColor: '#f59e0b' } : undefined}
+                  />
+                </div>
+                <button
+                  type="button"
+                  className="btn-glass btn-primary"
+                  disabled={generatingToken}
+                  onClick={handleAutoGenerateMeshToken}
+                  style={{ height: '38px', fontSize: '0.76rem', whiteSpace: 'nowrap' }}
+                >
+                  <KeyRound size={14} />
+                  <span>{generatingToken ? 'Generating...' : 'Generate Token'}</span>
+                </button>
+              </div>
+              {autoTokenMsg && (
+                <div style={{ fontSize: '0.76rem', color: autoTokenIsError ? '#f87171' : '#34d399', fontWeight: 600 }}>
+                  {autoTokenMsg}
+                </div>
+              )}
+            </div>
+          )}
+
+          {localMesh?.detected && localMesh.configPath && (
+            <div style={{ background: 'rgba(255, 255, 255, 0.03)', border: '1px solid var(--glass-border)', borderRadius: '8px', padding: '0.85rem 1rem', marginBottom: '1rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+              <div style={{ fontSize: '0.78rem', fontWeight: 600 }}>
+                Local MeshCentral Config Options (<code>{localMesh.configPath}</code>)
+              </div>
+              <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                Current: <code>allowFraming</code> = <strong>{String(localMesh.allowFraming ?? 'unset')}</strong> •{' '}
+                <code>disableAgentUpdate</code> = <strong>{String(localMesh.disableAgentUpdate ?? 'unset')}</strong>
+              </div>
+              {localMesh.configJsonValid && localMesh.configWritable ? (
+                <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', flexWrap: 'wrap', fontSize: '0.76rem' }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', cursor: 'pointer' }}>
+                    <input type="checkbox" checked={optAllowFraming} onChange={(e) => setOptAllowFraming(e.target.checked)} />
+                    <span>Set <code>&quot;allowFraming&quot;: true</code></span>
+                  </label>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', cursor: 'pointer' }}>
+                    <input type="checkbox" checked={optDisableAgentUpdate} onChange={(e) => setOptDisableAgentUpdate(e.target.checked)} />
+                    <span>Set <code>&quot;disableAgentUpdate&quot;: true</code></span>
+                  </label>
+                  <button
+                    type="button"
+                    className="btn-glass"
+                    disabled={applyingLocalCfg || (!optAllowFraming && !optDisableAgentUpdate)}
+                    onClick={handleApplyLocalMeshConfig}
+                    style={{ fontSize: '0.74rem', padding: '0.3rem 0.65rem' }}
+                  >
+                    {applyingLocalCfg ? 'Applying...' : 'Backup & Apply to config.json'}
+                  </button>
+                  {localCfgMsg && (
+                    <span style={{ fontSize: '0.74rem', color: localCfgIsError ? '#f87171' : '#34d399', fontWeight: 600 }}>
+                      {localCfgMsg}
+                    </span>
+                  )}
+                </div>
+              ) : (
+                <div style={{ fontSize: '0.73rem', color: '#fbbf24' }}>
+                  config.json is read-only or contains non-standard comments; edit manually under <code>&quot;settings&quot;</code> if desired.
+                </div>
+              )}
+            </div>
+          )}
 
           <div style={{ background: 'rgba(148, 163, 184, 0.06)', border: '1px solid var(--glass-border)', borderRadius: '8px', padding: '1rem', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
             <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', fontSize: '0.85rem' }}>
@@ -3064,7 +3402,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               ))}
             </div>
 
-            {discoveryPreview && !discoveryPreview.reachable && (
+            {discoveryPreview && (!discoveryPreview.reachable || discoveryPreview.authenticated === false) && (
               <div
                 style={{
                   marginTop: '0.85rem',
@@ -3094,7 +3432,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </div>
             )}
 
-            {discoveryPreview && discoveryPreview.reachable && (
+            {discoveryPreview && discoveryPreview.reachable && discoveryPreview.authenticated !== false && (
               <div style={{ marginTop: '0.85rem', padding: '0.9rem 1.1rem', borderRadius: '8px', background: 'rgba(16, 185, 129, 0.08)', border: '1px solid rgba(16, 185, 129, 0.35)' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem', flexWrap: 'wrap', gap: '0.5rem' }}>
                   <strong style={{ fontSize: '0.84rem', color: '#34d399' }}>
@@ -3133,7 +3471,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   Self-Update Engine (Stable Releases vs. Alpha Commits) &amp; Watchdog Auto-Rollback
                 </h3>
                 <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', margin: '0.2rem 0 0 0' }}>
-                  Installed Version: <strong>v{updaterStatus?.installedVersion || formData.installed_version || '2.6.0'}</strong> • Installed Commit:{' '}
+                  Installed Version: <strong>v{updaterStatus?.installedVersion || formData.installed_version || '2.6.1'}</strong> • Installed Commit:{' '}
                   <code>{updaterStatus?.installedCommit || formData.installed_commit || 'HEAD'}</code> • DB Schema:{' '}
                   <code>v{backupStorage.currentAppSchemaVersion}</code> • Mode:{' '}
                   <strong>{updaterStatus?.deploymentMode === 'docker' ? 'Docker Container' : 'Bare-Metal Systemd'}</strong>
@@ -3967,7 +4305,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <div style={{ padding: '0.75rem', borderRadius: '8px', background: 'var(--glass-bg)', border: '1px solid var(--glass-border)' }}>
                   <div style={{ fontSize: '0.73rem', color: 'var(--text-muted)' }}>Installed Software Target</div>
                   <div style={{ fontSize: '1.05rem', fontWeight: 700, color: '#38bdf8' }}>
-                    Schema v{schemaMismatchModal.appSchemaVersion} (App v{updaterStatus?.installedVersion || '2.6.0'})
+                    Schema v{schemaMismatchModal.appSchemaVersion} (App v{updaterStatus?.installedVersion || '2.6.1'})
                   </div>
                 </div>
               </div>

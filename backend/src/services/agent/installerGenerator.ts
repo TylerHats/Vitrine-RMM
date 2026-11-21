@@ -113,7 +113,7 @@ export class InstallerGeneratorService {
       options.os === 'linux' ? 'linux' : options.os === 'darwin' || options.os === 'macos' ? 'macos' : 'windows';
     const ms2Hash = crypto
       .createHash('sha256')
-      .update(`meshagent:${safeOs}:${options.meshServerId || 'ms2-primary'}:${settings.installed_version || '2.6.0'}`)
+      .update(`meshagent:${safeOs}:${options.meshServerId || 'ms2-primary'}:${settings.installed_version || '2.6.1'}`)
       .digest('hex');
 
     const signedMarkerPath = path.join(signedCacheDir, `meshagent-${safeOs}.signed.meta.json`);
