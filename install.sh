@@ -6,6 +6,14 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJ_ROOT"
 
+run_priv() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
 # 1. Check Node.js version (Node.js 20+ required for Fastify 5 & better-sqlite3)
 if ! command -v node &> /dev/null; then
     echo "Error: node is not installed. Please install Node.js 20 LTS or higher."
@@ -108,10 +116,11 @@ cd "$PROJ_ROOT"
 # 4. Ensure persistent isolated directories exist with hardened permissions
 mkdir -p "$PROJ_ROOT/data"
 mkdir -p "$PROJ_ROOT/data/backups"
+mkdir -p "$PROJ_ROOT/data/packages"
 mkdir -p "$PROJ_ROOT/data/signed-agents"
 mkdir -p "$PROJ_ROOT/data/recordings"
 mkdir -p "$PROJ_ROOT/branding"
-chmod 700 "$PROJ_ROOT/data" "$PROJ_ROOT/data/backups" "$PROJ_ROOT/data/recordings"
+chmod 700 "$PROJ_ROOT/data" "$PROJ_ROOT/data/backups" "$PROJ_ROOT/data/packages" "$PROJ_ROOT/data/recordings"
 chmod 755 "$PROJ_ROOT/branding"
 
 CURR_USER="${SUDO_USER:-$(whoami)}"
@@ -142,8 +151,24 @@ if [[ "$SETUP_SERVICE" =~ ^[Yy]$ ]]; then
     BRAND_PATH="$PROJ_ROOT/branding"
     TMP_UNIT="$PROJ_ROOT/data/vitrine-rmm.service.tmp"
 
-    # Escape any embedded double quotes/backslashes for systemd quoted assignment syntax
-    esc_systemd() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+    # Systemd specifier/quoting helpers:
+    # - WorkingDirectory= takes an unquoted path (even when containing spaces) with '%' escaped as '%%'.
+    # - Environment="K=V" and quoted ExecStart= args escape '\', '"', and '%'.
+    esc_systemd_raw() {
+        local val="$1"
+        printf '%s' "${val//%/%%}"
+    }
+    esc_systemd_quoted() {
+        printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g'
+    }
+    quote_systemd_arg() {
+        local val="$1"
+        if [[ "$val" =~ [[:space:]\"\'\\] ]]; then
+            printf '"%s"' "$(esc_systemd_quoted "$val")"
+        else
+            esc_systemd_raw "$val"
+        fi
+    }
 
     echo "--> Generating isolated vitrine-rmm.service unit..."
     cat <<EOF > "$TMP_UNIT"
@@ -154,12 +179,12 @@ After=network.target
 [Service]
 Type=simple
 User=$CURR_USER
-WorkingDirectory="$(esc_systemd "$WORK_DIR")"
+WorkingDirectory=$(esc_systemd_raw "$WORK_DIR")
 Environment="NODE_ENV=production"
 Environment="PORT=$DEFAULT_PORT"
-Environment="DATA_DIR=$(esc_systemd "$DATA_PATH")"
-Environment="BRANDING_DIR=$(esc_systemd "$BRAND_PATH")"
-ExecStart="$(esc_systemd "$NODE_PATH")" "$(esc_systemd "$SERVER_PATH")"
+Environment="DATA_DIR=$(esc_systemd_quoted "$DATA_PATH")"
+Environment="BRANDING_DIR=$(esc_systemd_quoted "$BRAND_PATH")"
+ExecStart=$(quote_systemd_arg "$NODE_PATH") $(quote_systemd_arg "$SERVER_PATH")
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -169,12 +194,17 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-    echo "--> Installing service unit to systemd (sudo permission required)..."
-    sudo install -m 0644 "$TMP_UNIT" /etc/systemd/system/vitrine-rmm.service
+    echo "--> Installing service unit to systemd..."
+    run_priv install -m 0644 "$TMP_UNIT" /etc/systemd/system/vitrine-rmm.service
     rm -f "$TMP_UNIT"
-    sudo systemctl daemon-reload
-    sudo systemctl enable vitrine-rmm.service
-    sudo systemctl restart vitrine-rmm.service
+    run_priv systemctl daemon-reload
+    run_priv systemctl enable vitrine-rmm.service
+    run_priv systemctl restart vitrine-rmm.service
+
+    if ! run_priv systemctl is-active --quiet vitrine-rmm.service; then
+        echo "Error: vitrine-rmm.service failed to start. Check logs with: journalctl -u vitrine-rmm.service -n 50 --no-pager"
+        exit 1
+    fi
 
     echo "--> Vitrine RMM systemd service is active and enabled on boot!"
 else
