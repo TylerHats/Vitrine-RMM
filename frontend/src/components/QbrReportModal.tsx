@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { FileText, Printer, CheckCircle2, Shield, AlertTriangle, X } from 'lucide-react';
 import { fetchQbrReport } from '../services/api.js';
 import { Tenant } from '../types/index.js';
+import { sanitizeSafeUrl } from '../utils/urlSafety.js';
 
 interface QbrReportData {
   tenantName?: string;
@@ -86,7 +87,7 @@ export const QbrReportModal: React.FC<QbrReportModalProps> = ({
             <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px solid var(--glass-border)', paddingBottom: '1.5rem' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-                  <img src={brandLogoUrl || '/branding/logo.png'} alt="Logo" style={{ width: '56px', height: '56px', objectFit: 'contain' }} />
+                  <img src={sanitizeSafeUrl(brandLogoUrl) || '/branding/logo.png'} alt="Brand Logo" style={{ width: '56px', height: '56px', objectFit: 'contain' }} />
                   <div>
                     <h2 style={{ fontFamily: 'var(--font-heading)', fontSize: '1.5rem' }}>
                       Quarterly Executive Business Review
@@ -134,7 +135,7 @@ export const QbrReportModal: React.FC<QbrReportModalProps> = ({
                 </div>
               </div>
 
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1.25rem' }}>
+              <div className="grid-3" style={{ gap: '1.25rem' }}>
                 <div className="glass-card" style={{ padding: '1.25rem' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.65rem' }}>
                     <Shield size={18} color="#10b981" />
@@ -164,7 +165,7 @@ export const QbrReportModal: React.FC<QbrReportModalProps> = ({
                   </div>
                   <div style={{ fontSize: '1.75rem', fontWeight: 700, color: '#fbbf24' }}>{data.remediationsAutomated}</div>
                   <div style={{ fontSize: '0.75rem', color: 'var(--text-dim)', marginTop: '0.25rem' }}>
-                    {data.ticketsSynchronized} PSA ticket{data.ticketsSynchronized === 1 ? '' : 's'} synchronized
+                    {data.ticketsSynchronized} support ticket{data.ticketsSynchronized === 1 ? '' : 's'} synchronized
                   </div>
                 </div>
               </div>

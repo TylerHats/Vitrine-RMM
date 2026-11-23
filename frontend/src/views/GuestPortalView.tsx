@@ -37,8 +37,8 @@ export const GuestPortalView: React.FC<GuestPortalViewProps> = ({ grantId }) => 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [meta, setMeta] = useState<{
-    vendor_name: string;
-    expires_at: string;
+    vendor_name?: string;
+    expires_at?: string;
     brand_name: string;
     brand_logo_url: string;
     primary_color: string;
@@ -133,7 +133,7 @@ export const GuestPortalView: React.FC<GuestPortalViewProps> = ({ grantId }) => 
         }
         await loadScopedPortalPayload();
       } catch (err: unknown) {
-        setError(err instanceof Error ? err.message : 'Network error connecting to Vitrine Portal');
+        setError(err instanceof Error ? err.message : 'Network error connecting to Vendor Portal');
       } finally {
         setLoading(false);
       }
@@ -220,24 +220,31 @@ export const GuestPortalView: React.FC<GuestPortalViewProps> = ({ grantId }) => 
       setScriptOutput({ deviceId: device.id, output: 'No authorized diagnostic script available.' });
       return;
     }
-    const res = await runGuestPortalScript(grantId, selectedScriptId, device.id);
-    if (res.success) {
+    try {
+      const res = await runGuestPortalScript(grantId, selectedScriptId, device.id);
+      if (res.success) {
+        setScriptOutput({
+          deviceId: device.id,
+          output: res.dispatched
+            ? `Authorized script dispatched live to ${device.hostname}.`
+            : `Authorized script queued for ${device.hostname}.`
+        });
+      } else {
+        setScriptOutput({
+          deviceId: device.id,
+          output: `Execution denied: ${res.error || 'Unauthorized'}`
+        });
+      }
+    } catch (err: unknown) {
       setScriptOutput({
         deviceId: device.id,
-        output: res.dispatched
-          ? `Authorized script dispatched live to ${device.hostname}.`
-          : `Authorized script queued for ${device.hostname}.`
-      });
-    } else {
-      setScriptOutput({
-        deviceId: device.id,
-        output: `Execution denied: ${res.error || 'Unauthorized'}`
+        output: `Execution failed: ${err instanceof Error ? err.message : 'Network error'}`
       });
     }
   };
   if (loading) {
     return (
-      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0a0d14', color: '#f3f4f6' }}>
+      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-gradient)', backgroundColor: 'var(--surface-base)', color: 'var(--text-main)' }}>
         <div style={{ textAlign: 'center' }}>
           <div className="pulse-dot" style={{ margin: '0 auto 1rem', width: '16px', height: '16px' }} />
           <h3>Connecting to Scoped Vendor Session...</h3>
@@ -249,18 +256,17 @@ export const GuestPortalView: React.FC<GuestPortalViewProps> = ({ grantId }) => 
 
   if (error || isExpired) {
     return (
-      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0a0d14', padding: '1.5rem' }}>
+      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-gradient)', backgroundColor: 'var(--surface-base)', color: 'var(--text-main)', padding: '1.5rem' }}>
         <div
+          className="glass-card"
           style={{
             maxWidth: '520px',
             width: '100%',
-            background: 'rgba(23, 27, 38, 0.85)',
-            backdropFilter: 'blur(16px)',
-            border: '1px solid rgba(239, 68, 68, 0.3)',
+            background: 'var(--surface-elevated)',
+            border: '1px solid rgba(239, 68, 68, 0.35)',
             borderRadius: '16px',
             padding: '2.5rem',
-            textAlign: 'center',
-            boxShadow: '0 20px 40px rgba(0, 0, 0, 0.6)'
+            textAlign: 'center'
           }}
         >
           <div
@@ -279,7 +285,7 @@ export const GuestPortalView: React.FC<GuestPortalViewProps> = ({ grantId }) => 
           >
             <Lock size={28} />
           </div>
-          <h2 style={{ fontSize: '1.4rem', fontWeight: 700, margin: '0 0 0.5rem', color: '#f87171' }}>
+          <h2 style={{ fontSize: '1.4rem', fontWeight: 700, margin: '0 0 0.5rem', color: 'var(--accent-danger)' }}>
             Session Expired or Revoked
           </h2>
           <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem', lineHeight: 1.5, margin: '0 0 1.5rem' }}>
@@ -287,19 +293,16 @@ export const GuestPortalView: React.FC<GuestPortalViewProps> = ({ grantId }) => 
           </p>
           <a
             href="/"
+            className="btn-glass"
             style={{
               display: 'inline-block',
-              background: 'rgba(255, 255, 255, 0.05)',
-              border: '1px solid var(--glass-border)',
-              color: '#f8fafc',
               padding: '0.6rem 1.5rem',
-              borderRadius: '8px',
               textDecoration: 'none',
               fontSize: '0.85rem',
               fontWeight: 600
             }}
           >
-            Return to Vitrine Portal
+            Return to {meta?.brand_name || 'Support'} Portal
           </a>
         </div>
       </div>
@@ -308,46 +311,51 @@ export const GuestPortalView: React.FC<GuestPortalViewProps> = ({ grantId }) => 
 
   if (authRequired) {
     return (
-      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'radial-gradient(ellipse at top, #131726, #0a0d14)', color: '#f3f4f6', padding: '1.5rem' }}>
+      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-gradient)', backgroundColor: 'var(--surface-base)', color: 'var(--text-main)', padding: '1.5rem' }}>
         <div
+          className="glass-card"
           style={{
             maxWidth: '460px',
             width: '100%',
-            background: 'rgba(23, 27, 38, 0.9)',
-            border: '1px solid rgba(99, 102, 241, 0.35)',
+            background: 'var(--surface-elevated)',
+            border: '1px solid var(--glass-border)',
             borderRadius: '16px',
-            padding: '2.25rem',
-            boxShadow: '0 24px 48px rgba(0, 0, 0, 0.55)'
+            padding: '2.25rem'
           }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.85rem', marginBottom: '1.25rem' }}>
-            <div style={{ width: '44px', height: '44px', borderRadius: '10px', background: 'linear-gradient(135deg, #6366f1, #a855f7)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <div style={{ width: '44px', height: '44px', borderRadius: '10px', background: 'linear-gradient(135deg, var(--primary), var(--secondary))', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
               <KeyRound size={22} color="#fff" />
             </div>
             <div>
               <h2 style={{ margin: 0, fontSize: '1.2rem', fontWeight: 700 }}>
-                {meta?.brand_name || 'Vitrine'} Vendor Portal
+                {meta?.brand_name || 'Support'} Vendor Portal
               </h2>
-              <div style={{ fontSize: '0.78rem', color: '#9ca3af' }}>
+              <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
                 Authorized Vendor: <strong>{meta?.vendor_name || 'Scoped Guest'}</strong>
               </div>
             </div>
           </div>
 
-          <p style={{ fontSize: '0.84rem', color: '#cbd5e1', lineHeight: 1.5, marginBottom: '1.25rem' }}>
-            Enter the temporary vendor username and password issued for this session. Time remaining:{' '}
-            <strong style={{ color: '#fbbf24', fontFamily: 'monospace' }}>{timeRemaining}</strong>
+          <p style={{ fontSize: '0.84rem', color: 'var(--text-muted)', lineHeight: 1.5, marginBottom: '1.25rem' }}>
+            Enter the temporary vendor username and password issued for this session.
+            {timeRemaining && (
+              <>
+                {' '}Time remaining:{' '}
+                <strong style={{ color: 'var(--accent-warning)', fontFamily: 'monospace' }}>{timeRemaining}</strong>
+              </>
+            )}
           </p>
 
           {credError && (
-            <div style={{ background: 'rgba(239, 68, 68, 0.15)', border: '1px solid rgba(239, 68, 68, 0.35)', color: '#fca5a5', padding: '0.7rem 0.9rem', borderRadius: '8px', fontSize: '0.8rem', marginBottom: '1rem' }}>
+            <div style={{ background: 'rgba(239, 68, 68, 0.14)', border: '1px solid rgba(239, 68, 68, 0.35)', color: 'var(--accent-danger)', padding: '0.7rem 0.9rem', borderRadius: '8px', fontSize: '0.8rem', marginBottom: '1rem' }}>
               {credError}
             </div>
           )}
 
           <form onSubmit={handleVerifyVendorCreds} style={{ display: 'flex', flexDirection: 'column', gap: '0.9rem' }}>
             <div>
-              <label style={{ display: 'block', fontSize: '0.78rem', color: '#cbd5e1', marginBottom: '0.35rem' }}>
+              <label className="form-label" style={{ display: 'block', marginBottom: '0.35rem' }}>
                 Temporary Username
               </label>
               <input
@@ -361,7 +369,7 @@ export const GuestPortalView: React.FC<GuestPortalViewProps> = ({ grantId }) => 
               />
             </div>
             <div>
-              <label style={{ display: 'block', fontSize: '0.78rem', color: '#cbd5e1', marginBottom: '0.35rem' }}>
+              <label className="form-label" style={{ display: 'block', marginBottom: '0.35rem' }}>
                 Temporary Password
               </label>
               <input
@@ -393,13 +401,13 @@ export const GuestPortalView: React.FC<GuestPortalViewProps> = ({ grantId }) => 
   };
 
   return (
-    <div style={{ minHeight: '100vh', background: 'radial-gradient(ellipse at top, #131726, #0a0d14)', color: '#f3f4f6', padding: '2rem 1.5rem' }}>
+    <div style={{ minHeight: '100vh', background: 'var(--bg-gradient)', backgroundColor: 'var(--surface-base)', color: 'var(--text-main)', padding: '2rem 1.5rem' }}>
       <div style={{ maxWidth: '1200px', margin: '0 auto' }}>
         <header
+          className="glass-card"
           style={{
-            background: 'rgba(23, 27, 38, 0.7)',
-            backdropFilter: 'blur(16px)',
-            border: '1px solid rgba(255, 255, 255, 0.08)',
+            background: 'var(--glass-bg)',
+            border: '1px solid var(--glass-border)',
             borderRadius: '16px',
             padding: '1.5rem 2rem',
             marginBottom: '2rem',
@@ -411,18 +419,18 @@ export const GuestPortalView: React.FC<GuestPortalViewProps> = ({ grantId }) => 
           }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-            <div style={{ width: '44px', height: '44px', borderRadius: '10px', background: 'linear-gradient(135deg, #6366f1, #a855f7)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff' }}>
+            <div style={{ width: '44px', height: '44px', borderRadius: '10px', background: 'linear-gradient(135deg, var(--primary), var(--secondary))', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff' }}>
               <Shield size={24} />
             </div>
             <div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
                 <h1 style={{ margin: 0, fontSize: '1.35rem', fontWeight: 700 }}>Vendor Access Portal</h1>
-                <span style={{ background: 'rgba(16, 185, 129, 0.2)', color: '#34d399', border: '1px solid rgba(16, 185, 129, 0.4)', fontSize: '0.72rem', padding: '0.15rem 0.6rem', borderRadius: '12px', fontWeight: 600 }}>
+                <span className="status-pill status-online" style={{ fontSize: '0.72rem' }}>
                   Authenticated
                 </span>
               </div>
-              <p style={{ margin: '0.2rem 0 0', fontSize: '0.85rem', color: '#9ca3af' }}>
-                Authorized Vendor: <strong style={{ color: '#e0e7ff' }}>{grant?.vendor_name}</strong>
+              <p style={{ margin: '0.2rem 0 0', fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+                Authorized Vendor: <strong style={{ color: 'var(--text-main)' }}>{grant?.vendor_name}</strong>
               </p>
             </div>
           </div>
@@ -431,10 +439,10 @@ export const GuestPortalView: React.FC<GuestPortalViewProps> = ({ grantId }) => 
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', background: 'rgba(245, 158, 11, 0.1)', border: '1px solid rgba(245, 158, 11, 0.3)', padding: '0.65rem 1.25rem', borderRadius: '12px' }}>
               <Clock size={20} color="#f59e0b" />
               <div>
-                <div style={{ fontSize: '0.7rem', color: '#f59e0b', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 700 }}>
+                <div style={{ fontSize: '0.7rem', color: 'var(--accent-warning)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 700 }}>
                   Time Remaining
                 </div>
-                <div style={{ fontSize: '1.1rem', fontWeight: 700, fontFamily: 'monospace', color: '#fbbf24' }}>
+                <div style={{ fontSize: '1.1rem', fontWeight: 700, fontFamily: 'monospace', color: 'var(--accent-warning)' }}>
                   {timeRemaining}
                 </div>
               </div>
@@ -455,16 +463,16 @@ export const GuestPortalView: React.FC<GuestPortalViewProps> = ({ grantId }) => 
           </div>
         </header>
 
-        <div style={{ background: 'rgba(15, 23, 42, 0.6)', border: '1px solid rgba(255, 255, 255, 0.05)', borderRadius: '12px', padding: '1rem 1.5rem', marginBottom: '2rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', color: '#9ca3af', flexWrap: 'wrap' }}>
-            <Lock size={15} color="#818cf8" />
+        <div className="glass-card" style={{ background: 'var(--surface-panel)', border: '1px solid var(--glass-border)', borderRadius: '12px', padding: '1rem 1.5rem', marginBottom: '2rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', color: 'var(--text-muted)', flexWrap: 'wrap' }}>
+            <Lock size={15} color="var(--primary)" />
             <span>Active Permissions:</span>
-            {perms.can_remote_screen && <span style={{ background: 'rgba(59, 130, 246, 0.2)', color: '#93c5fd', padding: '0.15rem 0.5rem', borderRadius: '4px', fontSize: '0.75rem' }}>Remote Screen</span>}
-            {perms.can_ghost_session && <span style={{ background: 'rgba(168, 85, 247, 0.2)', color: '#d8b4fe', padding: '0.15rem 0.5rem', borderRadius: '4px', fontSize: '0.75rem' }}>Ghost Desktop</span>}
-            {perms.can_view_telemetry && <span style={{ background: 'rgba(16, 185, 129, 0.2)', color: '#6ee7b7', padding: '0.15rem 0.5rem', borderRadius: '4px', fontSize: '0.75rem' }}>Live Telemetry</span>}
-            {perms.can_view_hardware && <span style={{ background: 'rgba(234, 179, 8, 0.2)', color: '#fde047', padding: '0.15rem 0.5rem', borderRadius: '4px', fontSize: '0.75rem' }}>Hardware Specs</span>}
-            {perms.can_view_custom_fields && <span style={{ background: 'rgba(14, 165, 233, 0.2)', color: '#7dd3fc', padding: '0.15rem 0.5rem', borderRadius: '4px', fontSize: '0.75rem' }}>Custom Fields</span>}
-            {perms.can_run_scripts && <span style={{ background: 'rgba(239, 68, 68, 0.2)', color: '#fca5a5', padding: '0.15rem 0.5rem', borderRadius: '4px', fontSize: '0.75rem' }}>Script Execution</span>}
+            {perms.can_remote_screen && <span className="status-pill status-info" style={{ fontSize: '0.72rem' }}>Remote Screen</span>}
+            {perms.can_ghost_session && <span className="status-pill" style={{ background: 'rgba(168, 85, 247, 0.16)', color: 'var(--secondary)', border: '1px solid rgba(168, 85, 247, 0.35)', fontSize: '0.72rem' }}>Ghost Desktop</span>}
+            {perms.can_view_telemetry && <span className="status-pill status-online" style={{ fontSize: '0.72rem' }}>Live Telemetry</span>}
+            {perms.can_view_hardware && <span className="status-pill status-reboot" style={{ fontSize: '0.72rem' }}>Hardware Specs</span>}
+            {perms.can_view_custom_fields && <span className="status-pill status-info" style={{ fontSize: '0.72rem' }}>Custom Fields</span>}
+            {perms.can_run_scripts && <span className="status-pill status-critical" style={{ fontSize: '0.72rem' }}>Script Execution</span>}
           </div>
           {perms.can_run_scripts && availableScripts.length > 0 && (
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.78rem' }}>
@@ -480,15 +488,15 @@ export const GuestPortalView: React.FC<GuestPortalViewProps> = ({ grantId }) => 
 
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '1rem' }}>
-            <Laptop size={20} color="#00f2fe" />
+            <Laptop size={20} color="var(--primary)" />
             <h2 style={{ margin: 0, fontSize: '1.15rem', fontWeight: 600 }}>
               Authorized Target Endpoints ({devices.length})
             </h2>
           </div>
 
           {devices.length === 0 ? (
-            <div style={{ textAlign: 'center', padding: '3rem', background: 'rgba(255, 255, 255, 0.02)', borderRadius: '12px', border: '1px dashed rgba(255,255,255,0.12)' }}>
-              <p style={{ margin: 0, color: '#9ca3af' }}>No devices are currently assigned to this vendor session.</p>
+            <div className="glass-card" style={{ textAlign: 'center', padding: '3rem', background: 'var(--surface-panel)', border: '1px dashed var(--glass-border)' }}>
+              <p style={{ margin: 0, color: 'var(--text-muted)' }}>No devices are currently assigned to this vendor session.</p>
             </div>
           ) : (
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(360px, 1fr))', gap: '1.25rem' }}>
@@ -496,45 +504,45 @@ export const GuestPortalView: React.FC<GuestPortalViewProps> = ({ grantId }) => 
                 const isOnline = device.status === 'online';
                 const cFields = deviceCustomFields[device.id] || [];
                 return (
-                  <div key={device.id} style={{ background: 'rgba(23, 27, 38, 0.75)', border: '1px solid rgba(255, 255, 255, 0.08)', borderRadius: '12px', padding: '1.5rem', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                  <div key={device.id} className="glass-card" style={{ background: 'var(--glass-bg)', border: '1px solid var(--glass-border)', borderRadius: '12px', padding: '1.5rem', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                       <div>
-                        <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 600, color: '#f9fafb' }}>{device.hostname}</h3>
-                        <div style={{ fontSize: '0.8rem', color: '#9ca3af', marginTop: '0.2rem' }}>
+                        <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 600, color: 'var(--text-main)' }}>{device.hostname}</h3>
+                        <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: '0.2rem' }}>
                           {device.os_type} {device.os_version} • {device.ip_address}
                         </div>
                       </div>
-                      <span style={{ fontSize: '0.75rem', padding: '0.2rem 0.5rem', borderRadius: '4px', background: isOnline ? 'rgba(16, 185, 129, 0.15)' : 'rgba(107, 114, 128, 0.15)', color: isOnline ? '#34d399' : '#9ca3af' }}>
+                      <span className={`status-pill ${isOnline ? 'status-online' : 'status-offline'}`} style={{ fontSize: '0.72rem' }}>
                         {isOnline ? 'Online' : 'Offline'}
                       </span>
                     </div>
 
                     {perms.can_view_telemetry && (
-                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.5rem', background: 'rgba(0, 0, 0, 0.25)', padding: '0.75rem', borderRadius: '8px', fontSize: '0.75rem' }}>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.5rem', background: 'var(--surface-panel)', border: '1px solid var(--glass-border)', padding: '0.75rem', borderRadius: '8px', fontSize: '0.75rem' }}>
                         <div>
-                          <div style={{ color: '#9ca3af' }}>CPU Load</div>
-                          <div style={{ fontWeight: 700, fontSize: '0.95rem', color: '#60a5fa', marginTop: '0.2rem' }}>{device.cpu_usage || 0}%</div>
+                          <div style={{ color: 'var(--text-muted)' }}>CPU Load</div>
+                          <div style={{ fontWeight: 700, fontSize: '0.95rem', color: 'var(--accent-info)', marginTop: '0.2rem' }}>{device.cpu_usage || 0}%</div>
                         </div>
                         <div>
-                          <div style={{ color: '#9ca3af' }}>Memory</div>
-                          <div style={{ fontWeight: 700, fontSize: '0.95rem', color: '#c084fc', marginTop: '0.2rem' }}>{device.ram_total_gb ? Math.round((device.ram_used_gb / device.ram_total_gb) * 100) : 0}%</div>
+                          <div style={{ color: 'var(--text-muted)' }}>Memory</div>
+                          <div style={{ fontWeight: 700, fontSize: '0.95rem', color: 'var(--secondary)', marginTop: '0.2rem' }}>{device.ram_total_gb ? Math.round((device.ram_used_gb / device.ram_total_gb) * 100) : 0}%</div>
                         </div>
                         <div>
-                          <div style={{ color: '#9ca3af' }}>Disk Used</div>
-                          <div style={{ fontWeight: 700, fontSize: '0.95rem', color: '#34d399', marginTop: '0.2rem' }}>{device.disk_total_gb ? Math.round(((device.disk_total_gb - device.disk_free_gb) / device.disk_total_gb) * 100) : 0}%</div>
+                          <div style={{ color: 'var(--text-muted)' }}>Disk Used</div>
+                          <div style={{ fontWeight: 700, fontSize: '0.95rem', color: 'var(--accent-success)', marginTop: '0.2rem' }}>{device.disk_total_gb ? Math.round(((device.disk_total_gb - device.disk_free_gb) / device.disk_total_gb) * 100) : 0}%</div>
                         </div>
                       </div>
                     )}
 
                     {perms.can_view_hardware && (
-                      <div style={{ fontSize: '0.75rem', color: '#9ca3af', display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                      <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
                         <div><strong>CPU / Role:</strong> {device.cpu_model || 'Standard Endpoint'} • {device.device_role}</div>
                         <div><strong>Serial / BIOS:</strong> {device.serial_number || 'N/A'} • {device.bios_version || 'UEFI'}</div>
                       </div>
                     )}
 
                     {perms.can_view_custom_fields && cFields.length > 0 && (
-                      <div style={{ fontSize: '0.74rem', color: '#cbd5e1', background: 'rgba(255,255,255,0.03)', padding: '0.55rem 0.75rem', borderRadius: '6px' }}>
+                      <div style={{ fontSize: '0.74rem', color: 'var(--text-main)', background: 'var(--surface-panel)', border: '1px solid var(--glass-border)', padding: '0.55rem 0.75rem', borderRadius: '6px' }}>
                         {cFields.map((cf) => (
                           <div key={cf.field_id}><strong>{cf.label}:</strong> {cf.value || '—'}</div>
                         ))}
@@ -542,7 +550,7 @@ export const GuestPortalView: React.FC<GuestPortalViewProps> = ({ grantId }) => 
                     )}
 
                     {scriptOutput && scriptOutput.deviceId === device.id && (
-                      <pre style={{ background: 'rgba(0,0,0,0.45)', padding: '0.6rem', borderRadius: '6px', fontSize: '0.72rem', color: '#34d399', margin: 0, whiteSpace: 'pre-wrap' }}>
+                      <pre style={{ background: 'var(--surface-panel)', border: '1px solid var(--glass-border)', padding: '0.6rem', borderRadius: '6px', fontSize: '0.72rem', color: 'var(--text-main)', margin: 0, whiteSpace: 'pre-wrap' }}>
                         {scriptOutput.output}
                       </pre>
                     )}
@@ -555,7 +563,7 @@ export const GuestPortalView: React.FC<GuestPortalViewProps> = ({ grantId }) => 
                         </button>
                       )}
                       {perms.can_ghost_session && (
-                        <button className="btn-glass" style={{ flex: 1, padding: '0.6rem', fontSize: '0.82rem', justifyContent: 'center', borderColor: 'rgba(168, 85, 247, 0.4)', color: '#d8b4fe' }} disabled={!isOnline} onClick={() => setActiveRemote({ open: true, device, isGhost: true })}>
+                        <button className="btn-glass" style={{ flex: 1, padding: '0.6rem', fontSize: '0.82rem', justifyContent: 'center', borderColor: 'rgba(168, 85, 247, 0.4)', color: 'var(--secondary)' }} disabled={!isOnline} onClick={() => setActiveRemote({ open: true, device, isGhost: true })}>
                           <Activity size={15} />
                           <span>Ghost Session</span>
                         </button>

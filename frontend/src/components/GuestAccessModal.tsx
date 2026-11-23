@@ -25,6 +25,8 @@ export const GuestAccessModal: React.FC<GuestAccessModalProps> = ({ devices, onC
   const [grants, setGrants] = useState<GuestAccessGrant[]>([]);
   const [loading, setLoading] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ text: string; isError?: boolean } | null>(null);
+  const [pendingRevokeId, setPendingRevokeId] = useState<string | null>(null);
 
   // Form state
   const [vendorName, setVendorName] = useState('');
@@ -81,14 +83,25 @@ export const GuestAccessModal: React.FC<GuestAccessModalProps> = ({ devices, onC
     }
   };
 
+  const parseGrantDeviceIds = (grant: GuestAccessGrant & { device_ids_json?: string }): string[] => {
+    if (Array.isArray(grant.device_ids)) return grant.device_ids;
+    try {
+      const parsed = JSON.parse(grant.device_ids_json || '[]');
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  };
+
   const handleCreateGrant = async (e: React.FormEvent) => {
     e.preventDefault();
+    setNotice(null);
     if (!vendorName.trim()) {
-      alert('Please specify the vendor or guest name.');
+      setNotice({ text: 'Please specify the vendor or guest name.', isError: true });
       return;
     }
     if (selectedDeviceIds.length === 0) {
-      alert('Please select at least one endpoint for this vendor session.');
+      setNotice({ text: 'Please select at least one endpoint for this vendor session.', isError: true });
       return;
     }
 
@@ -120,22 +133,28 @@ export const GuestAccessModal: React.FC<GuestAccessModalProps> = ({ devices, onC
         });
         loadGrants();
       } else {
-        alert(`Failed to issue guest pass: ${res.error || 'Unknown error'}`);
+        setNotice({ text: `Failed to issue guest pass: ${res.error || 'Unknown error'}`, isError: true });
       }
     } catch (err: unknown) {
-      alert(`Error creating grant: ${err instanceof Error ? err.message : String(err)}`);
+      setNotice({ text: `Error creating grant: ${err instanceof Error ? err.message : String(err)}`, isError: true });
     } finally {
       setLoading(false);
     }
   };
 
   const handleRevoke = async (id: string) => {
-    if (!confirm('Are you sure you want to immediately terminate and revoke this vendor access pass?')) return;
+    setNotice(null);
     try {
-      await revokeGuestGrant(id);
+      const res: any = await revokeGuestGrant(id);
+      if (res?.success === false) {
+        setNotice({ text: `Failed to revoke grant: ${res.error || 'Unknown error'}`, isError: true });
+        return;
+      }
+      setPendingRevokeId(null);
+      setNotice({ text: 'Vendor access pass revoked and active sessions invalidated.' });
       loadGrants();
     } catch (err: unknown) {
-      alert(`Failed to revoke grant: ${err instanceof Error ? err.message : String(err)}`);
+      setNotice({ text: `Failed to revoke grant: ${err instanceof Error ? err.message : String(err)}`, isError: true });
     }
   };
 
@@ -208,6 +227,28 @@ export const GuestAccessModal: React.FC<GuestAccessModalProps> = ({ devices, onC
 
         {/* Modal Body */}
         <div className="modal-body" style={{ maxHeight: '70vh', overflowY: 'auto', padding: '1.5rem' }}>
+          {notice && (
+            <div
+              style={{
+                marginBottom: '1rem',
+                padding: '0.7rem 0.95rem',
+                borderRadius: '8px',
+                fontSize: '0.8rem',
+                background: notice.isError ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+                border: `1px solid ${notice.isError ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`,
+                color: notice.isError ? '#f87171' : '#34d399',
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                gap: '0.5rem'
+              }}
+            >
+              <span>{notice.text}</span>
+              <button type="button" className="btn-glass" style={{ padding: '0.15rem 0.45rem', fontSize: '0.72rem' }} onClick={() => setNotice(null)}>
+                Dismiss
+              </button>
+            </div>
+          )}
           {activeTab === 'list' && (
             <div>
               {loading && grants.length === 0 ? (
@@ -239,10 +280,7 @@ export const GuestAccessModal: React.FC<GuestAccessModalProps> = ({ devices, onC
                     const isExpired = new Date(grant.expires_at).getTime() < Date.now();
                     const isRevoked = grant.status === 'revoked';
                     const isActive = !isExpired && !isRevoked;
-                    const grantWithJson = grant as GuestAccessGrant & { device_ids_json?: string };
-                    const deviceIds: string[] = Array.isArray(grant.device_ids)
-                      ? grant.device_ids
-                      : JSON.parse(grantWithJson.device_ids_json || '[]');
+                    const deviceIds = parseGrantDeviceIds(grant as GuestAccessGrant & { device_ids_json?: string });
 
                     return (
                       <div
@@ -283,16 +321,37 @@ export const GuestAccessModal: React.FC<GuestAccessModalProps> = ({ devices, onC
                           </div>
 
                           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                            {isActive && (
-                              <button
-                                className="btn-glass"
-                                style={{ color: '#ef4444', borderColor: 'rgba(239, 68, 68, 0.3)', fontSize: '0.8rem', padding: '0.35rem 0.65rem' }}
-                                onClick={() => handleRevoke(grant.id)}
-                                title="Instantly kill active sessions and invalidate credentials"
-                              >
-                                <Ban size={14} /> Revoke
-                              </button>
-                            )}
+                            {isActive &&
+                              (pendingRevokeId === grant.id ? (
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                                  <button
+                                    type="button"
+                                    className="btn-glass btn-danger"
+                                    style={{ fontSize: '0.75rem', padding: '0.3rem 0.6rem' }}
+                                    onClick={() => handleRevoke(grant.id)}
+                                  >
+                                    Confirm Revoke
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="btn-glass"
+                                    style={{ fontSize: '0.75rem', padding: '0.3rem 0.5rem' }}
+                                    onClick={() => setPendingRevokeId(null)}
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              ) : (
+                                <button
+                                  type="button"
+                                  className="btn-glass"
+                                  style={{ color: '#ef4444', borderColor: 'rgba(239, 68, 68, 0.3)', fontSize: '0.8rem', padding: '0.35rem 0.65rem' }}
+                                  onClick={() => setPendingRevokeId(grant.id)}
+                                  title="Instantly kill active sessions and invalidate credentials"
+                                >
+                                  <Ban size={14} /> Revoke
+                                </button>
+                              ))}
                             <button
                               className="btn-glass"
                               style={{ fontSize: '0.8rem', padding: '0.35rem 0.65rem' }}

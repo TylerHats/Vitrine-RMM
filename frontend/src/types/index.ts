@@ -13,6 +13,7 @@ export interface Device {
   mac_address: string;
   status: 'online' | 'offline' | 'isolated' | 'reboot_pending';
   device_role: string;
+  device_role_manual?: number | boolean;
   cpu_model: string;
   cpu_cores: number;
   cpu_usage: number;
@@ -51,9 +52,16 @@ export interface Device {
   warranty?: OemWarranty | null;
   mesh_server_id?: string;
   agent_privilege_mode?: 'standard_user' | 'elevated_admin' | 'system_service';
+  agent_privilege_level?: 'standard_user' | 'elevated_admin' | 'system_service';
   companion_installed?: number | boolean;
+  companion_deploy_pending?: number | boolean;
+  logged_in_user?: string | null;
   agent_code_signed?: number | boolean;
   laps_account?: string;
+  net_rx_mbps?: number;
+  net_tx_mbps?: number;
+  uptime_seconds?: number;
+  hardware_details_json?: string;
   lifecycle_state?: 'active' | 'pending_offboard' | 'archived';
   tenant_lifecycle_state?: 'active' | 'pending_offboard' | 'archived';
   offboard_queued_at?: string | null;
@@ -101,16 +109,30 @@ export interface ConditionAlertRule {
   autoResolveTicket: boolean;
 }
 
+export interface TrayMenuItem {
+  id: string;
+  label: string;
+  action:
+    | 'open_url'
+    | 'open_support_ticket'
+    | 'show_device_info'
+    | 'request_remote_help'
+    | 'copy_hostname'
+    | 'custom_message';
+  target?: string;
+  enabled?: boolean;
+}
+
 export interface Policy {
   id: string;
   name: string;
-  tier: 'global' | 'client' | 'site' | 'role';
+  tier: 'global' | 'quicksupport' | 'client' | 'site' | 'role';
   target_id: string | null;
-  telemetry_interval_sec: number;
-  require_remote_consent: number;
-  consent_timeout_sec: number;
-  consent_timeout_action: string;
-  auto_lock_on_disconnect: number;
+  telemetry_interval_sec?: number;
+  require_remote_consent?: number;
+  consent_timeout_sec?: number;
+  consent_timeout_action?: string;
+  auto_lock_on_disconnect?: number;
   patch_schedule: string;
   patch_reboot_enforcement: string;
   self_healing_enabled: number;
@@ -151,6 +173,17 @@ export interface Policy {
   mdm_profile_id?: string | null;
   alert_rules?: ConditionAlertRule[];
   alert_rules_json?: string | null;
+  tray_brand_name?: string | null;
+  tray_icon_url?: string | null;
+  tray_theme_mode?: 'inherit' | 'system' | 'dark' | 'light' | null;
+  tray_enabled?: number | boolean;
+  tray_tooltip?: string | null;
+  tray_support_url?: string | null;
+  tray_support_phone?: string | null;
+  tray_support_email?: string | null;
+  tray_menu_items?: TrayMenuItem[];
+  tray_menu_items_json?: string | null;
+  companion_auto_deploy?: number | boolean | null;
 }
 
 export interface Patch {
@@ -225,7 +258,17 @@ export interface LapsCredential {
   rotationPendingOnline?: boolean;
   pendingRotationReason?: string | null;
   pendingAccountName?: string | null;
-  rotationStatus?: 'active' | 'rotated_live' | 'deferred_until_online' | 'skipped_pending_offboard';
+  provisioned?: boolean;
+  verifiedOnEndpoint?: boolean;
+  error?: string;
+  pushOutput?: string;
+  rotationStatus?:
+    | 'active'
+    | 'rotated_live'
+    | 'deferred_until_online'
+    | 'skipped_pending_offboard'
+    | 'not_provisioned'
+    | 'push_failed';
 }
 
 export interface HardwareHistoryItem {
@@ -301,6 +344,7 @@ export interface Settings {
   patch_auto_approve_third_party?: number | boolean;
   patch_canary_delay_days?: number;
   code_signing_url?: string;
+  code_signing_api_key?: string;
   code_signing_enabled?: number | boolean;
   code_signing_sign_scripts?: number | boolean;
   code_signing_sign_agents?: number | boolean;
@@ -317,6 +361,7 @@ export interface Settings {
   session_recording_quality?: string;
   session_recording_visual_indicator?: number | boolean;
   session_recording_stealth_for_techs?: number | boolean;
+  session_idle_timeout_min?: number;
   maintenance_auto_clear_hours?: number;
   mesh_sync_enabled?: number | boolean;
   mesh_client_delete_action?: string;
@@ -351,6 +396,7 @@ export interface Settings {
   backup_offsite_enabled?: number | boolean;
   backup_offsite_provider?: 's3' | 'backblaze_b2' | 'b2' | 'minio' | 'sftp' | 'smb' | string;
   backup_offsite_endpoint?: string;
+  backup_offsite_region?: string;
   backup_offsite_bucket?: string;
   backup_offsite_access_key?: string;
   backup_offsite_secret_key?: string;
@@ -407,6 +453,8 @@ export interface SessionRecording {
   id: string;
   device_id: string;
   hostname?: string;
+  tenant_id?: string | null;
+  tenant_name?: string | null;
   technician: string;
   duration_sec: number;
   file_path: string;
@@ -620,6 +668,11 @@ export interface RemoteSessionDescriptor {
   resolution: string;
   meshRelayUrl?: string | null;
   meshBridgeConnected?: boolean;
+  shareLinkSource?: string;
+  meshRelayError?: string | null;
+  serverUrl?: string | null;
+  recordingEnabled?: boolean;
+  visualIndicator?: boolean;
   userInterference: string;
 }
 
@@ -887,6 +940,9 @@ export interface PublicPortalConfig {
   quicksupport_enabled: boolean;
   quicksupport_url_path: string;
   quicksupport_custom_domain: string;
+  quicksupport_brand_name?: string;
+  quicksupport_icon_url?: string;
+  quicksupport_theme_mode?: 'system' | 'dark' | 'light';
   code_signing_enabled: boolean;
 }
 
@@ -1134,4 +1190,138 @@ export interface AuditLogRecord {
   action: string;
   details: string;
   timestamp: string;
+}
+
+export interface TelemetryHistoryPoint {
+  recorded_at: string;
+  cpu_usage: number;
+  ram_used_gb: number;
+  ram_total_gb: number;
+  ram_used_pct: number;
+  disk_used_pct: number;
+  disk_free_gb: number;
+  disk_total_gb: number;
+  net_rx_mbps: number;
+  net_tx_mbps: number;
+  net_total_mbps: number;
+}
+
+export interface TelemetrySeriesStats {
+  current: number;
+  avg: number;
+  max: number;
+  min: number;
+}
+
+export interface TelemetryHistoryResponse {
+  deviceId: string;
+  range: string;
+  sampleCount: number;
+  current: {
+    cpu_usage: number;
+    ram_used_gb: number;
+    ram_total_gb: number;
+    ram_used_pct: number;
+    disk_free_gb: number;
+    disk_total_gb: number;
+    disk_used_pct: number;
+    net_rx_mbps: number;
+    net_tx_mbps: number;
+    uptime_seconds: number;
+    logged_in_user: string;
+    last_seen: string;
+  } | null;
+  summary: {
+    cpu: TelemetrySeriesStats;
+    ramPct: TelemetrySeriesStats;
+    ramUsedGb: TelemetrySeriesStats;
+    diskUsedPct: TelemetrySeriesStats;
+    netMbps: TelemetrySeriesStats;
+  };
+  points: TelemetryHistoryPoint[];
+}
+
+export interface DeviceHardwareDetails {
+  deviceId: string;
+  hostname: string;
+  status: string;
+  system: {
+    manufacturer: string;
+    model: string;
+    serialNumber: string;
+    uuid: string;
+    motherboardVendor: string;
+    motherboardName: string;
+    motherboardSerial: string;
+    biosVendor: string;
+    biosVersion: string;
+    biosDate: string;
+    tpmVersion: string;
+    chassisType?: number;
+    chassisLabel?: string;
+    hasBattery?: boolean | null;
+    isVirtualMachine?: boolean | null;
+    isHypervisorHost?: boolean | null;
+    hypervisorVendor?: string;
+    osProductType?: string;
+  };
+  cpu: {
+    model: string;
+    physicalCores: number | null;
+    logicalCores: number;
+    maxClockMhz: number | null;
+    usagePct: number;
+  };
+  memory: {
+    totalGb: number;
+    usedGb: number;
+    usedPct: number;
+    modules: Array<{
+      slot?: string;
+      capacityGb?: number;
+      speedMhz?: number;
+      manufacturer?: string;
+      partNumber?: string;
+    }>;
+  };
+  storage: {
+    totalGb: number;
+    freeGb: number;
+    smartStatus: string;
+    encryptionStatus: string;
+    physicalDisks: Array<{
+      name?: string;
+      model?: string;
+      sizeGb?: number;
+      interfaceType?: string;
+      mediaType?: string;
+      status?: string;
+    }>;
+    volumes: Array<{
+      mount?: string;
+      label?: string;
+      filesystem?: string;
+      totalGb?: number;
+      freeGb?: number;
+      usedPct?: number;
+    }>;
+  };
+  gpus: Array<{ name?: string; vramMb?: number | null; driverVersion?: string }>;
+  network: {
+    primaryIp: string;
+    primaryMac: string;
+    netRxMbps: number;
+    netTxMbps: number;
+    adapters: Array<{ name?: string; mac?: string; ipv4?: string; ipv6?: string }>;
+  };
+  os: {
+    osType: string;
+    osVersion: string;
+    osBuild: string;
+    uptimeSeconds: number;
+    loggedInUser: string;
+    pendingReboot: boolean;
+    lastSeen: string;
+  };
+  lastHardwareScanAt?: string | null;
 }

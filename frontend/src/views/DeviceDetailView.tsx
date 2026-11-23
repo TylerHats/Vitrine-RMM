@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Cpu,
   HardDrive,
@@ -33,9 +33,12 @@ import {
   Plus,
   Trash2,
   Archive,
-  Download
+  Download,
+  BarChart3,
+  Server,
+  ChevronDown
 } from 'lucide-react';
-import { AuthUser, Device, CustomFieldDefinition, OemWarranty, ChatMessage, HardwareHistoryItem, NetworkHistoryItem, SoftwareItem, DeviceNote, SessionRecording, WakeOnLanResult, DeviceBackupJob, DocumentationArticle } from '../types/index.js';
+import { AuthUser, Device, CustomFieldDefinition, OemWarranty, ChatMessage, HardwareHistoryItem, NetworkHistoryItem, SoftwareItem, DeviceNote, SessionRecording, WakeOnLanResult, DeviceBackupJob, DocumentationArticle, TelemetryHistoryResponse, DeviceHardwareDetails, Settings } from '../types/index.js';
 import {
   fetchDeviceCustomFields,
   revealDeviceSecretCustomFields,
@@ -68,11 +71,19 @@ import {
   fetchDeviceBackupJobs,
   runDeviceBackupNow,
   fetchDocumentation,
-  acknowledgeHardwareDrift
+  acknowledgeHardwareDrift,
+  deployDeviceCompanion,
+  syncDeviceHardwareFromMesh,
+  fetchDeviceTelemetryHistory,
+  sampleDeviceTelemetryNow,
+  fetchDeviceHardwareDetails,
+  updateDeviceRole
 } from '../services/api.js';
 import { MfaChallengeModal } from '../components/MfaChallengeModal.js';
+import { TelemetryChartCard } from '../components/TelemetryCharts.js';
 import { copyToClipboard } from '../utils/clipboard.js';
 import { canMutateFleet } from '../utils/permissions.js';
+import { isIntelAmtEligible, isTemporaryOrNonServiceAgent } from '../utils/deviceHelpers.js';
 
 interface DeviceDetailViewProps {
   device: Device;
@@ -82,7 +93,26 @@ interface DeviceDetailViewProps {
   onOpenLaps: (device: Device) => void;
   onOpenQuarantine: (device: Device) => void;
   currentUser?: AuthUser | null;
+  settings?: Settings | null;
   onRefreshFleet?: () => void;
+}
+
+function parseFieldOptions(raw?: string | null): string[] {
+  if (!raw) return [];
+  const trimmed = raw.trim();
+  if (!trimmed) return [];
+  if (trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) return parsed.map((v) => String(v));
+    } catch {
+      // Fallback to comma-separated parsing if JSON is malformed
+    }
+  }
+  return trimmed
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 const PCI_VENDORS: Record<string, string> = {
@@ -101,6 +131,17 @@ function formatVendor(vendorId?: string): string {
   return PCI_VENDORS[vendorId] || `Vendor ID ${vendorId}`;
 }
 
+function formatUptime(seconds?: number | null): string {
+  const s = Number(seconds || 0);
+  if (!Number.isFinite(s) || s <= 0) return 'Not reported';
+  const days = Math.floor(s / 86400);
+  const hours = Math.floor((s % 86400) / 3600);
+  const mins = Math.floor((s % 3600) / 60);
+  if (days > 0) return `${days}d ${hours}h ${mins}m`;
+  if (hours > 0) return `${hours}h ${mins}m`;
+  return `${mins}m`;
+}
+
 export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
   device,
   onBack,
@@ -109,22 +150,27 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
   onOpenLaps,
   onOpenQuarantine,
   currentUser,
+  settings,
   onRefreshFleet
 }) => {
   const canMutate = canMutateFleet(currentUser);
-  const [activeTab, setActiveTab] = useState<'overview' | 'history' | 'software' | 'attributes' | 'chat'>('overview');
+  const enableLabDemo = import.meta.env.VITE_ENABLE_LAB_DEMO === 'true';
+  const [activeTab, setActiveTab] = useState<'overview' | 'performance' | 'hardware' | 'history' | 'software' | 'attributes' | 'chat'>('overview');
 
   // Maintenance state
   const [isMaintenanceActive, setIsMaintenanceActive] = useState(Boolean(device.maintenance_active));
   const [maintenanceUntil, setMaintenanceUntil] = useState<string | null>(device.maintenance_until || null);
   const [maintenanceDuration, setMaintenanceDuration] = useState(60);
 
-  // Software & CVE state + 5-Tier Peer Reachability Chain state
+  // Software & CVE state + Wake Reachability state
   const [softwareItems, setSoftwareItems] = useState<SoftwareItem[]>([]);
   const [deviceStatus, setDeviceStatus] = useState<Device['status']>(device.status);
   const [wakingUp, setWakingUp] = useState(false);
   const [wolNotice, setWolNotice] = useState<string | null>(null);
   const [wolChainResult, setWolChainResult] = useState<WakeOnLanResult | null>(null);
+  const [deployingCompanion, setDeployingCompanion] = useState(false);
+  const [companionDeployNotice, setCompanionDeployNotice] = useState<string | null>(null);
+  const [syncingHardware, setSyncingHardware] = useState(false);
 
   // Warranty state
   const [warranty, setWarranty] = useState<OemWarranty | null>(device.warranty || null);
@@ -153,13 +199,54 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
   const [isBitlockerRevealed, setIsBitlockerRevealed] = useState(false);
   const [revealedBitlockerKey, setRevealedBitlockerKey] = useState<string | null>(null);
   const [showBitlockerMfa, setShowBitlockerMfa] = useState(false);
+  const [bitlockerError, setBitlockerError] = useState<string | null>(null);
   const [showElevateMfa, setShowElevateMfa] = useState(false);
   const [bitlockerCopied, setBitlockerCopied] = useState(false);
 
-  // Live Telemetry WebSocket state
+  // Live Telemetry WebSocket & History state
   const [liveCpu, setLiveCpu] = useState<number>(device.cpu_usage);
   const [liveRam, setLiveRam] = useState<number>(device.ram_used_gb);
-  const [liveNetMbps, setLiveNetMbps] = useState<string>(device.status === 'online' ? '1.2' : '0.0');
+  const [liveRamTotal, setLiveRamTotal] = useState<number>(device.ram_total_gb);
+  const [liveDiskFree, setLiveDiskFree] = useState<number>(device.disk_free_gb);
+  const [liveDiskTotal, setLiveDiskTotal] = useState<number>(device.disk_total_gb);
+  const [liveNetRxMbps, setLiveNetRxMbps] = useState<number>(device.net_rx_mbps || 0);
+  const [liveNetTxMbps, setLiveNetTxMbps] = useState<number>(device.net_tx_mbps || 0);
+  const [liveNetMbps, setLiveNetMbps] = useState<string>(
+    ((device.net_rx_mbps || 0) + (device.net_tx_mbps || 0)).toFixed(2)
+  );
+  const [telemetryRange, setTelemetryRange] = useState<'1h' | '6h' | '24h' | '7d' | '30d'>('24h');
+  const [telemetryHistory, setTelemetryHistory] = useState<TelemetryHistoryResponse | null>(null);
+  const [loadingTelemetry, setLoadingTelemetry] = useState(false);
+  const [samplingTelemetry, setSamplingTelemetry] = useState(false);
+  const [telemetryNotice, setTelemetryNotice] = useState<string | null>(null);
+  const [hardwareDetails, setHardwareDetails] = useState<DeviceHardwareDetails | null>(null);
+  const [loadingHardware, setLoadingHardware] = useState(false);
+  const [deepScanningHardware, setDeepScanningHardware] = useState(false);
+  const [currentRole, setCurrentRole] = useState<string>(device.device_role || 'Workstation');
+  const [isManualRole, setIsManualRole] = useState<boolean>(Boolean(device.device_role_manual));
+  const [savingRole, setSavingRole] = useState(false);
+  const [showMoreActions, setShowMoreActions] = useState(false);
+  const moreActionsRef = useRef<HTMLDivElement | null>(null);
+  const autoSampledDeviceRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    setShowMoreActions(false);
+  }, [device.id]);
+
+  useEffect(() => {
+    if (!showMoreActions) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (moreActionsRef.current && !moreActionsRef.current.contains(e.target as Node)) {
+        setShowMoreActions(false);
+      }
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, [showMoreActions]);
+  const onRefreshFleetRef = useRef(onRefreshFleet);
+  onRefreshFleetRef.current = onRefreshFleet;
+  const liveTotalsRef = useRef({ liveRamTotal, liveDiskFree, liveDiskTotal });
+  liveTotalsRef.current = { liveRamTotal, liveDiskFree, liveDiskTotal };
 
   // Technician Runbook Notes, Session Recordings, Backups & Endpoint Security state
   const [notes, setNotes] = useState<DeviceNote[]>([]);
@@ -186,19 +273,61 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
     setOffboardNotice(null);
     setIsBitlockerRevealed(false);
     setRevealedBitlockerKey(null);
+    setBitlockerError(null);
     setRevealedSecretFields({});
+    setCurrentRole(device.device_role || 'Workstation');
+    setIsManualRole(Boolean(device.device_role_manual));
   }, [
     device.id,
     device.maintenance_active,
     device.maintenance_until,
     device.status,
     device.lifecycle_state,
-    device.offboard_reason
+    device.offboard_reason,
+    device.device_role,
+    device.device_role_manual
   ]);
+
+  const handleRoleChange = async (val: string) => {
+    if (savingRole) return;
+    setSavingRole(true);
+    try {
+      const res = await updateDeviceRole(
+        device.id,
+        val === 'auto' ? { auto_detect: true } : { device_role: val }
+      );
+      if (res.success) {
+        setCurrentRole(res.device_role);
+        setIsManualRole(Boolean(res.device_role_manual));
+        onRefreshFleetRef.current?.();
+      }
+    } finally {
+      setSavingRole(false);
+    }
+  };
 
   useEffect(() => {
     setLiveCpu(device.cpu_usage);
     setLiveRam(device.ram_used_gb);
+    setLiveRamTotal(device.ram_total_gb);
+    setLiveDiskFree(device.disk_free_gb);
+    setLiveDiskTotal(device.disk_total_gb);
+    setLiveNetRxMbps(device.net_rx_mbps || 0);
+    setLiveNetTxMbps(device.net_tx_mbps || 0);
+    setLiveNetMbps(((device.net_rx_mbps || 0) + (device.net_tx_mbps || 0)).toFixed(2));
+  }, [
+    device.id,
+    device.cpu_usage,
+    device.ram_used_gb,
+    device.ram_total_gb,
+    device.disk_free_gb,
+    device.disk_total_gb,
+    device.net_rx_mbps,
+    device.net_tx_mbps
+  ]);
+
+  useEffect(() => {
+    setTelemetryNotice(null);
     fetchWarranty(device.id).then((w) => setWarranty(w)).catch(() => setWarranty(null));
 
     fetchDeviceCustomFields(device.id)
@@ -220,7 +349,71 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
     fetchRecordings(device.id).then(setRecordings).catch(console.error);
     fetchDeviceBackupJobs(device.id).then(setBackupJobs).catch(() => setBackupJobs([]));
     fetchDocumentation({ tenant_id: device.tenant_id }).then(setLinkedDocs).catch(() => setLinkedDocs([]));
-  }, [device.id, device.tenant_id, device.cpu_usage, device.ram_used_gb]);
+    setLoadingHardware(true);
+    fetchDeviceHardwareDetails(device.id)
+      .then(setHardwareDetails)
+      .catch(() => setHardwareDetails(null))
+      .finally(() => setLoadingHardware(false));
+  }, [device.id, device.tenant_id]);
+
+  useEffect(() => {
+    let active = true;
+    setLoadingTelemetry(true);
+    fetchDeviceTelemetryHistory(device.id, telemetryRange)
+      .then((res) => {
+        if (!active) return;
+        setTelemetryHistory(res);
+        if (res.current && res.current.ram_used_gb > 0) {
+          setLiveRam(res.current.ram_used_gb);
+        }
+      })
+      .catch(() => {
+        if (active) setTelemetryHistory(null);
+      })
+      .finally(() => {
+        if (active) setLoadingTelemetry(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [device.id, telemetryRange]);
+
+  useEffect(() => {
+    if (deviceStatus !== 'online') return;
+    if (autoSampledDeviceRef.current === device.id) return;
+    const missingMetrics = device.ram_used_gb <= 0 || device.cpu_usage <= 0;
+    const noHistoryYet = telemetryHistory !== null && telemetryHistory.sampleCount === 0;
+    if (!missingMetrics && !noHistoryYet) return;
+    autoSampledDeviceRef.current = device.id;
+    let cancelled = false;
+    setSamplingTelemetry(true);
+    sampleDeviceTelemetryNow(device.id, false)
+      .then(async (res) => {
+        if (cancelled) return;
+        if (res.sampled && res.device) {
+          setLiveCpu(res.device.cpu_usage);
+          setLiveRam(res.device.ram_used_gb);
+          setLiveRamTotal(res.device.ram_total_gb);
+          setLiveDiskFree(res.device.disk_free_gb);
+          setLiveDiskTotal(res.device.disk_total_gb);
+          const rx = res.device.net_rx_mbps || 0;
+          const tx = res.device.net_tx_mbps || 0;
+          setLiveNetRxMbps(rx);
+          setLiveNetTxMbps(tx);
+          setLiveNetMbps((rx + tx).toFixed(2));
+          const hist = await fetchDeviceTelemetryHistory(device.id, telemetryRange).catch(() => null);
+          if (!cancelled && hist) setTelemetryHistory(hist);
+          onRefreshFleetRef.current?.();
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled) setSamplingTelemetry(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [device.id, deviceStatus, device.ram_used_gb, device.cpu_usage, telemetryHistory, telemetryRange]);
 
   useEffect(() => {
     if (activeTab !== 'chat') return;
@@ -251,14 +444,54 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
       ws.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data);
-          if (msg.type === 'telemetry_tick') {
-            setLiveCpu(Number(msg.cpu));
-            setLiveRam(Number(msg.ramGb));
-            setLiveNetMbps(String(msg.netMbps));
-          } else if (typeof msg.cpuUsage === 'number') {
-            setLiveCpu(Number(msg.cpuUsage));
-            setLiveRam(Number(msg.ramUsageGb || 0));
-            setLiveNetMbps(String(msg.networkMbps || '0.0'));
+          const nextCpu = msg.type === 'telemetry_tick' ? Number(msg.cpu) : typeof msg.cpuUsage === 'number' ? Number(msg.cpuUsage) : null;
+          if (nextCpu === null) return;
+          const nextRam = msg.type === 'telemetry_tick' ? Number(msg.ramGb || 0) : Number(msg.ramUsageGb || 0);
+          const nextRamTotal = Number(msg.ramTotalGb ?? liveTotalsRef.current.liveRamTotal);
+          const nextDiskFree = Number(msg.diskFreeGb ?? liveTotalsRef.current.liveDiskFree);
+          const nextDiskTotal = Number(msg.diskTotalGb ?? liveTotalsRef.current.liveDiskTotal);
+          const nextRx = Number(msg.netRxMbps ?? 0);
+          const nextTx = Number(msg.netTxMbps ?? 0);
+          const nextNetStr = String(
+            msg.type === 'telemetry_tick'
+              ? msg.netMbps ?? (nextRx + nextTx).toFixed(2)
+              : msg.networkMbps ?? (nextRx + nextTx).toFixed(2)
+          );
+          setLiveCpu(nextCpu);
+          setLiveRam(nextRam);
+          if (Number.isFinite(nextRamTotal) && nextRamTotal > 0) setLiveRamTotal(nextRamTotal);
+          if (Number.isFinite(nextDiskFree) && nextDiskFree >= 0) setLiveDiskFree(nextDiskFree);
+          if (Number.isFinite(nextDiskTotal) && nextDiskTotal > 0) setLiveDiskTotal(nextDiskTotal);
+          setLiveNetRxMbps(nextRx);
+          setLiveNetTxMbps(nextTx);
+          setLiveNetMbps(nextNetStr);
+          if (telemetryRange === '1h' || telemetryRange === '6h') {
+            setTelemetryHistory((prev) => {
+              if (!prev) return prev;
+              const ts = msg.timestamp || new Date().toISOString();
+              const ramPct = nextRamTotal > 0 ? Number(((nextRam / nextRamTotal) * 100).toFixed(1)) : 0;
+              const diskUsedPct =
+                nextDiskTotal > 0 ? Number((((nextDiskTotal - nextDiskFree) / nextDiskTotal) * 100).toFixed(1)) : 0;
+              const lastPt = prev.points[prev.points.length - 1];
+              if (lastPt && Math.abs(new Date(ts).getTime() - new Date(lastPt.recorded_at).getTime()) < 9000) {
+                return prev;
+              }
+              const nextPoint = {
+                recorded_at: ts,
+                cpu_usage: nextCpu,
+                ram_used_gb: nextRam,
+                ram_total_gb: nextRamTotal,
+                ram_used_pct: ramPct,
+                disk_used_pct: diskUsedPct,
+                disk_free_gb: nextDiskFree,
+                disk_total_gb: nextDiskTotal,
+                net_rx_mbps: nextRx,
+                net_tx_mbps: nextTx,
+                net_total_mbps: Number((nextRx + nextTx).toFixed(2))
+              };
+              const nextPoints = [...prev.points, nextPoint].slice(-200);
+              return { ...prev, sampleCount: prev.sampleCount + 1, points: nextPoints };
+            });
           }
         } catch {
           // ignore parse errors
@@ -269,7 +502,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
       cancelled = true;
       ws?.close();
     };
-  }, [device.id, deviceStatus]);
+  }, [device.id, deviceStatus, telemetryRange]);
 
   const handleRunSecurityAction = async (
     action: 'av_quick_scan' | 'av_full_scan' | 'av_update_signatures' | 'verify_encryption' | 'enable_encryption'
@@ -299,6 +532,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
   };
 
   const handleRequestBitlockerReveal = async () => {
+    setBitlockerError(null);
     try {
       const res = await revealDeviceBitlockerKey(device.id);
       if (res.mfaRequired) {
@@ -308,9 +542,16 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
       if (res.success) {
         setRevealedBitlockerKey(res.bitlocker_key || null);
         setIsBitlockerRevealed(true);
+      } else {
+        setBitlockerError((res as any).error || 'Unable to reveal BitLocker recovery key.');
       }
-    } catch {
-      setShowBitlockerMfa(true);
+    } catch (err: any) {
+      const msg = String(err?.message || '');
+      if (msg.toLowerCase().includes('mfa')) {
+        setShowBitlockerMfa(true);
+      } else {
+        setBitlockerError(msg || 'Failed to retrieve BitLocker recovery key.');
+      }
     }
   };
 
@@ -396,25 +637,25 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
 
   const handleWakeOnLan = async (bootTarget: 'normal' | 'bios_uefi' | 'pxe' = 'normal') => {
     setWakingUp(true);
-    setWolNotice('Executing 5-Tier Same-Company & Same-Network Peer Reachability Chain (Cloud CIRA -> Peer LAN AMT 16993 -> Multi-Peer WoL Magic Packets -> Historical Roaming Subnets -> ARP Verification)...');
+    setWolNotice('Sending Wake-on-LAN & out-of-band power reachability signal...');
     try {
       const res = await wakeDeviceOnLan(device.id, { wakeAndOnline: true, bootTarget });
       if (res.success) {
         setWolChainResult(res);
         const relayStr = res.dispatchedRelays?.length
-          ? `Relayed via same-company peers: ${res.dispatchedRelays.join(', ')}.`
+          ? `Relayed via peer devices: ${res.dispatchedRelays.join(', ')}.`
           : 'Dispatched via local subnet broadcast.';
         if (res.verifiedOnline) {
           setDeviceStatus('online');
-          setWolNotice(`⚡ 5-Tier Wake & AMT Reachability Chain Succeeded for ${res.targetHostname} (${res.targetMac}). ${relayStr} Endpoint verified ONLINE via Peer ARP & Agent TLS Handshake!`);
+          setWolNotice(`⚡ Wake & Reachability Check Succeeded for ${res.targetHostname} (${res.targetMac}). ${relayStr} Endpoint verified ONLINE.`);
         } else {
-          setWolNotice(`📡 Wake-on-LAN / Peer Relay packets dispatched for ${res.targetHostname} (${res.targetMac}). ${relayStr} Awaiting live Agent TLS check-in before marking endpoint online.`);
+          setWolNotice(`📡 Wake-on-LAN / peer relay packets dispatched for ${res.targetHostname} (${res.targetMac}). ${relayStr} Awaiting agent check-in before marking online.`);
         }
       } else {
-        setWolNotice(`Failed to execute reachability chain: ${res.error || 'Unknown error'}`);
+        setWolNotice(`Failed to execute reachability check: ${res.error || 'Unknown error'}`);
       }
     } catch {
-      setWolNotice('Error communicating with 5-Tier WoL & AMT relay engine.');
+      setWolNotice('Error communicating with wake relay service.');
     } finally {
       setWakingUp(false);
     }
@@ -565,6 +806,101 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
     }
   };
 
+  const handleDeployCompanion = async () => {
+    setDeployingCompanion(true);
+    setCompanionDeployNotice(null);
+    try {
+      const res = await deployDeviceCompanion(device.id);
+      if (res.success) {
+        setCompanionDeployNotice(
+          res.live
+            ? `✓ Vitrine companion & tray deployed over live MS2 relay (${res.output?.slice(0, 120) || 'enrolled'}).`
+            : `Vitrine companion rollout queued: ${res.output || 'will execute on next online check-in'}`
+        );
+        onRefreshFleet?.();
+      } else {
+        setCompanionDeployNotice(`Companion deploy failed: ${res.error || res.output || 'Unknown error'}`);
+      }
+    } catch (err: any) {
+      setCompanionDeployNotice(`Companion deploy failed: ${err?.message || 'Request failed'}`);
+    } finally {
+      setDeployingCompanion(false);
+    }
+  };
+
+  const handleSampleTelemetry = async (includeDetailedHardware = false) => {
+    if (includeDetailedHardware) {
+      setDeepScanningHardware(true);
+    } else {
+      setSamplingTelemetry(true);
+    }
+    setTelemetryNotice(null);
+    try {
+      const res = await sampleDeviceTelemetryNow(device.id, includeDetailedHardware);
+      if (res.success && res.sampled) {
+        if (res.device) {
+          setLiveCpu(res.device.cpu_usage);
+          setLiveRam(res.device.ram_used_gb);
+          setLiveRamTotal(res.device.ram_total_gb);
+          setLiveDiskFree(res.device.disk_free_gb);
+          setLiveDiskTotal(res.device.disk_total_gb);
+          const rx = res.device.net_rx_mbps || 0;
+          const tx = res.device.net_tx_mbps || 0;
+          setLiveNetRxMbps(rx);
+          setLiveNetTxMbps(tx);
+          setLiveNetMbps((rx + tx).toFixed(2));
+        }
+        const [hist, hw] = await Promise.all([
+          fetchDeviceTelemetryHistory(device.id, telemetryRange).catch(() => null),
+          fetchDeviceHardwareDetails(device.id).catch(() => null)
+        ]);
+        if (hist) setTelemetryHistory(hist);
+        if (hw) setHardwareDetails(hw);
+        setTelemetryNotice(
+          includeDetailedHardware
+            ? '✓ Deep hardware inventory scan & live telemetry sample completed.'
+            : '✓ Live CPU, memory, disk, and network sample recorded.'
+        );
+        onRefreshFleet?.();
+      } else {
+        setTelemetryNotice(
+          res.reason || res.error || 'Live telemetry probe could not reach the endpoint agent right now.'
+        );
+      }
+    } catch (err: any) {
+      setTelemetryNotice(`Telemetry sampling failed: ${err?.message || 'Request failed'}`);
+    } finally {
+      setSamplingTelemetry(false);
+      setDeepScanningHardware(false);
+    }
+  };
+
+  const handleSyncHardware = async () => {
+    setSyncingHardware(true);
+    setCompanionDeployNotice(null);
+    try {
+      const res = await syncDeviceHardwareFromMesh(device.id);
+      const [hw, hist] = await Promise.all([
+        fetchDeviceHardwareDetails(device.id).catch(() => null),
+        fetchDeviceTelemetryHistory(device.id, telemetryRange).catch(() => null)
+      ]);
+      if (hw) setHardwareDetails(hw);
+      if (hist) setTelemetryHistory(hist);
+      if (res.success && res.updated) {
+        setCompanionDeployNotice('✓ Hardware inventory, serial number, CPU, RAM, and network metadata synced.');
+        onRefreshFleet?.();
+      } else if (res.success) {
+        setCompanionDeployNotice('Remote engine probe completed (no new hardware fields reported; check device online status).');
+      } else {
+        setCompanionDeployNotice(`Hardware sync failed: ${res.error || 'Unknown error'}`);
+      }
+    } catch (err: any) {
+      setCompanionDeployNotice(`Hardware sync failed: ${err?.message || 'Request failed'}`);
+    } finally {
+      setSyncingHardware(false);
+    }
+  };
+
   const handleToggleMaintenance = async () => {
     const nextState = !isMaintenanceActive;
     const res = await toggleDeviceMaintenance(device.id, nextState, maintenanceDuration);
@@ -673,61 +1009,58 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                 </span>
               )}
             </div>
-            <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-              {device.tenant_name || 'Unassigned Client'} • {device.site_name || 'Unassigned Site'} • IP: {device.ip_address}
-            </span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap', fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+              <span>{device.tenant_name || 'Unassigned Client'} • {device.site_name || 'Unassigned Site'} • IP: {device.ip_address} • Role:</span>
+              {canMutate ? (
+                <select
+                  className="glass-select"
+                  value={currentRole}
+                  disabled={savingRole}
+                  onChange={(e) => handleRoleChange(e.target.value)}
+                  title={isManualRole ? 'Manually assigned role (select Re-detect Auto to revert)' : 'Auto-detected device role'}
+                  style={{ fontSize: '0.76rem', padding: '0.18rem 0.45rem', minHeight: 'auto', width: 'auto' }}
+                >
+                  {![
+                    'Desktop',
+                    'Laptop',
+                    'Server',
+                    'Domain Controller',
+                    'Hypervisor',
+                    'Virtual Machine',
+                    'Virtual Server',
+                    'Workstation',
+                    'QuickSupport'
+                  ].includes(currentRole) && <option value={currentRole}>{currentRole}</option>}
+                  <option value="Desktop">Desktop</option>
+                  <option value="Laptop">Laptop</option>
+                  <option value="Server">Server</option>
+                  <option value="Domain Controller">Domain Controller</option>
+                  <option value="Hypervisor">Hypervisor</option>
+                  <option value="Virtual Machine">Virtual Machine</option>
+                  <option value="Virtual Server">Virtual Server</option>
+                  <option value="Workstation">Workstation</option>
+                  <option value="QuickSupport">QuickSupport</option>
+                  <option value="auto">Auto-Detect (Reset)</option>
+                </select>
+              ) : (
+                <span style={{ fontWeight: 600, color: 'var(--text-main)' }}>{currentRole}</span>
+              )}
+            </div>
           </div>
         </div>
 
         {/* Quick Action Toolbar */}
         {canMutate && (
-          <div style={{ display: 'flex', gap: '0.65rem', flexWrap: 'wrap' }}>
-            <button
-              className="btn-glass"
-              style={{ background: 'rgba(56, 189, 248, 0.16)', color: '#38bdf8', border: '1px solid rgba(56, 189, 248, 0.4)' }}
-              onClick={() => handleWakeOnLan('normal')}
-              disabled={wakingUp}
-              title="Execute 5-Tier Reachability Chain (Cloud CIRA -> Same-Subnet Peer AMT 16993 -> Same-Subnet Peer Magic Packets -> Historical Roaming Subnet Relay -> ARP Link-Up Verification)"
-            >
-              <Zap size={15} /> {wakingUp ? 'Relaying 5-Tier Wake...' : deviceStatus === 'offline' ? '5-Tier Wake (WoL + Peer AMT)' : 'Test 5-Tier Peer Reachability'}
-            </button>
-            {Boolean(device.intel_amt_enabled) && (
+          <div style={{ display: 'flex', gap: '0.6rem', flexWrap: 'wrap', alignItems: 'center' }}>
+            {deviceStatus === 'offline' && (
               <button
                 className="btn-glass"
-                style={{ background: 'rgba(245, 158, 11, 0.2)', color: '#fbbf24', border: '1px solid rgba(245, 158, 11, 0.4)' }}
-                onClick={() => handleWakeOnLan('bios_uefi')}
+                style={{ background: 'rgba(56, 189, 248, 0.16)', color: '#38bdf8', border: '1px solid rgba(56, 189, 248, 0.4)' }}
+                onClick={() => handleWakeOnLan('normal')}
                 disabled={wakingUp}
-                title="Relay Intel AMT / vPro WS-Management Power-On / Force UEFI Setup via Online Peer on the Same LAN Subnet"
+                title="Send Wake-on-LAN / peer-relayed wake signal and verify endpoint reachability"
               >
-                <Power size={15} /> Peer-Relayed AMT Boot
-              </button>
-            )}
-
-            {deviceStatus === 'online' && (
-              <button
-                className="btn-glass"
-                style={{ background: 'rgba(56, 189, 248, 0.12)', color: '#38bdf8', border: '1px solid rgba(56, 189, 248, 0.3)' }}
-                onClick={handleEnableWol}
-                disabled={enablingWol}
-                title="Configure Windows Driver properties, disable Fast Startup, and execute OEM WMI BIOS commands without a manual reboot"
-              >
-                <Zap size={15} /> {enablingWol ? 'Configuring WoL...' : 'Enable WoL (OS & BIOS)'}
-              </button>
-            )}
-
-            {deviceStatus === 'online' && (
-              <button
-                className="btn-glass"
-                style={{
-                  background: device.intel_amt_enabled ? 'rgba(16, 185, 129, 0.12)' : 'rgba(168, 85, 247, 0.12)',
-                  color: device.intel_amt_enabled ? '#34d399' : '#c084fc',
-                  border: `1px solid ${device.intel_amt_enabled ? 'rgba(16, 185, 129, 0.35)' : 'rgba(168, 85, 247, 0.35)'}`
-                }}
-                onClick={handleProvisionAmt}
-                disabled={provisioningAmt}
-                title="Inspect Intel MEI driver and provision Intel vPro AMT CIRA tunnel without duplicate nodes"
-              >
-                <Cpu size={15} /> {provisioningAmt ? 'Provisioning...' : device.intel_amt_enabled ? '⚡ vPro Provisioned' : 'Auto-Provision vPro'}
+                <Zap size={15} /> {wakingUp ? 'Waking Device...' : 'Wake Device'}
               </button>
             )}
 
@@ -743,33 +1076,167 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
             <button className="btn-glass" onClick={() => onOpenLaps(device)}>
               <KeyRound size={15} color="#fbbf24" /> LAPS Vault
             </button>
-            <button
-              className="btn-glass"
-              style={{
-                background: showElevateCard ? 'rgba(245, 158, 11, 0.22)' : 'rgba(245, 158, 11, 0.1)',
-                color: '#fbbf24',
-                border: '1px solid rgba(245, 158, 11, 0.4)'
-              }}
-              onClick={() => setShowElevateCard(!showElevateCard)}
-              title="Remotely self-elevate a non-admin QuickSupport agent or promote it to a permanent signed service"
-            >
-              <ShieldCheck size={15} /> Elevate / Promote Agent
-            </button>
-            <button className={`btn-glass ${device.quarantined ? 'btn-primary' : 'btn-danger'}`} onClick={() => onOpenQuarantine(device)}>
-              <ShieldAlert size={15} /> {device.quarantined ? 'Restore Network' : 'Quarantine'}
-            </button>
-            <button
-              className="btn-glass"
-              style={{
-                background: showOffboardCard ? 'rgba(239, 68, 68, 0.22)' : 'rgba(239, 68, 68, 0.1)',
-                color: '#f87171',
-                border: '1px solid rgba(239, 68, 68, 0.4)'
-              }}
-              onClick={() => setShowOffboardCard(!showOffboardCard)}
-              title="Cleanly offboard endpoint (revert policies, apply LAPS local admin rule, uninstall agents, and preserve BitLocker & LAPS in Archive)"
-            >
-              <Archive size={15} /> {lifecycleState === 'archived' ? 'Archived Vault Controls' : 'Offboard Endpoint'}
-            </button>
+            {isTemporaryOrNonServiceAgent(device) && (
+              <button
+                className="btn-glass"
+                style={{
+                  background: showElevateCard ? 'rgba(245, 158, 11, 0.22)' : 'rgba(245, 158, 11, 0.1)',
+                  color: '#fbbf24',
+                  border: '1px solid rgba(245, 158, 11, 0.4)'
+                }}
+                onClick={() => setShowElevateCard(!showElevateCard)}
+                title="Remotely self-elevate a non-admin QuickSupport agent or promote it to a permanent signed service"
+              >
+                <ShieldCheck size={15} /> Elevate / Promote Agent
+              </button>
+            )}
+            {Boolean(device.quarantined) && (
+              <button className="btn-glass btn-primary" onClick={() => onOpenQuarantine(device)}>
+                <ShieldAlert size={15} /> Restore Network
+              </button>
+            )}
+            {deviceStatus === 'online' && !device.companion_installed && Boolean(device.mesh_node_id) && (
+              <button
+                className="btn-glass"
+                style={{
+                  background: 'rgba(16, 185, 129, 0.12)',
+                  color: '#34d399',
+                  border: '1px solid rgba(16, 185, 129, 0.35)'
+                }}
+                onClick={handleDeployCompanion}
+                disabled={deployingCompanion}
+                title="Deploy or repair the companion agent & branded tray on this endpoint"
+              >
+                <Download size={15} /> {deployingCompanion ? 'Deploying Companion...' : 'Deploy Companion Tray'}
+              </button>
+            )}
+
+            <div ref={moreActionsRef} style={{ position: 'relative' }}>
+              <button
+                type="button"
+                className="btn-glass"
+                onClick={() => setShowMoreActions((prev) => !prev)}
+                aria-expanded={showMoreActions}
+              >
+                <span>More Actions</span>
+                <ChevronDown size={14} style={{ transform: showMoreActions ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s' }} />
+              </button>
+              {showMoreActions && (
+                <div
+                  className="glass-card"
+                  style={{
+                    position: 'absolute',
+                    right: 0,
+                    top: 'calc(100% + 0.45rem)',
+                    minWidth: '235px',
+                    padding: '0.45rem',
+                    zIndex: 40,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '0.25rem',
+                    background: 'var(--surface-elevated)',
+                    border: '1px solid var(--border-glass)',
+                    boxShadow: '0 16px 36px rgba(0, 0, 0, 0.42)'
+                  }}
+                >
+                  {deviceStatus === 'online' && (
+                    <button
+                      type="button"
+                      className="btn-glass"
+                      style={{ justifyContent: 'flex-start', width: '100%', fontSize: '0.8rem', border: 'none' }}
+                      onClick={() => {
+                        setShowMoreActions(false);
+                        handleWakeOnLan('normal');
+                      }}
+                      disabled={wakingUp}
+                    >
+                      <Zap size={14} color="#38bdf8" /> {wakingUp ? 'Waking Device...' : 'Test Wake Reachability'}
+                    </button>
+                  )}
+                  {deviceStatus === 'online' && (
+                    <button
+                      type="button"
+                      className="btn-glass"
+                      style={{ justifyContent: 'flex-start', width: '100%', fontSize: '0.8rem', border: 'none' }}
+                      onClick={() => {
+                        setShowMoreActions(false);
+                        handleEnableWol();
+                      }}
+                      disabled={enablingWol}
+                    >
+                      <Zap size={14} color="#38bdf8" /> {enablingWol ? 'Configuring WoL...' : 'Enable WoL (OS & BIOS)'}
+                    </button>
+                  )}
+                  {Boolean(device.intel_amt_enabled) && isIntelAmtEligible(device) && (
+                    <button
+                      type="button"
+                      className="btn-glass"
+                      style={{ justifyContent: 'flex-start', width: '100%', fontSize: '0.8rem', border: 'none', color: '#fbbf24' }}
+                      onClick={() => {
+                        setShowMoreActions(false);
+                        handleWakeOnLan('bios_uefi');
+                      }}
+                      disabled={wakingUp}
+                    >
+                      <Power size={14} /> Peer-Relayed AMT Boot
+                    </button>
+                  )}
+                  {deviceStatus === 'online' && isIntelAmtEligible(device) && (
+                    <button
+                      type="button"
+                      className="btn-glass"
+                      style={{ justifyContent: 'flex-start', width: '100%', fontSize: '0.8rem', border: 'none', color: device.intel_amt_enabled ? '#34d399' : '#c084fc' }}
+                      onClick={() => {
+                        setShowMoreActions(false);
+                        handleProvisionAmt();
+                      }}
+                      disabled={provisioningAmt}
+                    >
+                      <Cpu size={14} /> {provisioningAmt ? 'Provisioning...' : device.intel_amt_enabled ? '⚡ vPro Provisioned' : 'Auto-Provision vPro'}
+                    </button>
+                  )}
+                  {Boolean(device.mesh_node_id) && (
+                    <button
+                      type="button"
+                      className="btn-glass"
+                      style={{ justifyContent: 'flex-start', width: '100%', fontSize: '0.8rem', border: 'none' }}
+                      onClick={() => {
+                        setShowMoreActions(false);
+                        handleSyncHardware();
+                      }}
+                      disabled={syncingHardware}
+                    >
+                      <RotateCw size={14} className={syncingHardware ? 'spin' : ''} /> {syncingHardware ? 'Syncing Inventory...' : 'Sync Hardware Inventory'}
+                    </button>
+                  )}
+                  <div style={{ height: '1px', background: 'var(--border-glass)', margin: '0.25rem 0.4rem' }} />
+                  {!device.quarantined && (
+                    <button
+                      type="button"
+                      className="btn-glass"
+                      style={{ justifyContent: 'flex-start', width: '100%', fontSize: '0.8rem', border: 'none', color: '#f87171' }}
+                      onClick={() => {
+                        setShowMoreActions(false);
+                        onOpenQuarantine(device);
+                      }}
+                    >
+                      <ShieldAlert size={14} /> Quarantine Endpoint
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="btn-glass"
+                    style={{ justifyContent: 'flex-start', width: '100%', fontSize: '0.8rem', border: 'none', color: '#f87171' }}
+                    onClick={() => {
+                      setShowMoreActions(false);
+                      setShowOffboardCard(!showOffboardCard);
+                    }}
+                  >
+                    <Archive size={14} /> {lifecycleState === 'archived' ? 'Archived Vault Controls' : 'Offboard Endpoint'}
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         )}
       </div>
@@ -813,13 +1280,13 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                   Force Move to Archive Now
                 </button>
               )}
-              {canMutate && lifecycleState !== 'active' && (
+              {enableLabDemo && canMutate && lifecycleState !== 'active' && (
                 <button
                   type="button"
                   className="btn-glass"
                   style={{ fontSize: '0.74rem', borderColor: 'rgba(56, 189, 248, 0.45)', color: '#38bdf8' }}
                   onClick={handleSimulateWakeOrCheckIn}
-                  title="Simulate this PC waking up or re-installing: resurrects to Active if Archived & client is Active; or runs queued/quiet offboard if Pending Offboard or client is Archived/Deleted"
+                  title="Lab demo: simulate this endpoint waking up or re-installing"
                 >
                   <Zap size={13} /> Simulate Wake / Re-Install Check-In
                 </button>
@@ -915,14 +1382,14 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
         </div>
       )}
 
-      {/* Tech-Side Remote Self-Elevation & QuickSupport Promotion Card */}
-      {showElevateCard && (
+      {/* Remote Elevation & Permanent Agent Promotion Card */}
+      {showElevateCard && isTemporaryOrNonServiceAgent(device) && (
         <div className="glass-card" style={{ border: '1px solid rgba(245, 158, 11, 0.45)', background: 'var(--glass-bg)' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem', flexWrap: 'wrap', gap: '0.5rem' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
               <KeyRound size={18} color="#fbbf24" />
               <strong style={{ fontSize: '0.95rem', color: 'var(--text-main)' }}>
-                Tech-Side Remote Self-Elevation &amp; Permanent Service Promotion — {device.hostname}
+                Elevate Session &amp; Install Permanent Agent — {device.hostname}
               </strong>
               <span className="status-pill status-online" style={{ fontSize: '0.7rem' }}>
                 Current Privilege: {device.agent_privilege_mode || 'SYSTEM / Administrator'}
@@ -997,6 +1464,37 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
         </div>
       )}
 
+      {companionDeployNotice && (() => {
+        const isCompErr = /fail|error/i.test(companionDeployNotice);
+        return (
+          <div
+            style={{
+              padding: '0.85rem 1.25rem',
+              background: isCompErr ? 'rgba(239, 68, 68, 0.12)' : 'rgba(16, 185, 129, 0.12)',
+              border: `1px solid ${isCompErr ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`,
+              borderRadius: '10px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              color: isCompErr ? '#fca5a5' : '#34d399',
+              fontSize: '0.82rem'
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+              <CheckCircle2 size={18} />
+              <span>{companionDeployNotice}</span>
+            </div>
+            <button
+              className="btn-glass"
+              style={{ padding: '0.2rem 0.5rem', fontSize: '0.72rem' }}
+              onClick={() => setCompanionDeployNotice(null)}
+            >
+              Dismiss
+            </button>
+          </div>
+        );
+      })()}
+
       {/* Maintenance Mode Banner & WoL Status Notice */}
       {wolNotice && (() => {
         const isWolErr = /^(failed|error|wol configuration failed)/i.test(wolNotice.trim());
@@ -1029,14 +1527,14 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
         );
       })()}
 
-      {/* 5-Tier Peer-Relayed Wake-on-LAN & Intel AMT Execution Trace Card */}
+      {/* Wake-on-LAN & Out-of-Band Reachability Trace Card */}
       {wolChainResult?.stages && (
         <div className="glass-card" style={{ border: '1px solid rgba(56, 189, 248, 0.35)', background: 'var(--glass-bg)' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.85rem', flexWrap: 'wrap', gap: '0.5rem' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
               <Network size={18} color="#38bdf8" />
               <strong style={{ fontSize: '0.95rem', color: 'var(--text-main)' }}>
-                5-Tier Same-Company &amp; Same-Network Peer Reachability Chain — {wolChainResult.targetHostname} ({wolChainResult.targetIp})
+                Wake-on-LAN &amp; Out-of-Band Reachability Trace — {wolChainResult.targetHostname} ({wolChainResult.targetIp || device.ip_address || 'endpoint'})
               </strong>
               <span
                 className={`status-pill ${wolChainResult.verifiedOnline ? 'status-online' : 'status-reboot'}`}
@@ -1141,7 +1639,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
             <Clock size={18} />
             <span>
               <strong>Maintenance Mode Active:</strong> Condition watchdogs &amp; automated ticketing are suppressed until{' '}
-              <strong>{maintenanceUntil ? new Date(maintenanceUntil).toLocaleTimeString() : 'manually cleared'}</strong> (Auto-clear limit: 24h online).
+              <strong>{maintenanceUntil ? new Date(maintenanceUntil).toLocaleTimeString() : 'manually cleared'}</strong> (Auto-clear limit: {settings?.maintenance_auto_clear_hours ?? 24}h online).
             </span>
           </div>
           {canMutate && (
@@ -1160,7 +1658,15 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
       <div className="tab-list">
         <button className={`tab-btn ${activeTab === 'overview' ? 'active' : ''}`} onClick={() => setActiveTab('overview')}>
           <Activity size={16} />
-          <span>System &amp; Hardware</span>
+          <span>Overview</span>
+        </button>
+        <button className={`tab-btn ${activeTab === 'performance' ? 'active' : ''}`} onClick={() => setActiveTab('performance')}>
+          <BarChart3 size={16} />
+          <span>Performance &amp; Graphs{telemetryHistory?.sampleCount ? ` (${telemetryHistory.sampleCount})` : ''}</span>
+        </button>
+        <button className={`tab-btn ${activeTab === 'hardware' ? 'active' : ''}`} onClick={() => setActiveTab('hardware')}>
+          <Server size={16} />
+          <span>Hardware Specs</span>
         </button>
         <button className={`tab-btn ${activeTab === 'history' ? 'active' : ''}`} onClick={() => setActiveTab('history')}>
           <History size={16} />
@@ -1180,6 +1686,422 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
         </button>
       </div>
 
+      {/* PERFORMANCE & TELEMETRY GRAPHS TAB */}
+      {activeTab === 'performance' && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+          <div className="glass-card" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.85rem' }}>
+            <div>
+              <h3 style={{ fontSize: '1.1rem', fontWeight: 600, margin: 0 }}>Tracked Resource Usage &amp; Telemetry History</h3>
+              <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                {telemetryHistory?.sampleCount
+                  ? `${telemetryHistory.sampleCount} persisted samples in selected window • Last check-in ${new Date(telemetryHistory.current?.last_seen || device.last_seen).toLocaleString()}`
+                  : 'Waiting for endpoint telemetry samples'}
+              </span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+              {(['1h', '6h', '24h', '7d', '30d'] as const).map((r) => (
+                <button
+                  key={r}
+                  type="button"
+                  className={`btn-glass ${telemetryRange === r ? 'btn-primary' : ''}`}
+                  style={{ fontSize: '0.74rem', padding: '0.3rem 0.65rem' }}
+                  onClick={() => setTelemetryRange(r)}
+                >
+                  {r.toUpperCase()}
+                </button>
+              ))}
+              {canMutate && (
+                <button
+                  type="button"
+                  className="btn-glass"
+                  style={{ fontSize: '0.76rem', borderColor: 'rgba(56, 189, 248, 0.35)', color: '#38bdf8' }}
+                  onClick={() => handleSampleTelemetry(false)}
+                  disabled={samplingTelemetry || deviceStatus !== 'online'}
+                  title={deviceStatus !== 'online' ? 'Device must be online to run a live telemetry probe' : 'Query live CPU, memory, disk, and network counters now'}
+                >
+                  <RotateCw size={13} className={samplingTelemetry ? 'spin' : ''} />{' '}
+                  {samplingTelemetry ? 'Sampling...' : 'Sample Now'}
+                </button>
+              )}
+            </div>
+          </div>
+
+          {telemetryNotice && (
+            <div
+              style={{
+                padding: '0.6rem 0.9rem',
+                borderRadius: '8px',
+                fontSize: '0.78rem',
+                background: telemetryNotice.startsWith('✓') ? 'rgba(16, 185, 129, 0.12)' : 'rgba(245, 158, 11, 0.12)',
+                border: `1px solid ${telemetryNotice.startsWith('✓') ? 'rgba(16, 185, 129, 0.35)' : 'rgba(245, 158, 11, 0.35)'}`,
+                color: telemetryNotice.startsWith('✓') ? '#34d399' : '#fbbf24'
+              }}
+            >
+              {telemetryNotice}
+            </div>
+          )}
+
+          {loadingTelemetry && !telemetryHistory ? (
+            <div className="glass-card" style={{ padding: '2rem', textAlign: 'center', color: 'var(--text-muted)' }}>
+              Loading telemetry history...
+            </div>
+          ) : (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(420px, 1fr))', gap: '1.25rem' }}>
+              <TelemetryChartCard
+                title="CPU Utilization"
+                subtitle={`${device.cpu_model || 'Processor'} (${device.cpu_cores || 0} logical cores)`}
+                unit="%"
+                range={telemetryRange}
+                primaryLabel="CPU %"
+                primaryColor="#38bdf8"
+                maxY={100}
+                points={(telemetryHistory?.points || []).map((p) => ({
+                  timestamp: p.recorded_at,
+                  primary: p.cpu_usage
+                }))}
+                currentText={`${(telemetryHistory?.summary?.cpu?.current ?? liveCpu).toFixed(1)}%`}
+                avgText={`${(telemetryHistory?.summary?.cpu?.avg ?? 0).toFixed(1)}%`}
+                peakText={`${(telemetryHistory?.summary?.cpu?.max ?? 0).toFixed(1)}%`}
+                emptyMessage="No CPU samples recorded yet. Online endpoints sample periodically or via Sample Now."
+              />
+
+              <TelemetryChartCard
+                title="Physical Memory Usage"
+                subtitle={`Installed RAM: ${liveRamTotal > 0 ? `${liveRamTotal.toFixed(1)} GB` : 'Unknown'}`}
+                unit=" GB"
+                range={telemetryRange}
+                primaryLabel="RAM Used"
+                primaryColor="#a78bfa"
+                maxY={Math.max(liveRamTotal || 1, 1)}
+                points={(telemetryHistory?.points || []).map((p) => ({
+                  timestamp: p.recorded_at,
+                  primary: p.ram_used_gb
+                }))}
+                currentText={
+                  liveRam > 0
+                    ? `${liveRam.toFixed(1)} GB${liveRamTotal > 0 ? ` (${Math.round((liveRam / liveRamTotal) * 100)}%)` : ''}`
+                    : 'Not sampled'
+                }
+                avgText={`${(telemetryHistory?.summary?.ramUsedGb?.avg ?? 0).toFixed(1)} GB`}
+                peakText={`${(telemetryHistory?.summary?.ramUsedGb?.max ?? 0).toFixed(1)} GB`}
+                formatValue={(v) => `${v.toFixed(1)} GB`}
+                emptyMessage="No memory utilization samples recorded yet."
+              />
+
+              <TelemetryChartCard
+                title="Storage Utilization"
+                subtitle={`${liveDiskFree.toFixed(0)} GB free of ${liveDiskTotal.toFixed(0)} GB total`}
+                unit="%"
+                range={telemetryRange}
+                primaryLabel="Disk Used %"
+                primaryColor="#f59e0b"
+                maxY={100}
+                points={(telemetryHistory?.points || []).map((p) => ({
+                  timestamp: p.recorded_at,
+                  primary:
+                    p.disk_used_pct > 0
+                      ? p.disk_used_pct
+                      : p.disk_total_gb > 0
+                      ? Number((((p.disk_total_gb - p.disk_free_gb) / p.disk_total_gb) * 100).toFixed(1))
+                      : 0
+                }))}
+                currentText={`${(telemetryHistory?.summary?.diskUsedPct?.current ?? (liveDiskTotal > 0 ? ((liveDiskTotal - liveDiskFree) / liveDiskTotal) * 100 : 0)).toFixed(1)}%`}
+                avgText={`${(telemetryHistory?.summary?.diskUsedPct?.avg ?? 0).toFixed(1)}%`}
+                peakText={`${(telemetryHistory?.summary?.diskUsedPct?.max ?? 0).toFixed(1)}%`}
+                emptyMessage="No disk utilization history recorded yet."
+              />
+
+              <TelemetryChartCard
+                title="Network Throughput"
+                subtitle={`Primary NIC: ${device.ip_address || 'Unknown IP'} • MAC: ${device.mac_address || 'Unknown'}`}
+                unit=" Mbps"
+                range={telemetryRange}
+                primaryLabel="Download (Rx)"
+                primaryColor="#10b981"
+                secondaryLabel="Upload (Tx)"
+                secondaryColor="#60a5fa"
+                points={(telemetryHistory?.points || []).map((p) => ({
+                  timestamp: p.recorded_at,
+                  primary: p.net_rx_mbps,
+                  secondary: p.net_tx_mbps
+                }))}
+                currentText={`${(liveNetRxMbps + liveNetTxMbps).toFixed(2)} Mbps (${liveNetRxMbps.toFixed(2)}↓ / ${liveNetTxMbps.toFixed(2)}↑)`}
+                avgText={`${(telemetryHistory?.summary?.netMbps?.avg ?? 0).toFixed(2)} Mbps`}
+                peakText={`${(telemetryHistory?.summary?.netMbps?.max ?? 0).toFixed(2)} Mbps`}
+                formatValue={(v) => `${v.toFixed(2)} Mbps`}
+                emptyMessage="No network throughput samples recorded yet."
+              />
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* HARDWARE SPECIFICATIONS TAB */}
+      {activeTab === 'hardware' && (() => {
+        const hwSys = hardwareDetails?.system;
+        const hwCpu = hardwareDetails?.cpu;
+        const hwMem = hardwareDetails?.memory;
+        const hwStor = hardwareDetails?.storage;
+        const hwGpus = hardwareDetails?.gpus || [];
+        const hwNet = hardwareDetails?.network;
+        const hwOs = hardwareDetails?.os;
+        const ramUsedVal = hwMem?.usedGb && hwMem.usedGb > 0 ? hwMem.usedGb : liveRam;
+        const ramTotalVal = hwMem?.totalGb && hwMem.totalGb > 0 ? hwMem.totalGb : liveRamTotal;
+        const ramPctVal = ramTotalVal > 0 && ramUsedVal > 0 ? Math.min(100, Math.round((ramUsedVal / ramTotalVal) * 100)) : 0;
+
+        return (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+            <div className="glass-card" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.85rem' }}>
+              <div>
+                <h3 style={{ fontSize: '1.1rem', fontWeight: 600, margin: 0 }}>Detailed Endpoint Hardware Inventory</h3>
+                <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                  {hardwareDetails?.lastHardwareScanAt
+                    ? `Last deep hardware scan: ${new Date(hardwareDetails.lastHardwareScanAt).toLocaleString()}`
+                    : 'Run a Deep Hardware Scan on an online endpoint to collect DIMMs, physical disks, motherboard, BIOS, and GPUs.'}
+                </span>
+              </div>
+              {canMutate && (
+                <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                  <button
+                    type="button"
+                    className="btn-glass"
+                    style={{ fontSize: '0.78rem' }}
+                    onClick={handleSyncHardware}
+                    disabled={syncingHardware}
+                  >
+                    <RotateCw size={13} className={syncingHardware ? 'spin' : ''} />{' '}
+                    {syncingHardware ? 'Syncing...' : 'Sync Inventory'}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-glass btn-primary"
+                    style={{ fontSize: '0.78rem' }}
+                    onClick={() => handleSampleTelemetry(true)}
+                    disabled={deepScanningHardware || deviceStatus !== 'online'}
+                    title={deviceStatus !== 'online' ? 'Device must be online to run a deep OS hardware scan' : 'Collect full SMBIOS, DIMM, storage, GPU, and NIC specifications'}
+                  >
+                    <Server size={13} /> {deepScanningHardware ? 'Scanning Hardware...' : 'Deep Hardware Scan'}
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {telemetryNotice && (
+              <div
+                style={{
+                  padding: '0.6rem 0.9rem',
+                  borderRadius: '8px',
+                  fontSize: '0.78rem',
+                  background: telemetryNotice.startsWith('✓') ? 'rgba(16, 185, 129, 0.12)' : 'rgba(245, 158, 11, 0.12)',
+                  border: `1px solid ${telemetryNotice.startsWith('✓') ? 'rgba(16, 185, 129, 0.35)' : 'rgba(245, 158, 11, 0.35)'}`,
+                  color: telemetryNotice.startsWith('✓') ? '#34d399' : '#fbbf24'
+                }}
+              >
+                {telemetryNotice}
+              </div>
+            )}
+
+            {loadingHardware && !hardwareDetails ? (
+              <div className="glass-card" style={{ padding: '2rem', textAlign: 'center', color: 'var(--text-muted)' }}>
+                Loading hardware specifications...
+              </div>
+            ) : (
+              <>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(360px, 1fr))', gap: '1.25rem' }}>
+                  {/* System, Motherboard, BIOS & TPM */}
+                  <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                      <Laptop size={18} color="var(--primary)" />
+                      <h4 style={{ margin: 0, fontSize: '1rem', fontWeight: 600 }}>System, Motherboard, BIOS &amp; TPM</h4>
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.65rem', fontSize: '0.8rem' }}>
+                      <div><span style={{ color: 'var(--text-dim)', fontSize: '0.72rem' }}>MANUFACTURER</span><div style={{ fontWeight: 600 }}>{hwSys?.manufacturer || device.manufacturer || 'Unknown'}</div></div>
+                      <div><span style={{ color: 'var(--text-dim)', fontSize: '0.72rem' }}>MODEL</span><div style={{ fontWeight: 600 }}>{hwSys?.model || device.model || 'Unknown'}</div></div>
+                      <div><span style={{ color: 'var(--text-dim)', fontSize: '0.72rem' }}>SERIAL / SERVICE TAG</span><div style={{ fontFamily: 'var(--font-mono)' }}>{hwSys?.serialNumber || device.serial_number || 'Pending'}</div></div>
+                      <div style={{ gridColumn: '1 / -1' }}><span style={{ color: 'var(--text-dim)', fontSize: '0.72rem' }}>SYSTEM UUID</span><div style={{ fontFamily: 'var(--font-mono)', fontSize: '0.76rem' }}>{hwSys?.uuid || '—'}</div></div>
+                      <div><span style={{ color: 'var(--text-dim)', fontSize: '0.72rem' }}>MOTHERBOARD</span><div>{hwSys?.motherboardVendor || hwSys?.motherboardName ? `${hwSys?.motherboardVendor || ''} ${hwSys?.motherboardName || ''}`.trim() : '—'}</div></div>
+                      <div><span style={{ color: 'var(--text-dim)', fontSize: '0.72rem' }}>BOARD SERIAL</span><div style={{ fontFamily: 'var(--font-mono)', fontSize: '0.74rem' }}>{hwSys?.motherboardSerial || '—'}</div></div>
+                      <div><span style={{ color: 'var(--text-dim)', fontSize: '0.72rem' }}>BIOS / UEFI</span><div>{hwSys?.biosVersion ? `${hwSys?.biosVendor ? `${hwSys.biosVendor} • ` : ''}${hwSys.biosVersion}` : device.bios_version || '—'}</div></div>
+                      <div><span style={{ color: 'var(--text-dim)', fontSize: '0.72rem' }}>BIOS DATE / TPM</span><div>{[hwSys?.biosDate, hwSys?.tpmVersion || device.tpm_version].filter(Boolean).join(' • ') || '—'}</div></div>
+                      <div><span style={{ color: 'var(--text-dim)', fontSize: '0.72rem' }}>FORM FACTOR / CHASSIS</span><div>{[hwSys?.chassisLabel || (hwSys?.chassisType ? `Chassis #${hwSys.chassisType}` : ''), hwSys?.hasBattery === true ? 'Battery Present' : hwSys?.hasBattery === false ? 'AC / No Battery' : ''].filter(Boolean).join(' • ') || '—'}</div></div>
+                      <div><span style={{ color: 'var(--text-dim)', fontSize: '0.72rem' }}>VIRTUALIZATION / ROLE</span><div>{hwSys?.isVirtualMachine ? `Virtual Machine${hwSys?.hypervisorVendor ? ` (${hwSys.hypervisorVendor})` : ''}` : hwSys?.isHypervisorHost ? 'Hypervisor Host' : currentRole}</div></div>
+                    </div>
+                  </div>
+
+                  {/* Processor & OS */}
+                  <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                      <Cpu size={18} color="#38bdf8" />
+                      <h4 style={{ margin: 0, fontSize: '1rem', fontWeight: 600 }}>Processor &amp; Operating System</h4>
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.65rem', fontSize: '0.8rem' }}>
+                      <div style={{ gridColumn: '1 / -1' }}><span style={{ color: 'var(--text-dim)', fontSize: '0.72rem' }}>PROCESSOR MODEL</span><div style={{ fontWeight: 600 }}>{hwCpu?.model || device.cpu_model || 'Unknown'}</div></div>
+                      <div><span style={{ color: 'var(--text-dim)', fontSize: '0.72rem' }}>CORES / THREADS</span><div>{hwCpu?.physicalCores != null ? `${hwCpu.physicalCores} Physical / ` : ''}{hwCpu?.logicalCores || device.cpu_cores || 0} Logical</div></div>
+                      <div><span style={{ color: 'var(--text-dim)', fontSize: '0.72rem' }}>MAX CLOCK SPEED</span><div>{hwCpu?.maxClockMhz ? `${(hwCpu.maxClockMhz / 1000).toFixed(2)} GHz (${hwCpu.maxClockMhz} MHz)` : '—'}</div></div>
+                      <div><span style={{ color: 'var(--text-dim)', fontSize: '0.72rem' }}>OPERATING SYSTEM</span><div>{hwOs?.osVersion || device.os_version}</div></div>
+                      <div><span style={{ color: 'var(--text-dim)', fontSize: '0.72rem' }}>OS BUILD / PLATFORM</span><div>{hwOs?.osBuild || device.os_build || '—'} ({(hwOs?.osType || device.os_type).toUpperCase()})</div></div>
+                      <div><span style={{ color: 'var(--text-dim)', fontSize: '0.72rem' }}>SYSTEM UPTIME</span><div>{formatUptime(hwOs?.uptimeSeconds ?? device.uptime_seconds)}</div></div>
+                      <div><span style={{ color: 'var(--text-dim)', fontSize: '0.72rem' }}>LOGGED-IN USER</span><div>{hwOs?.loggedInUser || device.logged_in_user || 'None'}</div></div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Memory & DIMM Modules */}
+                <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                      <Activity size={18} color="#a78bfa" />
+                      <h4 style={{ margin: 0, fontSize: '1rem', fontWeight: 600 }}>Physical Memory &amp; DIMM Slots</h4>
+                    </div>
+                    <span style={{ fontSize: '0.8rem', fontWeight: 600 }}>
+                      {ramUsedVal > 0 ? `${ramUsedVal.toFixed(1)} GB used of ${ramTotalVal.toFixed(1)} GB (${ramPctVal}%)` : ramTotalVal > 0 ? `${ramTotalVal.toFixed(1)} GB Total Installed` : 'RAM size pending'}
+                    </span>
+                  </div>
+                  {ramTotalVal > 0 && (
+                    <div style={{ width: '100%', height: '8px', background: 'rgba(148, 163, 184, 0.16)', borderRadius: '999px', overflow: 'hidden' }}>
+                      <div style={{ width: `${ramPctVal}%`, height: '100%', background: ramPctVal > 85 ? '#ef4444' : '#a78bfa' }} />
+                    </div>
+                  )}
+                  {(hwMem?.modules || []).length > 0 ? (
+                    <div style={{ overflowX: 'auto' }}>
+                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.78rem' }}>
+                        <thead>
+                          <tr style={{ textAlign: 'left', color: 'var(--text-dim)', borderBottom: '1px solid var(--glass-border)' }}>
+                            <th style={{ padding: '0.4rem 0.5rem' }}>Slot</th>
+                            <th style={{ padding: '0.4rem 0.5rem' }}>Capacity</th>
+                            <th style={{ padding: '0.4rem 0.5rem' }}>Speed</th>
+                            <th style={{ padding: '0.4rem 0.5rem' }}>Manufacturer</th>
+                            <th style={{ padding: '0.4rem 0.5rem' }}>Part Number</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {(hwMem?.modules || []).map((m, idx) => (
+                            <tr key={`${m.slot || 'dimm'}-${idx}`} style={{ borderBottom: '1px solid rgba(148, 163, 184, 0.08)' }}>
+                              <td style={{ padding: '0.45rem 0.5rem', fontFamily: 'var(--font-mono)' }}>{m.slot || `DIMM ${idx + 1}`}</td>
+                              <td style={{ padding: '0.45rem 0.5rem', fontWeight: 600 }}>{m.capacityGb != null ? `${m.capacityGb} GB` : '—'}</td>
+                              <td style={{ padding: '0.45rem 0.5rem' }}>{m.speedMhz ? `${m.speedMhz} MT/s` : '—'}</td>
+                              <td style={{ padding: '0.45rem 0.5rem' }}>{m.manufacturer || '—'}</td>
+                              <td style={{ padding: '0.45rem 0.5rem', fontFamily: 'var(--font-mono)' }}>{m.partNumber || '—'}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: '0.78rem', color: 'var(--text-dim)' }}>
+                      Per-slot DIMM metadata has not been collected yet. Click <strong>Deep Hardware Scan</strong> above while the endpoint is online.
+                    </div>
+                  )}
+                </div>
+
+                {/* Storage Drives & Volumes */}
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(360px, 1fr))', gap: '1.25rem' }}>
+                  <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                      <HardDrive size={18} color="#f59e0b" />
+                      <h4 style={{ margin: 0, fontSize: '1rem', fontWeight: 600 }}>Physical Disks &amp; Volumes</h4>
+                    </div>
+                    {(hwStor?.physicalDisks || []).length > 0 ? (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem' }}>
+                        {(hwStor?.physicalDisks || []).map((disk, idx) => (
+                          <div key={`${disk.name || disk.model || 'disk'}-${idx}`} style={{ padding: '0.55rem 0.7rem', borderRadius: '6px', background: 'rgba(148, 163, 184, 0.06)', border: '1px solid var(--glass-border)', fontSize: '0.78rem' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 600 }}>
+                              <span>{disk.model || disk.name || `Disk ${idx}`}</span>
+                              <span>{disk.sizeGb != null ? `${disk.sizeGb} GB` : ''}</span>
+                            </div>
+                            <div style={{ fontSize: '0.72rem', color: 'var(--text-dim)', marginTop: '0.15rem' }}>
+                              {[disk.interfaceType, disk.mediaType, disk.status ? `Health: ${disk.status}` : null].filter(Boolean).join(' • ') || `SMART: ${hwStor?.smartStatus || device.smart_status}`}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: '0.78rem', color: 'var(--text-dim)' }}>
+                        Primary capacity: {liveDiskFree.toFixed(0)} GB free of {liveDiskTotal.toFixed(0)} GB (SMART: {hwStor?.smartStatus || device.smart_status} • {hwStor?.encryptionStatus || device.bitlocker_status || 'Unknown'}).
+                      </div>
+                    )}
+
+                    {(hwStor?.volumes || []).length > 0 && (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', marginTop: '0.25rem' }}>
+                        {(hwStor?.volumes || []).map((vol, idx) => {
+                          const total = vol.totalGb || 0;
+                          const free = vol.freeGb || 0;
+                          const pct = vol.usedPct != null ? vol.usedPct : total > 0 ? Math.round(((total - free) / total) * 100) : 0;
+                          return (
+                            <div key={`${vol.mount || 'vol'}-${idx}`} style={{ fontSize: '0.76rem' }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.2rem' }}>
+                                <span>
+                                  <strong>{vol.mount || '/'}</strong> {vol.label ? `(${vol.label})` : ''} {vol.filesystem ? `• ${vol.filesystem}` : ''}
+                                </span>
+                                <span>{free.toFixed(1)} GB free / {total.toFixed(1)} GB ({pct}% used)</span>
+                              </div>
+                              <div style={{ width: '100%', height: '6px', background: 'rgba(148, 163, 184, 0.16)', borderRadius: '999px', overflow: 'hidden' }}>
+                                <div style={{ width: `${Math.min(100, Math.max(0, pct))}%`, height: '100%', background: pct > 88 ? '#ef4444' : '#f59e0b' }} />
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* GPUs & Network Adapters */}
+                  <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                      <Network size={18} color="#10b981" />
+                      <h4 style={{ margin: 0, fontSize: '1rem', fontWeight: 600 }}>Graphics &amp; Network Interfaces</h4>
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem' }}>
+                      {hwGpus.length > 0 ? (
+                        hwGpus.map((g, idx) => (
+                          <div key={`${g.name || 'gpu'}-${idx}`} style={{ padding: '0.45rem 0.65rem', borderRadius: '6px', background: 'rgba(148, 163, 184, 0.06)', border: '1px solid var(--glass-border)', fontSize: '0.78rem' }}>
+                            <strong>GPU: {g.name || 'Display Adapter'}</strong>
+                            {(g.vramMb || g.driverVersion) && (
+                              <div style={{ fontSize: '0.71rem', color: 'var(--text-dim)' }}>
+                                {[g.vramMb ? `${Math.round(g.vramMb / 1024 * 10) / 10} GB VRAM` : null, g.driverVersion ? `Driver ${g.driverVersion}` : null].filter(Boolean).join(' • ')}
+                              </div>
+                            )}
+                          </div>
+                        ))
+                      ) : (
+                        <div style={{ fontSize: '0.76rem', color: 'var(--text-dim)' }}>GPU details pending deep hardware scan.</div>
+                      )}
+                    </div>
+
+                    {(hwNet?.adapters || []).length > 0 ? (
+                      <div style={{ overflowX: 'auto' }}>
+                        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.75rem' }}>
+                          <thead>
+                            <tr style={{ textAlign: 'left', color: 'var(--text-dim)', borderBottom: '1px solid var(--glass-border)' }}>
+                              <th style={{ padding: '0.35rem 0.45rem' }}>Interface</th>
+                              <th style={{ padding: '0.35rem 0.45rem' }}>IPv4</th>
+                              <th style={{ padding: '0.35rem 0.45rem' }}>MAC</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {(hwNet?.adapters || []).map((nic, idx) => (
+                              <tr key={`${nic.name || nic.mac || 'nic'}-${idx}`} style={{ borderBottom: '1px solid rgba(148, 163, 184, 0.08)' }}>
+                                <td style={{ padding: '0.4rem 0.45rem', fontWeight: 500 }}>{nic.name || `eth${idx}`}</td>
+                                <td style={{ padding: '0.4rem 0.45rem', fontFamily: 'var(--font-mono)' }}>{nic.ipv4 || nic.ipv6 || '—'}</td>
+                                <td style={{ padding: '0.4rem 0.45rem', fontFamily: 'var(--font-mono)' }}>{nic.mac || '—'}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: '0.78rem', color: 'var(--text-dim)' }}>
+                        Primary IP: <code>{hwNet?.primaryIp || device.ip_address || 'Unknown'}</code> • MAC: <code>{hwNet?.primaryMac || device.mac_address || 'Unknown'}</code>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        );
+      })()}
+
       {/* TAB 1: OVERVIEW */}
       {activeTab === 'overview' && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '1.75rem' }}>
@@ -1190,7 +2112,9 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                 <span className="metric-title">PROCESSOR LOAD</span>
                 <div className="metric-icon-wrap"><Cpu size={18} /></div>
               </div>
-              <div className="metric-value">{liveCpu.toFixed(1)}%</div>
+              <div className="metric-value">
+                {deviceStatus === 'offline' && liveCpu <= 0 ? 'Offline' : `${liveCpu.toFixed(1)}%`}
+              </div>
               <div className="metric-subtext">{device.cpu_model} ({device.cpu_cores} Cores • {liveNetMbps} Mbps)</div>
             </div>
 
@@ -1199,8 +2123,22 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                 <span className="metric-title">PHYSICAL RAM</span>
                 <div className="metric-icon-wrap"><Activity size={18} /></div>
               </div>
-              <div className="metric-value">{liveRam.toFixed(1)} GB</div>
-              <div className="metric-subtext">of {device.ram_total_gb.toFixed(1)} GB Total Installed</div>
+              <div className="metric-value" style={liveRam <= 0 ? { fontSize: '1.35rem', color: 'var(--text-muted)' } : undefined}>
+                {liveRam > 0
+                  ? `${liveRam.toFixed(1)} GB`
+                  : deviceStatus === 'online'
+                  ? samplingTelemetry
+                    ? 'Sampling…'
+                    : 'Pending'
+                  : 'Offline'}
+              </div>
+              <div className="metric-subtext">
+                {liveRamTotal > 0
+                  ? liveRam > 0
+                    ? `${Math.round((liveRam / liveRamTotal) * 100)}% of ${liveRamTotal.toFixed(1)} GB Total Installed`
+                    : `of ${liveRamTotal.toFixed(1)} GB Total Installed`
+                  : 'Awaiting hardware inventory'}
+              </div>
             </div>
 
             <div className="glass-card">
@@ -1208,21 +2146,110 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                 <span className="metric-title">SYSTEM STORAGE</span>
                 <div className="metric-icon-wrap"><HardDrive size={18} /></div>
               </div>
-              <div className="metric-value">{device.disk_free_gb.toFixed(0)} GB</div>
-              <div className="metric-subtext">Free of {device.disk_total_gb.toFixed(0)} GB ({device.smart_status} SMART • Encrypted)</div>
+              <div className="metric-value">{liveDiskFree.toFixed(0)} GB</div>
+              <div className="metric-subtext">Free of {liveDiskTotal.toFixed(0)} GB ({device.smart_status} SMART • {device.bitlocker_status || 'Unknown'})</div>
             </div>
 
             <div className="glass-card">
               <div className="metric-header">
-                <span className="metric-title">OUT-OF-BAND (AMT)</span>
+                <span className="metric-title">POWER &amp; REACHABILITY</span>
                 <div className="metric-icon-wrap" style={{ background: 'rgba(16, 185, 129, 0.1)', color: '#10b981' }}>
                   <Power size={18} />
                 </div>
               </div>
               <div className="metric-value" style={{ fontSize: '1.4rem', color: '#34d399' }}>
-                {device.intel_amt_enabled ? (device.intel_amt_reachable ? 'vPro Online (OOB)' : 'Intel vPro Ready') : 'WoL Subnet Active'}
+                {isIntelAmtEligible(device) && device.intel_amt_enabled
+                  ? device.intel_amt_reachable
+                    ? 'vPro Online (OOB)'
+                    : 'Intel vPro Ready'
+                  : 'WoL Subnet Active'}
               </div>
-              <div className="metric-subtext">Hardware-level remote power cycling &amp; KVM</div>
+              <div className="metric-subtext">
+                {isIntelAmtEligible(device) && device.intel_amt_enabled
+                  ? 'Hardware-level remote power cycling & KVM'
+                  : 'Wake-on-LAN & relay wake support'}
+              </div>
+            </div>
+          </div>
+
+          {/* Telemetry & Hardware Quick Preview */}
+          <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.65rem' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                <BarChart3 size={18} color="var(--primary)" />
+                <div>
+                  <h3 style={{ fontSize: '1rem', fontWeight: 600, margin: 0 }}>Recent Resource Utilization ({telemetryRange.toUpperCase()})</h3>
+                  <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                    Network: {liveNetRxMbps.toFixed(2)} Mbps ↓ / {liveNetTxMbps.toFixed(2)} Mbps ↑ • Uptime: {formatUptime(hardwareDetails?.os?.uptimeSeconds ?? device.uptime_seconds)}
+                  </span>
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap', alignItems: 'center' }}>
+                {(['1h', '6h', '24h', '7d', '30d'] as const).map((r) => (
+                  <button
+                    key={r}
+                    type="button"
+                    className={`btn-glass ${telemetryRange === r ? 'btn-primary' : ''}`}
+                    style={{ fontSize: '0.7rem', padding: '0.22rem 0.5rem' }}
+                    onClick={() => setTelemetryRange(r)}
+                  >
+                    {r.toUpperCase()}
+                  </button>
+                ))}
+                {canMutate && deviceStatus === 'online' && (
+                  <button
+                    type="button"
+                    className="btn-glass"
+                    style={{ fontSize: '0.75rem' }}
+                    onClick={() => handleSampleTelemetry(false)}
+                    disabled={samplingTelemetry}
+                  >
+                    <RotateCw size={13} className={samplingTelemetry ? 'spin' : ''} />{' '}
+                    {samplingTelemetry ? 'Sampling...' : 'Sample Now'}
+                  </button>
+                )}
+                <button type="button" className="btn-glass" style={{ fontSize: '0.75rem' }} onClick={() => setActiveTab('performance')}>
+                  <BarChart3 size={13} /> All Usage Graphs
+                </button>
+                <button type="button" className="btn-glass" style={{ fontSize: '0.75rem' }} onClick={() => setActiveTab('hardware')}>
+                  <Server size={13} /> Full Hardware Specs
+                </button>
+              </div>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(340px, 1fr))', gap: '1rem' }}>
+              <TelemetryChartCard
+                title="CPU Load"
+                unit="%"
+                range={telemetryRange}
+                primaryLabel="CPU %"
+                primaryColor="#38bdf8"
+                maxY={100}
+                height={150}
+                points={(telemetryHistory?.points || []).map((p) => ({
+                  timestamp: p.recorded_at,
+                  primary: p.cpu_usage
+                }))}
+                currentText={`${liveCpu.toFixed(1)}%`}
+                peakText={`${(telemetryHistory?.summary?.cpu?.max ?? 0).toFixed(1)}%`}
+                emptyMessage="No telemetry samples recorded yet."
+              />
+              <TelemetryChartCard
+                title="Memory Usage"
+                unit=" GB"
+                range={telemetryRange}
+                primaryLabel="RAM Used"
+                primaryColor="#a78bfa"
+                maxY={Math.max(liveRamTotal || 1, 1)}
+                height={150}
+                points={(telemetryHistory?.points || []).map((p) => ({
+                  timestamp: p.recorded_at,
+                  primary: p.ram_used_gb
+                }))}
+                currentText={liveRam > 0 ? `${liveRam.toFixed(1)} / ${liveRamTotal.toFixed(1)} GB` : 'Pending sample'}
+                peakText={`${(telemetryHistory?.summary?.ramUsedGb?.max ?? 0).toFixed(1)} GB`}
+                formatValue={(v) => `${v.toFixed(1)} GB`}
+                emptyMessage="No memory samples recorded yet."
+              />
             </div>
           </div>
 
@@ -1279,7 +2306,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                     </div>
                     <div>
                       <span style={{ color: 'var(--text-dim)', fontSize: '0.75rem' }}>ENROLLED INTO VITRINE</span>
-                      <div style={{ fontWeight: 600, color: 'var(--accent-primary, #00f2fe)' }}>
+                      <div style={{ fontWeight: 600, color: 'var(--primary)' }}>
                         {device.enrolled_at ? new Date(device.enrolled_at).toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'Initial Discovery'}
                       </div>
                     </div>
@@ -1297,7 +2324,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
                     <div>
                       <span style={{ color: 'var(--text-dim)', fontSize: '0.75rem' }}>ENROLLED INTO VITRINE</span>
-                      <div style={{ fontWeight: 600, color: 'var(--accent-primary, #00f2fe)' }}>
+                      <div style={{ fontWeight: 600, color: 'var(--primary)' }}>
                         {device.enrolled_at ? new Date(device.enrolled_at).toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'Initial Discovery'}
                       </div>
                     </div>
@@ -1365,7 +2392,9 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
               <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', fontSize: '0.85rem' }}>
                 <div>
                   <span style={{ color: 'var(--text-dim)', fontSize: '0.75rem' }}>ENCRYPTION STATUS</span>
-                  <div style={{ fontWeight: 600, color: '#34d399' }}>{device.bitlocker_status || 'XTS-AES 128-bit Fully Encrypted'}</div>
+                  <div style={{ fontWeight: 600, color: device.bitlocker_status?.includes('Encrypted') ? '#34d399' : '#f59e0b' }}>
+                    {device.bitlocker_status || 'Not Reported'}
+                  </div>
                 </div>
 
                 <div>
@@ -1411,12 +2440,17 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                       ? (revealedBitlockerKey || 'No BitLocker recovery key escrowed')
                       : (device.has_bitlocker_key ? '••••••••-••••-••••-••••-••••••••••••' : 'Not Escrowed')}
                   </div>
+                  {bitlockerError && (
+                    <div style={{ marginTop: '0.4rem', fontSize: '0.76rem', color: '#f87171' }}>
+                      {bitlockerError}
+                    </div>
+                  )}
                 </div>
 
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
                   <div>
                     <span style={{ color: 'var(--text-dim)', fontSize: '0.75rem' }}>TPM HARDWARE CHIP</span>
-                    <div style={{ fontWeight: 600 }}>{device.tpm_version || 'TPM 2.0 (TCG Certified)'}</div>
+                    <div style={{ fontWeight: 600 }}>{device.tpm_version || 'Not Reported'}</div>
                   </div>
                   <div>
                     <span style={{ color: 'var(--text-dim)', fontSize: '0.75rem' }}>BIOS FIRMWARE</span>
@@ -1454,7 +2488,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                   </div>
                 </div>
 
-                {/* NinjaOne Parity: Managed Antivirus / Defender & Encryption Live Remediation Controls */}
+                {/* Managed Antivirus / Defender & Encryption Live Remediation Controls */}
                 {canMutate && (
                   <div style={{ display: 'flex', gap: '0.45rem', flexWrap: 'wrap', paddingTop: '0.4rem', borderTop: '1px solid var(--glass-border)' }}>
                     <button
@@ -1725,7 +2759,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                       key={playingRecId}
                       controls
                       autoPlay
-                      src={getRecordingDownloadUrl(playingRecId)}
+                      src={getRecordingDownloadUrl(playingRecId, 'inline')}
                       style={{ width: '100%', maxHeight: '260px', display: 'block' }}
                     />
                   </div>
@@ -1745,9 +2779,9 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
                 <Cpu size={20} color="var(--primary)" />
                 <div>
-                  <h3 style={{ fontSize: '1.15rem', fontWeight: 600, margin: 0 }}>Hardware Audit Trail &amp; Vendor Delta Tracking</h3>
+                  <h3 style={{ fontSize: '1.15rem', fontWeight: 600, margin: 0 }}>Hardware Change History</h3>
                   <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-                    Accurate hardware component recognition decoded via PCI/SMBIOS Vendor IDs (Micron, Samsung, NVIDIA, Intel)
+                    Hardware component tracking &amp; delta events detected across agent inventory scans
                   </span>
                 </div>
               </div>
@@ -1796,7 +2830,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                       <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
                         {new Date(item.timestamp).toLocaleString()}
                       </span>
-                      {Boolean(item.acknowledged) ? (
+                      {item.acknowledged ? (
                         <span className="status-pill status-online" style={{ fontSize: '0.68rem' }}>
                           ✓ Acknowledged{item.acknowledged_by ? ` (${item.acknowledged_by})` : ''}
                         </span>
@@ -1874,9 +2908,9 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                           )}
                         </div>
                         <div style={{ display: 'flex', gap: '1rem', fontSize: '0.75rem', color: 'var(--text-dim)', flexWrap: 'wrap' }}>
-                          <span>Gateway IP: <code>{net.gateway_ip || '10.0.1.1'}</code></span>
-                          <span>Gateway MAC: <code>{net.gateway_mac || '00:1A:2B:3C:4D:5E'}</code></span>
-                          <span>Subnet: <code>{net.subnet || '10.0.1.0/24'}</code></span>
+                          <span>Gateway IP: <code>{net.gateway_ip || 'N/A'}</code></span>
+                          <span>Gateway MAC: <code>{net.gateway_mac || 'N/A'}</code></span>
+                          <span>Subnet: <code>{net.subnet || 'N/A'}</code></span>
                         </div>
                       </div>
                       <div style={{ textAlign: 'right', fontSize: '0.75rem', color: 'var(--text-dim)' }}>
@@ -1902,8 +2936,8 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                   </span>
                 </div>
               </div>
-              <span className="status-pill status-reboot" style={{ fontSize: '0.72rem' }}>
-                OEM Updates Synchronized
+              <span className={`status-pill ${warranty?.manufacturer ? 'status-online' : 'status-offline'}`} style={{ fontSize: '0.72rem' }}>
+                {warranty?.manufacturer ? `${warranty.manufacturer} Detected` : 'On-Demand Catalog'}
               </span>
             </div>
 
@@ -2049,7 +3083,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
             <div>
               <h3 style={{ fontSize: '1.15rem', fontWeight: 600 }}>Custom Attributes &amp; Inventory Parameters</h3>
               <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                Ninja-style device custom fields. Values are injected into scripts and automation runbooks as <code>$vitrine.CustomField</code>.
+                Custom endpoint attributes. Values are passed to scripts and automations via <code>VITRINE_PARAM_*</code> environment variables.
               </span>
             </div>
             {canMutate && (
@@ -2068,7 +3102,7 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem' }}>
             {customFields.map((f) => {
               const currentVal = fieldValues[f.id] ?? '';
-              const options = f.options ? JSON.parse(f.options) : [];
+              const options = parseFieldOptions(f.options);
 
               return (
                 <div key={f.id} className="form-group">

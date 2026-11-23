@@ -64,13 +64,17 @@ export const VirtualizationView: React.FC<VirtualizationViewProps> = ({ currentU
   }, [loadHosts]);
 
   const handleVmPower = async (hostId: string, vmid: number | string, action: 'start' | 'stop' | 'reboot' | 'snapshot') => {
-    const res = await manageVmPower(hostId, Number(vmid), action);
-    if (res.success) {
-      setActionMsg(`Dispatched ${action.toUpperCase()} command to VM #${vmid} on ${hostId}.`);
-      loadHosts();
-      setTimeout(() => setActionMsg(null), 4000);
-    } else {
-      setActionMsg(`Hypervisor error: ${(res as any).error || 'Command rejected'}`);
+    try {
+      const res = await manageVmPower(hostId, vmid, action);
+      if (res.success) {
+        setActionMsg(`Dispatched ${action.toUpperCase()} command to VM #${vmid} on ${hostId}.`);
+        loadHosts();
+        setTimeout(() => setActionMsg(null), 4000);
+      } else {
+        setActionMsg(`Hypervisor error: ${(res as any).error || 'Command rejected'}`);
+      }
+    } catch (err: any) {
+      setActionMsg(`Hypervisor error: ${err?.message || 'Command failed'}`);
     }
   };
 
@@ -110,8 +114,17 @@ export const VirtualizationView: React.FC<VirtualizationViewProps> = ({ currentU
 
   const handleDeleteHost = async (id: string, name: string) => {
     if (!confirm(`Remove hypervisor host "${name}" from Vitrine monitoring?`)) return;
-    await deleteVirtualizationHost(id);
-    loadHosts();
+    try {
+      const res: any = await deleteVirtualizationHost(id);
+      if (res?.success === false) {
+        setActionMsg(`Hypervisor error: ${res.error || 'Unable to remove host'}`);
+        return;
+      }
+      setActionMsg(`Removed hypervisor host "${name}".`);
+      loadHosts();
+    } catch (err: any) {
+      setActionMsg(`Hypervisor error: ${err?.message || 'Unable to remove host'}`);
+    }
   };
 
   return (

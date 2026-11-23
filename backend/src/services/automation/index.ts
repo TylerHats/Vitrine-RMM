@@ -2,6 +2,43 @@ import crypto from 'crypto';
 import { db } from '../../db/index.js';
 import { meshBridge } from '../meshcentral/index.js';
 import { decryptVaultSecret } from '../vault/index.js';
+import { codeSigningService } from '../signing/index.js';
+
+const ALLOWED_SMART_GROUP_COLUMNS = new Set([
+  'id',
+  'tenant_id',
+  'site_id',
+  'hostname',
+  'os_type',
+  'os_version',
+  'os_build',
+  'ip_address',
+  'mac_address',
+  'status',
+  'manufacturer',
+  'model',
+  'cpu_model',
+  'cpu_cores',
+  'ram_total_gb',
+  'ram_used_gb',
+  'disk_total_gb',
+  'disk_free_gb',
+  'serial_number',
+  'bios_version',
+  'tpm_version',
+  'edr_name',
+  'edr_status',
+  'bitlocker_status',
+  'bitlocker_encrypted',
+  'pending_reboot',
+  'logged_in_user',
+  'device_role',
+  'patch_ring',
+  'quarantined',
+  'wol_supported',
+  'amt_supported',
+  'companion_installed'
+]);
 
 export interface SmartGroupRule {
   field: string;
@@ -39,6 +76,7 @@ export function evaluateDeviceAgainstRule(device: any, rule: SmartGroupRule): bo
       return op === 'not_contains' || op === 'neq' ? !found : Boolean(found);
     }
     default:
+      if (!ALLOWED_SMART_GROUP_COLUMNS.has(field)) return false;
       actual = device[field];
       break;
   }
@@ -339,12 +377,43 @@ export async function executeScheduledAutomationNow(
   let succeededCount = 0;
   let failedCount = 0;
 
+  const scriptLang = script.language === 'powershell' ? 'powershell' : script.language === 'python' ? 'python' : 'bash';
+
   for (const dev of targetDevices) {
     const startMs = Date.now();
     const execId = `exec-${crypto.randomUUID()}`;
-    const res = await meshBridge.executeCommandOnNode(dev.id, script.code, {
+    const isWin = String(dev.os_type || '').toLowerCase() === 'windows';
+    let codeToRun = String(script.code || '');
+
+    if (scriptLang === 'powershell' && isWin) {
+      const wrapped = await codeSigningService.wrapPowerShellExecutionIfSigningEnabled(codeToRun);
+      if (wrapped.error && !wrapped.command) {
+        failedCount++;
+        db.prepare(`
+          INSERT INTO script_executions (
+            id, script_id, script_name, device_id, hostname, triggered_by, run_as, params_json, status, exit_code, output, stdout, stderr, duration_ms
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Failed', 1, ?, '', ?, ?)
+        `).run(
+          execId,
+          script.id,
+          script.name,
+          dev.id,
+          dev.hostname,
+          actorUsername,
+          auto.run_as || 'system',
+          JSON.stringify(parsedParams),
+          wrapped.error,
+          wrapped.error,
+          Math.max(1, Date.now() - startMs)
+        );
+        continue;
+      }
+      codeToRun = wrapped.command;
+    }
+
+    const res = await meshBridge.executeCommandOnNode(dev.id, codeToRun, {
       runAs: auto.run_as === 'user' ? 'user' : 'system',
-      shell: script.language === 'powershell' ? 'powershell' : script.language === 'python' ? 'python' : 'bash',
+      shell: scriptLang,
       timeoutMs: Math.max(5000, Number(script.timeout_sec || 120) * 1000),
       env: envParams
     });
@@ -369,7 +438,7 @@ export async function executeScheduledAutomationNow(
       auto.run_as || 'system',
       JSON.stringify(parsedParams),
       execStatus,
-      res.live ? res.exitCode : null,
+      res.live ? res.exitCode : -1,
       res.output || '',
       ok ? res.output : '',
       ok ? '' : res.output,

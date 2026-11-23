@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import type { FastifyRequest } from 'fastify';
 import { db } from '../../db/index.js';
 import { decryptVaultSecret, safeOutboundFetch, validateOutboundHostSafety } from '../vault/index.js';
-import { AuthenticatedUser, resolveEffectivePermissions } from './index.js';
+import { AuthenticatedUser, hydrateUserRow } from './index.js';
 
 interface OidcDiscoveryMetadata {
   issuer: string;
@@ -83,11 +83,11 @@ export function resolveRequestOrigin(req: FastifyRequest): string {
   const protoHeader = trustProxy ? String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() : '';
   const proto = protoHeader === 'https' || req.protocol === 'https' ? 'https' : 'http';
   const rawHost = String(
-    (trustProxy ? req.headers['x-forwarded-host'] : '') || req.headers.host || 'localhost:3001'
+    (trustProxy ? req.headers['x-forwarded-host'] : '') || req.headers.host || 'localhost:8080'
   )
     .split(',')[0]
     .trim();
-  const safeHost = /^[a-zA-Z0-9.:[\]-]+$/.test(rawHost) ? rawHost : 'localhost:3001';
+  const safeHost = /^[a-zA-Z0-9.:[\]-]+$/.test(rawHost) ? rawHost : 'localhost:8080';
   return `${proto}://${safeHost}`;
 }
 
@@ -428,6 +428,15 @@ export async function completeOidcCallback(params: {
   }
 
   const meta = await fetchOidcDiscovery(cfg.issuerUrl);
+  const expectedCfgIssuer = cfg.issuerUrl
+    .replace(/\/\.well-known\/openid-configuration\/?$/i, '')
+    .replace(/\/+$/, '');
+  const discoveredMetaIssuer = String(meta.issuer || '').trim().replace(/\/+$/, '');
+  if (!discoveredMetaIssuer || discoveredMetaIssuer !== expectedCfgIssuer) {
+    throw new Error(
+      `OIDC discovery issuer mismatch: expected '${expectedCfgIssuer}', received '${discoveredMetaIssuer}'.`
+    );
+  }
   const safetyOpts = allowLocalOidc();
 
   const form = new URLSearchParams();
@@ -539,15 +548,5 @@ export async function completeOidcCallback(params: {
     `Authenticated via verified OpenID Connect SSO (${issuer}, sub=${subject}) as ${email || existing.email}.`
   );
 
-  return {
-    id: existing.id,
-    username: existing.username,
-    email: existing.email,
-    role: existing.role,
-    tenant_id: existing.tenant_id || null,
-    totp_enabled: Boolean(existing.totp_enabled),
-    totp_confirmed: Boolean(existing.totp_confirmed_at),
-    custom_role_id: existing.custom_role_id || null,
-    permissions: resolveEffectivePermissions(existing.role)
-  };
+  return hydrateUserRow(existing);
 }

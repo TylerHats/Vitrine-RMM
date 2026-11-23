@@ -110,6 +110,7 @@ export const ScriptLibraryView: React.FC<ScriptLibraryViewProps> = ({ devices, c
   const [schedCron, setSchedCron] = useState('0 3 * * *');
   const [schedRunAs, setSchedRunAs] = useState<'system' | 'user'>('system');
   const [schedNotice, setSchedNotice] = useState<string | null>(null);
+  const [schedNoticeIsError, setSchedNoticeIsError] = useState(false);
 
   const parseParamSchema = (s?: ScriptItem | null): ScriptParameterDef[] => {
     if (!s) return [];
@@ -118,7 +119,9 @@ export const ScriptLibraryView: React.FC<ScriptLibraryViewProps> = ({ devices, c
       try {
         const parsed = JSON.parse(s.parameters_schema_json);
         if (Array.isArray(parsed)) return parsed;
-      } catch {}
+      } catch {
+        // Ignore malformed parameter schema JSON
+      }
     }
     return [];
   };
@@ -162,15 +165,22 @@ export const ScriptLibraryView: React.FC<ScriptLibraryViewProps> = ({ devices, c
   }, [loadScripts, loadAutomations]);
 
   useEffect(() => {
-    if (!selectedScript) return;
+    setEditingCode(false);
+    setEditedCodeBuffer(selectedScript?.code || '');
+    if (!selectedScript) {
+      setTypedParamValues({});
+      return;
+    }
     const defs = parseParamSchema(selectedScript);
     const defaults: Record<string, string> = {};
     defs.forEach((d) => {
-      if (d.default !== undefined) defaults[d.name] = String(d.default);
+      const defaultVal = d.default ?? d.defaultValue;
+      if (defaultVal !== undefined) defaults[d.name] = String(defaultVal);
     });
     setTypedParamValues(defaults);
     loadExecutions(selectedScript.id);
-  }, [selectedScript, loadExecutions]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedScript?.id]);
 
   const handleSaveEditedCode = async () => {
     if (!selectedScript || !editedCodeBuffer.trim()) return;
@@ -227,14 +237,22 @@ export const ScriptLibraryView: React.FC<ScriptLibraryViewProps> = ({ devices, c
   const handleToggleEnabled = async (script: ScriptItem, e: React.MouseEvent) => {
     e.stopPropagation();
     const newStatus = (script.enabled ?? 1) !== 0 ? 0 : 1;
+    setNotice(null);
+    setNoticeIsError(false);
     try {
-      await updateScript(script.id, { enabled: newStatus });
+      const res = await updateScript(script.id, { enabled: newStatus });
+      if (!res.success) {
+        setNoticeIsError(true);
+        setNotice(res.error || 'Failed to update script enabled status.');
+        return;
+      }
       setScripts((prev) => prev.map((s) => (s.id === script.id ? { ...s, enabled: newStatus } : s)));
       if (selectedScript?.id === script.id) {
         setSelectedScript((prev) => (prev ? { ...prev, enabled: newStatus } : null));
       }
-    } catch (err) {
-      console.error('Failed to update script enabled status:', err);
+    } catch (err: any) {
+      setNoticeIsError(true);
+      setNotice(err?.message || 'Failed to update script enabled status.');
     }
   };
 
@@ -242,6 +260,8 @@ export const ScriptLibraryView: React.FC<ScriptLibraryViewProps> = ({ devices, c
     e.preventDefault();
     if (!newScriptName.trim() || !newScriptCode.trim()) return;
     setSavingNewScript(true);
+    setNotice(null);
+    setNoticeIsError(false);
     try {
       const cleanParams = newParamDefs.filter((p) => p.name.trim());
       const res = await createScript({
@@ -254,7 +274,7 @@ export const ScriptLibraryView: React.FC<ScriptLibraryViewProps> = ({ devices, c
         enabled: newScriptEnabled ? 1 : 0,
         is_builtin: 0,
         tenant_id: newScriptTenantId || null,
-        parameters_schema_json: cleanParams.length > 0 ? JSON.stringify(cleanParams) : undefined
+        parameters_schema: cleanParams.length > 0 ? cleanParams : undefined
       });
       if (res.success) {
         setShowAddModal(false);
@@ -263,10 +283,16 @@ export const ScriptLibraryView: React.FC<ScriptLibraryViewProps> = ({ devices, c
         setNewScriptCode('');
         setNewScriptTenantId('');
         setNewParamDefs([]);
+        setNoticeIsError(false);
+        setNotice(`Script "${newScriptName.trim()}" added to library.`);
         await loadScripts();
+      } else {
+        setNoticeIsError(true);
+        setNotice(res.error || 'Failed to create script.');
       }
-    } catch (err) {
-      console.error('Failed to create script:', err);
+    } catch (err: any) {
+      setNoticeIsError(true);
+      setNotice(err?.message || 'Failed to create script.');
     } finally {
       setSavingNewScript(false);
     }
@@ -314,36 +340,64 @@ export const ScriptLibraryView: React.FC<ScriptLibraryViewProps> = ({ devices, c
   const handleCreateAutomation = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!schedName.trim() || !schedScriptId || !schedCron.trim()) return;
-    const res = await createAutomation({
-      name: schedName.trim(),
-      script_id: schedScriptId,
-      target_type: schedTargetType,
-      target_id: schedTargetType === 'all' ? null : schedTargetId || null,
-      cron_expr: schedCron.trim(),
-      run_as: schedRunAs,
-      enabled: true
-    });
-    if (res.success) {
-      setShowCreateScheduleModal(false);
-      setSchedName('');
-      loadAutomations();
-      setSchedNotice(`Scheduled automation "${schedName.trim()}" active (${schedCron.trim()}).`);
+    try {
+      const res: any = await createAutomation({
+        name: schedName.trim(),
+        script_id: schedScriptId,
+        target_type: schedTargetType,
+        target_id: schedTargetType === 'all' ? null : schedTargetId || null,
+        cron_expr: schedCron.trim(),
+        run_as: schedRunAs,
+        enabled: true
+      });
+      if (res.success) {
+        setShowCreateScheduleModal(false);
+        setSchedName('');
+        loadAutomations();
+        setSchedNoticeIsError(false);
+        setSchedNotice(`Scheduled automation "${schedName.trim()}" active (${schedCron.trim()}).`);
+      } else {
+        setSchedNoticeIsError(true);
+        setSchedNotice(res.error || 'Failed to create scheduled automation.');
+      }
+    } catch (err: any) {
+      setSchedNoticeIsError(true);
+      setSchedNotice(err?.message || 'Failed to create scheduled automation.');
     }
   };
 
   const handleRunAutomationNow = async (id: string) => {
-    const res = await runAutomationNow(id);
-    setSchedNotice(
-      res.success
-        ? `✓ Dispatched scheduled automation across ${res.targetedDevices ?? 0} endpoint(s).`
-        : `⚠ Automation error: ${res.error || 'Failed'}`
-    );
-    loadAutomations();
+    try {
+      const res = await runAutomationNow(id);
+      setSchedNoticeIsError(!res.success);
+      setSchedNotice(
+        res.success
+          ? `✓ Dispatched scheduled automation across ${res.targetedDevices ?? 0} endpoint(s).`
+          : `⚠ Automation error: ${res.error || 'Failed'}`
+      );
+      loadAutomations();
+    } catch (err: any) {
+      setSchedNoticeIsError(true);
+      setSchedNotice(err?.message || 'Failed to execute scheduled automation.');
+    }
   };
 
   const handleDeleteAutomation = async (id: string) => {
-    await deleteAutomation(id);
-    loadAutomations();
+    if (!confirm('Delete this scheduled automation?')) return;
+    try {
+      const res: any = await deleteAutomation(id);
+      if (res?.success === false) {
+        setSchedNoticeIsError(true);
+        setSchedNotice(res.error || 'Failed to delete scheduled automation.');
+        return;
+      }
+      setSchedNoticeIsError(false);
+      setSchedNotice('Scheduled automation removed.');
+      loadAutomations();
+    } catch (err: any) {
+      setSchedNoticeIsError(true);
+      setSchedNotice(err?.message || 'Failed to delete scheduled automation.');
+    }
   };
 
   const toggleDeviceSelection = (id: string) => {
@@ -439,8 +493,21 @@ export const ScriptLibraryView: React.FC<ScriptLibraryViewProps> = ({ devices, c
       {activeTab === 'schedules' && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
           {schedNotice && (
-            <div className="glass-card" style={{ padding: '0.75rem 1.15rem', fontSize: '0.82rem', color: '#34d399', borderColor: 'rgba(16, 185, 129, 0.35)' }}>
-              {schedNotice}
+            <div
+              className="glass-card"
+              style={{
+                padding: '0.75rem 1.15rem',
+                fontSize: '0.82rem',
+                background: schedNoticeIsError ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+                borderColor: schedNoticeIsError ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)',
+                color: schedNoticeIsError ? '#f87171' : '#34d399',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.55rem'
+              }}
+            >
+              {schedNoticeIsError && <AlertCircle size={15} style={{ flexShrink: 0 }} />}
+              <span>{schedNotice}</span>
             </div>
           )}
           <div className="glass-card" style={{ padding: 0 }}>
@@ -515,7 +582,7 @@ export const ScriptLibraryView: React.FC<ScriptLibraryViewProps> = ({ devices, c
           {/* Filter Toolbar */}
           <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', flexWrap: 'wrap' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-              <Sliders size={14} color="var(--accent-primary, #00f2fe)" />
+              <Sliders size={14} color="var(--primary)" />
               <span style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-dim)' }}>Category:</span>
               <select
                 className="glass-select"
@@ -531,7 +598,7 @@ export const ScriptLibraryView: React.FC<ScriptLibraryViewProps> = ({ devices, c
             </div>
 
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-              <Shield size={14} color="var(--accent-secondary, #7f00ff)" />
+              <Shield size={14} color="var(--secondary)" />
               <span style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-dim)' }}>RBAC Tier:</span>
               <select
                 className="glass-select"
@@ -1045,7 +1112,7 @@ export const ScriptLibraryView: React.FC<ScriptLibraryViewProps> = ({ devices, c
           >
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                <Plus size={18} color="var(--accent-primary, #00f2fe)" />
+                <Plus size={18} color="var(--primary)" />
                 <h3 style={{ fontSize: '1.25rem', fontWeight: 700, margin: 0 }}>Add Automation Script</h3>
               </div>
               <button

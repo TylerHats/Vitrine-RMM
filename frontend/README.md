@@ -1,50 +1,27 @@
-# React + TypeScript + Vite
+# Vitrine RMM Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Single-page web application for **Vitrine RMM**, built with **React 18**, **TypeScript**, and **Vite 5** (Node.js **20+** required).
 
-Currently, two official plugins are available:
+## Development
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react/README.md) uses [Babel](https://babeljs.io/) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type aware lint rules:
-
-- Configure the top-level `parserOptions` property like this:
-
-```js
-export default tseslint.config({
-  languageOptions: {
-    // other options...
-    parserOptions: {
-      project: ['./tsconfig.node.json', './tsconfig.app.json'],
-      tsconfigRootDir: import.meta.dirname,
-    },
-  },
-})
+```bash
+npm ci
+npm run dev
 ```
 
-- Replace `tseslint.configs.recommended` to `tseslint.configs.recommendedTypeChecked` or `tseslint.configs.strictTypeChecked`
-- Optionally add `...tseslint.configs.stylisticTypeChecked`
-- Install [eslint-plugin-react](https://github.com/jsx-eslint/eslint-plugin-react) and update the config:
+*   Runs the Vite dev server on **`http://localhost:5173`**.
+*   `vite.config.ts` proxies `/api`, `/ws` (WebSocket upgrades enabled), and `/branding` to the Fastify backend at `http://localhost:8080`.
 
-```js
-// eslint.config.js
-import react from 'eslint-plugin-react'
+## Scripts
 
-export default tseslint.config({
-  // Set the react version
-  settings: { react: { version: '18.3' } },
-  plugins: {
-    // Add the react plugin
-    react,
-  },
-  rules: {
-    // other rules...
-    // Enable its recommended rules
-    ...react.configs.recommended.rules,
-    ...react.configs['jsx-runtime'].rules,
-  },
-})
-```
+*   `npm run dev` — Start Vite HMR development server (`:5173`).
+*   `npm run build` — Run `tsc -b && vite build` to produce the production bundle in `dist/`.
+*   `npm run lint` — Run ESLint across the TypeScript/React codebase.
+*   `npm run preview` — Preview the production `dist/` build locally.
+
+## Architecture Highlights
+
+*   **Code-Split Views & Modals**: Route-level views and heavy modals (including `DeviceDetailView`, `SessionRecordingsView`, `AuditExplorerView`, `DocumentationView`, `PsaSyncView`, `SettingsView`, `QuickSupportPortalView`, and `GuestPortalView`) are lazy-loaded via `React.lazy` in `src/App.tsx`, with vendor chunks (`react-vendor`, `icons-vendor`) configured in `vite.config.ts` (`~34 kB` gzipped core entry).
+*   **Interactive PTY Shell & Hardware Specs**: `BackgroundToolsModal` embeds `@xterm/xterm` and `@xterm/addon-fit` connected to `/ws/terminal` for live SYSTEM/root and user-context PTY terminals, while `DeviceDetailView` renders live SMBIOS, DIMM, volume, NIC, BitLocker, and `Uninstall` inventory telemetry.
+*   **Square Icon Cropper & Branding (`IconCropModal`)**: Client-side interactive canvas cropper (Fit/Fill square framing, zoom, padding, rounding, backdrop fill, and `16px / 32px / 48px / 64px` live previews) shared by **Policies** (per-tenant/site/role EXE & tray icons) and **Settings** (Global & QuickSupport Portal profiles).
+*   **PWA & Service Worker**: `public/manifest.webmanifest` and `public/sw.js` provide installable PWA metadata with network-first caching for `/manifest.webmanifest` and `/logo.png` and strict cache bypass for `/api/`, `/ws/`, and `/branding/`.

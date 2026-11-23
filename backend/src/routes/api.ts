@@ -24,18 +24,23 @@ import {
 } from '../services/laps/index.js';
 import {
   resolveEffectiveDevicePolicy,
+  resolvePolicyForInstallerScope,
   sanitizeEffectivePolicyForResponse,
   parsePolicyAlertRules,
+  parsePolicyTrayMenuItems,
   evaluateFleetAlertConditions,
   syncTicketWithExternalPsas
 } from '../services/policy/index.js';
 import { installerGenerator, quotePowerShellLiteral } from '../services/agent/installerGenerator.js';
+import { sanitizeAndSquareBrandingPng } from '../services/agent/iconProcessor.js';
 import { codeSigningService } from '../services/signing/index.js';
 import { backupService } from '../services/backup/index.js';
 import { systemUpdaterService } from '../services/updater/index.js';
 import {
   initiateDeviceOffboard,
+  initiateDeviceOffboardAsync,
   offboardClientTenant,
+  offboardClientTenantAsync,
   reactivateArchivedClient,
   handleAgentCheckInOrWake,
   sweepPendingOffboards
@@ -70,13 +75,26 @@ import {
   evaluateSmartGroupDevices,
   buildSafeScriptEnvParams
 } from '../services/automation/index.js';
+import {
+  recordDeviceTelemetrySample,
+  queryDeviceTelemetryHistory,
+  mergeHardwareDetailsJson
+} from '../services/telemetry/index.js';
+import {
+  extractSignalsFromHardwareDetails,
+  getSmbiosChassisLabel,
+  inferDeviceRole,
+  isAutoRolePlaceholder,
+  shouldAutoUpdateDeviceRole
+} from '../utils/deviceRole.js';
 import { registerParityRoutes } from './parityRoutes.js';
 import {
   checkRateLimit,
   isSuperAdminRole,
   isTechnicianOrAbove,
   canUserAccessTenant,
-  getScopedTenantFilter,
+  getAllowedTenantIds,
+  parseCookies,
   hasUserPermission,
   canUserRunScriptRole,
   getActorUsername,
@@ -88,6 +106,9 @@ import {
   clearSessionCookie,
   extractAuthContext,
   authenticateUserPassword,
+  doesUserRequireLoginMfa,
+  issuePendingMfaLoginToken,
+  verifyPendingMfaLoginChallenge,
   verifySessionStepUpMfa,
   getOrEnrollUserMfaDetails,
   issueGuestPortalToken,
@@ -123,6 +144,44 @@ function constantTimeEquals(a: string, b: string): boolean {
   const bufB = Buffer.from(b, 'utf8');
   if (bufA.length !== bufB.length) return false;
   return crypto.timingSafeEqual(bufA, bufB);
+}
+
+function resolveSafeRequestOriginParts(request: FastifyRequest): { proto: string; host: string } {
+  const trustProxy = process.env.VITRINE_TRUST_PROXY === 'true';
+  const fwdProto = trustProxy ? String(request.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase() : '';
+  const proto = fwdProto === 'https' || fwdProto === 'http' ? fwdProto : request.protocol === 'https' ? 'https' : 'http';
+  const rawHost = String((trustProxy ? request.headers['x-forwarded-host'] : '') || request.headers.host || 'localhost:8080')
+    .split(',')[0]
+    .trim();
+  const host = /^[a-zA-Z0-9.:[\]-]+$/.test(rawHost) ? rawHost : 'localhost:8080';
+  return { proto, host };
+}
+
+function resolvePublicBaseUrl(request: FastifyRequest, settings?: { custom_domain?: string | null }): string {
+  const { proto, host } = resolveSafeRequestOriginParts(request);
+  const rawCustom = String(settings?.custom_domain || '').trim().replace(/\/+$/, '');
+  if (!rawCustom) {
+    return `${proto}://${host}`;
+  }
+  const candidate = /^https?:\/\//i.test(rawCustom) ? rawCustom : `${proto}://${rawCustom}`;
+  try {
+    const parsed = new URL(candidate);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      return parsed.origin;
+    }
+  } catch {
+    // Fall back to safe request origin on malformed custom_domain
+  }
+  return `${proto}://${host}`;
+}
+
+function isSameUrlOrigin(candidateUrl: string, storedUrl?: string | null): boolean {
+  if (!storedUrl) return false;
+  try {
+    return new URL(candidateUrl.trim()).origin === new URL(storedUrl.trim()).origin;
+  } catch {
+    return false;
+  }
 }
 
 function sanitizeDeviceRowForResponse(row: any): any {
@@ -282,7 +341,20 @@ async function probeNetworkEndpoint(params: {
 
       if (parsed.protocol === 'https:') {
         const tlsInfo = await new Promise<{ days?: number; authorized: boolean }>((resolve) => {
-          const sock = tls.connect(
+          let settled = false;
+          let sock: tls.TLSSocket | null = null;
+          const finish = (info: { days?: number; authorized: boolean }) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(hardTimer);
+            try {
+              sock?.destroy();
+            } catch {}
+            resolve(info);
+          };
+          const hardTimer = setTimeout(() => finish({ days: undefined, authorized: false }), 4000);
+
+          sock = tls.connect(
             {
               host: pinnedIp,
               port: Number(parsed.port || 443),
@@ -292,29 +364,22 @@ async function probeNetworkEndpoint(params: {
             },
             () => {
               try {
-                const cert = sock.getPeerCertificate();
-                const authorized = Boolean(sock.authorized);
+                const cert = sock?.getPeerCertificate();
+                const authorized = Boolean(sock?.authorized);
                 if (cert?.valid_to) {
                   const days = Math.floor((new Date(cert.valid_to).getTime() - Date.now()) / 86400000);
-                  resolve({ days, authorized });
+                  finish({ days, authorized });
                 } else {
-                  resolve({ days: undefined, authorized });
+                  finish({ days: undefined, authorized });
                 }
               } catch {
-                resolve({ days: undefined, authorized: false });
-              } finally {
-                sock.destroy();
+                finish({ days: undefined, authorized: false });
               }
             }
           );
-          sock.on('error', () => {
-            sock.destroy();
-            resolve({ days: undefined, authorized: false });
-          });
-          sock.on('timeout', () => {
-            sock.destroy();
-            resolve({ days: undefined, authorized: false });
-          });
+          sock.on('error', () => finish({ days: undefined, authorized: false }));
+          sock.on('timeout', () => finish({ days: undefined, authorized: false }));
+          sock.on('close', () => finish({ days: undefined, authorized: false }));
         });
         tlsDaysRemaining = tlsInfo.days;
         tlsAuthorized = tlsInfo.authorized;
@@ -402,7 +467,8 @@ export async function registerApiRoutes(server: FastifyInstance) {
   function getRequiredRoutePermission(
     pathname: string,
     method: string,
-    rawUrl: string
+    rawUrl: string,
+    isApiKey = false
   ): string | null {
     const isSafe = method === 'GET' || method === 'HEAD' || method === 'OPTIONS';
     const hasRevealQuery = /[?&]reveal=true(?:&|$)/i.test(rawUrl);
@@ -425,7 +491,10 @@ export async function registerApiRoutes(server: FastifyInstance) {
     ) {
       return 'remote:elevate';
     }
-    if (/^\/api\/devices\/[^/]+\/(remote-session|mesh-url)$/.test(pathname)) {
+    if (/^\/api\/devices\/[^/]+\/remote-session\/consent-bypass$/.test(pathname)) {
+      return 'remote:unattended';
+    }
+    if (/^\/api\/devices\/[^/]+\/(remote-session|mesh-url|lock-screen)$/.test(pathname)) {
       return 'remote:connect';
     }
     if (/^\/api\/scripts\/[^/]+\/run$/.test(pathname) && !isSafe) {
@@ -484,6 +553,85 @@ export async function registerApiRoutes(server: FastifyInstance) {
     if (pathname.startsWith('/api/devices') && isSafe) {
       return 'devices:read';
     }
+
+    if (!isApiKey) {
+      return null;
+    }
+
+    // Deny-by-default strict route scope mapping for Scoped REST API Keys
+    if (pathname.startsWith('/api/scripts')) return 'scripts:run';
+    if (pathname.startsWith('/api/automations') || pathname.startsWith('/api/self-healing')) {
+      return 'automations:manage';
+    }
+    if (pathname.startsWith('/api/patches/blacklist')) return 'patches:approve';
+    if (pathname.startsWith('/api/patches')) return 'devices:read';
+    if (pathname.startsWith('/api/software-packages') || pathname.startsWith('/api/software-deployments')) {
+      return 'devices:read';
+    }
+    if (pathname === '/api/policies/evaluate-conditions') return 'alerts:triage';
+    if (
+      pathname.startsWith('/api/policies') ||
+      pathname.startsWith('/api/backup-policies') ||
+      pathname.startsWith('/api/mdm-profiles')
+    ) {
+      return 'policies:write';
+    }
+    if (pathname.startsWith('/api/alerts') || pathname.startsWith('/api/notifications')) {
+      return isSafe ? 'alerts:read' : 'alerts:triage';
+    }
+    if (pathname.startsWith('/api/notification-channels')) return 'alerts:triage';
+    if (pathname.startsWith('/api/documentation')) return 'docs:read';
+    if (pathname.startsWith('/api/psa/integrations')) return 'settings:write';
+    if (pathname.startsWith('/api/psa')) return 'psa:manage';
+    if (
+      pathname.startsWith('/api/users') ||
+      pathname.startsWith('/api/roles') ||
+      pathname.startsWith('/api/api-keys') ||
+      pathname.startsWith('/api/auth/sessions')
+    ) {
+      return 'users:manage';
+    }
+    if (pathname.startsWith('/api/backups') || pathname.startsWith('/api/backup-jobs')) {
+      return 'backups:manage';
+    }
+    if (
+      pathname.startsWith('/api/settings') ||
+      pathname === '/api/demo/seed' ||
+      pathname === '/api/smtp/test' ||
+      pathname === '/api/signing/sign' ||
+      pathname === '/api/code-signing/test' ||
+      pathname === '/api/proxy-tls/test' ||
+      pathname === '/api/auth/oidc/test' ||
+      pathname.startsWith('/api/updater') ||
+      pathname.startsWith('/api/system/') ||
+      pathname.startsWith('/api/mesh-servers') ||
+      pathname.startsWith('/api/meshcentral')
+    ) {
+      return 'settings:write';
+    }
+    if (pathname.startsWith('/api/audit')) return 'audit:export';
+    if (pathname.startsWith('/api/recordings')) {
+      return method === 'POST' ? 'remote:connect' : 'audit:export';
+    }
+    if (pathname.startsWith('/api/guest-grants') || pathname.startsWith('/api/quicksupport')) {
+      return 'remote:connect';
+    }
+    if (pathname === '/api/agent/installer' || pathname.startsWith('/api/installers')) {
+      return isSafe ? 'devices:read' : 'devices:manage';
+    }
+    if (
+      pathname.startsWith('/api/tenants') ||
+      pathname.startsWith('/api/sites') ||
+      pathname.startsWith('/api/smart-groups') ||
+      pathname.startsWith('/api/custom-fields') ||
+      pathname.startsWith('/api/maintenance-windows') ||
+      pathname.startsWith('/api/discovery') ||
+      pathname.startsWith('/api/network-appliances') ||
+      pathname.startsWith('/api/virtualization') ||
+      pathname === '/api/reports/qbr'
+    ) {
+      return isSafe ? 'devices:read' : 'devices:manage';
+    }
     return null;
   }
 
@@ -512,6 +660,8 @@ export async function registerApiRoutes(server: FastifyInstance) {
       pathname === '/api/agent/enroll' ||
       pathname === '/api/agent/checkin' ||
       pathname === '/api/agent/chat' ||
+      pathname === '/api/agent/mesh-binary' ||
+      pathname === '/api/agent/binary' ||
       /^\/api\/agent\/tasks\/[^/]+\/result$/.test(pathname) ||
       /^\/api\/software-packages\/[^/]+\/download$/.test(pathname) ||
       pathname === '/api/public/portal-config' ||
@@ -519,6 +669,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
       pathname === '/api/auth/status' ||
       pathname === '/api/auth/setup-initial-admin' ||
       pathname === '/api/auth/login' ||
+      pathname === '/api/auth/login/verify-mfa' ||
       pathname === '/api/auth/logout' ||
       pathname === '/api/auth/oidc/login' ||
       pathname === '/api/auth/oidc/callback' ||
@@ -569,6 +720,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
       pathname === '/api/signing/sign' ||
       pathname === '/api/code-signing/test' ||
       pathname === '/api/proxy-tls/test' ||
+      pathname === '/api/system/cleanup-vitrine-companions' ||
       pathname === '/api/mesh-servers/local-detect' ||
       (pathname.startsWith('/api/mesh-servers') && !isSafeMethod) ||
       (pathname.startsWith('/api/psa/integrations') && !isSafeMethod) ||
@@ -577,7 +729,11 @@ export async function registerApiRoutes(server: FastifyInstance) {
       (pathname === '/api/tenants' && !isSafeMethod) ||
       (pathname === '/api/sites' && !isSafeMethod) ||
       (pathname.startsWith('/api/tenants/') &&
-        (request.method === 'DELETE' || pathname.endsWith('/offboard') || pathname.endsWith('/reactivate'))) ||
+        (request.method === 'PUT' ||
+          request.method === 'DELETE' ||
+          pathname.endsWith('/offboard') ||
+          pathname.endsWith('/reactivate'))) ||
+      (pathname.startsWith('/api/recordings/') && request.method === 'DELETE') ||
       pathname.endsWith('/archive-purge');
 
     if (isSuperAdminOnly && !isSuperAdminRole(userRole)) {
@@ -587,7 +743,13 @@ export async function registerApiRoutes(server: FastifyInstance) {
     }
 
     // Enforce granular RBAC / API key permission scopes across REST routes
-    const requiredPerm = getRequiredRoutePermission(pathname, request.method, rawUrl);
+    const isApiKey = Boolean(request.auth.isApiKey || request.auth.user.is_api_key);
+    const requiredPerm = getRequiredRoutePermission(pathname, request.method, rawUrl, isApiKey);
+    if (isApiKey && !requiredPerm) {
+      return reply.status(403).send({
+        error: 'API key endpoint not permitted by scoped route policy'
+      });
+    }
     if (requiredPerm && !hasUserPermission(request.auth.user, requiredPerm)) {
       return reply.status(403).send({
         error: `Forbidden: missing required permission '${requiredPerm}'.`,
@@ -673,14 +835,24 @@ export async function registerApiRoutes(server: FastifyInstance) {
       deviceId?: string;
       hostname?: string;
       cpu?: number | string;
+      cpuUsage?: number | string;
       ramUsedGb?: number | string;
+      ramTotalGb?: number | string;
       diskFreeGb?: number | string;
+      diskTotalGb?: number | string;
+      netRxMbps?: number | string;
+      netTxMbps?: number | string;
     };
     const providedToken = String(request.headers['x-vitrine-agent-token'] || '').trim();
-    const isTechSession = Boolean(request.auth && isTechnicianOrAbove(request.auth.user.role));
+    const isTechSession = Boolean(
+      request.auth &&
+        isTechnicianOrAbove(request.auth.user.role) &&
+        hasUserPermission(request.auth.user, 'devices:manage')
+    );
 
     let targetDevice: any = null;
     let tokenMatched = false;
+    let usedSessionFallback = false;
 
     if (body.deviceId) {
       const candidate = db.prepare('SELECT * FROM devices WHERE id = ?').get(body.deviceId) as any;
@@ -689,9 +861,10 @@ export async function registerApiRoutes(server: FastifyInstance) {
         if (providedToken && deviceToken && constantTimeEquals(providedToken, deviceToken)) {
           targetDevice = candidate;
           tokenMatched = true;
-        } else if (isTechSession && canUserAccessTenant(request.auth?.user, candidate.tenant_id)) {
+        } else if (!providedToken && isTechSession && canUserAccessTenant(request.auth?.user, candidate.tenant_id)) {
           targetDevice = candidate;
           tokenMatched = true;
+          usedSessionFallback = true;
         }
       }
     } else if (body.hostname && providedToken) {
@@ -706,8 +879,19 @@ export async function registerApiRoutes(server: FastifyInstance) {
           break;
         }
       }
-    } else if (isTechSession && !body.deviceId && !body.hostname) {
+    } else if (!providedToken && isTechSession && !body.deviceId && !body.hostname) {
       tokenMatched = true;
+      usedSessionFallback = true;
+    }
+
+    if (usedSessionFallback && request.auth?.authSource === 'cookie') {
+      const csrfHeader = String(request.headers['x-vitrine-csrf'] || '').trim();
+      if (csrfHeader !== '1') {
+        return reply.status(403).send({
+          error: 'CSRF verification failed: missing X-Vitrine-CSRF header.',
+          code: 'CSRF_REQUIRED'
+        });
+      }
     }
 
     if (!tokenMatched) {
@@ -715,22 +899,24 @@ export async function registerApiRoutes(server: FastifyInstance) {
     }
 
     if (targetDevice) {
-      const cpuVal = body.cpu != null ? Number(body.cpu) : null;
+      const cpuRaw = body.cpuUsage ?? body.cpu;
+      const cpuVal = cpuRaw != null ? Number(cpuRaw) : null;
       const ramVal = body.ramUsedGb != null ? Number(body.ramUsedGb) : null;
+      const ramTotVal = body.ramTotalGb != null ? Number(body.ramTotalGb) : null;
       const diskVal = body.diskFreeGb != null ? Number(body.diskFreeGb) : null;
+      const diskTotVal = body.diskTotalGb != null ? Number(body.diskTotalGb) : null;
+      const netRxVal = body.netRxMbps != null ? Number(body.netRxMbps) : null;
+      const netTxVal = body.netTxMbps != null ? Number(body.netTxMbps) : null;
 
-      db.prepare(`
-        UPDATE devices
-        SET cpu_usage = COALESCE(?, cpu_usage),
-            ram_used_gb = COALESCE(?, ram_used_gb),
-            disk_free_gb = COALESCE(?, disk_free_gb)
-        WHERE id = ?
-      `).run(
-        Number.isFinite(cpuVal) ? cpuVal : null,
-        Number.isFinite(ramVal) ? ramVal : null,
-        Number.isFinite(diskVal) ? diskVal : null,
-        targetDevice.id
-      );
+      recordDeviceTelemetrySample(targetDevice.id, {
+        cpuUsage: Number.isFinite(cpuVal) ? cpuVal : null,
+        ramUsedGb: Number.isFinite(ramVal) ? ramVal : null,
+        ramTotalGb: Number.isFinite(ramTotVal) ? ramTotVal : null,
+        diskFreeGb: Number.isFinite(diskVal) ? diskVal : null,
+        diskTotalGb: Number.isFinite(diskTotVal) ? diskTotVal : null,
+        netRxMbps: Number.isFinite(netRxVal) ? netRxVal : null,
+        netTxMbps: Number.isFinite(netTxVal) ? netTxVal : null
+      });
 
       const lifecycleResult = handleAgentCheckInOrWake(targetDevice.id, 'wake_checkin');
       return { status: 'ack', lifecycle: lifecycleResult, timestamp: new Date().toISOString() };
@@ -748,10 +934,12 @@ export async function registerApiRoutes(server: FastifyInstance) {
     const body = (request.body || {}) as {
       token?: string;
       enrollmentToken?: string;
+      deviceId?: string;
       hostname?: string;
       osType?: 'windows' | 'linux' | 'macos' | 'darwin' | string;
       osVersion?: string;
       osBuild?: string;
+      deviceRole?: string;
       ipAddress?: string;
       macAddress?: string;
       cpuModel?: string;
@@ -762,7 +950,9 @@ export async function registerApiRoutes(server: FastifyInstance) {
       serialNumber?: string;
       manufacturer?: string;
       model?: string;
+      biosVersion?: string;
       meshNodeId?: string;
+      hardwareDetails?: Record<string, any>;
     };
 
     const token = String(body.token || body.enrollmentToken || '').trim();
@@ -786,7 +976,73 @@ export async function registerApiRoutes(server: FastifyInstance) {
     const enrollTx = db.transaction((): { status: number; payload: Record<string, any> } => {
       const tokenRow = db.prepare('SELECT * FROM installer_audit_log WHERE token_id = ?').get(token) as any;
       if (!tokenRow) {
-        return { status: 401, payload: { error: 'Invalid deployment token' } };
+        const qsRow = db
+          .prepare('SELECT * FROM quicksupport_sessions WHERE session_code = ? OR id = ?')
+          .get(token, token) as any;
+        if (!qsRow) {
+          return { status: 401, payload: { error: 'Invalid deployment token' } };
+        }
+        if (qsRow.expires_at && new Date(qsRow.expires_at).getTime() <= Date.now()) {
+          return { status: 401, payload: { error: 'QuickSupport session has expired.' } };
+        }
+
+        const qsRawOs = String(body.osType || qsRow.platform || 'windows').trim().toLowerCase();
+        const qsNormalizedOs: 'windows' | 'linux' | 'macos' =
+          qsRawOs === 'darwin' || qsRawOs === 'macos' ? 'macos' : qsRawOs === 'linux' ? 'linux' : 'windows';
+        const fallbackTenantId =
+          qsRow.tenant_id ||
+          (db.prepare('SELECT id FROM tenants ORDER BY created_at ASC LIMIT 1').get() as { id?: string } | undefined)?.id ||
+          't-default';
+        const qsAgentToken = crypto.randomBytes(32).toString('hex');
+        const qsEncToken = encryptVaultSecret(qsAgentToken);
+        const qsDeviceId = `dev-qs-${crypto.randomUUID().slice(0, 8)}`;
+        const qsHwJson = mergeHardwareDetailsJson('{}', body.hardwareDetails || null);
+
+        db.prepare(`
+          INSERT INTO devices (
+            id, mesh_node_id, tenant_id, site_id, hostname, os_type, os_version, os_build,
+            ip_address, mac_address, status, device_role, device_role_manual, manufacturer, model, cpu_model, cpu_cores,
+            ram_total_gb, disk_total_gb, disk_free_gb, serial_number, hardware_details_json, companion_installed, agent_auth_token
+          ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 'online', 'QuickSupport', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        `).run(
+          qsDeviceId,
+          body.meshNodeId || `node//${qsDeviceId}`,
+          fallbackTenantId,
+          hostname,
+          qsNormalizedOs,
+          body.osVersion || 'Unknown OS',
+          body.osBuild || '',
+          safeIpAddress || '0.0.0.0',
+          body.macAddress || '00:00:00:00:00:00',
+          body.manufacturer || '',
+          body.model || '',
+          body.cpuModel || 'Unknown CPU',
+          Number(body.cpuCores || 4),
+          Number(body.ramTotalGb || 8),
+          Number(body.diskTotalGb || 256),
+          Number(body.diskFreeGb || 128),
+          body.serialNumber || '',
+          qsHwJson,
+          qsEncToken
+        );
+
+        db.prepare(`
+          UPDATE quicksupport_sessions
+          SET status = 'connected',
+              hostname = COALESCE(?, hostname),
+              username = COALESCE(?, username)
+          WHERE id = ?
+        `).run(hostname, null, qsRow.id);
+
+        return {
+          status: 200,
+          payload: {
+            success: true,
+            mode: 'quicksupport',
+            deviceId: qsDeviceId,
+            agentToken: qsAgentToken
+          }
+        };
       }
       if (tokenRow.expires_at && new Date(tokenRow.expires_at).getTime() <= Date.now()) {
         return { status: 401, payload: { error: 'Deployment token has expired' } };
@@ -833,32 +1089,137 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
       const rawAgentToken = crypto.randomBytes(32).toString('hex');
       const encryptedAgentToken = encryptVaultSecret(rawAgentToken);
-      const existing = db
-        .prepare('SELECT id FROM devices WHERE tenant_id = ? AND LOWER(hostname) = LOWER(?) LIMIT 1')
-        .get(tokenRow.tenant_id, hostname) as { id: string } | undefined;
 
-      const deviceId = existing?.id || `dev-${crypto.randomUUID().slice(0, 8)}`;
+      if (body.deviceId) {
+        const byIdAnyTenant = db
+          .prepare('SELECT id, tenant_id FROM devices WHERE id = ? LIMIT 1')
+          .get(String(body.deviceId)) as { id: string; tenant_id: string } | undefined;
+        if (byIdAnyTenant && byIdAnyTenant.tenant_id !== tokenRow.tenant_id) {
+          return {
+            status: 403,
+            payload: { error: 'Forbidden: deviceId belongs to a different client tenant.' }
+          };
+        }
+      }
+      if (body.meshNodeId) {
+        const byNodeAnyTenant = db
+          .prepare('SELECT id, tenant_id FROM devices WHERE mesh_node_id = ? LIMIT 1')
+          .get(String(body.meshNodeId)) as { id: string; tenant_id: string } | undefined;
+        if (byNodeAnyTenant && byNodeAnyTenant.tenant_id !== tokenRow.tenant_id) {
+          return {
+            status: 403,
+            payload: { error: 'Forbidden: meshNodeId belongs to a different client tenant.' }
+          };
+        }
+      }
+
+      const existing = ((body.deviceId
+        ? db
+            .prepare('SELECT id, device_role, device_role_manual, hardware_details_json, manufacturer, model, bios_version FROM devices WHERE id = ? AND tenant_id = ? LIMIT 1')
+            .get(String(body.deviceId), tokenRow.tenant_id)
+        : null) ||
+        (body.meshNodeId
+          ? db
+              .prepare('SELECT id, device_role, device_role_manual, hardware_details_json, manufacturer, model, bios_version FROM devices WHERE mesh_node_id = ? AND tenant_id = ? LIMIT 1')
+              .get(String(body.meshNodeId), tokenRow.tenant_id)
+          : null) ||
+        db
+          .prepare('SELECT id, device_role, device_role_manual, hardware_details_json, manufacturer, model, bios_version FROM devices WHERE tenant_id = ? AND LOWER(hostname) = LOWER(?) LIMIT 1')
+          .get(tokenRow.tenant_id, hostname)) as any;
+
+      // Atomically verify & increment token use_count inside the immediate DB transaction
+      const claimTokenRes = db
+        .prepare(
+          `UPDATE installer_audit_log
+           SET redeemed_at = CURRENT_TIMESTAMP,
+               use_count = COALESCE(use_count, 0) + 1
+           WHERE token_id = ? AND (COALESCE(max_uses, 1) = 0 OR COALESCE(use_count, 0) < COALESCE(max_uses, 1))`
+        )
+        .run(token);
+      if (claimTokenRes.changes === 0) {
+        return {
+          status: 401,
+          payload: { error: 'Deployment token has already reached its maximum enrollment limit.' }
+        };
+      }
+
+      const deviceId = (existing as { id: string } | undefined)?.id || `dev-${crypto.randomUUID().slice(0, 8)}`;
+
+      const tokenRoleRaw = String(tokenRow.device_role || '').trim();
+      const tokenRoleLower = tokenRoleRaw.toLowerCase();
+      const isExplicitManualTokenRole = Boolean(
+        tokenRoleRaw && tokenRoleLower !== 'auto' && tokenRoleLower !== 'auto-detect' && tokenRoleLower !== 'workstation'
+      );
+
+      const mergedEnrollHwJson = mergeHardwareDetailsJson(existing?.hardware_details_json, body.hardwareDetails || null);
+      const roleSignals = extractSignalsFromHardwareDetails(mergedEnrollHwJson, {
+        os_type: normalizedOs,
+        os_version: body.osVersion || null,
+        manufacturer: body.manufacturer || existing?.manufacturer || null,
+        model: body.model || existing?.model || null,
+        bios_version: body.biosVersion || existing?.bios_version || null
+      });
+      const inferredEnrollRole =
+        inferDeviceRole(roleSignals) ||
+        (body.deviceRole && !isAutoRolePlaceholder(body.deviceRole) ? String(body.deviceRole).trim() : '') ||
+        'Workstation';
 
       if (existing) {
+        const nextRole = isExplicitManualTokenRole
+          ? tokenRoleRaw
+          : shouldAutoUpdateDeviceRole(existing.device_role, existing.device_role_manual, inferredEnrollRole)
+            ? inferredEnrollRole
+            : existing.device_role;
+        const nextRoleManual = isExplicitManualTokenRole ? 1 : Number(existing.device_role_manual || 0);
+
         db.prepare(`
           UPDATE devices
           SET status = CASE WHEN quarantined = 1 THEN 'isolated' ELSE 'online' END,
               os_type = ?,
               ip_address = COALESCE(?, ip_address),
               os_version = COALESCE(?, os_version),
+              manufacturer = COALESCE(NULLIF(?, ''), manufacturer),
+              model = COALESCE(NULLIF(?, ''), model),
+              bios_version = COALESCE(NULLIF(?, ''), bios_version),
+              cpu_model = COALESCE(NULLIF(?, ''), cpu_model),
+              cpu_cores = COALESCE(?, cpu_cores),
+              serial_number = COALESCE(NULLIF(?, ''), serial_number),
+              device_role = ?,
+              device_role_manual = ?,
+              hardware_details_json = ?,
               companion_installed = 1,
+              companion_deploy_pending = 0,
               agent_auth_token = ?,
               last_seen = CURRENT_TIMESTAMP
-          WHERE id = ?
-        `).run(normalizedOs, safeIpAddress, body.osVersion || null, encryptedAgentToken, deviceId);
+          WHERE id = ? AND tenant_id = ?
+        `).run(
+          normalizedOs,
+          safeIpAddress,
+          body.osVersion || null,
+          body.manufacturer || '',
+          body.model || '',
+          body.biosVersion || '',
+          body.cpuModel || '',
+          body.cpuCores != null && Number.isFinite(Number(body.cpuCores)) ? Number(body.cpuCores) : null,
+          body.serialNumber || '',
+          nextRole,
+          nextRoleManual,
+          mergedEnrollHwJson,
+          encryptedAgentToken,
+          deviceId,
+          tokenRow.tenant_id
+        );
         handleAgentCheckInOrWake(deviceId, 'reinstall_agent');
       } else {
+        const initialRole = isExplicitManualTokenRole ? tokenRoleRaw : inferredEnrollRole;
+        const initialManual = isExplicitManualTokenRole ? 1 : 0;
+
         db.prepare(`
           INSERT INTO devices (
             id, mesh_node_id, tenant_id, site_id, hostname, os_type, os_version, os_build,
-            ip_address, mac_address, status, device_role, manufacturer, model, cpu_model, cpu_cores,
-            ram_total_gb, disk_total_gb, disk_free_gb, serial_number, companion_installed, agent_auth_token
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'online', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            ip_address, mac_address, status, device_role, device_role_manual, manufacturer, model, bios_version, cpu_model, cpu_cores,
+            ram_total_gb, disk_total_gb, disk_free_gb, serial_number, hardware_details_json, companion_installed, agent_auth_token
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'online', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         `).run(
           deviceId,
           body.meshNodeId || `node//${deviceId}`,
@@ -870,22 +1231,23 @@ export async function registerApiRoutes(server: FastifyInstance) {
           body.osBuild || '',
           safeIpAddress || '0.0.0.0',
           body.macAddress || '00:00:00:00:00:00',
-          tokenRow.device_role || 'Workstation',
+          initialRole,
+          initialManual,
           body.manufacturer || '',
           body.model || '',
+          body.biosVersion || '',
           body.cpuModel || 'Unknown CPU',
           Number(body.cpuCores || 4),
           Number(body.ramTotalGb || 8),
           Number(body.diskTotalGb || 256),
           Number(body.diskFreeGb || 128),
           body.serialNumber || '',
+          mergedEnrollHwJson,
           encryptedAgentToken
         );
       }
 
-      db.prepare(
-        'UPDATE installer_audit_log SET redeemed_at = CURRENT_TIMESTAMP, redeemed_device_id = ?, use_count = COALESCE(use_count, 0) + 1 WHERE token_id = ?'
-      ).run(deviceId, token);
+      db.prepare('UPDATE installer_audit_log SET redeemed_device_id = ? WHERE token_id = ?').run(deviceId, token);
 
       return {
         status: 200,
@@ -906,6 +1268,17 @@ export async function registerApiRoutes(server: FastifyInstance) {
   // ============================================================================
   server.get('/api/public/portal-config', async () => {
     const row = (db.prepare('SELECT * FROM settings WHERE id = 1').get() || {}) as any;
+    const qsPolicy = (db
+      .prepare(
+        "SELECT tray_brand_name, tray_icon_url, tray_theme_mode, tray_tooltip FROM policies WHERE id = 'pol-quicksupport' OR tier = 'quicksupport' LIMIT 1"
+      )
+      .get() || {}) as any;
+    const qsBrandName = String(qsPolicy.tray_brand_name || '').trim() || row.brand_name || 'Vitrine RMM';
+    const qsIconUrl = String(qsPolicy.tray_icon_url || '').trim() || row.brand_logo_url || '/branding/logo.png';
+    const qsThemeMode =
+      qsPolicy.tray_theme_mode === 'light' || qsPolicy.tray_theme_mode === 'dark' || qsPolicy.tray_theme_mode === 'system'
+        ? qsPolicy.tray_theme_mode
+        : row.theme_mode || 'system';
     return {
       brand_name: row.brand_name || 'Vitrine RMM',
       brand_logo_url: row.brand_logo_url || '/branding/logo.png',
@@ -915,6 +1288,9 @@ export async function registerApiRoutes(server: FastifyInstance) {
       quicksupport_enabled: Boolean(row.quicksupport_enabled ?? 1),
       quicksupport_url_path: row.quicksupport_url_path || '/remote',
       quicksupport_custom_domain: row.quicksupport_custom_domain || '',
+      quicksupport_brand_name: qsBrandName,
+      quicksupport_icon_url: qsIconUrl,
+      quicksupport_theme_mode: qsThemeMode,
       code_signing_enabled: Boolean(row.code_signing_enabled)
     };
   });
@@ -955,6 +1331,20 @@ export async function registerApiRoutes(server: FastifyInstance) {
     }
     try {
       const redirectUrl = await createOidcAuthorizationRedirect(request);
+      const stateParam = new URL(redirectUrl).searchParams.get('state') || '';
+      const isSecure =
+        request.protocol === 'https' ||
+        (process.env.VITRINE_TRUST_PROXY === 'true' && request.headers['x-forwarded-proto'] === 'https') ||
+        process.env.FORCE_SECURE_COOKIE === 'true';
+      const cookieParts = [
+        `vitrine_oidc_state=${encodeURIComponent(stateParam)}`,
+        'Path=/api/auth/oidc',
+        'HttpOnly',
+        'SameSite=Lax',
+        'Max-Age=600'
+      ];
+      if (isSecure) cookieParts.push('Secure');
+      reply.header('Set-Cookie', cookieParts.join('; '));
       return reply.redirect(redirectUrl);
     } catch (err: any) {
       return reply.redirect(
@@ -964,6 +1354,9 @@ export async function registerApiRoutes(server: FastifyInstance) {
   });
 
   server.get('/api/auth/oidc/callback', async (request, reply) => {
+    const clearOidcStateCookie = 'vitrine_oidc_state=; Path=/api/auth/oidc; HttpOnly; SameSite=Lax; Max-Age=0';
+    reply.header('Set-Cookie', clearOidcStateCookie);
+
     const query = (request.query || {}) as {
       code?: string;
       state?: string;
@@ -977,6 +1370,13 @@ export async function registerApiRoutes(server: FastifyInstance) {
     }
     if (!query.code || !query.state) {
       return reply.redirect(`/?sso_error=${encodeURIComponent('Missing authorization code or state parameter.')}`);
+    }
+    const cookies = parseCookies(request.headers.cookie);
+    const cookieState = cookies.vitrine_oidc_state || '';
+    if (!cookieState || !constantTimeEquals(cookieState, query.state)) {
+      return reply.redirect(
+        `/?sso_error=${encodeURIComponent('OIDC state validation failed (missing or mismatched state cookie). Please try again.')}`
+      );
     }
     try {
       const user = await completeOidcCallback({ code: query.code, state: query.state });
@@ -1032,12 +1432,17 @@ export async function registerApiRoutes(server: FastifyInstance) {
   server.post('/api/auth/login', async (request, reply) => {
     const body = (request.body || {}) as { username?: string; password?: string };
     const identifier = String(body.username || '').trim();
-    const rate = checkRateLimit(`login:${request.ip}:${identifier.toLowerCase()}`, 10, 5 * 60_000);
-    if (!rate.allowed) {
+    const rateIp = checkRateLimit(`login-ip:${request.ip}`, 25, 5 * 60_000);
+    const rateUser = identifier
+      ? checkRateLimit(`login-user:${identifier.toLowerCase()}`, 10, 5 * 60_000)
+      : { allowed: true, retryAfterSec: 0 };
+    const ratePair = checkRateLimit(`login:${request.ip}:${identifier.toLowerCase()}`, 10, 5 * 60_000);
+    if (!rateIp.allowed || !rateUser.allowed || !ratePair.allowed) {
+      const retryAfterSec = Math.max(rateIp.retryAfterSec, rateUser.retryAfterSec, ratePair.retryAfterSec);
       return reply.status(429).send({
         success: false,
-        error: `Too many failed sign-in attempts. Retry in ${rate.retryAfterSec}s.`,
-        retryAfterSec: rate.retryAfterSec
+        error: `Too many failed sign-in attempts. Retry in ${retryAfterSec}s.`,
+        retryAfterSec
       });
     }
 
@@ -1052,6 +1457,18 @@ export async function registerApiRoutes(server: FastifyInstance) {
         `Failed login attempt from IP ${request.ip}`
       );
       return reply.status(401).send({ success: false, error: 'Invalid username/email or password.' });
+    }
+
+    const mfaState = doesUserRequireLoginMfa(user.id);
+    if (mfaState.requiresMfaChallenge) {
+      const mfaChallengeToken = issuePendingMfaLoginToken(user.id);
+      return {
+        success: true,
+        mfaRequired: true,
+        mfaChallengeToken,
+        username: user.username,
+        message: 'Enter your 6-digit authenticator code or a single-use recovery code.'
+      };
     }
 
     const session = createUserSession(user.id, request.ip, request.headers['user-agent']);
@@ -1071,6 +1488,67 @@ export async function registerApiRoutes(server: FastifyInstance) {
       user,
       token: session.rawToken,
       expiresAt: session.expiresAt
+    };
+  });
+
+  server.post('/api/auth/login/verify-mfa', async (request, reply) => {
+    const rate = checkRateLimit(`login-mfa:${request.ip}`, 15, 5 * 60_000);
+    if (!rate.allowed) {
+      return reply.status(429).send({
+        success: false,
+        error: `Too many MFA attempts. Retry in ${rate.retryAfterSec}s.`,
+        retryAfterSec: rate.retryAfterSec
+      });
+    }
+
+    const body = (request.body || {}) as { mfaChallengeToken?: string; code?: string };
+    const challengeToken = String(body.mfaChallengeToken || '').trim();
+    const code = String(body.code || '').trim();
+    if (!challengeToken || !code) {
+      return reply.status(400).send({
+        success: false,
+        error: 'MFA challenge token and verification code are required.'
+      });
+    }
+
+    const verified = verifyPendingMfaLoginChallenge(challengeToken, code);
+    if (!verified.success || !verified.user) {
+      db.prepare(`
+        INSERT INTO audit_logs (id, username, action, details)
+        VALUES (?, 'unknown', 'Login MFA Verification Failed', ?)
+      `).run(
+        `aud-login-mfa-fail-${crypto.randomUUID()}`,
+        `Rejected login MFA verification from IP ${request.ip}: ${verified.error || 'Invalid code'}`
+      );
+      return reply.status(401).send({
+        success: false,
+        error: verified.error || 'Invalid authenticator or recovery code.'
+      });
+    }
+
+    const session = createUserSession(
+      verified.user.id,
+      request.ip,
+      request.headers['user-agent'],
+      { mfaVerified: true }
+    );
+    setSessionCookie(reply, request, session.rawToken);
+
+    db.prepare(`
+      INSERT INTO audit_logs (id, username, action, details)
+      VALUES (?, ?, 'User Signed In (MFA Verified)', ?)
+    `).run(
+      `aud-login-mfa-${crypto.randomUUID()}`,
+      verified.user.username,
+      `MFA-verified session started (${verified.user.role}${verified.usedRecoveryCode ? ', via recovery code' : ''}) from IP ${request.ip}`
+    );
+
+    return {
+      success: true,
+      user: verified.user,
+      token: session.rawToken,
+      expiresAt: session.expiresAt,
+      usedRecoveryCode: Boolean(verified.usedRecoveryCode)
     };
   });
 
@@ -1187,10 +1665,23 @@ export async function registerApiRoutes(server: FastifyInstance) {
       });
     }
 
-    const body = (request.body || {}) as { code?: string; secretType?: string; deviceId?: string };
-    const verification = verifySessionStepUpMfa(request.auth, body.code || '');
+    const body = (request.body || {}) as {
+      code?: string;
+      secretType?: string;
+      deviceId?: string;
+      totpOnly?: boolean;
+    };
+    const totpOnly =
+      Boolean(body.totpOnly) ||
+      body.secretType === 'initial_admin_mfa_enrollment' ||
+      body.secretType === 'mfa_enrollment_confirm';
+    const verification = verifySessionStepUpMfa(request.auth, body.code || '', { totpOnly });
 
     if (verification.success) {
+      const auditDetail =
+        body.secretType === 'initial_admin_mfa_enrollment'
+          ? 'Initial Super Admin TOTP authenticator enrollment verified via RFC 6238 TOTP'
+          : `Step-Up MFA verified${verification.usedRecoveryCode ? ' via single-use recovery code' : ' via RFC 6238 TOTP'} for ${body.secretType || 'vault access'}`;
       db.prepare(`
         INSERT INTO audit_logs (id, username, device_id, action, details)
         VALUES (?, ?, ?, 'MFA Step-Up Verified', ?)
@@ -1198,13 +1689,14 @@ export async function registerApiRoutes(server: FastifyInstance) {
         `aud-mfa-${crypto.randomUUID()}`,
         request.auth.user.username,
         body.deviceId || null,
-        `Step-Up MFA verified${verification.usedRecoveryCode ? ' via single-use recovery code' : ' via RFC 6238 TOTP'} for ${body.secretType || 'vault access'}`
+        auditDetail
       );
       return {
         success: true,
         verifiedAt: new Date().toISOString(),
         verifiedUntil: verification.verifiedUntil,
-        usedRecoveryCode: Boolean(verification.usedRecoveryCode)
+        usedRecoveryCode: Boolean(verification.usedRecoveryCode),
+        totpConfirmed: true
       };
     }
 
@@ -1258,7 +1750,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
           Boolean(current.backup_encryption_enabled)));
 
     if (mutatingCriticalSecurity && !requireStepUpMfaIfEnforced(request, reply, null)) {
-      return;
+      return reply;
     }
 
     const resolveSecretUpdate = (col: string): string | null => {
@@ -1397,6 +1889,11 @@ export async function registerApiRoutes(server: FastifyInstance) {
         backup_offsite_secret_key = COALESCE(?, backup_offsite_secret_key),
         patch_auto_approve_third_party = COALESCE(?, patch_auto_approve_third_party),
         patch_canary_delay_days = COALESCE(?, patch_canary_delay_days),
+        oobe_auto_deploy_companion = COALESCE(?, oobe_auto_deploy_companion),
+        oobe_enforce_laps_on_import = COALESCE(?, oobe_enforce_laps_on_import),
+        oobe_lock_signed_updates = COALESCE(?, oobe_lock_signed_updates),
+        session_idle_timeout_min = COALESCE(?, session_idle_timeout_min),
+        session_timeout_min = COALESCE(?, session_timeout_min),
         updated_at = CURRENT_TIMESTAMP
       WHERE id = 1
     `).run(
@@ -1478,10 +1975,19 @@ export async function registerApiRoutes(server: FastifyInstance) {
       resolveSecretUpdate('backup_offsite_access_key'),
       resolveSecretUpdate('backup_offsite_secret_key'),
       body.patch_auto_approve_third_party != null ? (body.patch_auto_approve_third_party ? 1 : 0) : null,
-      body.patch_canary_delay_days != null ? Number(body.patch_canary_delay_days) : null
+      body.patch_canary_delay_days != null ? Number(body.patch_canary_delay_days) : null,
+      body.oobe_auto_deploy_companion != null ? (body.oobe_auto_deploy_companion ? 1 : 0) : null,
+      body.oobe_enforce_laps_on_import != null ? (body.oobe_enforce_laps_on_import ? 1 : 0) : null,
+      body.oobe_lock_signed_updates != null ? (body.oobe_lock_signed_updates ? 1 : 0) : null,
+      body.session_idle_timeout_min != null && Number.isFinite(Number(body.session_idle_timeout_min))
+        ? Math.max(1, Math.min(43_200, Number(body.session_idle_timeout_min)))
+        : null,
+      body.session_timeout_min != null && Number.isFinite(Number(body.session_timeout_min))
+        ? Math.max(1, Math.min(43_200, Number(body.session_timeout_min)))
+        : null
     );
 
-    meshBridge.checkConfig();
+    await meshBridge.reconnectAndWait(3500);
 
     db.prepare(`
       INSERT INTO audit_logs (id, username, action, details)
@@ -1489,23 +1995,81 @@ export async function registerApiRoutes(server: FastifyInstance) {
     `).run(`aud-set-${crypto.randomUUID()}`, getActorUsername(request));
 
     const updated = db.prepare('SELECT * FROM settings WHERE id = 1').get() as any;
+    const wasOnboarded = Boolean(current.oobe_completed || current.is_onboarded);
+    const nowOnboarded = Boolean(updated?.oobe_completed || updated?.is_onboarded);
+
+    if (!wasOnboarded && nowOnboarded) {
+      const { proto: protoHdr, host: hostHdr } = resolveSafeRequestOriginParts(request);
+      const customDom = String(updated?.custom_domain || '').trim();
+      const reqOrigin = customDom
+        ? customDom.startsWith('http')
+          ? customDom
+          : `https://${customDom}`
+        : hostHdr
+          ? `${protoHdr}://${hostHdr}`
+          : undefined;
+
+      void (async () => {
+        try {
+          if (!meshBridge.getStatus().connected) {
+            await meshBridge.reconnectAndWait(3500);
+          }
+          if (updated?.oobe_auto_deploy_companion) {
+            const pendingDevs = db
+              .prepare(`
+                SELECT id FROM devices
+                WHERE COALESCE(lifecycle_state, 'active') = 'active'
+                  AND status = 'online'
+                  AND mesh_node_id IS NOT NULL
+                  AND COALESCE(companion_installed, 0) = 0
+                  AND COALESCE(companion_deploy_pending, 0) = 1
+              `)
+              .all() as Array<{ id: string }>;
+            for (const d of pendingDevs) {
+              try {
+                await meshBridge.deployCompanionOverMesh(d.id, reqOrigin);
+              } catch {}
+            }
+          }
+          if (updated?.oobe_enforce_laps_on_import) {
+            const unprovisionedLapsDevs = db
+              .prepare(`
+                SELECT d.id FROM devices d
+                LEFT JOIN laps_vault v ON v.device_id = d.id
+                WHERE COALESCE(d.lifecycle_state, 'active') = 'active'
+                  AND d.status = 'online'
+                  AND d.mesh_node_id IS NOT NULL
+                  AND v.device_id IS NULL
+              `)
+              .all() as Array<{ id: string }>;
+            for (const d of unprovisionedLapsDevs) {
+              try {
+                await rotateLapsPasswordVerifiedAsync(d.id, { reveal: false, actorUsername: 'oobe-rollout' });
+              } catch {}
+            }
+          }
+        } catch {}
+      })();
+    }
+
     return { success: true, settings: sanitizeSettingsRowForResponse(updated) };
   };
   server.post('/api/settings', handleSaveSettings);
   server.put('/api/settings', handleSaveSettings);
 
-  server.post('/api/settings/logo', async (request, reply) => {
-    const body = (request.body || {}) as { filename?: string; base64Data?: string };
-    if (!body.base64Data) {
-      return reply.status(400).send({ error: 'base64Data is required' });
+  const saveValidatedBrandingRasterImage = (
+    base64Data: string | undefined,
+    filePrefix: string
+  ): { ok: true; url: string } | { ok: false; status: number; error: string } => {
+    if (!base64Data) {
+      return { ok: false, status: 400, error: 'base64Data is required' };
     }
-    const cleanB64 = body.base64Data.includes(',') ? body.base64Data.split(',').pop()! : body.base64Data;
+    const cleanB64 = base64Data.includes(',') ? base64Data.split(',').pop()! : base64Data;
     const buf = Buffer.from(cleanB64, 'base64');
     if (buf.length === 0 || buf.length > 2 * 1024 * 1024) {
-      return reply.status(400).send({ error: 'Branding logo must be between 1 byte and 2 MB.' });
+      return { ok: false, status: 400, error: 'Branding image must be between 1 byte and 2 MB.' };
     }
 
-    // Validate binary magic headers (PNG, JPEG, WebP, GIF, ICO) — disallow active HTML/SVG scripts
     let ext = '';
     if (buf.length >= 8 && buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
       ext = '.png';
@@ -1520,22 +2084,53 @@ export async function registerApiRoutes(server: FastifyInstance) {
     } else if (buf.length >= 4 && buf[0] === 0x00 && buf[1] === 0x00 && buf[2] === 0x01 && buf[3] === 0x00) {
       ext = '.ico';
     } else {
-      return reply.status(400).send({
+      return {
+        ok: false,
+        status: 400,
         error: 'Unsupported image format. Upload a valid PNG, JPEG, WebP, or ICO image.'
-      });
+      };
+    }
+
+    let outBuf: Buffer = buf;
+    if (ext === '.png' || ext === '.ico') {
+      try {
+        const squared = sanitizeAndSquareBrandingPng(buf, 256);
+        if (!squared) {
+          return {
+            ok: false,
+            status: 400,
+            error: 'Malformed or unreadable PNG/ICO branding image.'
+          };
+        }
+        outBuf = squared;
+        ext = '.png';
+      } catch {
+        return {
+          ok: false,
+          status: 400,
+          error: 'Malformed or unreadable PNG/ICO branding image.'
+        };
+      }
     }
 
     if (!fs.existsSync(BRANDING_DIR_PATH)) {
       fs.mkdirSync(BRANDING_DIR_PATH, { recursive: true });
     }
-    const targetFilename = `custom-logo-${Date.now()}${ext}`;
+    const safePrefix = filePrefix.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40) || 'branding';
+    const targetFilename = `${safePrefix}-${Date.now()}${ext}`;
     const targetPath = path.join(BRANDING_DIR_PATH, targetFilename);
-    fs.writeFileSync(targetPath, buf);
+    fs.writeFileSync(targetPath, outBuf);
+    return { ok: true, url: `/branding/${targetFilename}` };
+  };
 
-    const logoUrl = `/branding/${targetFilename}`;
-    db.prepare('UPDATE settings SET brand_logo_url = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1').run(logoUrl);
-
-    return { success: true, brand_logo_url: logoUrl };
+  server.post('/api/settings/logo', async (request, reply) => {
+    const body = (request.body || {}) as { filename?: string; base64Data?: string };
+    const saved = saveValidatedBrandingRasterImage(body.base64Data, 'custom-logo');
+    if (!saved.ok) {
+      return reply.status(saved.status).send({ error: saved.error });
+    }
+    db.prepare('UPDATE settings SET brand_logo_url = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1').run(saved.url);
+    return { success: true, brand_logo_url: saved.url };
   });
 
   server.post('/api/demo/seed', async (request) => {
@@ -1564,7 +2159,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.post('/api/users', async (request, reply) => {
     if (!requireStepUpMfaIfEnforced(request, reply, null)) {
-      return;
+      return reply;
     }
     const body = (request.body || {}) as {
       username?: string;
@@ -1637,7 +2232,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.put('/api/users/:id', async (request, reply) => {
     if (!requireStepUpMfaIfEnforced(request, reply, null)) {
-      return;
+      return reply;
     }
     const { id } = request.params as { id: string };
     const body = (request.body || {}) as {
@@ -1725,7 +2320,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.post('/api/users/:id/reset-mfa', async (request, reply) => {
     if (!requireStepUpMfaIfEnforced(request, reply, null)) {
-      return;
+      return reply;
     }
     const { id } = request.params as { id: string };
     const existing = db.prepare('SELECT * FROM users WHERE id = ?').get(id) as any;
@@ -1752,7 +2347,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.delete('/api/users/:id', async (request, reply) => {
     if (!requireStepUpMfaIfEnforced(request, reply, null)) {
-      return;
+      return reply;
     }
     const { id } = request.params as { id: string };
     if (request.auth?.user.id === id) {
@@ -1786,17 +2381,20 @@ export async function registerApiRoutes(server: FastifyInstance) {
   // ============================================================================
   server.get('/api/tenants', async (request) => {
     const user = request.auth?.user;
-    const scopedTenantId = getScopedTenantFilter(user);
+    const allowedTenants = getAllowedTenantIds(user);
+    if (allowedTenants !== null && allowedTenants.length === 0) {
+      return [];
+    }
 
-    const rawTenants = (scopedTenantId
+    const rawTenants = (allowedTenants !== null
       ? db
           .prepare(`
             SELECT t.*, (SELECT COUNT(*) FROM devices d WHERE d.tenant_id = t.id) as computed_device_count
             FROM tenants t
-            WHERE t.id = ?
+            WHERE t.id IN (${allowedTenants.map(() => '?').join(',')})
             ORDER BY t.name ASC
           `)
-          .all(scopedTenantId)
+          .all(...allowedTenants)
       : db
           .prepare(`
             SELECT t.*, (SELECT COUNT(*) FROM devices d WHERE d.tenant_id = t.id) as computed_device_count
@@ -1855,6 +2453,36 @@ export async function registerApiRoutes(server: FastifyInstance) {
     return { success: true, id, siteId };
   });
 
+  server.put('/api/tenants/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const existing = db.prepare('SELECT * FROM tenants WHERE id = ?').get(id) as any;
+    if (!existing) return reply.status(404).send({ error: 'Tenant not found.' });
+
+    const body = (request.body || {}) as {
+      name?: string;
+      contact_email?: string;
+      offline_auto_archive_days?: number;
+    };
+
+    const nextName = body.name !== undefined ? String(body.name).trim() : existing.name;
+    if (!nextName) return reply.status(400).send({ error: 'Client organization name cannot be empty.' });
+
+    const nextEmail =
+      body.contact_email !== undefined ? String(body.contact_email).trim() : existing.contact_email;
+    const nextArchiveDays =
+      body.offline_auto_archive_days != null && Number.isFinite(Number(body.offline_auto_archive_days))
+        ? Math.max(1, Number(body.offline_auto_archive_days))
+        : existing.offline_auto_archive_days;
+
+    db.prepare(`
+      UPDATE tenants
+      SET name = ?, contact_email = ?, offline_auto_archive_days = COALESCE(?, offline_auto_archive_days)
+      WHERE id = ?
+    `).run(nextName, nextEmail, nextArchiveDays ?? null, id);
+
+    return { success: true, tenant: db.prepare('SELECT * FROM tenants WHERE id = ?').get(id) };
+  });
+
   server.post('/api/sites', async (request, reply) => {
     const body = (request.body || {}) as { tenant_id?: string; name?: string; subnet?: string };
     if (!body.tenant_id || !body.name?.trim()) {
@@ -1874,9 +2502,12 @@ export async function registerApiRoutes(server: FastifyInstance) {
   server.get('/api/devices', async (request) => {
     sweepPendingOffboards();
     const user = request.auth?.user;
-    const scopedTenantId = getScopedTenantFilter(user);
+    const allowedTenants = getAllowedTenantIds(user);
+    if (allowedTenants !== null && allowedTenants.length === 0) {
+      return [];
+    }
 
-    const rows = (scopedTenantId
+    const rows = (allowedTenants !== null
       ? db
           .prepare(`
             SELECT d.*, t.name as tenant_name, t.lifecycle_state as tenant_lifecycle_state, s.name as site_name,
@@ -1885,10 +2516,10 @@ export async function registerApiRoutes(server: FastifyInstance) {
             LEFT JOIN tenants t ON d.tenant_id = t.id
             LEFT JOIN sites s ON d.site_id = s.id
             LEFT JOIN laps_vault l ON d.id = l.device_id
-            WHERE d.tenant_id = ?
+            WHERE d.tenant_id IN (${allowedTenants.map(() => '?').join(',')})
             ORDER BY d.hostname ASC
           `)
-          .all(scopedTenantId)
+          .all(...allowedTenants)
       : db
           .prepare(`
             SELECT d.*, t.name as tenant_name, t.lifecycle_state as tenant_lifecycle_state, s.name as site_name,
@@ -1907,7 +2538,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
   server.get('/api/devices/:id', async (request, reply) => {
     const { id } = request.params as { id: string };
     const access = ensureDeviceTenantAccess(request, reply, id);
-    if (!access.allowed) return;
+    if (!access.allowed) return reply;
 
     const device = db
       .prepare(`
@@ -1947,6 +2578,169 @@ export async function registerApiRoutes(server: FastifyInstance) {
     return safeDevice;
   });
 
+  // Historical Telemetry Series & Live Telemetry Sampling + Detailed Hardware Inventory
+  server.get('/api/devices/:id/telemetry-history', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const access = ensureDeviceTenantAccess(request, reply, id);
+    if (!access.allowed || !access.device) return reply;
+    const query = (request.query || {}) as { range?: string };
+    return queryDeviceTelemetryHistory(id, query.range || '24h');
+  });
+
+  server.post('/api/devices/:id/telemetry-sample', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const access = ensureDeviceTenantAccess(request, reply, id);
+    if (!access.allowed || !access.device) return reply;
+    const body = (request.body || {}) as { includeDetailedHardware?: boolean; forceHistoryInsert?: boolean };
+
+    const res = await meshBridge.sampleLiveTelemetry(id, {
+      includeDetailedHardware: Boolean(body.includeDetailedHardware),
+      forceHistoryInsert: body.forceHistoryInsert !== false
+    });
+
+    const updated = db.prepare('SELECT * FROM devices WHERE id = ?').get(id);
+    return {
+      success: true,
+      sampled: res.sampled,
+      reason: res.reason || null,
+      sample: res.sample || null,
+      device: sanitizeDeviceRowForResponse(updated)
+    };
+  });
+
+  server.patch('/api/devices/:id/role', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const access = ensureDeviceTenantAccess(request, reply, id);
+    if (!access.allowed || !access.device) return reply;
+    if (!isTechnicianOrAbove(request.auth?.user.role)) {
+      return reply.status(403).send({ error: 'Technician role required to modify device role.' });
+    }
+
+    const body = (request.body || {}) as { device_role?: string; auto_detect?: boolean };
+    const dev = access.device as any;
+    const rawRole = String(body.device_role || '').trim().slice(0, 64);
+    const useAuto = Boolean(body.auto_detect) || ['auto', 'auto-detect', ''].includes(rawRole.toLowerCase());
+
+    if (useAuto) {
+      const signals = extractSignalsFromHardwareDetails(dev.hardware_details_json, {
+        os_type: dev.os_type,
+        os_version: dev.os_version,
+        manufacturer: dev.manufacturer,
+        model: dev.model,
+        bios_version: dev.bios_version
+      });
+      const nextRole = inferDeviceRole(signals) || 'Workstation';
+      db.prepare('UPDATE devices SET device_role = ?, device_role_manual = 0 WHERE id = ?').run(nextRole, id);
+      return {
+        success: true,
+        device_role: nextRole,
+        device_role_manual: 0,
+        device: sanitizeDeviceRowForResponse(db.prepare('SELECT * FROM devices WHERE id = ?').get(id))
+      };
+    }
+
+    db.prepare('UPDATE devices SET device_role = ?, device_role_manual = 1 WHERE id = ?').run(rawRole, id);
+    return {
+      success: true,
+      device_role: rawRole,
+      device_role_manual: 1,
+      device: sanitizeDeviceRowForResponse(db.prepare('SELECT * FROM devices WHERE id = ?').get(id))
+    };
+  });
+
+  server.get('/api/devices/:id/hardware', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const access = ensureDeviceTenantAccess(request, reply, id);
+    if (!access.allowed || !access.device) return reply;
+    const dev = access.device;
+
+    let parsedDetails: Record<string, any> = {};
+    if (dev.hardware_details_json) {
+      try {
+        const obj = JSON.parse(dev.hardware_details_json);
+        if (obj && typeof obj === 'object') parsedDetails = obj;
+      } catch {
+        parsedDetails = {};
+      }
+    }
+
+    return {
+      deviceId: dev.id,
+      hostname: dev.hostname,
+      status: dev.status,
+      system: {
+        manufacturer: parsedDetails.system?.manufacturer || dev.manufacturer || '',
+        model: parsedDetails.system?.model || dev.model || '',
+        serialNumber: parsedDetails.system?.serialNumber || dev.serial_number || '',
+        uuid: parsedDetails.system?.uuid || '',
+        motherboardVendor: parsedDetails.system?.motherboardVendor || '',
+        motherboardName: parsedDetails.system?.motherboardName || '',
+        motherboardSerial: parsedDetails.system?.motherboardSerial || '',
+        biosVendor: parsedDetails.system?.biosVendor || '',
+        biosVersion: parsedDetails.system?.biosVersion || dev.bios_version || '',
+        biosDate: parsedDetails.system?.biosDate || '',
+        tpmVersion: parsedDetails.system?.tpmVersion || dev.tpm_version || '',
+        chassisType: parsedDetails.system?.chassisType ? Number(parsedDetails.system.chassisType) : undefined,
+        chassisLabel:
+          parsedDetails.system?.chassisLabel ||
+          (parsedDetails.system?.chassisType ? getSmbiosChassisLabel(Number(parsedDetails.system.chassisType)) : ''),
+        hasBattery: parsedDetails.system?.hasBattery ?? null,
+        isVirtualMachine: parsedDetails.system?.isVirtualMachine ?? null,
+        isHypervisorHost: parsedDetails.system?.isHypervisorHost ?? null,
+        hypervisorVendor: parsedDetails.system?.hypervisorVendor || '',
+        osProductType: parsedDetails.system?.osProductType || ''
+      },
+      cpu: {
+        model: parsedDetails.cpu?.model || dev.cpu_model || '',
+        physicalCores: parsedDetails.cpu?.physicalCores || null,
+        logicalCores: parsedDetails.cpu?.logicalCores || dev.cpu_cores || 0,
+        maxClockMhz: parsedDetails.cpu?.maxClockMhz || null,
+        usagePct: Number(dev.cpu_usage || 0)
+      },
+      memory: {
+        totalGb: Number(dev.ram_total_gb || parsedDetails.memory?.totalGb || 0),
+        usedGb: Number(dev.ram_used_gb || 0),
+        usedPct:
+          Number(dev.ram_total_gb || 0) > 0
+            ? Number(((Number(dev.ram_used_gb || 0) / Number(dev.ram_total_gb)) * 100).toFixed(1))
+            : 0,
+        modules: Array.isArray(parsedDetails.memory?.modules) ? parsedDetails.memory.modules : []
+      },
+      storage: {
+        totalGb: Number(dev.disk_total_gb || 0),
+        freeGb: Number(dev.disk_free_gb || 0),
+        smartStatus: dev.smart_status || 'Unknown',
+        encryptionStatus: dev.bitlocker_status || 'Unknown',
+        physicalDisks: Array.isArray(parsedDetails.storage?.physicalDisks)
+          ? parsedDetails.storage.physicalDisks
+          : [],
+        volumes: Array.isArray(parsedDetails.storage?.volumes) ? parsedDetails.storage.volumes : []
+      },
+      gpus: Array.isArray(parsedDetails.gpus) ? parsedDetails.gpus : [],
+      network: {
+        primaryIp: dev.ip_address || '',
+        primaryMac: dev.mac_address || '',
+        netRxMbps: Number(dev.net_rx_mbps || 0),
+        netTxMbps: Number(dev.net_tx_mbps || 0),
+        adapters: Array.isArray(parsedDetails.networkAdapters)
+          ? parsedDetails.networkAdapters
+          : Array.isArray(parsedDetails.network?.adapters)
+            ? parsedDetails.network.adapters
+            : []
+      },
+      os: {
+        osType: dev.os_type || 'windows',
+        osVersion: dev.os_version || '',
+        osBuild: parsedDetails.os?.build || dev.os_build || '',
+        uptimeSeconds: Number(dev.uptime_seconds || 0),
+        loggedInUser: String(dev.logged_in_user || ''),
+        pendingReboot: Boolean(dev.pending_reboot),
+        lastSeen: dev.last_seen || ''
+      },
+      lastHardwareScanAt: parsedDetails.lastHardwareScanAt || null
+    };
+  });
+
   // Dedicated Step-Up MFA Gated BitLocker / LUKS / FileVault Escrow Reveal Endpoint
   server.get('/api/devices/:id/bitlocker', async (request, reply) => {
     const { id } = request.params as { id: string };
@@ -1954,10 +2748,10 @@ export async function registerApiRoutes(server: FastifyInstance) {
       return reply.status(403).send({ error: 'Technician privileges required to reveal recovery keys.' });
     }
     const access = ensureDeviceTenantAccess(request, reply, id);
-    if (!access.allowed || !access.device) return;
+    if (!access.allowed || !access.device) return reply;
 
     if (!requireStepUpMfaIfEnforced(request, reply, id)) {
-      return;
+      return reply;
     }
 
     const decryptedKey = decryptVaultSecret(access.device.bitlocker_key);
@@ -1983,7 +2777,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
   // Device Runbook Notes
   server.get('/api/devices/:id/notes', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return reply;
     return db
       .prepare('SELECT * FROM device_notes WHERE device_id = ? ORDER BY is_pinned DESC, created_at DESC')
       .all(id);
@@ -1991,7 +2785,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.post('/api/devices/:id/notes', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return reply;
     const body = (request.body || {}) as { author?: string; content?: string; is_pinned?: boolean };
     if (!body.content?.trim()) {
       return reply.status(400).send({ error: 'Note content is required.' });
@@ -2006,27 +2800,64 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.delete('/api/devices/:id/notes/:noteId', async (request, reply) => {
     const { id, noteId } = request.params as { id: string; noteId: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return reply;
     db.prepare('DELETE FROM device_notes WHERE id = ? AND device_id = ?').run(noteId, id);
     return { success: true };
   });
 
+  const setBackgroundToolHeaders = (reply: FastifyReply, dev: any, isEmpty: boolean) => {
+    if (!dev || (dev.status !== 'online' && dev.status !== 'isolated')) {
+      reply.header('X-Vitrine-Tool-Status', 'offline');
+      reply.header(
+        'X-Vitrine-Tool-Error',
+        `Endpoint ${dev?.hostname || 'device'} is offline; live query cannot run.`
+      );
+      return;
+    }
+    if (meshBridge.lastToolError) {
+      const cleanErr = String(meshBridge.lastToolError)
+        .replace(/[\r\n]+/g, ' ')
+        .trim()
+        .slice(0, 260);
+      reply.header('X-Vitrine-Tool-Status', 'error');
+      reply.header('X-Vitrine-Tool-Error', cleanErr);
+      return;
+    }
+    const bridgeStatus = meshBridge.getStatus();
+    if (!bridgeStatus.connected && isEmpty) {
+      const cleanBridgeErr = String(bridgeStatus.lastError || 'check MS2 URL and login token')
+        .replace(/[\r\n]+/g, ' ')
+        .trim()
+        .slice(0, 180);
+      reply.header('X-Vitrine-Tool-Status', 'disconnected');
+      reply.header(
+        'X-Vitrine-Tool-Error',
+        `MeshCentral 2 control bridge is disconnected (${cleanBridgeErr}).`
+      );
+      return;
+    }
+    reply.header('X-Vitrine-Tool-Status', 'live');
+  };
+
   // Remote Event Viewer
   server.get('/api/devices/:id/eventlogs', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    const access = ensureDeviceTenantAccess(request, reply, id);
+    if (!access.allowed || !access.device) return reply;
     const query = (request.query || {}) as Record<string, string>;
     const channel = query.channel || 'System';
     const level = query.level || 'all';
     const limit = Math.min(200, Math.max(1, parseInt(query.limit || '50', 10) || 50));
-    return await meshBridge.getEventLogs(id, channel, level, limit);
+    const logs = await meshBridge.getEventLogs(id, channel, level, limit);
+    setBackgroundToolHeaders(reply, access.device, !Array.isArray(logs) || logs.length === 0);
+    return logs;
   });
 
   // Device Remote Privacy & Consent Control
   server.get('/api/devices/:id/consent-status', async (request, reply) => {
     const { id } = request.params as { id: string };
     const access = ensureDeviceTenantAccess(request, reply, id);
-    if (!access.allowed || !access.device) return;
+    if (!access.allowed || !access.device) return reply;
     const policy = resolveEffectiveDevicePolicy(id);
     const roleLower = String(access.device.device_role || '').toLowerCase();
     const isUnattendedRole =
@@ -2046,13 +2877,16 @@ export async function registerApiRoutes(server: FastifyInstance) {
   // Silent Background Process Manager
   server.get('/api/devices/:id/processes', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
-    return await meshBridge.getProcesses(id);
+    const access = ensureDeviceTenantAccess(request, reply, id);
+    if (!access.allowed || !access.device) return reply;
+    const procs = await meshBridge.getProcesses(id);
+    setBackgroundToolHeaders(reply, access.device, !Array.isArray(procs) || procs.length === 0);
+    return procs;
   });
 
   server.post('/api/devices/:id/processes/:pid/kill', async (request, reply) => {
     const { id, pid } = request.params as { id: string; pid: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return reply;
     try {
       const success = await meshBridge.killProcess(id, parseInt(pid, 10), getActorUsername(request));
       return { success };
@@ -2064,8 +2898,11 @@ export async function registerApiRoutes(server: FastifyInstance) {
   // Silent Background Services Manager
   server.get('/api/devices/:id/services', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
-    return await meshBridge.getServices(id);
+    const access = ensureDeviceTenantAccess(request, reply, id);
+    if (!access.allowed || !access.device) return reply;
+    const svcs = await meshBridge.getServices(id);
+    setBackgroundToolHeaders(reply, access.device, !Array.isArray(svcs) || svcs.length === 0);
+    return svcs;
   });
 
   server.post('/api/devices/:id/services/:name/:action', async (request, reply) => {
@@ -2074,7 +2911,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
       name: string;
       action: 'start' | 'stop' | 'restart';
     };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return reply;
     try {
       const success = await meshBridge.manageService(id, name, action, getActorUsername(request));
       return { success };
@@ -2086,14 +2923,18 @@ export async function registerApiRoutes(server: FastifyInstance) {
   // Remote Registry / sysctl / plist Browser
   server.get('/api/devices/:id/registry', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    const access = ensureDeviceTenantAccess(request, reply, id);
+    if (!access.allowed || !access.device) return reply;
     const query = (request.query || {}) as { path?: string };
-    return await meshBridge.getRegistryKeys(query.path || '', id);
+    const reg = await meshBridge.getRegistryKeys(query.path || '', id);
+    const isEmpty = (!reg?.subkeys || reg.subkeys.length === 0) && (!reg?.values || reg.values.length === 0);
+    setBackgroundToolHeaders(reply, access.device, isEmpty);
+    return reg;
   });
 
   server.post('/api/devices/:id/registry', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return reply;
     const body = (request.body || {}) as {
       path?: string;
       name?: string;
@@ -2124,7 +2965,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.delete('/api/devices/:id/registry', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return reply;
     const query = (request.query || {}) as { path?: string; name?: string };
     const regPath = query.path || 'HKLM\\SOFTWARE\\VitrineRMM';
     try {
@@ -2138,13 +2979,16 @@ export async function registerApiRoutes(server: FastifyInstance) {
   // Scheduled Tasks Manager
   server.get('/api/devices/:id/tasks', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
-    return await meshBridge.getScheduledTasks(id);
+    const access = ensureDeviceTenantAccess(request, reply, id);
+    if (!access.allowed || !access.device) return reply;
+    const tasks = await meshBridge.getScheduledTasks(id);
+    setBackgroundToolHeaders(reply, access.device, !Array.isArray(tasks) || tasks.length === 0);
+    return tasks;
   });
 
   server.post('/api/devices/:id/tasks', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return reply;
     const body = (request.body || {}) as { name?: string; action?: 'run' | 'enable' | 'disable' };
     if (!body.name) return reply.status(400).send({ error: 'Task name is required' });
     try {
@@ -2159,16 +3003,18 @@ export async function registerApiRoutes(server: FastifyInstance) {
   server.get('/api/devices/:id/files', async (request, reply) => {
     const { id } = request.params as { id: string };
     const access = ensureDeviceTenantAccess(request, reply, id);
-    if (!access.allowed || !access.device) return;
+    if (!access.allowed || !access.device) return reply;
     const query = (request.query || {}) as { path?: string };
     const defaultRoot = access.device.os_type === 'windows' ? 'C:\\' : '/';
-    return await meshBridge.getDirectoryListing(id, query.path || defaultRoot);
+    const listing = await meshBridge.getDirectoryListing(id, query.path || defaultRoot);
+    setBackgroundToolHeaders(reply, access.device, !Array.isArray(listing) || listing.length === 0);
+    return listing;
   });
 
   server.post('/api/devices/:id/files', async (request, reply) => {
     const { id } = request.params as { id: string };
     const access = ensureDeviceTenantAccess(request, reply, id);
-    if (!access.allowed || !access.device) return;
+    if (!access.allowed || !access.device) return reply;
     const body = (request.body || {}) as {
       path?: string;
       action?: 'mkdir' | 'delete' | 'upload';
@@ -2198,7 +3044,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.get('/api/devices/:id/files/download', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return reply;
     const query = (request.query || {}) as { path?: string };
     if (!query.path) return reply.status(400).send({ error: 'File path is required' });
     const dl = await meshBridge.downloadFile(id, query.path, getActorUsername(request));
@@ -2210,7 +3056,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
   // Cyber Isolation / Network Quarantine
   server.post('/api/devices/:id/quarantine', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return reply;
     const body = (request.body || {}) as { quarantine?: boolean };
     const quarantined = Boolean(body.quarantine);
     meshBridge.toggleQuarantine(id, quarantined, getActorUsername(request));
@@ -2221,7 +3067,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
   server.get('/api/devices/:id/laps', async (request, reply) => {
     const { id } = request.params as { id: string };
     const access = ensureDeviceTenantAccess(request, reply, id);
-    if (!access.allowed) return;
+    if (!access.allowed) return reply;
     const query = (request.query || {}) as { reveal?: string };
     const reveal = query.reveal === 'true';
 
@@ -2230,7 +3076,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
         return reply.status(403).send({ error: 'Technician role required to reveal LAPS credentials.' });
       }
       if (!requireStepUpMfaIfEnforced(request, reply, id)) {
-        return;
+        return reply;
       }
       db.prepare(`
         INSERT INTO audit_logs (id, username, device_id, action, details)
@@ -2245,12 +3091,12 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.post('/api/devices/:id/laps/rotate', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return reply;
     const body = (request.body || {}) as { reveal?: boolean };
     const shouldReveal = Boolean(body.reveal);
 
     if (shouldReveal && !requireStepUpMfaIfEnforced(request, reply, id)) {
-      return;
+      return reply;
     }
 
     const cred = await rotateLapsPasswordVerifiedAsync(id, {
@@ -2268,11 +3114,12 @@ export async function registerApiRoutes(server: FastifyInstance) {
     ...p,
     laps_static_password: maskSecretValue(p.laps_static_password),
     overrides: safeJsonParse<string[]>(p.overrides_json, []),
-    alert_rules: parsePolicyAlertRules(p.alert_rules_json, p.tier, p.target_id)
+    alert_rules: parsePolicyAlertRules(p.alert_rules_json, p.tier, p.target_id),
+    tray_menu_items: p.tray_menu_items_json ? parsePolicyTrayMenuItems(p.tray_menu_items_json) : null
   });
 
   const resolvePolicyTenantId = (tier?: string | null, targetId?: string | null): string | null => {
-    if (!tier || tier === 'global') return null;
+    if (!tier || tier === 'global' || tier === 'quicksupport') return null;
     if (tier === 'client') return targetId || null;
     if (tier === 'site' && targetId) {
       const s = db.prepare('SELECT tenant_id FROM sites WHERE id = ?').get(targetId) as { tenant_id?: string } | undefined;
@@ -2289,11 +3136,11 @@ export async function registerApiRoutes(server: FastifyInstance) {
     const user = request.auth?.user;
     const rows = db
       .prepare(
-        "SELECT * FROM policies ORDER BY CASE tier WHEN 'global' THEN 1 WHEN 'client' THEN 2 WHEN 'site' THEN 3 ELSE 4 END ASC"
+        "SELECT * FROM policies ORDER BY CASE tier WHEN 'global' THEN 1 WHEN 'quicksupport' THEN 2 WHEN 'client' THEN 3 WHEN 'site' THEN 4 ELSE 5 END ASC"
       )
       .all() as any[];
     const visible = rows.filter((p) => {
-      if (p.tier === 'global') return true;
+      if (p.tier === 'global' || p.tier === 'quicksupport') return true;
       const pTenantId = resolvePolicyTenantId(p.tier, p.target_id);
       return pTenantId ? canUserAccessTenant(user, pTenantId) : isSuperAdminRole(user?.role);
     });
@@ -2345,18 +3192,33 @@ export async function registerApiRoutes(server: FastifyInstance) {
     'patch_ring',
     'patch_delay_days',
     'defender_managed',
-    'bitlocker_enforced'
+    'bitlocker_enforced',
+    'tray_brand_name',
+    'tray_icon_url',
+    'tray_theme_mode',
+    'tray_enabled',
+    'tray_tooltip',
+    'tray_support_url',
+    'tray_support_phone',
+    'tray_support_email',
+    'tray_menu_items_json',
+    'companion_auto_deploy'
   ];
 
   server.post('/api/policies', async (request, reply) => {
     const body = (request.body || {}) as Record<string, any>;
-    const tier = body.tier || 'client';
-    if (tier === 'global' && !isSuperAdminRole(request.auth?.user.role)) {
-      return reply.status(403).send({ error: 'Only MSP Super Admins can create global policies.' });
+    const tier = String(body.tier || 'client').trim().toLowerCase();
+    if (!['global', 'role', 'client', 'site', 'device'].includes(tier)) {
+      return reply.status(400).send({ error: `Invalid policy tier '${tier}'.` });
     }
-    const targetTenantId = resolvePolicyTenantId(tier, body.target_id);
-    if (tier !== 'global' && (!targetTenantId || !canUserAccessTenant(request.auth?.user, targetTenantId))) {
-      return reply.status(403).send({ error: 'Forbidden for target policy scope.' });
+    if ((tier === 'global' || tier === 'role') && !isSuperAdminRole(request.auth?.user.role)) {
+      return reply.status(403).send({ error: 'Only MSP Super Admins can create global or role policies.' });
+    }
+    if (tier !== 'global' && tier !== 'role') {
+      const targetTenantId = resolvePolicyTenantId(tier, body.target_id);
+      if (!targetTenantId || !canUserAccessTenant(request.auth?.user, targetTenantId)) {
+        return reply.status(403).send({ error: 'Forbidden for target policy scope.' });
+      }
     }
     const id = `pol-${crypto.randomUUID().slice(0, 8)}`;
 
@@ -2376,6 +3238,13 @@ export async function registerApiRoutes(server: FastifyInstance) {
           ? body.alert_rules_json
           : null;
 
+    const trayMenuItemsJson =
+      body.tray_menu_items !== undefined
+        ? JSON.stringify(parsePolicyTrayMenuItems(JSON.stringify(body.tray_menu_items)))
+        : body.tray_menu_items_json !== undefined
+          ? body.tray_menu_items_json
+          : null;
+
     db.prepare(`
       INSERT INTO policies (
         id, name, tier, target_id, telemetry_interval_sec, require_remote_consent,
@@ -2392,15 +3261,18 @@ export async function registerApiRoutes(server: FastifyInstance) {
         hardware_audit_enabled, network_drift_detection_enabled,
         self_healing_max_hourly_runs, self_healing_alert_psa,
         psa_flap_grace_minutes, auto_patch_cve_min_cvss,
+        tray_brand_name, tray_icon_url, tray_theme_mode, tray_enabled,
+        tray_tooltip, tray_support_url, tray_support_phone, tray_support_email,
+        tray_menu_items_json, companion_auto_deploy,
         overrides_json, alert_rules_json
       ) VALUES (
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
       )
     `).run(
       id,
       body.name || 'Custom Tier Policy',
-      body.tier || 'client',
-      body.target_id || null,
+      tier,
+      tier === 'global' ? null : body.target_id || null,
       Number(body.telemetry_interval_sec ?? 30),
       body.require_remote_consent !== undefined ? (body.require_remote_consent ? 1 : 0) : 1,
       Number(body.consent_timeout_sec ?? 30),
@@ -2438,6 +3310,16 @@ export async function registerApiRoutes(server: FastifyInstance) {
       body.self_healing_alert_psa !== undefined ? (body.self_healing_alert_psa ? 1 : 0) : 1,
       Number(body.psa_flap_grace_minutes ?? 15),
       Number(body.auto_patch_cve_min_cvss ?? 8.0),
+      String(body.tray_brand_name || ''),
+      String(body.tray_icon_url || ''),
+      String(body.tray_theme_mode || ''),
+      body.tray_enabled !== undefined ? (body.tray_enabled ? 1 : 0) : 1,
+      String(body.tray_tooltip || ''),
+      String(body.tray_support_url || ''),
+      String(body.tray_support_phone || ''),
+      String(body.tray_support_email || ''),
+      trayMenuItemsJson,
+      body.companion_auto_deploy !== undefined ? (body.companion_auto_deploy ? 1 : 0) : 0,
       JSON.stringify(explicitOverrides),
       alertRulesJson
     );
@@ -2448,9 +3330,27 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.delete('/api/policies/:id', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const existing = db.prepare('SELECT tier FROM policies WHERE id = ?').get(id) as { tier?: string } | undefined;
-    if (id === 'pol-global' || existing?.tier === 'global') {
+    const existing = db.prepare('SELECT tier, target_id FROM policies WHERE id = ?').get(id) as
+      | { tier?: string; target_id?: string | null }
+      | undefined;
+    if (!existing) {
+      return reply.status(404).send({ success: false, error: 'Policy not found' });
+    }
+    if (id === 'pol-global' || existing.tier === 'global') {
       return reply.status(400).send({ success: false, error: 'Cannot delete the Global MSP Baseline policy' });
+    }
+    if (id === 'pol-quicksupport' || existing.tier === 'quicksupport') {
+      return reply.status(400).send({ success: false, error: 'Cannot delete the built-in QuickSupport branding profile' });
+    }
+    if (existing.tier === 'role') {
+      if (!isSuperAdminRole(request.auth?.user.role)) {
+        return reply.status(403).send({ success: false, error: 'Only MSP Super Admins can delete role-tier policies.' });
+      }
+    } else {
+      const existingTenant = resolvePolicyTenantId(existing.tier, existing.target_id);
+      if (!existingTenant || !canUserAccessTenant(request.auth?.user, existingTenant)) {
+        return reply.status(403).send({ success: false, error: 'Forbidden for target policy scope.' });
+      }
     }
     db.prepare('DELETE FROM policies WHERE id = ?').run(id);
     return { success: true };
@@ -2458,7 +3358,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.get('/api/policies/effective/:deviceId', async (request, reply) => {
     const { deviceId } = request.params as { deviceId: string };
-    if (!ensureDeviceTenantAccess(request, reply, deviceId).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, deviceId).allowed) return reply;
     return sanitizeEffectivePolicyForResponse(resolveEffectiveDevicePolicy(deviceId));
   });
 
@@ -2470,12 +3370,27 @@ export async function registerApiRoutes(server: FastifyInstance) {
       return reply.status(404).send({ success: false, error: 'Policy not found' });
     }
 
-    if (existing.tier === 'global' && !isSuperAdminRole(request.auth?.user.role)) {
-      return reply.status(403).send({ success: false, error: 'Only MSP Super Admins can modify the Global Baseline policy.' });
+    if ((existing.tier === 'global' || existing.tier === 'quicksupport' || existing.tier === 'role') && !isSuperAdminRole(request.auth?.user.role)) {
+      return reply.status(403).send({ success: false, error: 'Only MSP Super Admins can modify global, QuickSupport, or role policies.' });
     }
-    if (existing.tier !== 'global') {
+    if (existing.tier !== 'global' && existing.tier !== 'quicksupport' && existing.tier !== 'role') {
       const existingTenant = resolvePolicyTenantId(existing.tier, existing.target_id);
       if (!existingTenant || !canUserAccessTenant(request.auth?.user, existingTenant)) {
+        return reply.status(403).send({ success: false, error: 'Forbidden for target policy scope.' });
+      }
+    }
+
+    const nextTier = body.tier !== undefined ? String(body.tier).trim().toLowerCase() : String(existing.tier || 'client').toLowerCase();
+    const nextTargetId = body.target_id !== undefined ? body.target_id : existing.target_id;
+    if (!['global', 'quicksupport', 'role', 'client', 'site', 'device'].includes(nextTier)) {
+      return reply.status(400).send({ success: false, error: `Invalid policy tier '${nextTier}'.` });
+    }
+    if ((nextTier === 'global' || nextTier === 'quicksupport' || nextTier === 'role') && !isSuperAdminRole(request.auth?.user.role)) {
+      return reply.status(403).send({ success: false, error: 'Only MSP Super Admins can target global, QuickSupport, or role policy tiers.' });
+    }
+    if (nextTier !== 'global' && nextTier !== 'quicksupport' && nextTier !== 'role') {
+      const nextTenant = resolvePolicyTenantId(nextTier, nextTargetId);
+      if (!nextTenant || !canUserAccessTenant(request.auth?.user, nextTenant)) {
         return reply.status(403).send({ success: false, error: 'Forbidden for target policy scope.' });
       }
     }
@@ -2486,10 +3401,21 @@ export async function registerApiRoutes(server: FastifyInstance) {
       (body.laps_static_password !== undefined && !isMaskedSecret(String(body.laps_static_password))) ||
       body.laps_offboard_client_deleted_action !== undefined;
     if (weakensSecurity && !requireStepUpMfaIfEnforced(request, reply, null)) {
-      return;
+      return reply;
     }
 
     const prevOverrides = new Set<string>(safeJsonParse<string[]>(existing.overrides_json, []));
+    const normalizedTrayMenuJson =
+      body.tray_menu_items !== undefined
+        ? body.tray_menu_items === null
+          ? null
+          : JSON.stringify(parsePolicyTrayMenuItems(JSON.stringify(body.tray_menu_items)))
+        : body.tray_menu_items_json !== undefined
+          ? body.tray_menu_items_json
+          : undefined;
+    if (normalizedTrayMenuJson !== undefined) {
+      body.tray_menu_items_json = normalizedTrayMenuJson;
+    }
     for (const col of OVERRIDABLE_POLICY_COLUMNS) {
       if (body[col] !== undefined && body[col] !== existing[col]) {
         prevOverrides.add(col);
@@ -2507,8 +3433,8 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
     const updated = {
       name: body.name ?? existing.name,
-      tier: body.tier ?? existing.tier,
-      target_id: body.target_id !== undefined ? body.target_id : existing.target_id,
+      tier: nextTier,
+      target_id: nextTier === 'global' ? null : nextTargetId,
       telemetry_interval_sec: body.telemetry_interval_sec ?? existing.telemetry_interval_sec,
       require_remote_consent:
         body.require_remote_consent !== undefined ? (body.require_remote_consent ? 1 : 0) : existing.require_remote_consent,
@@ -2675,7 +3601,18 @@ export async function registerApiRoutes(server: FastifyInstance) {
       defenderVal !== undefined ||
       bitlockerVal !== undefined ||
       body.backup_policy_id !== undefined ||
-      body.mdm_profile_id !== undefined
+      body.mdm_profile_id !== undefined ||
+      body.tray_brand_name !== undefined ||
+      body.tray_icon_url !== undefined ||
+      body.tray_theme_mode !== undefined ||
+      body.tray_enabled !== undefined ||
+      body.tray_tooltip !== undefined ||
+      body.tray_support_url !== undefined ||
+      body.tray_support_phone !== undefined ||
+      body.tray_support_email !== undefined ||
+      body.tray_menu_items !== undefined ||
+      body.tray_menu_items_json !== undefined ||
+      body.companion_auto_deploy !== undefined
     ) {
       db.prepare(`
         UPDATE policies SET
@@ -2684,7 +3621,17 @@ export async function registerApiRoutes(server: FastifyInstance) {
           defender_managed = COALESCE(?, defender_managed),
           bitlocker_enforced = COALESCE(?, bitlocker_enforced),
           backup_policy_id = ?,
-          mdm_profile_id = ?
+          mdm_profile_id = ?,
+          tray_brand_name = COALESCE(?, tray_brand_name),
+          tray_icon_url = COALESCE(?, tray_icon_url),
+          tray_theme_mode = COALESCE(?, tray_theme_mode),
+          tray_enabled = COALESCE(?, tray_enabled),
+          tray_tooltip = COALESCE(?, tray_tooltip),
+          tray_support_url = COALESCE(?, tray_support_url),
+          tray_support_phone = COALESCE(?, tray_support_phone),
+          tray_support_email = COALESCE(?, tray_support_email),
+          tray_menu_items_json = ?,
+          companion_auto_deploy = COALESCE(?, companion_auto_deploy)
         WHERE id = ?
       `).run(
         body.patch_ring ?? null,
@@ -2693,6 +3640,16 @@ export async function registerApiRoutes(server: FastifyInstance) {
         bitlockerVal != null ? (bitlockerVal ? 1 : 0) : null,
         body.backup_policy_id !== undefined ? body.backup_policy_id : existing.backup_policy_id ?? null,
         body.mdm_profile_id !== undefined ? body.mdm_profile_id : existing.mdm_profile_id ?? null,
+        body.tray_brand_name !== undefined ? String(body.tray_brand_name) : null,
+        body.tray_icon_url !== undefined ? String(body.tray_icon_url) : null,
+        body.tray_theme_mode !== undefined ? String(body.tray_theme_mode) : null,
+        body.tray_enabled !== undefined ? (body.tray_enabled ? 1 : 0) : null,
+        body.tray_tooltip !== undefined ? String(body.tray_tooltip) : null,
+        body.tray_support_url !== undefined ? String(body.tray_support_url) : null,
+        body.tray_support_phone !== undefined ? String(body.tray_support_phone) : null,
+        body.tray_support_email !== undefined ? String(body.tray_support_email) : null,
+        body.tray_menu_items_json !== undefined ? body.tray_menu_items_json : existing.tray_menu_items_json ?? null,
+        body.companion_auto_deploy !== undefined ? (body.companion_auto_deploy ? 1 : 0) : null,
         id
       );
     }
@@ -2702,6 +3659,38 @@ export async function registerApiRoutes(server: FastifyInstance) {
       success: true,
       policy: formatPolicyRowForResponse(savedRow)
     };
+  });
+
+  server.post('/api/policies/:id/tray-icon', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const existing = db.prepare('SELECT * FROM policies WHERE id = ?').get(id) as any;
+    if (!existing) {
+      return reply.status(404).send({ error: 'Policy not found' });
+    }
+    if ((existing.tier === 'global' || existing.tier === 'quicksupport' || existing.tier === 'role') && !isSuperAdminRole(request.auth?.user.role)) {
+      return reply.status(403).send({ error: 'Only MSP Super Admins can modify Global, QuickSupport, or Role policy icons.' });
+    }
+    if (existing.tier !== 'global' && existing.tier !== 'quicksupport' && existing.tier !== 'role') {
+      const existingTenant = resolvePolicyTenantId(existing.tier, existing.target_id);
+      if (!existingTenant || !canUserAccessTenant(request.auth?.user, existingTenant)) {
+        return reply.status(403).send({ error: 'Forbidden for target policy scope.' });
+      }
+    }
+
+    const body = (request.body || {}) as { filename?: string; base64Data?: string };
+    const saved = saveValidatedBrandingRasterImage(body.base64Data, `policy-${id}`);
+    if (!saved.ok) {
+      return reply.status(saved.status).send({ error: saved.error });
+    }
+
+    const prevOverrides = new Set<string>(safeJsonParse<string[]>(existing.overrides_json, []));
+    prevOverrides.add('tray_icon_url');
+    db.prepare('UPDATE policies SET tray_icon_url = ?, overrides_json = ? WHERE id = ?').run(
+      saved.url,
+      JSON.stringify(Array.from(prevOverrides)),
+      id
+    );
+    return { success: true, tray_icon_url: saved.url };
   });
 
   // ============================================================================
@@ -2765,17 +3754,20 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.get('/api/patches', async (request) => {
     const user = request.auth?.user;
-    const scopedTenantId = getScopedTenantFilter(user);
-    const rows = (scopedTenantId
+    const allowedTenants = getAllowedTenantIds(user);
+    if (allowedTenants !== null && allowedTenants.length === 0) {
+      return [];
+    }
+    const rows = (allowedTenants !== null
       ? db
           .prepare(`
             SELECT p.*, d.hostname, d.tenant_id
             FROM patches p
             JOIN devices d ON p.device_id = d.id
-            WHERE d.tenant_id = ?
+            WHERE d.tenant_id IN (${allowedTenants.map(() => '?').join(',')})
             ORDER BY p.release_date DESC
           `)
-          .all(scopedTenantId)
+          .all(...allowedTenants)
       : db
           .prepare(`
             SELECT p.*, d.hostname, d.tenant_id
@@ -3008,9 +4000,27 @@ export async function registerApiRoutes(server: FastifyInstance) {
     parameters_schema: safeJsonParse<any[]>(s.parameters_schema_json, [])
   });
 
-  server.get('/api/scripts', async (request) => {
+  const resolveScriptParametersSchemaJson = (body: Record<string, any>): string | null => {
+    const raw = body.parameters_schema !== undefined ? body.parameters_schema : body.parameters_schema_json;
+    if (raw === undefined) return null;
+    if (Array.isArray(raw)) return JSON.stringify(raw);
+    if (typeof raw === 'string') {
+      try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? JSON.stringify(parsed) : '[]';
+      } catch {
+        return '[]';
+      }
+    }
+    return '[]';
+  };
+
+  server.get('/api/scripts', async (request, reply) => {
     const user = request.auth?.user;
     const { tenantId } = (request.query || {}) as { tenantId?: string };
+    if (tenantId && tenantId !== 'all' && !canUserAccessTenant(user, tenantId)) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
     const rows = (
       tenantId && tenantId !== 'all'
         ? db
@@ -3030,9 +4040,10 @@ export async function registerApiRoutes(server: FastifyInstance) {
     const deviceId = query.deviceId;
     const scriptId = query.scriptId || query.script_id;
     const user = request.auth?.user;
+    const isGlobalUser = getAllowedTenantIds(user) === null;
 
     if (deviceId) {
-      if (!ensureDeviceTenantAccess(request, reply, deviceId).allowed) return;
+      if (!ensureDeviceTenantAccess(request, reply, deviceId).allowed) return reply;
       if (scriptId) {
         return db
           .prepare('SELECT * FROM script_executions WHERE device_id = ? AND script_id = ? ORDER BY executed_at DESC LIMIT 50')
@@ -3064,24 +4075,31 @@ export async function registerApiRoutes(server: FastifyInstance) {
           `)
           .all()) as any[];
 
-    return rows.filter((r) => !r.tenant_id || canUserAccessTenant(user, r.tenant_id));
+    return rows.filter((r) => (r.tenant_id ? canUserAccessTenant(user, r.tenant_id) : isGlobalUser));
   });
 
   server.post('/api/scripts', async (request, reply) => {
     const body = (request.body || {}) as any;
+    const user = request.auth?.user;
     if (!body.name?.trim() || !body.code?.trim()) {
       return reply.status(400).send({ error: 'Script name and code are required.' });
     }
-    if (
-      (body.required_role === 'admin' || body.required_role === 'super_admin' || body.required_role === 'msp_super_admin') &&
-      !isSuperAdminRole(request.auth?.user.role)
-    ) {
-      return reply.status(403).send({ error: 'Only Super Admins can create Super-Admin-restricted scripts.' });
+    if (body.required_role !== undefined && !isSuperAdminRole(user?.role)) {
+      if (String(body.required_role).trim().toLowerCase() !== 'technician') {
+        return reply.status(403).send({ error: 'Only MSP Super Admins can set script required_role.' });
+      }
+    }
+
+    const tenantId = body.tenant_id && body.tenant_id !== 'all' ? String(body.tenant_id) : null;
+    if (tenantId && !canUserAccessTenant(user, tenantId)) {
+      return reply.status(403).send({ error: 'Forbidden for target tenant scope.' });
+    }
+    if (!tenantId && getAllowedTenantIds(user) !== null) {
+      return reply.status(403).send({ error: 'Scoped accounts cannot create global (all-tenant) scripts.' });
     }
 
     const id = `scr-custom-${crypto.randomUUID().slice(0, 8)}`;
-    const tenantId = body.tenant_id && body.tenant_id !== 'all' ? body.tenant_id : null;
-    const paramsSchemaJson = Array.isArray(body.parameters_schema) ? JSON.stringify(body.parameters_schema) : '[]';
+    const paramsSchemaJson = resolveScriptParametersSchemaJson(body) ?? '[]';
 
     db.prepare(`
       INSERT INTO scripts (id, name, description, language, code, category, enabled, required_role, is_builtin, tenant_id, parameters_schema_json)
@@ -3094,7 +4112,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
       body.code,
       body.category || 'Maintenance',
       body.enabled != null ? (body.enabled ? 1 : 0) : 1,
-      body.required_role || 'technician',
+      isSuperAdminRole(user?.role) ? body.required_role || 'technician' : 'technician',
       tenantId,
       paramsSchemaJson
     );
@@ -3105,18 +4123,50 @@ export async function registerApiRoutes(server: FastifyInstance) {
     const { id } = request.params as { id: string };
     const existing = db.prepare('SELECT * FROM scripts WHERE id = ?').get(id) as any;
     if (!existing) return reply.status(404).send({ error: 'Script not found' });
-    if (!canUserRunScriptRole(request.auth?.user.role || '', existing.required_role)) {
+    const user = request.auth?.user;
+    if (!canUserRunScriptRole(user?.role || '', existing.required_role)) {
       return reply.status(403).send({ error: 'Insufficient privileges to modify this script.' });
     }
+    const existingTenantId = existing.tenant_id && existing.tenant_id !== 'all' ? existing.tenant_id : null;
+    if (!existingTenantId && !isSuperAdminRole(user?.role)) {
+      return reply.status(403).send({ error: 'Only MSP Super Admins may modify global scripts.' });
+    }
+    if (existingTenantId && !canUserAccessTenant(user, existingTenantId)) {
+      return reply.status(403).send({ error: 'Forbidden for target script tenant.' });
+    }
+
     const body = (request.body || {}) as any;
+    if (
+      body.required_role !== undefined &&
+      String(body.required_role).trim().toLowerCase() !== String(existing.required_role || 'technician').toLowerCase() &&
+      !isSuperAdminRole(user?.role)
+    ) {
+      return reply.status(403).send({ error: 'Only MSP Super Admins may change script required_role.' });
+    }
+
+    const nextTenantId =
+      body.tenant_id !== undefined
+        ? body.tenant_id && body.tenant_id !== 'all'
+          ? String(body.tenant_id)
+          : null
+        : existingTenantId;
+    if (!nextTenantId && !isSuperAdminRole(user?.role)) {
+      return reply.status(403).send({ error: 'Only MSP Super Admins may scope scripts globally.' });
+    }
+    if (nextTenantId && !canUserAccessTenant(user, nextTenantId)) {
+      return reply.status(403).send({ error: 'Forbidden for target tenant scope.' });
+    }
+
     if (existing.is_builtin && body.code !== undefined && body.code !== existing.code) {
-      if (!isSuperAdminRole(request.auth?.user.role)) {
+      if (!isSuperAdminRole(user?.role)) {
         return reply.status(403).send({ error: 'Only MSP Super Admins may modify built-in baseline scripts.' });
       }
       if (!requireStepUpMfaIfEnforced(request, reply, null)) {
-        return;
+        return reply;
       }
     }
+
+    const nextSchemaJson = resolveScriptParametersSchemaJson(body);
 
     db.prepare(`
       UPDATE scripts SET
@@ -3137,9 +4187,9 @@ export async function registerApiRoutes(server: FastifyInstance) {
       body.code ?? null,
       body.category ?? null,
       body.enabled != null ? (body.enabled ? 1 : 0) : null,
-      body.required_role ?? null,
-      body.tenant_id !== undefined ? (body.tenant_id === 'all' ? null : body.tenant_id) : existing.tenant_id,
-      Array.isArray(body.parameters_schema) ? JSON.stringify(body.parameters_schema) : null,
+      isSuperAdminRole(user?.role) ? body.required_role ?? null : null,
+      nextTenantId,
+      nextSchemaJson,
       id
     );
     return { success: true, script: formatScriptRow(db.prepare('SELECT * FROM scripts WHERE id = ?').get(id)) };
@@ -3149,6 +4199,17 @@ export async function registerApiRoutes(server: FastifyInstance) {
     const { id } = request.params as { id: string };
     const existing = db.prepare('SELECT * FROM scripts WHERE id = ?').get(id) as any;
     if (!existing) return reply.status(404).send({ error: 'Script not found' });
+    const user = request.auth?.user;
+    if (!canUserRunScriptRole(user?.role || '', existing.required_role)) {
+      return reply.status(403).send({ error: 'Insufficient privileges to delete this script.' });
+    }
+    const existingTenantId = existing.tenant_id && existing.tenant_id !== 'all' ? existing.tenant_id : null;
+    if (!existingTenantId && !isSuperAdminRole(user?.role)) {
+      return reply.status(403).send({ error: 'Only MSP Super Admins may delete global scripts.' });
+    }
+    if (existingTenantId && !canUserAccessTenant(user, existingTenantId)) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
     if (existing.is_builtin) {
       return reply.status(400).send({ error: 'Built-in baseline scripts cannot be deleted (disable instead).' });
     }
@@ -3159,29 +4220,55 @@ export async function registerApiRoutes(server: FastifyInstance) {
   server.post('/api/scripts/:id/run', async (request, reply) => {
     const { id } = request.params as { id: string };
     const body = (request.body || {}) as {
+      deviceId?: string;
       deviceIds?: string[];
       smartGroupId?: string;
       params?: Record<string, string>;
       runAs?: 'system' | 'user';
     };
+    const user = request.auth?.user;
     const script = db.prepare('SELECT * FROM scripts WHERE id = ?').get(id) as any;
     if (!script) return reply.status(404).send({ error: 'Script not found' });
     if (!script.enabled) {
       return reply.status(400).send({ error: `Script "${script.name}" is currently disabled.` });
     }
-    if (!canUserRunScriptRole(request.auth?.user.role || '', script.required_role)) {
+    if (!canUserRunScriptRole(user?.role || '', script.required_role)) {
       return reply.status(403).send({
         error: `Forbidden: Script "${script.name}" requires role '${script.required_role}'.`
       });
     }
+    if (script.tenant_id && script.tenant_id !== 'all' && !canUserAccessTenant(user, script.tenant_id)) {
+      return reply.status(403).send({ error: 'Forbidden: script belongs to another client tenant.' });
+    }
 
-    let targetDeviceIds = Array.isArray(body.deviceIds) ? body.deviceIds.filter(Boolean) : [];
+    const explicitDeviceIds = Array.from(
+      new Set([
+        ...(Array.isArray(body.deviceIds) ? body.deviceIds.map((d) => String(d || '').trim()).filter(Boolean) : []),
+        ...(typeof body.deviceId === 'string' && body.deviceId.trim() ? [body.deviceId.trim()] : [])
+      ])
+    );
+    for (const reqDevId of explicitDeviceIds) {
+      const devCheck = db.prepare('SELECT id, tenant_id FROM devices WHERE id = ?').get(reqDevId) as
+        | { id: string; tenant_id: string }
+        | undefined;
+      if (devCheck && !canUserAccessTenant(user, devCheck.tenant_id)) {
+        return reply.status(403).send({ error: 'Forbidden: target endpoint is outside your tenant scope.' });
+      }
+    }
+
+    let targetDeviceIds = [...explicitDeviceIds];
     if (body.smartGroupId) {
       const sg = db.prepare('SELECT * FROM smart_groups WHERE id = ?').get(body.smartGroupId) as any;
-      if (sg) {
-        const matched = evaluateSmartGroupDevices(sg.criteria_json, sg.tenant_id);
-        targetDeviceIds = Array.from(new Set([...targetDeviceIds, ...matched.map((m) => m.id)]));
+      if (!sg) {
+        return reply.status(404).send({ error: 'Smart group not found.' });
       }
+      if (sg.tenant_id ? !canUserAccessTenant(user, sg.tenant_id) : getAllowedTenantIds(user) !== null) {
+        return reply.status(403).send({ error: 'Forbidden: smart group is outside your tenant scope.' });
+      }
+      const matched = evaluateSmartGroupDevices(sg.criteria_json, sg.tenant_id).filter((m) =>
+        canUserAccessTenant(user, m.tenant_id)
+      );
+      targetDeviceIds = Array.from(new Set([...targetDeviceIds, ...matched.map((m) => m.id)]));
     }
     if (targetDeviceIds.length === 0) {
       return reply.status(400).send({ error: 'At least one target deviceId or smartGroupId is required.' });
@@ -3192,6 +4279,14 @@ export async function registerApiRoutes(server: FastifyInstance) {
     const actor = getActorUsername(request);
     const outputs: string[] = [];
     let dispatchedCount = 0;
+
+    const signingSettings = (db
+      .prepare('SELECT code_signing_enabled, code_signing_sign_scripts, code_signing_strict_verify FROM settings WHERE id = 1')
+      .get() || {}) as {
+      code_signing_enabled?: number;
+      code_signing_sign_scripts?: number;
+      code_signing_strict_verify?: number;
+    };
 
     const insertExec = db.prepare(`
       INSERT INTO script_executions (
@@ -3205,7 +4300,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
     for (const devId of targetDeviceIds) {
       const dev = db.prepare('SELECT * FROM devices WHERE id = ?').get(devId) as any;
-      if (!dev || !canUserAccessTenant(request.auth?.user, dev.tenant_id)) continue;
+      if (!dev || !canUserAccessTenant(user, dev.tenant_id)) continue;
 
       const shellLang: 'powershell' | 'bash' | 'python' =
         script.language === 'bash' ? 'bash' : script.language === 'python' ? 'python' : 'powershell';
@@ -3220,11 +4315,42 @@ export async function registerApiRoutes(server: FastifyInstance) {
       });
       const safeRenderedCode = String(script.code || '');
 
+      let bridgeCommand = safeRenderedCode;
+      let bridgeShell: 'powershell' | 'bash' = shellLang === 'bash' ? 'bash' : 'powershell';
+
+      if (shellLang === 'python') {
+        const b64Py = Buffer.from(safeRenderedCode, 'utf8').toString('base64');
+        if (dev.os_type === 'windows') {
+          bridgeShell = 'powershell';
+          bridgeCommand = `$pyCode = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${b64Py}')); if (Get-Command py -ErrorAction SilentlyContinue) { $pyCode | py -3 - } elseif (Get-Command python3 -ErrorAction SilentlyContinue) { $pyCode | python3 - } else { $pyCode | python - }`;
+        } else {
+          bridgeShell = 'bash';
+          bridgeCommand = `if command -v python3 >/dev/null 2>&1; then printf '%s' '${b64Py}' | (base64 -d 2>/dev/null || base64 -D) | python3 -; else printf '%s' '${b64Py}' | (base64 -d 2>/dev/null || base64 -D) | python -; fi`;
+        }
+      } else if (
+        dev.os_type === 'windows' &&
+        shellLang === 'powershell' &&
+        signingSettings.code_signing_enabled &&
+        signingSettings.code_signing_sign_scripts
+      ) {
+        const signedWrap = await codeSigningService.wrapPowerShellExecutionIfSigningEnabled(
+          safeRenderedCode,
+          Boolean(signingSettings.code_signing_strict_verify)
+        );
+        if (signedWrap.error && signingSettings.code_signing_strict_verify) {
+          return reply.status(502).send({
+            success: false,
+            error: `Code signing policy blocked unsigned PowerShell execution: ${signedWrap.error}`
+          });
+        }
+        bridgeCommand = signedWrap.command;
+      }
+
       const execId = `exec-${crypto.randomUUID().slice(0, 8)}`;
       const startMs = Date.now();
-      const execRes = await meshBridge.executeCommandOnNode(dev.id, safeRenderedCode, {
+      const execRes = await meshBridge.executeCommandOnNode(dev.id, bridgeCommand, {
         runAs,
-        shell: shellLang === 'bash' ? 'bash' : 'powershell',
+        shell: bridgeShell,
         timeoutMs: 12_000,
         env: envVars,
         executionId: execId
@@ -3269,7 +4395,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
         runAs,
         JSON.stringify(runtimeParams),
         statusLabel,
-        execRes.live ? execRes.exitCode : null,
+        execRes.live ? (execRes.exitCode ?? 0) : -1,
         execRes.output,
         execRes.live && execRes.exitCode === 0 ? execRes.output : '',
         execRes.live && execRes.exitCode !== 0 ? execRes.output : '',
@@ -3298,11 +4424,16 @@ export async function registerApiRoutes(server: FastifyInstance) {
   // ============================================================================
   // Self-Healing Watchdogs & Auto-Remediation (Policy, Cooldown & Maintenance Aware)
   // ============================================================================
-  server.get('/api/self-healing', async () => {
-    return db.prepare('SELECT * FROM self_healing_monitors ORDER BY id ASC').all();
+  server.get('/api/self-healing', async (request) => {
+    const user = request.auth?.user;
+    const isGlobalUser = getAllowedTenantIds(user) === null;
+    const rows = db.prepare('SELECT * FROM self_healing_monitors ORDER BY id ASC').all() as any[];
+    return rows.filter((m) => (m.tenant_id ? canUserAccessTenant(user, m.tenant_id) : isGlobalUser));
   });
 
   server.get('/api/self-healing/logs', async (request) => {
+    const user = request.auth?.user;
+    const isGlobalUser = getAllowedTenantIds(user) === null;
     const rows = db
       .prepare(`
         SELECT r.*, d.tenant_id
@@ -3312,10 +4443,11 @@ export async function registerApiRoutes(server: FastifyInstance) {
         LIMIT 50
       `)
       .all() as any[];
-    return rows.filter((r) => !r.tenant_id || canUserAccessTenant(request.auth?.user, r.tenant_id));
+    return rows.filter((r) => (r.tenant_id ? canUserAccessTenant(user, r.tenant_id) : isGlobalUser));
   });
 
   server.post('/api/self-healing', async (request, reply) => {
+    const user = request.auth?.user;
     const body = (request.body || {}) as {
       name?: string;
       condition_type?: string;
@@ -3323,55 +4455,131 @@ export async function registerApiRoutes(server: FastifyInstance) {
       remediation_script_id?: string;
       cooldown_min?: number;
       alert_on_failure?: boolean;
+      tenant_id?: string | null;
     };
     if (!body.name?.trim()) return reply.status(400).send({ error: 'Watchdog monitor name is required.' });
+    const scriptId = body.remediation_script_id || 'scr-1';
+    const remScript = db.prepare('SELECT * FROM scripts WHERE id = ?').get(scriptId) as any;
+    if (!remScript) return reply.status(404).send({ error: 'Remediation script not found.' });
+    if (!canUserRunScriptRole(user?.role || '', remScript.required_role)) {
+      return reply.status(403).send({
+        error: `Forbidden: remediation script "${remScript.name}" requires role '${remScript.required_role}'.`
+      });
+    }
+    if (remScript.tenant_id && remScript.tenant_id !== 'all' && !canUserAccessTenant(user, remScript.tenant_id)) {
+      return reply.status(403).send({ error: 'Forbidden: remediation script is outside your tenant scope.' });
+    }
+    const targetTenantId = body.tenant_id && body.tenant_id !== 'all' ? String(body.tenant_id) : null;
+    if (targetTenantId ? !canUserAccessTenant(user, targetTenantId) : getAllowedTenantIds(user) !== null) {
+      return reply.status(403).send({ error: 'Forbidden for target tenant scope.' });
+    }
     const id = `mon-${crypto.randomUUID().slice(0, 8)}`;
     db.prepare(`
-      INSERT INTO self_healing_monitors (id, name, condition_type, condition_value, remediation_script_id, cooldown_min, alert_on_failure, enabled)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+      INSERT INTO self_healing_monitors (id, name, condition_type, condition_value, remediation_script_id, cooldown_min, alert_on_failure, tenant_id, enabled)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
     `).run(
       id,
       body.name.trim(),
       body.condition_type || 'service_stopped',
       body.condition_value || 'Spooler',
-      body.remediation_script_id || 'scr-1',
+      scriptId,
       Math.max(1, Number(body.cooldown_min || 15)),
-      body.alert_on_failure !== false ? 1 : 0
+      body.alert_on_failure !== false ? 1 : 0,
+      targetTenantId
     );
     return { success: true, monitor: db.prepare('SELECT * FROM self_healing_monitors WHERE id = ?').get(id) };
   });
 
-  server.put('/api/self-healing/:id', async (request) => {
+  server.put('/api/self-healing/:id', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const body = (request.body || {}) as { enabled?: boolean | number; cooldown_min?: number; name?: string };
+    const existing = db.prepare('SELECT * FROM self_healing_monitors WHERE id = ?').get(id) as any;
+    if (!existing) return reply.status(404).send({ error: 'Watchdog monitor not found.' });
+    const user = request.auth?.user;
+    if (existing.tenant_id ? !canUserAccessTenant(user, existing.tenant_id) : getAllowedTenantIds(user) !== null) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
+    const existingScript = db.prepare('SELECT * FROM scripts WHERE id = ?').get(existing.remediation_script_id) as any;
+    if (existingScript && !canUserRunScriptRole(user?.role || '', existingScript.required_role)) {
+      return reply.status(403).send({ error: 'Insufficient privileges to modify watchdog using a restricted script.' });
+    }
+
+    const body = (request.body || {}) as {
+      enabled?: boolean | number;
+      cooldown_min?: number;
+      name?: string;
+      remediation_script_id?: string;
+      tenant_id?: string | null;
+    };
+    if (body.remediation_script_id) {
+      const nextScript = db.prepare('SELECT * FROM scripts WHERE id = ?').get(body.remediation_script_id) as any;
+      if (!nextScript) return reply.status(404).send({ error: 'Remediation script not found.' });
+      if (!canUserRunScriptRole(user?.role || '', nextScript.required_role)) {
+        return reply.status(403).send({
+          error: `Forbidden: remediation script "${nextScript.name}" requires role '${nextScript.required_role}'.`
+        });
+      }
+      if (nextScript.tenant_id && nextScript.tenant_id !== 'all' && !canUserAccessTenant(user, nextScript.tenant_id)) {
+        return reply.status(403).send({ error: 'Forbidden: remediation script is outside your tenant scope.' });
+      }
+    }
+    const nextTenantId =
+      body.tenant_id !== undefined
+        ? body.tenant_id && body.tenant_id !== 'all'
+          ? String(body.tenant_id)
+          : null
+        : existing.tenant_id ?? null;
+    if (nextTenantId ? !canUserAccessTenant(user, nextTenantId) : getAllowedTenantIds(user) !== null) {
+      return reply.status(403).send({ error: 'Forbidden for target tenant scope.' });
+    }
+
     db.prepare(`
       UPDATE self_healing_monitors SET
         enabled = COALESCE(?, enabled),
         cooldown_min = COALESCE(?, cooldown_min),
-        name = COALESCE(?, name)
+        name = COALESCE(?, name),
+        remediation_script_id = COALESCE(?, remediation_script_id),
+        tenant_id = ?
       WHERE id = ?
     `).run(
       body.enabled !== undefined ? (body.enabled ? 1 : 0) : null,
       body.cooldown_min != null ? Math.max(1, Number(body.cooldown_min)) : null,
       body.name ?? null,
+      body.remediation_script_id ?? null,
+      nextTenantId,
       id
     );
     return { success: true, monitor: db.prepare('SELECT * FROM self_healing_monitors WHERE id = ?').get(id) };
   });
 
-  server.delete('/api/self-healing/:id', async (request) => {
+  server.delete('/api/self-healing/:id', async (request, reply) => {
     const { id } = request.params as { id: string };
+    const existing = db.prepare('SELECT * FROM self_healing_monitors WHERE id = ?').get(id) as any;
+    if (!existing) return reply.status(404).send({ error: 'Watchdog monitor not found.' });
+    const user = request.auth?.user;
+    if (existing.tenant_id ? !canUserAccessTenant(user, existing.tenant_id) : getAllowedTenantIds(user) !== null) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
+    const existingScript = db.prepare('SELECT * FROM scripts WHERE id = ?').get(existing.remediation_script_id) as any;
+    if (existingScript && !canUserRunScriptRole(user?.role || '', existingScript.required_role)) {
+      return reply.status(403).send({ error: 'Insufficient privileges to delete watchdog using a restricted script.' });
+    }
     db.prepare('DELETE FROM self_healing_monitors WHERE id = ?').run(id);
     return { success: true };
   });
 
-  server.post('/api/self-healing/evaluate', async () => {
-    const monitors = db.prepare('SELECT * FROM self_healing_monitors WHERE enabled = 1').all() as any[];
-    const devices = db
-      .prepare(
-        "SELECT d.*, t.name as tenant_name FROM devices d LEFT JOIN tenants t ON d.tenant_id = t.id WHERE d.status = 'online' AND COALESCE(d.lifecycle_state, 'active') = 'active'"
-      )
-      .all() as any[];
+  server.post('/api/self-healing/evaluate', async (request) => {
+    const user = request.auth?.user;
+    const isGlobalUser = getAllowedTenantIds(user) === null;
+    const monitors = (db.prepare('SELECT * FROM self_healing_monitors WHERE enabled = 1').all() as any[]).filter((m) =>
+      m.tenant_id ? canUserAccessTenant(user, m.tenant_id) : isGlobalUser
+    );
+    const devices = (
+      db
+        .prepare(
+          "SELECT d.*, t.name as tenant_name FROM devices d LEFT JOIN tenants t ON d.tenant_id = t.id WHERE d.status = 'online' AND COALESCE(d.lifecycle_state, 'active') = 'active'"
+        )
+        .all() as any[]
+    ).filter((d) => canUserAccessTenant(user, d.tenant_id));
     const triggered: any[] = [];
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
@@ -3404,6 +4612,13 @@ export async function registerApiRoutes(server: FastifyInstance) {
       }
 
       for (const mon of monitors) {
+        if (mon.tenant_id && mon.tenant_id !== dev.tenant_id) continue;
+        const scriptCheck = db.prepare('SELECT * FROM scripts WHERE id = ?').get(mon.remediation_script_id) as any;
+        if (scriptCheck && !canUserRunScriptRole(user?.role || '', scriptCheck.required_role)) continue;
+        if (scriptCheck?.tenant_id && scriptCheck.tenant_id !== 'all' && !canUserAccessTenant(user, scriptCheck.tenant_id)) {
+          continue;
+        }
+
         const cooldownCutoffIso = new Date(nowMs - Math.max(1, Number(mon.cooldown_min || 15)) * 60_000).toISOString();
         const recentRun = db
           .prepare('SELECT id FROM remediation_logs WHERE monitor_id = ? AND device_id = ? AND executed_at >= ? LIMIT 1')
@@ -3493,12 +4708,24 @@ export async function registerApiRoutes(server: FastifyInstance) {
       }
     }
 
+    const scopedLogs = (
+      db
+        .prepare(`
+          SELECT r.*, d.tenant_id
+          FROM remediation_logs r
+          LEFT JOIN devices d ON r.device_id = d.id
+          ORDER BY r.executed_at DESC
+          LIMIT 50
+        `)
+        .all() as any[]
+    ).filter((r) => (r.tenant_id ? canUserAccessTenant(user, r.tenant_id) : isGlobalUser));
+
     return {
       success: true,
       evaluatedMonitors: monitors.length,
       evaluatedDevices: devices.length,
       remediationsTriggered: triggered.length,
-      logs: db.prepare('SELECT * FROM remediation_logs ORDER BY executed_at DESC LIMIT 50').all()
+      logs: scopedLogs
     };
   });
 
@@ -3507,6 +4734,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
   // ============================================================================
   server.get('/api/psa/tickets', async (request) => {
     const user = request.auth?.user;
+    const isGlobalUser = getAllowedTenantIds(user) === null;
     const rows = db
       .prepare(`
         SELECT p.*, d.tenant_id as device_tenant_id, t.id as matched_tenant_id
@@ -3518,21 +4746,44 @@ export async function registerApiRoutes(server: FastifyInstance) {
       .all() as any[];
     return rows.filter((r) => {
       const tid = r.device_tenant_id || r.matched_tenant_id;
-      return !tid ? isTechnicianOrAbove(user?.role) && !user?.tenant_id : canUserAccessTenant(user, tid);
+      return !tid ? isGlobalUser : canUserAccessTenant(user, tid);
     });
   });
 
   server.post('/api/psa/tickets', async (request, reply) => {
     const body = (request.body || {}) as any;
+    const user = request.auth?.user;
+    const isGlobalUser = getAllowedTenantIds(user) === null;
     if (!body.title?.trim()) return reply.status(400).send({ error: 'Ticket title is required.' });
     let resolvedDeviceId: string | null = null;
+    let resolvedDeviceTenant: string | null = null;
     if (body.device_id) {
-      const dev = db.prepare('SELECT id FROM devices WHERE id = ? OR LOWER(hostname) = LOWER(?) LIMIT 1').get(body.device_id, body.device_id) as { id: string } | undefined;
-      resolvedDeviceId = dev?.id || null;
+      const devs = db
+        .prepare('SELECT id, tenant_id FROM devices WHERE id = ? OR LOWER(hostname) = LOWER(?)')
+        .all(body.device_id, body.device_id) as Array<{ id: string; tenant_id: string }>;
+      const directMatch = devs.find((d) => d.id === body.device_id);
+      const accessibleMatch = devs.find((d) => canUserAccessTenant(user, d.tenant_id));
+      if (directMatch && !canUserAccessTenant(user, directMatch.tenant_id)) {
+        return reply.status(403).send({ error: 'Forbidden: target device is outside your tenant scope.' });
+      }
+      if (devs.length > 0 && !accessibleMatch) {
+        return reply.status(403).send({ error: 'Forbidden: target device is outside your tenant scope.' });
+      }
+      if (accessibleMatch) {
+        resolvedDeviceId = accessibleMatch.id;
+        resolvedDeviceTenant = accessibleMatch.tenant_id;
+      }
+    }
+    const clientName = body.client_name || 'Managed Client';
+    const matchedTenant = db
+      .prepare('SELECT id FROM tenants WHERE LOWER(name) = LOWER(?) LIMIT 1')
+      .get(String(clientName).trim()) as { id?: string } | undefined;
+    const effectiveTenant = resolvedDeviceTenant || matchedTenant?.id || null;
+    if (effectiveTenant ? !canUserAccessTenant(user, effectiveTenant) : !isGlobalUser) {
+      return reply.status(403).send({ error: 'Forbidden for target tenant scope.' });
     }
     const id = `tkt-${crypto.randomUUID().slice(0, 8)}`;
     const ticketNum = `ITF-${crypto.randomInt(1000, 9999)}`;
-    const clientName = body.client_name || 'Managed Client';
     const priority = body.priority || 'Medium';
     db.prepare(`
       INSERT INTO psa_tickets (id, ticket_number, title, client_name, device_id, status, priority)
@@ -3564,7 +4815,8 @@ export async function registerApiRoutes(server: FastifyInstance) {
       .get(id) as any;
     if (!existing) return reply.status(404).send({ error: 'Ticket not found' });
     const tid = existing.device_tenant_id || existing.matched_tenant_id;
-    if (tid && !canUserAccessTenant(request.auth?.user, tid)) {
+    const user = request.auth?.user;
+    if (tid ? !canUserAccessTenant(user, tid) : getAllowedTenantIds(user) !== null) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
     const body = (request.body || {}) as { status?: string; priority?: string };
@@ -3597,8 +4849,8 @@ export async function registerApiRoutes(server: FastifyInstance) {
     const settings = (db.prepare('SELECT psa_webhook_secret FROM settings WHERE id = 1').get() || {}) as any;
     const expectedSecret = decryptVaultSecret(settings.psa_webhook_secret);
 
-    const authorizedBySession = Boolean(request.auth && isTechnicianOrAbove(request.auth.user.role));
-    if (!authorizedBySession && (!providedSecret || !expectedSecret || !constantTimeEquals(providedSecret, expectedSecret))) {
+    // Webhook endpoint refuses cookie auth; requires HMAC/shared webhook secret
+    if (!providedSecret || !expectedSecret || !constantTimeEquals(providedSecret, expectedSecret)) {
       return reply.status(401).send({ error: 'Invalid or missing x-vitrine-webhook-secret header' });
     }
 
@@ -3617,22 +4869,53 @@ export async function registerApiRoutes(server: FastifyInstance) {
   // Outbound SMTP Test, Code Signing Verification & Reverse Proxy Probe
   // ============================================================================
   server.post('/api/smtp/test', async (request) => {
-    const body = (request.body || {}) as any;
+    const body = (request.body || {}) as {
+      host?: string;
+      port?: number | string;
+      user?: string;
+      pass?: string;
+      from?: string;
+      to?: string;
+      tls?: boolean;
+      secure?: boolean;
+      verifyOnly?: boolean;
+      mode?: string;
+    };
     const stored = (db.prepare('SELECT * FROM settings WHERE id = 1').get() || {}) as any;
-    const { sendAlertEmail } = await import('../services/smtp/index.js');
+    const { sendAlertEmail, verifySmtpConnection } = await import('../services/smtp/index.js');
 
-    const host = body.host || stored.smtp_host || '';
-    const port = parseInt(body.port ?? stored.smtp_port, 10) || 587;
-    const user = body.user ?? stored.smtp_user;
+    const host = body.host !== undefined ? String(body.host).trim() : String(stored.smtp_host || '').trim();
+    const port = parseInt(String(body.port ?? stored.smtp_port ?? 587), 10) || 587;
+    const user = body.user !== undefined ? String(body.user).trim() : String(stored.smtp_user || '').trim();
     const pass =
-      body.pass && !isMaskedSecret(String(body.pass))
+      body.pass !== undefined && !isMaskedSecret(String(body.pass))
         ? String(body.pass)
         : decryptVaultSecret(stored.smtp_pass);
-    const from = body.from || stored.smtp_from || 'alerts@vitrine.local';
-    const to = body.to || request.auth?.user.email || stored.letsencrypt_email || from;
+    const from =
+      body.from !== undefined && String(body.from).trim()
+        ? String(body.from).trim()
+        : stored.smtp_from || 'alerts@vitrine.local';
+    const tls = body.tls !== undefined ? Boolean(body.tls) : Boolean(stored.smtp_tls ?? 1);
+    const secure = body.secure !== undefined ? Boolean(body.secure) : port === 465;
+
+    if (Boolean(body.verifyOnly) || body.mode === 'verify') {
+      const verifyRes = await verifySmtpConnection({ host, port, user, pass, from, tls, secure } as any);
+      return {
+        success: verifyRes.success,
+        mode: 'verify',
+        latencyMs: verifyRes.latencyMs,
+        message: verifyRes.success
+          ? `SMTP connection and credentials verified for ${host}:${port}${user ? ` (${user})` : ''} (${verifyRes.latencyMs ?? 0}ms).`
+          : `SMTP verification failed: ${verifyRes.error}`,
+        error: verifyRes.error,
+        timestamp: new Date().toISOString()
+      };
+    }
+
+    const to = String(body.to || '').trim() || request.auth?.user.email || stored.letsencrypt_email || from;
 
     const result = await sendAlertEmail(
-      { host, port, user, pass, from },
+      { host, port, user, pass, from, tls, secure } as any,
       {
         to,
         subject: 'Vitrine RMM Test Notification — Outbound SMTP Verified',
@@ -3645,6 +4928,8 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
     return {
       success: result.success,
+      mode: 'send',
+      recipient: to,
       message: result.success
         ? `Test email dispatched to ${to} via ${host}:${port}. MessageID: ${result.messageId}`
         : `SMTP dispatch error: ${result.error}`,
@@ -3655,13 +4940,51 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   // Safe Admin Code Signing Test (Never reads arbitrary client-supplied host file paths!)
   server.post('/api/signing/sign', async () => {
+    const settings = (db.prepare('SELECT code_signing_enabled, code_signing_url FROM settings WHERE id = 1').get() || {}) as any;
+    if (!settings.code_signing_enabled || !String(settings.code_signing_url || '').trim()) {
+      return {
+        reachable: false,
+        endpoint: String(settings.code_signing_url || ''),
+        latencyMs: 0,
+        error: 'Code signing is disabled or no signing URL is configured.'
+      };
+    }
     const probe = await codeSigningService.testConnection();
     return probe;
   });
 
-  server.post('/api/code-signing/test', async (request) => {
+  server.post('/api/code-signing/test', async (request, reply) => {
     const body = (request.body || {}) as { url?: string };
-    const probe = await codeSigningService.testConnection(body.url);
+    const settings = (db.prepare('SELECT code_signing_enabled, code_signing_url FROM settings WHERE id = 1').get() || {}) as any;
+    const storedUrl = String(settings.code_signing_url || codeSigningService.getEndpoint() || '').trim();
+
+    let probe: { reachable: boolean; endpoint: string; latencyMs: number; error?: string };
+
+    if (body.url && String(body.url).trim()) {
+      const candidateUrl = String(body.url).trim();
+      let parsedCandidate: URL;
+      try {
+        parsedCandidate = new URL(candidateUrl);
+        if (parsedCandidate.protocol !== 'http:' && parsedCandidate.protocol !== 'https:') {
+          return reply.status(400).send({ success: false, reachable: false, error: 'Invalid code signing URL protocol.' });
+        }
+      } catch {
+        return reply.status(400).send({ success: false, reachable: false, error: 'Invalid code signing URL.' });
+      }
+
+      // CodeSigningService.testConnection already isolates stored API keys to exact origin matches only
+      probe = await codeSigningService.testConnection(candidateUrl);
+    } else if (!settings.code_signing_enabled || !storedUrl) {
+      probe = {
+        reachable: false,
+        endpoint: storedUrl,
+        latencyMs: 0,
+        error: 'Code signing is disabled or no signing URL is configured.'
+      };
+    } else {
+      probe = await codeSigningService.testConnection();
+    }
+
     const pipeline = await installerGenerator.runSigningPipeline({
       os: 'windows',
       mode: 'permanent'
@@ -3691,11 +5014,11 @@ export async function registerApiRoutes(server: FastifyInstance) {
     };
     const checks: Array<{ name: string; status: 'pass' | 'warn' | 'fail'; detail: string }> = [];
 
-    const forwardedProto = String(request.headers['x-forwarded-proto'] || request.protocol || 'http');
+    const { proto: forwardedProto, host: safeHost } = resolveSafeRequestOriginParts(request);
     checks.push({
       name: 'Control Plane HTTP / X-Forwarded-Proto Inspection',
       status: 'pass',
-      detail: `Active request received via ${forwardedProto.toUpperCase()} (${request.headers.host || 'local'})`
+      detail: `Active request received via ${forwardedProto.toUpperCase()} (${safeHost})`
     });
 
     if (body.custom_domain && !body.custom_domain.includes('localhost')) {
@@ -3739,9 +5062,28 @@ export async function registerApiRoutes(server: FastifyInstance) {
   // ============================================================================
   // Network Topology & Specialty Appliances (Encrypted Tokens + Real Probes)
   // ============================================================================
-  server.get('/api/discovery/topology', async () => {
-    const portRows = db.prepare('SELECT * FROM topology_ports ORDER BY port ASC').all() as any[];
-    const subnetRows = db.prepare('SELECT * FROM topology_subnets ORDER BY subnet ASC').all() as any[];
+  server.get('/api/discovery/topology', async (request) => {
+    const user = request.auth?.user;
+    const allowedTenants = getAllowedTenantIds(user);
+    const portRows = allowedTenants === null
+      ? (db.prepare('SELECT * FROM topology_ports ORDER BY port ASC').all() as any[])
+      : [];
+    const subnetRowsRaw = db.prepare('SELECT * FROM topology_subnets ORDER BY subnet ASC').all() as any[];
+    const subnetRows =
+      allowedTenants === null
+        ? subnetRowsRaw
+        : allowedTenants.length === 0
+          ? []
+          : (() => {
+              const allowedSubnets = new Set(
+                (
+                  db
+                    .prepare(`SELECT subnet FROM sites WHERE tenant_id IN (${allowedTenants.map(() => '?').join(',')})`)
+                    .all(...allowedTenants) as Array<{ subnet?: string }>
+                ).map((s) => s.subnet)
+              );
+              return subnetRowsRaw.filter((s) => allowedSubnets.has(s.subnet));
+            })();
     const firstSwitch = portRows[0];
 
     return {
@@ -3769,15 +5111,23 @@ export async function registerApiRoutes(server: FastifyInstance) {
   });
 
   const handleSubnetScan = async (request: FastifyRequest, reply: FastifyReply) => {
-    const body = (request.body || {}) as { subnet?: string; probeHost?: string; snmpCommunity?: string };
+    const user = request.auth?.user;
+    const body = (request.body || {}) as { subnet?: string; probeHost?: string; snmpCommunity?: string; tenant_id?: string };
+    const allowedTenants = getAllowedTenantIds(user);
+    const fallbackTenant =
+      allowedTenants && allowedTenants.length > 0
+        ? allowedTenants[0]
+        : (db.prepare('SELECT id FROM tenants ORDER BY created_at ASC LIMIT 1').get() as { id?: string } | undefined)?.id ||
+          'default';
+    const targetTenantId = body.tenant_id || fallbackTenant;
+    if (!canUserAccessTenant(user, targetTenantId)) {
+      return reply.status(403).send({ error: 'Forbidden for target tenant scope.' });
+    }
     let discoveredHosts: any[] = [];
     if (body.subnet) {
       try {
-        const fallbackTenant =
-          (db.prepare('SELECT id FROM tenants ORDER BY created_at ASC LIMIT 1').get() as { id?: string } | undefined)?.id ||
-          'default';
         const scanRes = await networkDiscoveryService.scanSubnet({
-          tenantId: request.auth?.user.tenant_id || fallbackTenant,
+          tenantId: targetTenantId,
           cidr: body.subnet,
           community: body.snmpCommunity || 'public',
           autoRegister: true
@@ -3786,7 +5136,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
       } catch (err: any) {
         return reply.status(400).send({ error: err?.message || 'Invalid subnet CIDR' });
       }
-    } else {
+    } else if (allowedTenants === null) {
       db.prepare('UPDATE topology_subnets SET last_scanned = CURRENT_TIMESTAMP').run();
     }
 
@@ -3805,6 +5155,9 @@ export async function registerApiRoutes(server: FastifyInstance) {
   server.post('/api/network-appliances/scan-subnet', handleSubnetScan);
 
   server.post('/api/discovery/ports', async (request, reply) => {
+    if (getAllowedTenantIds(request.auth?.user) !== null) {
+      return reply.status(403).send({ error: 'Forbidden: global switch topology management requires unrestricted access.' });
+    }
     const body = (request.body || {}) as {
       switchName?: string;
       switchIp?: string;
@@ -3834,9 +5187,12 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   const formatApplianceForResponse = (r: any) => {
     const copy = { ...r };
-    copy.vendor_api_token_masked = maskSecretValue(copy.vendor_api_token_encrypted || copy.vendor_api_token_masked);
+    copy.vendor_api_token_masked = maskSecretValue(
+      copy.vendor_api_token_encrypted || copy.api_token_encrypted || copy.vendor_api_token_masked
+    );
     copy.snmp_community_masked = maskSecretValue(copy.snmp_community_encrypted);
     delete copy.vendor_api_token_encrypted;
+    delete copy.api_token_encrypted;
     delete copy.snmp_community_encrypted;
     delete copy.snmp_v3_auth_key_encrypted;
     delete copy.snmp_v3_priv_key_encrypted;
@@ -3846,6 +5202,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.get('/api/discovery/appliances', async (request) => {
     const user = request.auth?.user;
+    const isGlobalUser = getAllowedTenantIds(user) === null;
     const rows = db
       .prepare(`
         SELECT a.*, t.name as tenant_name, s.name as site_name
@@ -3857,14 +5214,18 @@ export async function registerApiRoutes(server: FastifyInstance) {
       .all() as any[];
 
     return rows
-      .filter((r) => !r.tenant_id || canUserAccessTenant(user, r.tenant_id))
+      .filter((r) => (r.tenant_id ? canUserAccessTenant(user, r.tenant_id) : isGlobalUser))
       .map(formatApplianceForResponse);
   });
 
   server.post('/api/discovery/appliances', async (request, reply) => {
+    const user = request.auth?.user;
+    const allowedTenants = getAllowedTenantIds(user);
     const body = (request.body || {}) as {
       name?: string;
       appliance_type?: string;
+      manufacturer?: string;
+      model?: string;
       vendor_model?: string;
       ip_address?: string;
       mac_address?: string;
@@ -3872,13 +5233,16 @@ export async function registerApiRoutes(server: FastifyInstance) {
       snmp_port?: number;
       snmp_community?: string;
       snmp_v3_username?: string;
+      snmp_v3_user?: string;
       snmp_v3_auth_proto?: string;
+      snmp_v3_auth_protocol?: string;
       snmp_v3_auth_key?: string;
       snmp_v3_priv_proto?: string;
       snmp_v3_priv_key?: string;
       integration_protocol?: string;
       vendor_api_endpoint?: string;
       vendor_api_token?: string;
+      api_token?: string;
       vendor_api_token_masked?: string;
       tenant_id?: string;
       site_id?: string;
@@ -3919,12 +5283,29 @@ export async function registerApiRoutes(server: FastifyInstance) {
     const firstTenant = db.prepare('SELECT id FROM tenants ORDER BY created_at ASC LIMIT 1').get() as
       | { id: string }
       | undefined;
-    const tenantId = body.tenant_id || firstTenant?.id || 'unassigned';
+    const defaultTenant =
+      allowedTenants && allowedTenants.length > 0 ? allowedTenants[0] : firstTenant?.id || 'unassigned';
+    const tenantId = body.tenant_id || defaultTenant;
+    if (!canUserAccessTenant(user, tenantId)) {
+      return reply.status(403).send({ error: 'Forbidden for target tenant scope.' });
+    }
     const siteId = body.site_id || null;
+    if (siteId) {
+      const siteRow = db.prepare('SELECT tenant_id FROM sites WHERE id = ?').get(siteId) as { tenant_id?: string } | undefined;
+      if (!siteRow || siteRow.tenant_id !== tenantId) {
+        return reply.status(400).send({ error: 'Selected site does not belong to the target tenant.' });
+      }
+    }
 
     let probeDevice: any = null;
     if (body.probe_device_id) {
-      probeDevice = db.prepare('SELECT id, hostname FROM devices WHERE id = ?').get(body.probe_device_id);
+      probeDevice = db.prepare('SELECT id, hostname, tenant_id FROM devices WHERE id = ?').get(body.probe_device_id);
+      if (!probeDevice) {
+        return reply.status(404).send({ error: 'Selected probe device not found.' });
+      }
+      if (!canUserAccessTenant(user, probeDevice.tenant_id)) {
+        return reply.status(403).send({ error: 'Forbidden: probe device belongs to another tenant.' });
+      }
     }
     if (!probeDevice) {
       probeDevice =
@@ -3933,35 +5314,49 @@ export async function registerApiRoutes(server: FastifyInstance) {
           .get(tenantId) || { id: 'control-plane', hostname: 'Vitrine Direct Probe' };
     }
 
-    const rawToken = body.vendor_api_token || (!isMaskedSecret(body.vendor_api_token_masked) ? body.vendor_api_token_masked : '') || '';
+    const rawToken =
+      body.vendor_api_token ||
+      body.api_token ||
+      (!isMaskedSecret(body.vendor_api_token_masked) ? body.vendor_api_token_masked : '') ||
+      '';
     const encryptedToken = rawToken ? encryptVaultSecret(rawToken) : null;
     const encCommunity = body.snmp_community ? encryptVaultSecret(body.snmp_community.trim()) : null;
     const encV3Auth = body.snmp_v3_auth_key ? encryptVaultSecret(body.snmp_v3_auth_key.trim()) : null;
     const encV3Priv = body.snmp_v3_priv_key ? encryptVaultSecret(body.snmp_v3_priv_key.trim()) : null;
+    const manufacturer = String(body.manufacturer || '').trim() || null;
+    const model = String(body.model || '').trim() || null;
+    const vendorModel =
+      String(body.vendor_model || '').trim() ||
+      [manufacturer, model].filter(Boolean).join(' ') ||
+      'Managed Network Appliance';
+    const v3User = body.snmp_v3_username || body.snmp_v3_user || null;
+    const v3AuthProto = body.snmp_v3_auth_proto || body.snmp_v3_auth_protocol || 'SHA';
 
     db.prepare(`
       INSERT INTO network_appliances (
-        id, tenant_id, site_id, name, appliance_type, vendor_model, ip_address, mac_address,
+        id, tenant_id, site_id, name, appliance_type, manufacturer, model, vendor_model, ip_address, mac_address,
         snmp_version, snmp_port, snmp_community_encrypted, snmp_v3_username, snmp_v3_auth_proto,
         snmp_v3_auth_key_encrypted, snmp_v3_priv_proto, snmp_v3_priv_key_encrypted,
         integration_protocol, vendor_api_endpoint, vendor_api_token_masked, vendor_api_token_encrypted,
         probe_device_id, probe_hostname, status, uptime_days, latency_ms,
         packet_loss_pct, cpu_pct, memory_pct, metrics_json, alert_summary, last_polled
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0.0, 0, 0.0, 0.0, 0.0, '{}', NULL, CURRENT_TIMESTAMP)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0.0, 0, 0.0, 0.0, 0.0, '{}', NULL, CURRENT_TIMESTAMP)
     `).run(
       id,
       tenantId,
       siteId,
       body.name.trim(),
       body.appliance_type || 'switch',
-      body.vendor_model || 'Managed Network Appliance',
+      manufacturer,
+      model,
+      vendorModel,
       body.ip_address.trim(),
       body.mac_address || '00:00:00:00:00:00',
       body.snmp_version || 'SNMPv3',
       Number(body.snmp_port || 161),
       encCommunity,
-      body.snmp_v3_username || null,
-      body.snmp_v3_auth_proto || 'SHA',
+      v3User,
+      v3AuthProto,
       encV3Auth,
       body.snmp_v3_priv_proto || 'AES',
       encV3Priv,
@@ -3992,11 +5387,152 @@ export async function registerApiRoutes(server: FastifyInstance) {
     };
   });
 
+  const handleUpdateAppliance = async (request: FastifyRequest, reply: FastifyReply) => {
+    const { id } = request.params as { id: string };
+    const existing = db.prepare('SELECT * FROM network_appliances WHERE id = ?').get(id) as any;
+    if (!existing) return reply.status(404).send({ error: 'Network appliance not found.' });
+    const user = request.auth?.user;
+    if (existing.tenant_id ? !canUserAccessTenant(user, existing.tenant_id) : getAllowedTenantIds(user) !== null) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
+
+    const body = (request.body || {}) as Record<string, any>;
+    const nextTenantId = body.tenant_id !== undefined ? String(body.tenant_id || '') : existing.tenant_id;
+    if (nextTenantId ? !canUserAccessTenant(user, nextTenantId) : getAllowedTenantIds(user) !== null) {
+      return reply.status(403).send({ error: 'Forbidden for target tenant scope.' });
+    }
+
+    if (body.ip_address !== undefined) {
+      const rawTarget = String(body.ip_address || '').trim();
+      if (!rawTarget) return reply.status(400).send({ error: 'IP address / hostname cannot be empty.' });
+      let parsedHost = rawTarget;
+      try {
+        parsedHost = rawTarget.includes('://') ? new URL(rawTarget).hostname : rawTarget.split(':')[0];
+      } catch {
+        return reply.status(400).send({ error: 'Invalid IP address or hostname format.' });
+      }
+      const hostCheck = await validateOutboundHostSafety(parsedHost, { allowLoopback: false, allowPrivateLan: true });
+      if (!hostCheck.safe) {
+        return reply.status(400).send({ error: hostCheck.reason || 'Blocked unsafe appliance target.' });
+      }
+    }
+
+    if (body.vendor_api_endpoint && String(body.vendor_api_endpoint).includes('://')) {
+      try {
+        const epHost = new URL(String(body.vendor_api_endpoint)).hostname;
+        const epCheck = await validateOutboundHostSafety(epHost, { allowLoopback: false, allowPrivateLan: true });
+        if (!epCheck.safe) {
+          return reply.status(400).send({ error: epCheck.reason || 'Blocked unsafe vendor API endpoint.' });
+        }
+      } catch {
+        return reply.status(400).send({ error: 'Invalid vendor API endpoint URL.' });
+      }
+    }
+
+    const rawToken =
+      body.vendor_api_token !== undefined
+        ? String(body.vendor_api_token || '')
+        : body.api_token !== undefined
+          ? String(body.api_token || '')
+          : undefined;
+    const nextEncToken =
+      rawToken !== undefined && !isMaskedSecret(rawToken)
+        ? rawToken.trim()
+          ? encryptVaultSecret(rawToken.trim())
+          : null
+        : existing.vendor_api_token_encrypted;
+    const nextEncCommunity =
+      body.snmp_community !== undefined && !isMaskedSecret(String(body.snmp_community))
+        ? String(body.snmp_community).trim()
+          ? encryptVaultSecret(String(body.snmp_community).trim())
+          : null
+        : existing.snmp_community_encrypted;
+    const nextEncV3Auth =
+      body.snmp_v3_auth_key !== undefined && !isMaskedSecret(String(body.snmp_v3_auth_key))
+        ? String(body.snmp_v3_auth_key).trim()
+          ? encryptVaultSecret(String(body.snmp_v3_auth_key).trim())
+          : null
+        : existing.snmp_v3_auth_key_encrypted;
+    const nextEncV3Priv =
+      body.snmp_v3_priv_key !== undefined && !isMaskedSecret(String(body.snmp_v3_priv_key))
+        ? String(body.snmp_v3_priv_key).trim()
+          ? encryptVaultSecret(String(body.snmp_v3_priv_key).trim())
+          : null
+        : existing.snmp_v3_priv_key_encrypted;
+
+    const nextMfg = body.manufacturer !== undefined ? String(body.manufacturer || '').trim() || null : existing.manufacturer;
+    const nextModel = body.model !== undefined ? String(body.model || '').trim() || null : existing.model;
+    const nextVendorModel =
+      body.vendor_model !== undefined
+        ? String(body.vendor_model || '').trim() || existing.vendor_model
+        : body.manufacturer !== undefined || body.model !== undefined
+          ? [nextMfg, nextModel].filter(Boolean).join(' ') || existing.vendor_model
+          : existing.vendor_model;
+
+    db.prepare(`
+      UPDATE network_appliances SET
+        tenant_id = ?,
+        site_id = ?,
+        name = COALESCE(?, name),
+        appliance_type = COALESCE(?, appliance_type),
+        manufacturer = ?,
+        model = ?,
+        vendor_model = ?,
+        ip_address = COALESCE(?, ip_address),
+        mac_address = COALESCE(?, mac_address),
+        snmp_version = COALESCE(?, snmp_version),
+        snmp_port = COALESCE(?, snmp_port),
+        snmp_community_encrypted = ?,
+        snmp_v3_username = COALESCE(?, snmp_v3_username),
+        snmp_v3_auth_proto = COALESCE(?, snmp_v3_auth_proto),
+        snmp_v3_auth_key_encrypted = ?,
+        snmp_v3_priv_proto = COALESCE(?, snmp_v3_priv_proto),
+        snmp_v3_priv_key_encrypted = ?,
+        integration_protocol = COALESCE(?, integration_protocol),
+        vendor_api_endpoint = COALESCE(?, vendor_api_endpoint),
+        vendor_api_token_masked = ?,
+        vendor_api_token_encrypted = ?
+      WHERE id = ?
+    `).run(
+      nextTenantId,
+      body.site_id !== undefined ? body.site_id || null : existing.site_id,
+      body.name ? String(body.name).trim() : null,
+      body.appliance_type ?? null,
+      nextMfg,
+      nextModel,
+      nextVendorModel,
+      body.ip_address ? String(body.ip_address).trim() : null,
+      body.mac_address ?? null,
+      body.snmp_version ?? null,
+      body.snmp_port != null ? Number(body.snmp_port) : null,
+      nextEncCommunity,
+      body.snmp_v3_username ?? body.snmp_v3_user ?? null,
+      body.snmp_v3_auth_proto ?? body.snmp_v3_auth_protocol ?? null,
+      nextEncV3Auth,
+      body.snmp_v3_priv_proto ?? null,
+      nextEncV3Priv,
+      body.integration_protocol ?? null,
+      body.vendor_api_endpoint ?? null,
+      nextEncToken ? '••••••••••••' : null,
+      nextEncToken,
+      id
+    );
+
+    const updated = db.prepare('SELECT * FROM network_appliances WHERE id = ?').get(id);
+    return { success: true, appliance: formatApplianceForResponse(updated) };
+  };
+  server.put('/api/discovery/appliances/:id', handleUpdateAppliance);
+  server.put('/api/network-appliances/:id', handleUpdateAppliance);
+
   const handlePollAppliance = async (request: FastifyRequest, reply: FastifyReply) => {
     const { id } = request.params as { id: string };
     const appRow = db.prepare('SELECT * FROM network_appliances WHERE id = ?').get(id) as any;
     if (!appRow) return reply.status(404).send({ success: false, error: 'Network appliance not found' });
-    if (appRow.tenant_id && !canUserAccessTenant(request.auth?.user, appRow.tenant_id)) {
+    if (
+      appRow.tenant_id
+        ? !canUserAccessTenant(request.auth?.user, appRow.tenant_id)
+        : getAllowedTenantIds(request.auth?.user) !== null
+    ) {
       return reply.status(403).send({ success: false, error: 'Forbidden' });
     }
 
@@ -4032,7 +5568,12 @@ export async function registerApiRoutes(server: FastifyInstance) {
   server.delete('/api/discovery/appliances/:id', async (request, reply) => {
     const { id } = request.params as { id: string };
     const appRow = db.prepare('SELECT tenant_id FROM network_appliances WHERE id = ?').get(id) as any;
-    if (appRow?.tenant_id && !canUserAccessTenant(request.auth?.user, appRow.tenant_id)) {
+    if (!appRow) return reply.status(404).send({ error: 'Network appliance not found.' });
+    if (
+      appRow.tenant_id
+        ? !canUserAccessTenant(request.auth?.user, appRow.tenant_id)
+        : getAllowedTenantIds(request.auth?.user) !== null
+    ) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
     db.prepare('DELETE FROM network_appliances WHERE id = ?').run(id);
@@ -4042,12 +5583,20 @@ export async function registerApiRoutes(server: FastifyInstance) {
   // ============================================================================
   // Virtualization / Hypervisor Monitoring
   // ============================================================================
-  server.get('/api/virtualization/hosts', async () => {
-    const hosts = db.prepare('SELECT * FROM virtualization_hosts ORDER BY name ASC').all() as any[];
-    const vms = db.prepare('SELECT * FROM virtualization_vms ORDER BY vmid ASC').all() as any[];
+  server.get('/api/virtualization/hosts', async (request) => {
+    const user = request.auth?.user;
+    const isGlobalUser = getAllowedTenantIds(user) === null;
+    const hosts = (db.prepare('SELECT * FROM virtualization_hosts ORDER BY name ASC').all() as any[]).filter((h) =>
+      h.tenant_id ? canUserAccessTenant(user, h.tenant_id) : isGlobalUser
+    );
+    const allowedHostIds = new Set(hosts.map((h) => h.id));
+    const vms = (db.prepare('SELECT * FROM virtualization_vms ORDER BY vmid ASC').all() as any[]).filter((v) =>
+      allowedHostIds.has(v.host_id)
+    );
 
     return hosts.map((h) => ({
       id: h.id,
+      tenantId: h.tenant_id || null,
       name: h.name,
       hostType: h.host_type,
       ipAddress: h.ip_address,
@@ -4076,6 +5625,8 @@ export async function registerApiRoutes(server: FastifyInstance) {
   });
 
   server.post('/api/virtualization/hosts', async (request, reply) => {
+    const user = request.auth?.user;
+    const isGlobalUser = getAllowedTenantIds(user) === null;
     const body = (request.body || {}) as {
       name?: string;
       hostType?: string;
@@ -4086,12 +5637,43 @@ export async function registerApiRoutes(server: FastifyInstance) {
       allowSelfSigned?: boolean;
       tlsFingerprintSha256?: string;
       linkedDeviceId?: string;
+      linked_device_id?: string;
+      tenantId?: string | null;
+      tenant_id?: string | null;
       ramTotalGb?: number;
       storageTotalTb?: number;
     };
     if (!body.name?.trim() || !body.ipAddress?.trim()) {
       return reply.status(400).send({ error: 'Hypervisor hostname and IP address are required.' });
     }
+
+    const linkedDeviceId = body.linkedDeviceId || body.linked_device_id || null;
+    let resolvedTenantId = (body.tenantId ?? body.tenant_id ?? null) || null;
+
+    if (linkedDeviceId) {
+      const linkedDev = db.prepare('SELECT id, tenant_id FROM devices WHERE id = ?').get(linkedDeviceId) as
+        | { id: string; tenant_id: string }
+        | undefined;
+      if (!linkedDev) {
+        return reply.status(404).send({ error: 'Linked endpoint device not found.' });
+      }
+      if (!canUserAccessTenant(user, linkedDev.tenant_id)) {
+        return reply.status(403).send({ error: 'Forbidden: linked device belongs to another tenant.' });
+      }
+      if (resolvedTenantId && resolvedTenantId !== linkedDev.tenant_id) {
+        return reply.status(400).send({ error: 'linked_device_id belongs to a different tenant than tenant_id.' });
+      }
+      resolvedTenantId = resolvedTenantId || linkedDev.tenant_id;
+    }
+
+    if (resolvedTenantId) {
+      if (!canUserAccessTenant(user, resolvedTenantId)) {
+        return reply.status(403).send({ error: 'Forbidden for target tenant scope.' });
+      }
+    } else if (!isGlobalUser) {
+      return reply.status(403).send({ error: 'Scoped accounts must provide an accessible tenant_id for hypervisor hosts.' });
+    }
+
     const id = `vh-${crypto.randomUUID().slice(0, 6)}`;
     const ramTotal = Math.max(4, Number(body.ramTotalGb || 64));
     const storageTotal = Math.max(0.5, Number(body.storageTotalTb || 2.0));
@@ -4105,12 +5687,13 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
     db.prepare(`
       INSERT INTO virtualization_hosts (
-        id, name, host_type, ip_address, api_port, api_username, api_token_encrypted,
+        id, tenant_id, name, host_type, ip_address, api_port, api_username, api_token_encrypted,
         allow_self_signed, tls_fingerprint_sha256, linked_device_id,
         status, cpu_usage_pct, ram_usage_gb, ram_total_gb, storage_free_tb, storage_total_tb
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 0.0, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, 0.0, ?, ?, ?)
     `).run(
       id,
+      resolvedTenantId,
       body.name.trim(),
       body.hostType || 'Proxmox VE',
       body.ipAddress.trim(),
@@ -4119,7 +5702,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
       encToken,
       body.allowSelfSigned !== false ? 1 : 0,
       body.tlsFingerprintSha256 || null,
-      body.linkedDeviceId || null,
+      linkedDeviceId,
       probe.reachable ? 'Online' : 'Unreachable',
       ramTotal,
       storageTotal,
@@ -4130,6 +5713,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
     return {
       success: true,
       id,
+      tenantId: resolvedTenantId,
       reachable: syncReport.synced || probe.reachable,
       sync: syncReport
     };
@@ -4137,9 +5721,13 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.post('/api/virtualization/hosts/:id/sync', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const existing = db.prepare('SELECT id, name FROM virtualization_hosts WHERE id = ?').get(id) as any;
+    const existing = db.prepare('SELECT id, name, tenant_id FROM virtualization_hosts WHERE id = ?').get(id) as any;
     if (!existing) {
       return reply.status(404).send({ success: false, error: 'Virtualization host not found.' });
+    }
+    const user = request.auth?.user;
+    if (existing.tenant_id ? !canUserAccessTenant(user, existing.tenant_id) : getAllowedTenantIds(user) !== null) {
+      return reply.status(403).send({ success: false, error: 'Forbidden' });
     }
     const syncReport = await syncVirtualizationHost(id);
     db.prepare(`
@@ -4153,8 +5741,14 @@ export async function registerApiRoutes(server: FastifyInstance) {
     return { success: true, ...syncReport };
   });
 
-  server.delete('/api/virtualization/hosts/:id', async (request) => {
+  server.delete('/api/virtualization/hosts/:id', async (request, reply) => {
     const { id } = request.params as { id: string };
+    const existing = db.prepare('SELECT id, tenant_id FROM virtualization_hosts WHERE id = ?').get(id) as any;
+    if (!existing) return reply.status(404).send({ error: 'Virtualization host not found.' });
+    const user = request.auth?.user;
+    if (existing.tenant_id ? !canUserAccessTenant(user, existing.tenant_id) : getAllowedTenantIds(user) !== null) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
     db.prepare('DELETE FROM virtualization_vms WHERE host_id = ?').run(id);
     db.prepare('DELETE FROM virtualization_hosts WHERE id = ?').run(id);
     return { success: true };
@@ -4162,8 +5756,20 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.post('/api/virtualization/hosts/:hostId/vms/:vmid/action', async (request, reply) => {
     const { hostId, vmid } = request.params as { hostId: string; vmid: string };
+    const host = db.prepare('SELECT id, tenant_id FROM virtualization_hosts WHERE id = ?').get(hostId) as any;
+    if (!host) {
+      return reply.status(404).send({ success: false, error: 'Virtualization host not found.' });
+    }
+    const user = request.auth?.user;
+    if (host.tenant_id ? !canUserAccessTenant(user, host.tenant_id) : getAllowedTenantIds(user) !== null) {
+      return reply.status(403).send({ success: false, error: 'Forbidden' });
+    }
     const body = (request.body || {}) as { action?: 'start' | 'stop' | 'reboot' | 'snapshot' };
-    const vmIdNum = parseInt(vmid, 10);
+    const vmKey = String(vmid || '').trim();
+    if (!vmKey) {
+      return reply.status(400).send({ success: false, error: 'VM identifier is required.' });
+    }
+    const vmTarget: any = /^\d+$/.test(vmKey) ? Number(vmKey) : vmKey;
     const act = body.action || 'start';
 
     let liveResult: { dispatchedLive: boolean; detail: string } = {
@@ -4171,7 +5777,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
       detail: 'Local VM state updated.'
     };
     try {
-      liveResult = await dispatchLiveHypervisorVmAction(hostId, vmIdNum, act);
+      liveResult = await dispatchLiveHypervisorVmAction(hostId, vmTarget, act);
     } catch (err: any) {
       return reply.status(502).send({
         success: false,
@@ -4181,13 +5787,12 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
     if (act === 'start' || act === 'reboot') {
       db.prepare(
-        "UPDATE virtualization_vms SET status = 'Running', cpu = CASE WHEN cpu = 0 THEN 4 ELSE cpu END WHERE host_id = ? AND vmid = ?"
-      ).run(hostId, vmIdNum);
+        "UPDATE virtualization_vms SET status = 'Running', cpu = CASE WHEN cpu = 0 THEN 4 ELSE cpu END WHERE host_id = ? AND (CAST(vmid AS TEXT) = ? OR id = ? OR moref_id = ?)"
+      ).run(hostId, vmKey, vmKey, vmKey);
     } else if (act === 'stop') {
-      db.prepare("UPDATE virtualization_vms SET status = 'Stopped', cpu = 0 WHERE host_id = ? AND vmid = ?").run(
-        hostId,
-        vmIdNum
-      );
+      db.prepare(
+        "UPDATE virtualization_vms SET status = 'Stopped', cpu = 0 WHERE host_id = ? AND (CAST(vmid AS TEXT) = ? OR id = ? OR moref_id = ?)"
+      ).run(hostId, vmKey, vmKey, vmKey);
     } else if (act === 'snapshot') {
       const snapStr = new Date().toLocaleString('en-US', {
         month: 'short',
@@ -4195,11 +5800,9 @@ export async function registerApiRoutes(server: FastifyInstance) {
         hour: '2-digit',
         minute: '2-digit'
       });
-      db.prepare('UPDATE virtualization_vms SET last_snapshot = ? WHERE host_id = ? AND vmid = ?').run(
-        snapStr,
-        hostId,
-        vmIdNum
-      );
+      db.prepare(
+        'UPDATE virtualization_vms SET last_snapshot = ? WHERE host_id = ? AND (CAST(vmid AS TEXT) = ? OR id = ? OR moref_id = ?)'
+      ).run(snapStr, hostId, vmKey, vmKey, vmKey);
     }
 
     db.prepare(`
@@ -4208,7 +5811,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
     `).run(
       `aud-vm-${crypto.randomUUID()}`,
       getActorUsername(request),
-      `Executed '${act}' on VM #${vmIdNum} (Host: ${hostId}) — ${liveResult.detail}`
+      `Executed '${act}' on VM #${vmKey} (Host: ${hostId}) — ${liveResult.detail}`
     );
 
     return {
@@ -4223,17 +5826,19 @@ export async function registerApiRoutes(server: FastifyInstance) {
   // ============================================================================
   server.get('/api/audit', async (request) => {
     const user = request.auth?.user;
-    const scopedTenantId = getScopedTenantFilter(user);
-    if (scopedTenantId || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0)) {
+    const allowedTenants = getAllowedTenantIds(user);
+    if (allowedTenants !== null) {
+      if (allowedTenants.length === 0) return [];
       const rows = db
         .prepare(`
           SELECT a.*, d.tenant_id as device_tenant_id
           FROM audit_logs a
           LEFT JOIN devices d ON a.device_id = d.id
+          WHERE d.tenant_id IN (${allowedTenants.map(() => '?').join(',')})
           ORDER BY a.timestamp DESC
           LIMIT 250
         `)
-        .all() as any[];
+        .all(...allowedTenants) as any[];
       return rows.filter((r) => r.device_tenant_id && canUserAccessTenant(user, r.device_tenant_id));
     }
     return db.prepare('SELECT * FROM audit_logs ORDER BY timestamp DESC LIMIT 200').all();
@@ -4242,17 +5847,26 @@ export async function registerApiRoutes(server: FastifyInstance) {
   server.get('/api/reports/qbr', async (request, reply) => {
     const query = (request.query || {}) as { tenant_id?: string };
     const user = request.auth?.user;
-    const forcedScope = getScopedTenantFilter(user);
-    let targetTenantId = forcedScope || (query.tenant_id && query.tenant_id !== 'all' ? query.tenant_id : null);
-
-    if (targetTenantId === '__DENY_ALL__' || (targetTenantId && !canUserAccessTenant(user, targetTenantId))) {
+    const allowedTenants = getAllowedTenantIds(user);
+    if (allowedTenants !== null && allowedTenants.length === 0) {
       return reply.status(403).send({ error: 'Forbidden for requested tenant' });
     }
 
-    const activeWhere = targetTenantId
-      ? "WHERE COALESCE(lifecycle_state, 'active') = 'active' AND tenant_id = ?"
-      : "WHERE COALESCE(lifecycle_state, 'active') = 'active'";
-    const params = targetTenantId ? [targetTenantId] : [];
+    let scopedIds: string[] | null = null;
+    if (query.tenant_id && query.tenant_id !== 'all') {
+      if (!canUserAccessTenant(user, query.tenant_id)) {
+        return reply.status(403).send({ error: 'Forbidden for requested tenant' });
+      }
+      scopedIds = [query.tenant_id];
+    } else if (allowedTenants !== null) {
+      scopedIds = allowedTenants;
+    }
+
+    const activeWhere =
+      scopedIds && scopedIds.length > 0
+        ? `WHERE COALESCE(lifecycle_state, 'active') = 'active' AND tenant_id IN (${scopedIds.map(() => '?').join(',')})`
+        : "WHERE COALESCE(lifecycle_state, 'active') = 'active'";
+    const params = scopedIds && scopedIds.length > 0 ? scopedIds : [];
 
     const totalDevices = (db.prepare(`SELECT COUNT(*) as c FROM devices ${activeWhere}`).get(...params) as any).c || 0;
     const onlineDevices =
@@ -4272,13 +5886,16 @@ export async function registerApiRoutes(server: FastifyInstance) {
     const edrProtected =
       (
         db
-          .prepare(`SELECT COUNT(*) as c FROM devices ${activeWhere} AND edr_status LIKE 'Active%'`)
+          .prepare(
+            `SELECT COUNT(*) as c FROM devices ${activeWhere} AND (LOWER(edr_status) LIKE 'active%' OR LOWER(edr_status) IN ('healthy', 'protected', 'running'))`
+          )
           .get(...params) as any
       ).c || 0;
     const quarantinedEndpoints =
       (db.prepare(`SELECT COUNT(*) as c FROM devices ${activeWhere} AND quarantined = 1`).get(...params) as any).c || 0;
 
-    const patchJoinWhere = targetTenantId ? 'WHERE d.tenant_id = ?' : '';
+    const patchJoinWhere =
+      scopedIds && scopedIds.length > 0 ? `WHERE d.tenant_id IN (${scopedIds.map(() => '?').join(',')})` : '';
     const approvedPatches =
       (
         db
@@ -4294,31 +5911,41 @@ export async function registerApiRoutes(server: FastifyInstance) {
           .get(...params) as any
       ).c || 0;
 
-    const remCount = targetTenantId
-      ? (
-          db
-            .prepare(
-              'SELECT COUNT(*) as c FROM remediation_logs r JOIN devices d ON r.device_id = d.id WHERE d.tenant_id = ?'
-            )
-            .get(targetTenantId) as any
-        ).c || 0
-      : (db.prepare('SELECT COUNT(*) as c FROM remediation_logs').get() as any).c || 0;
+    const remCount =
+      scopedIds && scopedIds.length > 0
+        ? (
+            db
+              .prepare(
+                `SELECT COUNT(*) as c FROM remediation_logs r JOIN devices d ON r.device_id = d.id WHERE d.tenant_id IN (${scopedIds.map(() => '?').join(',')})`
+              )
+              .get(...scopedIds) as any
+          ).c || 0
+        : (db.prepare('SELECT COUNT(*) as c FROM remediation_logs').get() as any).c || 0;
 
     let tenantName = 'All Managed Clients';
-    if (targetTenantId) {
-      const tRow = db.prepare('SELECT name FROM tenants WHERE id = ?').get(targetTenantId) as
+    if (scopedIds && scopedIds.length === 1) {
+      const tRow = db.prepare('SELECT name FROM tenants WHERE id = ?').get(scopedIds[0]) as
         | { name?: string }
         | undefined;
-      tenantName = tRow?.name || targetTenantId;
+      tenantName = tRow?.name || scopedIds[0];
+    } else if (scopedIds && scopedIds.length > 1) {
+      tenantName = 'Scoped Managed Clients';
     }
 
-    const ticketCount = targetTenantId
-      ? (
-          db
-            .prepare('SELECT COUNT(*) as c FROM psa_tickets WHERE client_name = ?')
-            .get(tenantName) as any
-        ).c || 0
-      : (db.prepare('SELECT COUNT(*) as c FROM psa_tickets').get() as any).c || 0;
+    const ticketCount =
+      scopedIds && scopedIds.length > 0
+        ? (
+            db
+              .prepare(
+                `SELECT COUNT(DISTINCT p.id) as c
+                 FROM psa_tickets p
+                 LEFT JOIN devices d ON p.device_id = d.id
+                 LEFT JOIN tenants t ON LOWER(p.client_name) = LOWER(t.name)
+                 WHERE COALESCE(d.tenant_id, t.id) IN (${scopedIds.map(() => '?').join(',')})`
+              )
+              .get(...scopedIds) as any
+          ).c || 0
+        : (db.prepare('SELECT COUNT(*) as c FROM psa_tickets').get() as any).c || 0;
 
     const availPct = totalDevices > 0 ? (onlineDevices / totalDevices) * 100 : 100;
     const patchPct = totalPatches > 0 ? (approvedPatches / totalPatches) * 100 : 100;
@@ -4351,13 +5978,16 @@ export async function registerApiRoutes(server: FastifyInstance) {
   // ============================================================================
   // Custom Asset Fields & Entity Values
   // ============================================================================
-  server.get('/api/custom-fields', async () => {
-    return db
+  server.get('/api/custom-fields', async (request) => {
+    const user = request.auth?.user;
+    const rows = db
       .prepare('SELECT * FROM custom_field_definitions ORDER BY category ASC, label ASC')
-      .all();
+      .all() as any[];
+    return rows.filter((r) => !r.tenant_id || canUserAccessTenant(user, r.tenant_id));
   });
 
   server.post('/api/custom-fields', async (request, reply) => {
+    const user = request.auth?.user;
     const body = (request.body || {}) as {
       key?: string;
       label?: string;
@@ -4367,7 +5997,12 @@ export async function registerApiRoutes(server: FastifyInstance) {
       scope?: string;
       options?: string;
       description?: string;
+      tenant_id?: string | null;
     };
+    const targetTenantId = body.tenant_id && body.tenant_id !== 'all' ? String(body.tenant_id) : null;
+    if (targetTenantId ? !canUserAccessTenant(user, targetTenantId) : getAllowedTenantIds(user) !== null) {
+      return reply.status(403).send({ error: 'Forbidden for target custom field scope.' });
+    }
     const label = String(body.label || body.name || '').trim();
     if (!label) {
       return reply.status(400).send({ error: 'Custom field label is required.' });
@@ -4382,8 +6017,8 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
     try {
       db.prepare(`
-        INSERT INTO custom_field_definitions (id, key, label, category, field_type, scope, options, description)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO custom_field_definitions (id, key, label, category, field_type, scope, options, description, tenant_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         id,
         key,
@@ -4392,7 +6027,8 @@ export async function registerApiRoutes(server: FastifyInstance) {
         body.field_type || 'text',
         body.scope || 'device',
         body.options || null,
-        body.description || ''
+        body.description || '',
+        targetTenantId
       );
     } catch (err: any) {
       return reply.status(409).send({ error: `Custom field key '${key}' already exists: ${err?.message || ''}` });
@@ -4400,8 +6036,69 @@ export async function registerApiRoutes(server: FastifyInstance) {
     return { success: true, id, key };
   });
 
-  server.delete('/api/custom-fields/:id', async (request) => {
+  server.put('/api/custom-fields/:id', async (request, reply) => {
     const { id } = request.params as { id: string };
+    const existing = db.prepare('SELECT * FROM custom_field_definitions WHERE id = ?').get(id) as any;
+    if (!existing) return reply.status(404).send({ error: 'Custom field not found.' });
+    const user = request.auth?.user;
+    if (existing.tenant_id ? !canUserAccessTenant(user, existing.tenant_id) : getAllowedTenantIds(user) !== null) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
+
+    const body = (request.body || {}) as {
+      label?: string;
+      name?: string;
+      category?: string;
+      field_type?: string;
+      scope?: string;
+      options?: string | null;
+      description?: string;
+      tenant_id?: string | null;
+    };
+    const nextTenantId =
+      body.tenant_id !== undefined
+        ? body.tenant_id && body.tenant_id !== 'all'
+          ? String(body.tenant_id)
+          : null
+        : existing.tenant_id ?? null;
+    if (nextTenantId ? !canUserAccessTenant(user, nextTenantId) : getAllowedTenantIds(user) !== null) {
+      return reply.status(403).send({ error: 'Forbidden for target custom field scope.' });
+    }
+    const nextLabel = String(body.label || body.name || existing.label).trim();
+    if (!nextLabel) return reply.status(400).send({ error: 'Custom field label cannot be empty.' });
+
+    db.prepare(`
+      UPDATE custom_field_definitions
+      SET label = ?,
+          category = ?,
+          field_type = ?,
+          scope = ?,
+          options = ?,
+          description = ?,
+          tenant_id = ?
+      WHERE id = ?
+    `).run(
+      nextLabel,
+      body.category ?? existing.category,
+      body.field_type ?? existing.field_type,
+      body.scope ?? existing.scope,
+      body.options !== undefined ? body.options : existing.options,
+      body.description ?? existing.description,
+      nextTenantId,
+      id
+    );
+
+    return { success: true, field: db.prepare('SELECT * FROM custom_field_definitions WHERE id = ?').get(id) };
+  });
+
+  server.delete('/api/custom-fields/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const existing = db.prepare('SELECT tenant_id FROM custom_field_definitions WHERE id = ?').get(id) as any;
+    if (!existing) return reply.status(404).send({ error: 'Custom field not found.' });
+    const user = request.auth?.user;
+    if (existing.tenant_id ? !canUserAccessTenant(user, existing.tenant_id) : getAllowedTenantIds(user) !== null) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
     db.prepare('DELETE FROM custom_field_values WHERE field_id = ?').run(id);
     db.prepare('DELETE FROM custom_field_definitions WHERE id = ?').run(id);
     return { success: true };
@@ -4410,7 +6107,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
   server.get('/api/devices/:id/custom-fields', async (request, reply) => {
     const { id } = request.params as { id: string };
     const access = ensureDeviceTenantAccess(request, reply, id);
-    if (!access.allowed || !access.device) return;
+    if (!access.allowed || !access.device) return reply;
 
     const isTech = isTechnicianOrAbove(request.auth?.user.role);
     const query = (request.query || {}) as { reveal?: string; fieldId?: string };
@@ -4418,7 +6115,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
     if (revealSecrets) {
       if (!requireStepUpMfaIfEnforced(request, reply, id)) {
-        return;
+        return reply;
       }
       db.prepare(`
         INSERT INTO audit_logs (id, username, device_id, action, details)
@@ -4437,10 +6134,10 @@ export async function registerApiRoutes(server: FastifyInstance) {
                COALESCE(v.value, '') as value, v.updated_at
         FROM custom_field_definitions d
         LEFT JOIN custom_field_values v ON d.id = v.field_id AND v.entity_id = ?
-        WHERE d.scope = 'device' OR d.scope = 'all'
+        WHERE (d.scope = 'device' OR d.scope = 'all') AND (d.tenant_id IS NULL OR d.tenant_id = ?)
         ORDER BY d.category ASC, d.label ASC
       `)
-      .all(id) as any[];
+      .all(id, access.device.tenant_id) as any[];
 
     return rows
       .filter((r) => isTech || r.field_type !== 'secret')
@@ -4461,7 +6158,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.post('/api/devices/:id/custom-fields', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return reply;
     const body = (request.body || {}) as {
       fieldId?: string;
       field_id?: string;
@@ -4514,19 +6211,28 @@ export async function registerApiRoutes(server: FastifyInstance) {
   // ============================================================================
   // Maintenance Windows & Emergency Alert Suppression
   // ============================================================================
-  server.get('/api/maintenance-windows', async () => {
-    return db
+  server.get('/api/maintenance-windows', async (request) => {
+    const user = request.auth?.user;
+    const isGlobalUser = getAllowedTenantIds(user) === null;
+    const rows = db
       .prepare(`
-        SELECT m.*, d.hostname as device_hostname, t.name as tenant_name
+        SELECT m.*, d.hostname as device_hostname, d.tenant_id as device_tenant_id, t.name as tenant_name
         FROM maintenance_windows m
         LEFT JOIN devices d ON m.device_id = d.id
         LEFT JOIN tenants t ON m.tenant_id = t.id
         ORDER BY m.start_time DESC
       `)
-      .all();
+      .all() as any[];
+    return rows
+      .filter((r) => {
+        const tid = r.tenant_id || r.device_tenant_id;
+        return tid ? canUserAccessTenant(user, tid) : isGlobalUser;
+      })
+      .map(({ device_tenant_id: _unused, ...rest }) => rest);
   });
 
   server.post('/api/maintenance-windows', async (request, reply) => {
+    const user = request.auth?.user;
     const body = (request.body || {}) as {
       device_id?: string | null;
       tenant_id?: string | null;
@@ -4536,6 +6242,30 @@ export async function registerApiRoutes(server: FastifyInstance) {
       durationMinutes?: number;
       suppress_alerts?: boolean;
     };
+    let devTenantId: string | null = null;
+    if (body.device_id) {
+      const dev = db.prepare('SELECT id, tenant_id FROM devices WHERE id = ?').get(body.device_id) as
+        | { id: string; tenant_id: string }
+        | undefined;
+      if (!dev) return reply.status(404).send({ error: 'Target device not found.' });
+      if (!canUserAccessTenant(user, dev.tenant_id)) {
+        return reply.status(403).send({ error: 'Forbidden: target device is outside your tenant scope.' });
+      }
+      devTenantId = dev.tenant_id;
+    }
+    if (body.tenant_id && body.tenant_id !== 'all') {
+      if (!canUserAccessTenant(user, body.tenant_id)) {
+        return reply.status(403).send({ error: 'Forbidden for target tenant scope.' });
+      }
+      if (devTenantId && devTenantId !== body.tenant_id) {
+        return reply.status(400).send({ error: 'Target device belongs to a different tenant.' });
+      }
+    }
+    const effectiveTenantId = body.tenant_id && body.tenant_id !== 'all' ? body.tenant_id : devTenantId;
+    if (!effectiveTenantId && getAllowedTenantIds(user) !== null) {
+      return reply.status(403).send({ error: 'Scoped accounts cannot create global maintenance windows.' });
+    }
+
     const title = String(body.title || 'Scheduled Maintenance Window').trim();
     const startIso = body.start_time ? new Date(body.start_time).toISOString() : new Date().toISOString();
     const endIso = body.end_time
@@ -4553,7 +6283,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
     `).run(
       id,
       body.device_id || null,
-      body.tenant_id || null,
+      effectiveTenantId,
       title,
       startIso,
       endIso,
@@ -4563,8 +6293,114 @@ export async function registerApiRoutes(server: FastifyInstance) {
     return { success: true, id, start_time: startIso, end_time: endIso };
   });
 
-  server.delete('/api/maintenance-windows/:id', async (request) => {
+  server.put('/api/maintenance-windows/:id', async (request, reply) => {
     const { id } = request.params as { id: string };
+    const existing = db
+      .prepare(`
+        SELECT m.*, d.tenant_id as device_tenant_id
+        FROM maintenance_windows m
+        LEFT JOIN devices d ON m.device_id = d.id
+        WHERE m.id = ?
+      `)
+      .get(id) as any;
+    if (!existing) return reply.status(404).send({ error: 'Maintenance window not found.' });
+    const user = request.auth?.user;
+    const isGlobalUser = getAllowedTenantIds(user) === null;
+    const existingTenant = existing.tenant_id || existing.device_tenant_id;
+    if (existingTenant ? !canUserAccessTenant(user, existingTenant) : !isGlobalUser) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
+
+    const body = (request.body || {}) as {
+      title?: string;
+      device_id?: string | null;
+      tenant_id?: string | null;
+      start_time?: string;
+      end_time?: string;
+      durationMinutes?: number;
+      suppress_alerts?: boolean;
+      is_active?: boolean;
+    };
+
+    const nextDeviceId = body.device_id !== undefined ? body.device_id || null : existing.device_id;
+    let nextDevTenant: string | null = existing.device_tenant_id || null;
+    if (nextDeviceId) {
+      const dev = db.prepare('SELECT id, tenant_id FROM devices WHERE id = ?').get(nextDeviceId) as
+        | { id: string; tenant_id: string }
+        | undefined;
+      if (!dev) return reply.status(404).send({ error: 'Target device not found.' });
+      if (!canUserAccessTenant(user, dev.tenant_id)) {
+        return reply.status(403).send({ error: 'Forbidden: target device is outside your tenant scope.' });
+      }
+      nextDevTenant = dev.tenant_id;
+    } else {
+      nextDevTenant = null;
+    }
+    const nextTenantId =
+      body.tenant_id !== undefined
+        ? body.tenant_id && body.tenant_id !== 'all'
+          ? body.tenant_id
+          : null
+        : existing.tenant_id;
+    const effectiveNextTenant = nextTenantId || nextDevTenant;
+    if (effectiveNextTenant ? !canUserAccessTenant(user, effectiveNextTenant) : !isGlobalUser) {
+      return reply.status(403).send({ error: 'Forbidden for target tenant scope.' });
+    }
+
+    const nextTitle = body.title !== undefined ? String(body.title).trim() : existing.title;
+    if (!nextTitle) return reply.status(400).send({ error: 'Maintenance window title cannot be empty.' });
+
+    const startIso = body.start_time ? new Date(body.start_time).toISOString() : existing.start_time;
+    const endIso = body.end_time
+      ? new Date(body.end_time).toISOString()
+      : body.durationMinutes != null
+        ? new Date(new Date(startIso).getTime() + Math.max(5, Number(body.durationMinutes)) * 60_000).toISOString()
+        : existing.end_time;
+
+    if (new Date(endIso).getTime() <= new Date(startIso).getTime()) {
+      return reply.status(400).send({ error: 'Maintenance end_time must be after start_time.' });
+    }
+
+    db.prepare(`
+      UPDATE maintenance_windows
+      SET title = ?,
+          device_id = ?,
+          tenant_id = ?,
+          start_time = ?,
+          end_time = ?,
+          suppress_alerts = ?,
+          is_active = ?
+      WHERE id = ?
+    `).run(
+      nextTitle,
+      nextDeviceId,
+      effectiveNextTenant,
+      startIso,
+      endIso,
+      body.suppress_alerts !== undefined ? (body.suppress_alerts ? 1 : 0) : existing.suppress_alerts,
+      body.is_active !== undefined ? (body.is_active ? 1 : 0) : existing.is_active,
+      id
+    );
+
+    return { success: true, window: db.prepare('SELECT * FROM maintenance_windows WHERE id = ?').get(id) };
+  });
+
+  server.delete('/api/maintenance-windows/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const existing = db
+      .prepare(`
+        SELECT m.tenant_id, d.tenant_id as device_tenant_id
+        FROM maintenance_windows m
+        LEFT JOIN devices d ON m.device_id = d.id
+        WHERE m.id = ?
+      `)
+      .get(id) as any;
+    if (!existing) return reply.status(404).send({ error: 'Maintenance window not found.' });
+    const user = request.auth?.user;
+    const tid = existing.tenant_id || existing.device_tenant_id;
+    if (tid ? !canUserAccessTenant(user, tid) : getAllowedTenantIds(user) !== null) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
     db.prepare('DELETE FROM maintenance_windows WHERE id = ?').run(id);
     return { success: true };
   });
@@ -4572,7 +6408,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
   server.post('/api/devices/:id/maintenance', async (request, reply) => {
     const { id } = request.params as { id: string };
     const access = ensureDeviceTenantAccess(request, reply, id);
-    if (!access.allowed || !access.device) return;
+    if (!access.allowed || !access.device) return reply;
     const body = (request.body || {}) as {
       enabled?: boolean;
       mute?: boolean;
@@ -4613,7 +6449,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
   // ============================================================================
   server.get('/api/devices/:id/chat', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return reply;
     return db
       .prepare('SELECT * FROM chat_messages WHERE device_id = ? ORDER BY created_at ASC LIMIT 200')
       .all(id);
@@ -4622,7 +6458,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
   server.post('/api/devices/:id/chat', async (request, reply) => {
     const { id } = request.params as { id: string };
     const access = ensureDeviceTenantAccess(request, reply, id);
-    if (!access.allowed || !access.device) return;
+    if (!access.allowed || !access.device) return reply;
     const body = (request.body || {}) as { sender?: string; sender_role?: string; message?: string };
     const cleanMsg = String(body.message || '').trim().slice(0, 4000);
     if (!cleanMsg) {
@@ -4673,30 +6509,38 @@ export async function registerApiRoutes(server: FastifyInstance) {
     };
   });
 
-  server.get('/api/recordings', async (request) => {
+  server.get('/api/recordings', async (request, reply) => {
+    const user = request.auth?.user;
+    const isGlobalUser = getAllowedTenantIds(user) === null;
     const query = (request.query || {}) as { device_id?: string };
+    if (query.device_id) {
+      const access = ensureDeviceTenantAccess(request, reply, query.device_id);
+      if (!access.allowed) return reply;
+    }
     const rows = (query.device_id
       ? db
           .prepare(`
-            SELECT r.*, d.hostname, d.tenant_id
+            SELECT r.*, d.hostname, d.tenant_id, t.name as tenant_name
             FROM session_recordings r
             LEFT JOIN devices d ON r.device_id = d.id
+            LEFT JOIN tenants t ON d.tenant_id = t.id
             WHERE r.device_id = ?
             ORDER BY r.created_at DESC
           `)
           .all(query.device_id)
       : db
           .prepare(`
-            SELECT r.*, d.hostname, d.tenant_id
+            SELECT r.*, d.hostname, d.tenant_id, t.name as tenant_name
             FROM session_recordings r
             LEFT JOIN devices d ON r.device_id = d.id
+            LEFT JOIN tenants t ON d.tenant_id = t.id
             ORDER BY r.created_at DESC
-            LIMIT 100
+            LIMIT 250
           `)
           .all()) as any[];
 
     return rows
-      .filter((r) => !r.tenant_id || canUserAccessTenant(request.auth?.user, r.tenant_id))
+      .filter((r) => (r.tenant_id ? canUserAccessTenant(user, r.tenant_id) : isGlobalUser))
       .map((r) => ({
         ...r,
         has_video: Boolean(r.video_path && fs.existsSync(r.video_path))
@@ -4714,7 +6558,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
     if (!body.device_id) {
       return reply.status(400).send({ error: 'device_id is required.' });
     }
-    if (!ensureDeviceTenantAccess(request, reply, body.device_id).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, body.device_id).allowed) return reply;
 
     const id = `rec-${crypto.randomUUID().slice(0, 8)}`;
     const durationSec = Math.max(1, Number(body.duration_sec || 60));
@@ -4799,7 +6643,8 @@ export async function registerApiRoutes(server: FastifyInstance) {
       `)
       .get(id) as any;
     if (!rec) return reply.status(404).send({ error: 'Session recording not found.' });
-    if (rec.tenant_id && !canUserAccessTenant(request.auth?.user, rec.tenant_id)) {
+    const user = request.auth?.user;
+    if (rec.tenant_id ? !canUserAccessTenant(user, rec.tenant_id) : getAllowedTenantIds(user) !== null) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
 
@@ -4843,19 +6688,53 @@ export async function registerApiRoutes(server: FastifyInstance) {
     return reply.send(auditPacket);
   });
 
+  server.delete('/api/recordings/:id', async (request, reply) => {
+    if (!isSuperAdminRole(request.auth?.user?.role)) {
+      return reply.status(403).send({ error: 'Forbidden: Super Admin privileges required to delete recordings.' });
+    }
+    const { id } = request.params as { id: string };
+    const rec = db.prepare('SELECT id, device_id, video_path FROM session_recordings WHERE id = ?').get(id) as any;
+    if (!rec) return reply.status(404).send({ error: 'Session recording not found.' });
+
+    if (rec.video_path && fs.existsSync(RECORDINGS_DIR_PATH) && fs.existsSync(rec.video_path)) {
+      try {
+        const realRoot = fs.realpathSync(RECORDINGS_DIR_PATH);
+        if (!fs.lstatSync(rec.video_path).isSymbolicLink()) {
+          const resolved = fs.realpathSync(rec.video_path);
+          if (resolved.startsWith(realRoot + path.sep) && !fs.lstatSync(resolved).isSymbolicLink() && fs.statSync(resolved).isFile()) {
+            fs.unlinkSync(resolved);
+          }
+        }
+      } catch {}
+    }
+
+    db.prepare('DELETE FROM session_recordings WHERE id = ?').run(id);
+    db.prepare(`
+      INSERT INTO audit_logs (id, username, device_id, action, details)
+      VALUES (?, ?, ?, 'Session Recording Deleted', ?)
+    `).run(
+      `aud-recdel-${crypto.randomUUID()}`,
+      getActorUsername(request),
+      rec.device_id || null,
+      `Deleted compliance session recording '${id}'`
+    );
+
+    return { success: true };
+  });
+
   // ============================================================================
   // OEM Warranty Lookup (Honest Hardware Manufacturer Derivation)
   // ============================================================================
   server.get('/api/devices/:id/warranty', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return reply;
     return db.prepare('SELECT * FROM oem_warranties WHERE device_id = ?').get(id) || null;
   });
 
   server.post('/api/devices/:id/warranty/lookup', async (request, reply) => {
     const { id } = request.params as { id: string };
     const access = ensureDeviceTenantAccess(request, reply, id);
-    if (!access.allowed || !access.device) return;
+    if (!access.allowed || !access.device) return reply;
     const dev = access.device;
 
     const rawMfg = String(dev.manufacturer || '').trim();
@@ -4905,16 +6784,21 @@ export async function registerApiRoutes(server: FastifyInstance) {
   // ============================================================================
   server.get('/api/notifications', async (request) => {
     const user = request.auth?.user;
-    const scopedTenantId = getScopedTenantFilter(user);
-    const rows = (scopedTenantId
+    const allowedTenants = getAllowedTenantIds(user);
+    if (allowedTenants !== null && allowedTenants.length === 0) {
+      return [];
+    }
+    const rows = (allowedTenants !== null
       ? db
-          .prepare('SELECT * FROM notifications WHERE tenant_id = ? ORDER BY is_read ASC, created_at DESC LIMIT 100')
-          .all(scopedTenantId)
+          .prepare(
+            `SELECT * FROM notifications WHERE tenant_id IN (${allowedTenants.map(() => '?').join(',')}) ORDER BY is_read ASC, created_at DESC LIMIT 100`
+          )
+          .all(...allowedTenants)
       : db
           .prepare('SELECT * FROM notifications ORDER BY is_read ASC, created_at DESC LIMIT 100')
           .all()) as any[];
     return rows
-      .filter((r) => !r.tenant_id ? !scopedTenantId : canUserAccessTenant(user, r.tenant_id))
+      .filter((r) => (!r.tenant_id ? allowedTenants === null : canUserAccessTenant(user, r.tenant_id)))
       .map((r) => ({
         ...r,
         is_read: Boolean(r.is_read),
@@ -4925,12 +6809,19 @@ export async function registerApiRoutes(server: FastifyInstance) {
   server.post('/api/notifications/:id/read', async (request) => {
     const { id } = request.params as { id: string };
     const user = request.auth?.user;
-    const scopedTenantId = getScopedTenantFilter(user);
-    if (scopedTenantId) {
+    const allowedTenants = getAllowedTenantIds(user);
+    if (allowedTenants !== null) {
+      if (allowedTenants.length === 0) {
+        return { success: true };
+      }
+      const placeholders = allowedTenants.map(() => '?').join(',');
       if (id === 'all') {
-        db.prepare('UPDATE notifications SET is_read = 1 WHERE tenant_id = ?').run(scopedTenantId);
+        db.prepare(`UPDATE notifications SET is_read = 1 WHERE tenant_id IN (${placeholders})`).run(...allowedTenants);
       } else {
-        db.prepare('UPDATE notifications SET is_read = 1 WHERE id = ? AND tenant_id = ?').run(id, scopedTenantId);
+        db.prepare(`UPDATE notifications SET is_read = 1 WHERE id = ? AND tenant_id IN (${placeholders})`).run(
+          id,
+          ...allowedTenants
+        );
       }
       return { success: true };
     }
@@ -4951,7 +6842,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
         return reply.status(403).send({ error: 'Super Admin role is required to execute client deletion actions.' });
       }
       if (!requireStepUpMfaIfEnforced(request, reply, null)) {
-        return;
+        return reply;
       }
       result = await meshBridge.handleClientDeletion(body.tenantId, body.action, getActorUsername(request));
     }
@@ -4965,7 +6856,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.delete('/api/tenants/:id', async (request, reply) => {
     if (!requireStepUpMfaIfEnforced(request, reply, null)) {
-      return;
+      return reply;
     }
     const { id } = request.params as { id: string };
     const query = (request.query || {}) as { action?: 'uninstall' | 'move_to_unassigned' };
@@ -4983,30 +6874,33 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.get('/api/devices/:id/hardware-history', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return reply;
     return db.prepare('SELECT * FROM hardware_history WHERE device_id = ? ORDER BY timestamp DESC').all(id);
   });
 
   server.post('/api/devices/:id/hardware-history/:histId/ack', async (request, reply) => {
     const { id, histId } = request.params as { id: string; histId: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return reply;
     db.prepare('UPDATE hardware_history SET acknowledged = 1 WHERE id = ? AND device_id = ?').run(histId, id);
     return { success: true };
   });
 
   server.get('/api/devices/:id/network-history', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return reply;
     return db.prepare('SELECT * FROM network_history WHERE device_id = ? ORDER BY connected_at DESC').all(id);
   });
 
   server.get('/api/smart-groups', async (request) => {
     const user = request.auth?.user;
+    const isGlobalUser = getAllowedTenantIds(user) === null;
     const rows = db.prepare('SELECT * FROM smart_groups ORDER BY created_at DESC').all() as any[];
     return rows
-      .filter((g) => !g.tenant_id || canUserAccessTenant(user, g.tenant_id))
+      .filter((g) => (g.tenant_id ? canUserAccessTenant(user, g.tenant_id) : isGlobalUser))
       .map((g) => {
-        const matched = evaluateSmartGroupDevices(g.criteria_json, g.tenant_id);
+        const matched = evaluateSmartGroupDevices(g.criteria_json, g.tenant_id).filter((d: any) =>
+          canUserAccessTenant(user, d.tenant_id)
+        );
         return {
           ...g,
           criteria: safeJsonParse<Record<string, any>>(g.criteria_json, {}),
@@ -5020,14 +6914,18 @@ export async function registerApiRoutes(server: FastifyInstance) {
     const { id } = request.params as { id: string };
     const grp = db.prepare('SELECT * FROM smart_groups WHERE id = ?').get(id) as any;
     if (!grp) return reply.status(404).send({ error: 'Smart group not found.' });
-    if (grp.tenant_id && !canUserAccessTenant(request.auth?.user, grp.tenant_id)) {
+    const user = request.auth?.user;
+    if (grp.tenant_id ? !canUserAccessTenant(user, grp.tenant_id) : getAllowedTenantIds(user) !== null) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
-    const matched = evaluateSmartGroupDevices(grp.criteria_json, grp.tenant_id);
+    const matched = evaluateSmartGroupDevices(grp.criteria_json, grp.tenant_id).filter((d: any) =>
+      canUserAccessTenant(user, d.tenant_id)
+    );
     return matched.map(sanitizeDeviceRowForResponse);
   });
 
   server.post('/api/smart-groups', async (request, reply) => {
+    const user = request.auth?.user;
     const body = (request.body || {}) as {
       name?: string;
       description?: string;
@@ -5038,16 +6936,19 @@ export async function registerApiRoutes(server: FastifyInstance) {
     if (!body.name?.trim()) {
       return reply.status(400).send({ error: 'Smart group name is required.' });
     }
-    if (body.tenant_id && !canUserAccessTenant(request.auth?.user, body.tenant_id)) {
-      return reply.status(403).send({ error: 'Forbidden' });
+    const targetTenantId = body.tenant_id && body.tenant_id !== 'all' ? body.tenant_id : null;
+    if (targetTenantId ? !canUserAccessTenant(user, targetTenantId) : getAllowedTenantIds(user) !== null) {
+      return reply.status(403).send({ error: 'Forbidden for target smart group tenant scope.' });
     }
     const id = `sg-${crypto.randomUUID().slice(0, 8)}`;
     const criteriaJson = body.criteria ? JSON.stringify(body.criteria) : body.criteria_json || '{}';
     db.prepare(`
       INSERT INTO smart_groups (id, name, description, tenant_id, criteria_json)
       VALUES (?, ?, ?, ?, ?)
-    `).run(id, body.name.trim(), body.description || '', body.tenant_id || null, criteriaJson);
-    const matched = evaluateSmartGroupDevices(criteriaJson, body.tenant_id || null);
+    `).run(id, body.name.trim(), body.description || '', targetTenantId, criteriaJson);
+    const matched = evaluateSmartGroupDevices(criteriaJson, targetTenantId).filter((d: any) =>
+      canUserAccessTenant(user, d.tenant_id)
+    );
     return {
       success: true,
       id,
@@ -5060,7 +6961,9 @@ export async function registerApiRoutes(server: FastifyInstance) {
     const { id } = request.params as { id: string };
     const existing = db.prepare('SELECT * FROM smart_groups WHERE id = ?').get(id) as any;
     if (!existing) return reply.status(404).send({ error: 'Smart group not found.' });
-    if (existing.tenant_id && !canUserAccessTenant(request.auth?.user, existing.tenant_id)) {
+    const user = request.auth?.user;
+    const isGlobalUser = getAllowedTenantIds(user) === null;
+    if (existing.tenant_id ? !canUserAccessTenant(user, existing.tenant_id) : !isGlobalUser) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
     const body = (request.body || {}) as {
@@ -5076,7 +6979,15 @@ export async function registerApiRoutes(server: FastifyInstance) {
         : body.criteria_json !== undefined
           ? body.criteria_json
           : existing.criteria_json;
-    const nextTenantId = body.tenant_id !== undefined ? body.tenant_id || null : existing.tenant_id;
+    const nextTenantId =
+      body.tenant_id !== undefined
+        ? body.tenant_id && body.tenant_id !== 'all'
+          ? body.tenant_id
+          : null
+        : existing.tenant_id;
+    if (nextTenantId ? !canUserAccessTenant(user, nextTenantId) : !isGlobalUser) {
+      return reply.status(403).send({ error: 'Forbidden for target tenant scope.' });
+    }
 
     db.prepare(`
       UPDATE smart_groups
@@ -5087,7 +6998,9 @@ export async function registerApiRoutes(server: FastifyInstance) {
       WHERE id = ?
     `).run(body.name?.trim() || null, body.description ?? null, nextTenantId, nextCriteriaJson, id);
 
-    const matched = evaluateSmartGroupDevices(nextCriteriaJson, nextTenantId);
+    const matched = evaluateSmartGroupDevices(nextCriteriaJson, nextTenantId).filter((d: any) =>
+      canUserAccessTenant(user, d.tenant_id)
+    );
     return {
       success: true,
       id,
@@ -5099,7 +7012,9 @@ export async function registerApiRoutes(server: FastifyInstance) {
   server.delete('/api/smart-groups/:id', async (request, reply) => {
     const { id } = request.params as { id: string };
     const existing = db.prepare('SELECT tenant_id FROM smart_groups WHERE id = ?').get(id) as any;
-    if (existing?.tenant_id && !canUserAccessTenant(request.auth?.user, existing.tenant_id)) {
+    if (!existing) return reply.status(404).send({ error: 'Smart group not found.' });
+    const user = request.auth?.user;
+    if (existing.tenant_id ? !canUserAccessTenant(user, existing.tenant_id) : getAllowedTenantIds(user) !== null) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
     db.prepare('DELETE FROM smart_groups WHERE id = ?').run(id);
@@ -5108,7 +7023,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.get('/api/devices/:id/software', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return reply;
     const rows = db
       .prepare('SELECT * FROM software_inventory WHERE device_id = ? ORDER BY highest_cvss DESC, name ASC')
       .all(id) as any[];
@@ -5121,7 +7036,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
   server.post('/api/devices/:id/software/:softId/upgrade', async (request, reply) => {
     const { id, softId } = request.params as { id: string; softId: string };
     const access = ensureDeviceTenantAccess(request, reply, id);
-    if (!access.allowed || !access.device) return;
+    if (!access.allowed || !access.device) return reply;
 
     const soft = db
       .prepare('SELECT * FROM software_inventory WHERE id = ? AND device_id = ?')
@@ -5189,33 +7104,76 @@ export async function registerApiRoutes(server: FastifyInstance) {
   server.post('/api/devices/:id/remote-session', async (request, reply) => {
     const { id } = request.params as { id: string };
     const access = ensureDeviceTenantAccess(request, reply, id);
-    if (!access.allowed || !access.device) return;
+    if (!access.allowed || !access.device) return reply;
     const dev = access.device;
 
-    const body = (request.body || {}) as { mode?: 'interactive' | 'view_only' | 'ghost' };
+    const body = (request.body || {}) as { mode?: 'interactive' | 'view_only' | 'ghost' | 'amt_kvm' };
     const mode = body.mode || 'interactive';
+    if (
+      mode === 'ghost' &&
+      !isSuperAdminRole(request.auth?.user.role) &&
+      !hasUserPermission(request.auth?.user, 'remote:unattended')
+    ) {
+      return reply.status(403).send({
+        error: "Forbidden: missing required permission 'remote:unattended' for Ghost background sessions.",
+        requiredPermission: 'remote:unattended'
+      });
+    }
     const settings = (db.prepare('SELECT * FROM settings WHERE id = 1').get() || {}) as any;
+
+    if (mode === 'amt_kvm') {
+      const cpuStr = String(dev.cpu_model || '');
+      const nonIntel = /\b(amd|ryzen|epyc|threadripper|athlon|apple|arm|aarch64|qualcomm|snapdragon)\b/i.test(cpuStr);
+      if (dev.os_type === 'macos' || nonIntel || (!dev.amt_supported && !dev.amt_provisioned)) {
+        return reply.status(400).send({
+          success: false,
+          error:
+            dev.os_type === 'macos'
+              ? 'Intel AMT / vPro KVM is not supported on macOS hardware.'
+              : nonIntel
+                ? `Endpoint CPU (${cpuStr}) does not support Intel vPro / AMT hardware KVM.`
+                : 'Intel vPro / AMT has not been detected or provisioned on this endpoint.'
+        });
+      }
+    }
+
+    let policyConsentRequired = false;
+    try {
+      const policy = resolveEffectiveDevicePolicy(id);
+      policyConsentRequired = Boolean(policy?.requireRemoteConsent);
+    } catch {}
+    const roleLower = String(dev.device_role || '').toLowerCase();
+    const isUnattended =
+      dev.status === 'isolated' ||
+      roleLower.includes('server') ||
+      roleLower.includes('controller') ||
+      roleLower.includes('hypervisor') ||
+      mode === 'ghost' ||
+      mode === 'amt_kvm';
+    const requireConsent = policyConsentRequired && !isUnattended;
 
     const liveSession = await meshBridge.createLiveDeviceSessionUrl({
       deviceId: id,
-      mode: 'desktop',
+      mode: mode === 'ghost' ? 'terminal' : 'desktop',
       viewOnly: mode === 'view_only',
+      requireConsent,
       guestName: getActorUsername(request),
       durationMinutes: 60
     });
 
     let fallbackUrl: string | null = null;
     const rawMeshUrl = String(settings.meshcentral_url || '').trim();
-    if (
-      !liveSession.url &&
+    const validRawMeshUrl =
       rawMeshUrl &&
       !rawMeshUrl.includes('mesh.vitrine.local') &&
       (rawMeshUrl.startsWith('https://') || rawMeshUrl.startsWith('http://'))
-    ) {
+        ? rawMeshUrl
+        : null;
+    if (!liveSession.url && validRawMeshUrl) {
       try {
-        const parsed = new URL(rawMeshUrl);
+        const parsed = new URL(validRawMeshUrl);
         const nodeRef = encodeURIComponent(dev.mesh_node_id || dev.id);
-        const viewParam = mode === 'view_only' ? '&viewonly=1' : mode === 'ghost' ? '&ghost=1' : '';
+        const viewParam = mode === 'view_only' ? '&viewonly=1' : '';
         fallbackUrl = `${parsed.origin}/?viewmode=11&gotonode=${nodeRef}${viewParam}`;
       } catch {
         fallbackUrl = null;
@@ -5223,13 +7181,17 @@ export async function registerApiRoutes(server: FastifyInstance) {
     }
 
     const meshRelayUrl = liveSession.url || fallbackUrl;
+    const bridgeStatus = meshBridge.getStatus();
+    const meshRelayError =
+      liveSession.error ||
+      (!bridgeStatus.connected ? bridgeStatus.lastError || 'MeshCentral bridge not connected' : null);
 
     const ghostArchitecture =
       dev.os_type === 'windows'
-        ? 'Win32 CreateDesktopW Isolated Hidden Desktop + WinRM Session'
+        ? 'Win32 CreateDesktopW / Background Session Host'
         : dev.os_type === 'macos'
-          ? 'macOS CGSession Hidden Aqua Session / SSH Framebuffer'
-          : 'Linux Xvfb / Headless Wayland Compositor (:99)';
+          ? 'macOS Background SSH / Terminal Multiplexer'
+          : 'Linux Background PTY / Headless Session';
 
     db.prepare(`
       INSERT INTO audit_logs (id, username, device_id, action, details)
@@ -5249,11 +7211,76 @@ export async function registerApiRoutes(server: FastifyInstance) {
       osType: dev.os_type,
       mode,
       meshRelayUrl,
+      serverUrl: liveSession.serverUrl || validRawMeshUrl || null,
+      meshRelayError,
       shareLinkSource: liveSession.live ? 'meshcentral_share_link' : fallbackUrl ? 'meshcentral_gotonode' : 'unavailable',
-      meshBridgeConnected: meshBridge.getStatus().connected,
+      meshBridgeConnected: bridgeStatus.connected,
       ghostArchitecture: mode === 'ghost' ? ghostArchitecture : null,
       recordingEnabled: Boolean(settings.session_recording_enabled),
       visualIndicator: Boolean(settings.session_recording_visual_indicator)
+    };
+  });
+
+  server.post('/api/devices/:id/lock-screen', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const user = request.auth?.user;
+    if (!isTechnicianOrAbove(user?.role) || !hasUserPermission(user, 'remote:connect')) {
+      return reply.status(403).send({ error: 'Technician role and remote:connect permission required to lock screen.' });
+    }
+    const access = ensureDeviceTenantAccess(request, reply, id);
+    if (!access.allowed || !access.device) return reply;
+
+    const actor = getActorUsername(request);
+    const lockRes = await meshBridge.lockEndpointScreen(id, actor);
+    db.prepare(`
+      INSERT INTO audit_logs (id, username, device_id, action, details)
+      VALUES (?, ?, ?, 'Endpoint Screen Locked', ?)
+    `).run(
+      `aud-lock-${crypto.randomUUID()}`,
+      actor,
+      id,
+      `Triggered endpoint lock-screen on ${access.device.hostname} (dispatched=${lockRes.dispatched}, live=${lockRes.live})`
+    );
+    return {
+      success: lockRes.dispatched,
+      dispatched: lockRes.dispatched,
+      live: lockRes.live,
+      output: lockRes.output
+    };
+  });
+
+  server.post('/api/devices/:id/remote-session/consent-bypass', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const user = request.auth?.user;
+    if (!isSuperAdminRole(user?.role) && !hasUserPermission(user, 'remote:unattended')) {
+      return reply.status(403).send({
+        error: "Forbidden: missing required permission 'remote:unattended' to bypass remote consent.",
+        requiredPermission: 'remote:unattended'
+      });
+    }
+    const access = ensureDeviceTenantAccess(request, reply, id);
+    if (!access.allowed || !access.device) return reply;
+
+    const body = (request.body || {}) as { reason?: string; sessionId?: string };
+    const reason = String(body.reason || 'Unattended administrative override').trim().slice(0, 240);
+    const actor = getActorUsername(request);
+
+    db.prepare(`
+      INSERT INTO audit_logs (id, username, device_id, action, details)
+      VALUES (?, ?, ?, 'Remote Consent Bypassed', ?)
+    `).run(
+      `aud-cbyp-${crypto.randomUUID()}`,
+      actor,
+      id,
+      `Operator '${actor}' bypassed interactive consent on ${access.device.hostname}: ${reason}`
+    );
+
+    return {
+      success: true,
+      bypassed: true,
+      deviceId: id,
+      audited: true,
+      reason
     };
   });
 
@@ -5272,13 +7299,13 @@ export async function registerApiRoutes(server: FastifyInstance) {
           ? `${subnetPrefix}.0/24`
           : undefined;
 
-    // Discover real online subnet peers using exact schema column `device_role` (never invent fake hostnames!)
+    // Discover real online subnet peers strictly within the same client tenant (prevents cross-tenant lateral relay)
     const peerRelay = subnetPrefix
       ? (db
           .prepare(
-            "SELECT id, hostname, ip_address, device_role, os_type, companion_installed FROM devices WHERE id != ? AND status = 'online' AND ip_address LIKE ? ORDER BY CASE WHEN LOWER(device_role) LIKE '%server%' THEN 0 ELSE 1 END LIMIT 1"
+            "SELECT id, hostname, ip_address, device_role, os_type, companion_installed FROM devices WHERE id != ? AND tenant_id = ? AND status = 'online' AND ip_address LIKE ? ORDER BY CASE WHEN LOWER(device_role) LIKE '%server%' THEN 0 ELSE 1 END LIMIT 1"
           )
-          .get(dev.id, `${subnetPrefix}.%`) as any)
+          .get(dev.id, dev.tenant_id, `${subnetPrefix}.%`) as any)
       : null;
 
     const recentNet = db
@@ -5373,6 +7400,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
       success: true,
       deviceId: dev.id,
       hostname: dev.hostname,
+      targetIp: dev.ip_address || siteSubnet?.split('/')[0] || null,
       macAddress: dev.mac_address,
       wolSent: wolBroadcastResult.sent,
       wolTargets: wolBroadcastResult.targets,
@@ -5384,28 +7412,35 @@ export async function registerApiRoutes(server: FastifyInstance) {
   server.post('/api/devices/:id/wake-on-lan', async (request, reply) => {
     const { id } = request.params as { id: string };
     const access = ensureDeviceTenantAccess(request, reply, id);
-    if (!access.allowed || !access.device) return;
+    if (!access.allowed || !access.device) return reply;
     return await executeReachabilityChain(access.device, getActorUsername(request));
   });
 
   server.post('/api/devices/:id/wol', async (request, reply) => {
     const { id } = request.params as { id: string };
     const access = ensureDeviceTenantAccess(request, reply, id);
-    if (!access.allowed || !access.device) return;
+    if (!access.allowed || !access.device) return reply;
+    return await executeReachabilityChain(access.device, getActorUsername(request));
+  });
+
+  server.post('/api/devices/:id/wake', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const access = ensureDeviceTenantAccess(request, reply, id);
+    if (!access.allowed || !access.device) return reply;
     return await executeReachabilityChain(access.device, getActorUsername(request));
   });
 
   server.post('/api/devices/:id/reachability-chain', async (request, reply) => {
     const { id } = request.params as { id: string };
     const access = ensureDeviceTenantAccess(request, reply, id);
-    if (!access.allowed || !access.device) return;
+    if (!access.allowed || !access.device) return reply;
     return await executeReachabilityChain(access.device, getActorUsername(request));
   });
 
   server.post('/api/devices/:id/enable-wol', async (request, reply) => {
     const { id } = request.params as { id: string };
     const access = ensureDeviceTenantAccess(request, reply, id);
-    if (!access.allowed || !access.device) return;
+    if (!access.allowed || !access.device) return reply;
     const dev = access.device;
 
     const mfg = String(dev.manufacturer || '').toLowerCase();
@@ -5418,22 +7453,35 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
     const execRes = await meshBridge.executeCommandOnNode(id, cmd, { runAs: 'system' });
     const dispatched = execRes.live;
-    db.prepare("UPDATE devices SET wol_supported = 1, wol_status = 'Enabled (NIC + OS Power Policy)' WHERE id = ?").run(
-      id
-    );
+    const confirmed = Boolean(execRes.live && execRes.exitCode === 0);
+    const nextWolStatus = confirmed
+      ? 'Enabled (NIC + OS Power Policy)'
+      : execRes.live
+        ? `Failed (Exit ${execRes.exitCode})`
+        : 'Pending (Endpoint Offline)';
+
+    if (confirmed) {
+      db.prepare('UPDATE devices SET wol_supported = 1, wol_status = ? WHERE id = ?').run(nextWolStatus, id);
+    } else {
+      db.prepare('UPDATE devices SET wol_status = ? WHERE id = ?').run(nextWolStatus, id);
+    }
 
     return {
-      success: true,
+      success: confirmed,
       dispatched,
+      live: execRes.live,
+      exitCode: execRes.exitCode,
+      wol_supported: confirmed ? 1 : Number(dev.wol_supported || 0),
       manufacturer: dev.manufacturer || (mfg ? mfg : 'Generic OEM'),
-      wol_status: 'Enabled (NIC + OS Power Policy)'
+      wol_status: nextWolStatus,
+      output: execRes.output
     };
   });
 
-  server.post('/api/devices/:id/provision-amt', async (request, reply) => {
+  const handleProvisionAmt = async (request: FastifyRequest, reply: FastifyReply) => {
     const { id } = request.params as { id: string };
     const access = ensureDeviceTenantAccess(request, reply, id);
-    if (!access.allowed || !access.device) return;
+    if (!access.allowed || !access.device) return reply;
     const dev = access.device;
 
     if (dev.os_type === 'macos') {
@@ -5443,10 +7491,19 @@ export async function registerApiRoutes(server: FastifyInstance) {
       });
     }
 
+    const cpuStr = String(dev.cpu_model || '');
+    if (/\b(amd|ryzen|epyc|threadripper|athlon|apple|arm|aarch64|qualcomm|snapdragon)\b/i.test(cpuStr)) {
+      return reply.status(400).send({
+        success: false,
+        amt_provisioned: false,
+        error: `Endpoint CPU (${cpuStr}) is not an Intel vPro / AMT platform.`
+      });
+    }
+
     const probeCmd =
       dev.os_type === 'windows'
-        ? `$mei = Get-PnpDevice -FriendlyName '*Management Engine*' -ErrorAction SilentlyContinue | Select-Object -First 1; if ($mei) { Write-Output "AMT_PRESENT|$($mei.Status)" } else { exit 2 }`
-        : `if [ -e /dev/mei0 ] || lspci 2>/dev/null | grep -qi 'Management Engine'; then echo 'AMT_PRESENT|Active'; else exit 2; fi`;
+        ? `$mei = Get-PnpDevice -FriendlyName '*Management Engine*' -ErrorAction SilentlyContinue | Select-Object -First 1; if (-not $mei) { exit 2 }; Write-Output "AMT_PRESENT|$($mei.Status)"; $mc = "$env:ProgramFiles\\Mesh Agent\\meshcmd.exe"; if (Test-Path $mc) { & $mc amtinfo }`
+        : `if [ -e /dev/mei0 ] || lspci 2>/dev/null | grep -qi 'Management Engine'; then echo 'AMT_PRESENT|Active'; if command -v meshcmd >/dev/null 2>&1; then meshcmd amtinfo || true; fi; else exit 2; fi`;
 
     const probeRes = await meshBridge.executeCommandOnNode(id, probeCmd, {
       runAs: 'system',
@@ -5462,41 +7519,60 @@ export async function registerApiRoutes(server: FastifyInstance) {
       });
     }
 
-    const verifiedLive = Boolean(probeRes.live && probeRes.exitCode === 0 && probeRes.output.includes('AMT_PRESENT'));
-    if (!verifiedLive && !dev.amt_supported) {
+    const verifiedHardware = Boolean(probeRes.live && probeRes.exitCode === 0 && probeRes.output.includes('AMT_PRESENT'));
+    if (!verifiedHardware && !dev.amt_supported) {
       return reply.status(409).send({
         success: false,
         amt_provisioned: false,
         queued: probeRes.output.startsWith('[Vitrine Companion Queue]'),
-        error: 'Endpoint must be online with verified Intel vPro/MEI hardware before AMT CIRA provisioning can complete.'
+        error: 'Endpoint must be online with verified Intel vPro/MEI hardware before AMT probe or provisioning can run.'
       });
     }
 
-    const resolvedVersion = dev.amt_version || '16.1 (CCM CIRA)';
+    // Only report amt_provisioned=true if amtinfo confirms active CCM/ACM provisioning (not from a bare hardware probe)
+    const amtProvisioningConfirmed = Boolean(
+      probeRes.live &&
+        /(control\s*mode\s*:\s*(client|admin)|provisioning\s*state\s*:\s*post|cira\s*connected)/i.test(
+          probeRes.output || ''
+        )
+    );
+    const finalProvisioned = amtProvisioningConfirmed || Boolean(dev.amt_provisioned);
+    const resolvedVersion = dev.amt_version || (finalProvisioned ? '16.1 (CCM CIRA)' : '');
+
     db.prepare(`
       UPDATE devices
       SET amt_supported = 1,
-          amt_provisioned = 1,
+          amt_provisioned = ?,
           amt_version = ?
       WHERE id = ?
-    `).run(resolvedVersion, id);
+    `).run(finalProvisioned ? 1 : 0, resolvedVersion, id);
 
     db.prepare(`
       INSERT INTO audit_logs (id, username, device_id, action, details)
-      VALUES (?, ?, ?, 'Intel vPro / AMT Provisioned', ?)
+      VALUES (?, ?, ?, ?, ?)
     `).run(
       `aud-amt-${crypto.randomUUID()}`,
       getActorUsername(request),
       id,
-      `Configured Client Control Mode (CCM) CIRA profile on ${dev.hostname}`
+      finalProvisioned ? 'Intel vPro / AMT Verified' : 'Intel vPro / AMT Hardware Probe Completed',
+      finalProvisioned
+        ? `Confirmed AMT provisioning (${resolvedVersion}) on ${dev.hostname}`
+        : `Detected Intel MEI hardware capability on ${dev.hostname}; AMT CCM/CIRA provisioning not yet active`
     );
 
     return {
       success: true,
-      amt_provisioned: true,
-      amt_version: resolvedVersion
+      amt_supported: true,
+      amt_provisioned: finalProvisioned,
+      amt_version: resolvedVersion,
+      probeOnly: !finalProvisioned,
+      message: finalProvisioned
+        ? 'Intel vPro / AMT provisioning verified on endpoint.'
+        : 'Intel MEI hardware capability detected, but AMT CIRA/CCM provisioning has not been activated yet.'
     };
-  });
+  };
+  server.post('/api/devices/:id/provision-amt', handleProvisionAmt);
+  server.post('/api/devices/:id/configure-amt', handleProvisionAmt);
 
   // ============================================================================
   // Guest / Vendor Scoped Time-Bombed Portal (Password + HMAC Token Enforced)
@@ -5537,19 +7613,50 @@ export async function registerApiRoutes(server: FastifyInstance) {
       });
       return { ok: false };
     }
+    const isSafeMethod = request.method === 'GET' || request.method === 'HEAD' || request.method === 'OPTIONS';
+    if (!isSafeMethod && !isGuestTokenValid && request.auth?.authSource === 'cookie') {
+      const csrfHeader = String(request.headers['x-vitrine-csrf'] || '').trim();
+      if (csrfHeader !== '1') {
+        reply.status(403).send({
+          error: 'CSRF verification failed: missing X-Vitrine-CSRF header.',
+          code: 'CSRF_REQUIRED'
+        });
+        return { ok: false };
+      }
+    }
+    const deviceIds = safeJsonParse<string[]>(grant.device_ids_json, []);
+    if (!isGuestTokenValid && isAdminSession) {
+      const user = request.auth?.user;
+      if (deviceIds.length === 0) {
+        if (!isSuperAdminRole(user?.role)) {
+          reply.status(403).send({ error: 'Forbidden' });
+          return { ok: false };
+        }
+      } else {
+        const placeholders = deviceIds.map(() => '?').join(',');
+        const devs = db
+          .prepare(`SELECT id, tenant_id FROM devices WHERE id IN (${placeholders})`)
+          .all(...deviceIds) as Array<{ id: string; tenant_id: string }>;
+        if (devs.length !== deviceIds.length || devs.some((d) => !canUserAccessTenant(user, d.tenant_id))) {
+          reply.status(403).send({ error: 'Forbidden: vendor pass includes devices outside your tenant scope.' });
+          return { ok: false };
+        }
+      }
+    }
     return {
       ok: true,
       grant,
-      deviceIds: safeJsonParse<string[]>(grant.device_ids_json, [])
+      deviceIds
     };
   };
 
   server.get('/api/guest-grants', async (request) => {
     const user = request.auth?.user;
+    const isGlobalUser = getAllowedTenantIds(user) === null;
     const rows = db.prepare('SELECT * FROM guest_access_grants ORDER BY created_at DESC').all() as any[];
     const visible = rows.filter((g) => {
       const devIds = safeJsonParse<string[]>(g.device_ids_json, []);
-      if (devIds.length === 0) return isSuperAdminRole(user?.role);
+      if (devIds.length === 0) return isGlobalUser;
       const placeholders = devIds.map(() => '?').join(',');
       const devs = db
         .prepare(`SELECT tenant_id FROM devices WHERE id IN (${placeholders})`)
@@ -5592,7 +7699,8 @@ export async function registerApiRoutes(server: FastifyInstance) {
       }
     }
 
-    const hours = Math.max(1, Math.min(168, Number(body.duration_hours ?? body.expires_in_hours ?? 4)));
+    const rawHours = Number(body.duration_hours ?? body.expires_in_hours ?? 4);
+    const hours = Number.isFinite(rawHours) ? Math.max(1, Math.min(168, rawHours)) : 4;
     const expiresAt = new Date(Date.now() + hours * 3600_000).toISOString();
     const id = `gg-${crypto.randomUUID().slice(0, 10)}`;
     const slug = vendorName.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 10) || 'vendor';
@@ -5685,9 +7793,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
       grant.status !== 'active' || (grant.expires_at ? new Date(grant.expires_at).getTime() <= Date.now() : true);
     return {
       id: grant.id,
-      vendor_name: grant.vendor_name,
-      expires_at: grant.expires_at,
-      status: grant.status,
+      status: isExpired ? 'expired' : 'active',
       is_expired: isExpired,
       authRequired: Boolean(grant.password_hash || grant.temp_password),
       auth_required: Boolean(grant.password_hash || grant.temp_password),
@@ -5776,6 +7882,14 @@ export async function registerApiRoutes(server: FastifyInstance) {
     };
   });
 
+  server.get('/api/guest-portal/:id/ws-ticket', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const authz = authorizeGuestGrant(request, reply, id);
+    if (!authz.ok || !authz.grant) return;
+    const ticket = issueEphemeralWsTicket({ grantId: id });
+    return { success: true, ticket, expiresInSeconds: 45 };
+  });
+
   server.get('/api/guest-portal/:id/custom-fields/:deviceId', async (request, reply) => {
     const { id, deviceId } = request.params as { id: string; deviceId: string };
     const authz = authorizeGuestGrant(request, reply, id);
@@ -5783,15 +7897,21 @@ export async function registerApiRoutes(server: FastifyInstance) {
     if (!authz.grant.can_view_custom_fields || !authz.deviceIds.includes(deviceId)) {
       return reply.status(403).send({ error: 'Custom field visibility is not permitted on this vendor pass.' });
     }
+    const dev = db.prepare('SELECT tenant_id FROM devices WHERE id = ?').get(deviceId) as
+      | { tenant_id?: string }
+      | undefined;
+    if (!dev) return reply.status(404).send({ error: 'Device not found.' });
     return db
       .prepare(`
         SELECT d.id as field_id, d.key, d.label, d.category, COALESCE(v.value, '') as value
         FROM custom_field_definitions d
         LEFT JOIN custom_field_values v ON d.id = v.field_id AND v.entity_id = ?
-        WHERE (d.scope = 'device' OR d.scope = 'all') AND d.field_type != 'secret'
+        WHERE (d.scope = 'device' OR d.scope = 'all')
+          AND d.field_type != 'secret'
+          AND (d.tenant_id IS NULL OR d.tenant_id = ?)
         ORDER BY d.category ASC, d.label ASC
       `)
-      .all(deviceId);
+      .all(deviceId, dev.tenant_id || '');
   });
 
   server.post('/api/guest-portal/:id/remote-session', async (request, reply) => {
@@ -5817,7 +7937,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
     const liveSession = await meshBridge.createLiveDeviceSessionUrl({
       deviceId,
-      mode: 'desktop',
+      mode: mode === 'ghost' ? 'terminal' : 'desktop',
       viewOnly: mode === 'view_only',
       guestName: `${authz.grant.vendor_name} (${authz.grant.temp_username})`,
       durationMinutes: 60
@@ -5849,15 +7969,28 @@ export async function registerApiRoutes(server: FastifyInstance) {
   server.get('/api/guest-portal/:id/scripts', async (request, reply) => {
     const { id } = request.params as { id: string };
     const authz = authorizeGuestGrant(request, reply, id);
-    if (!authz.ok || !authz.grant) return;
+    if (!authz.ok || !authz.grant || !authz.deviceIds) return;
     if (!authz.grant.can_run_scripts) {
       return reply.status(403).send({ error: 'Script execution is disabled on this vendor pass.' });
     }
-    return db
+    const grantTenants = new Set<string>();
+    if (authz.deviceIds.length > 0) {
+      const placeholders = authz.deviceIds.map(() => '?').join(',');
+      const devs = db
+        .prepare(`SELECT DISTINCT tenant_id FROM devices WHERE id IN (${placeholders})`)
+        .all(...authz.deviceIds) as Array<{ tenant_id?: string }>;
+      for (const d of devs) {
+        if (d.tenant_id) grantTenants.add(d.tenant_id);
+      }
+    }
+    const rows = db
       .prepare(
-        "SELECT id, name, description, language, category FROM scripts WHERE COALESCE(required_role, 'technician') NOT IN ('admin', 'super_admin', 'msp_super_admin') ORDER BY name ASC"
+        "SELECT id, name, description, language, category, tenant_id FROM scripts WHERE COALESCE(enabled, 1) = 1 AND COALESCE(required_role, 'technician') NOT IN ('admin', 'super_admin', 'msp_super_admin') ORDER BY name ASC"
       )
-      .all();
+      .all() as any[];
+    return rows
+      .filter((s) => !s.tenant_id || s.tenant_id === 'all' || grantTenants.has(s.tenant_id))
+      .map(({ tenant_id: _tid, ...rest }) => rest);
   });
 
   server.post('/api/guest-portal/:id/scripts/:scriptId/run', async (request, reply) => {
@@ -5872,9 +8005,18 @@ export async function registerApiRoutes(server: FastifyInstance) {
     if (!authz.deviceIds.includes(deviceId)) {
       return reply.status(403).send({ error: 'Device is outside this vendor grant scope.' });
     }
+    const targetDev = db.prepare('SELECT id, tenant_id FROM devices WHERE id = ?').get(deviceId) as
+      | { id: string; tenant_id: string }
+      | undefined;
+    if (!targetDev) return reply.status(404).send({ error: 'Device not found.' });
 
     const script = db.prepare('SELECT * FROM scripts WHERE id = ?').get(scriptId) as any;
-    if (!script || ['admin', 'super_admin', 'msp_super_admin'].includes(String(script.required_role || ''))) {
+    if (
+      !script ||
+      !script.enabled ||
+      ['admin', 'super_admin', 'msp_super_admin'].includes(String(script.required_role || '')) ||
+      (script.tenant_id && script.tenant_id !== 'all' && script.tenant_id !== targetDev.tenant_id)
+    ) {
       return reply.status(403).send({ error: 'Script is restricted or does not exist.' });
     }
 
@@ -5913,6 +8055,8 @@ export async function registerApiRoutes(server: FastifyInstance) {
       return {
         mode: 'permanent' as const,
         tenantId: auditToken.tenant_id,
+        siteId: auditToken.site_id || undefined,
+        deviceRole: auditToken.device_role || undefined,
         os: (auditToken.platform === 'linux' || auditToken.platform === 'darwin'
           ? auditToken.platform
           : 'windows') as 'windows' | 'linux' | 'darwin',
@@ -5929,7 +8073,9 @@ export async function registerApiRoutes(server: FastifyInstance) {
       }
       return {
         mode: 'quicksupport' as const,
-        tenantId: qsSession.tenant_id || 'quicksupport',
+        tenantId: qsSession.tenant_id || undefined,
+        siteId: undefined,
+        deviceRole: undefined,
         os: (qsSession.platform === 'linux' || qsSession.platform === 'darwin'
           ? qsSession.platform
           : 'windows') as 'windows' | 'linux' | 'darwin',
@@ -5952,19 +8098,27 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
     const query = (request.query || {}) as {
       os?: string;
+      mode?: string;
       tenant_id?: string;
       site_id?: string;
       role?: string;
       ticket?: string;
       max_uses?: string;
     };
+    const requestedQueryMode = String(query.mode || '').trim().toLowerCase();
+    const installerMode: 'permanent' | 'companion_only' =
+      requestedQueryMode === 'companion' || requestedQueryMode === 'companion_only' ? 'companion_only' : 'permanent';
     if (settings.installer_require_ticket && !query.ticket?.trim()) {
       return reply.status(400).send({ error: 'A valid PSA ticket reference is required to generate an installer.' });
     }
 
     const osParam: 'windows' | 'linux' | 'darwin' =
       query.os === 'linux' ? 'linux' : query.os === 'darwin' || query.os === 'macos' ? 'darwin' : 'windows';
-    const fallbackTenant = (db.prepare('SELECT id FROM tenants ORDER BY created_at ASC LIMIT 1').get() as any)?.id || 'default';
+    const allowedTenants = getAllowedTenantIds(request.auth?.user);
+    const fallbackTenant =
+      allowedTenants && allowedTenants.length > 0
+        ? allowedTenants[0]
+        : (db.prepare('SELECT id FROM tenants ORDER BY created_at ASC LIMIT 1').get() as any)?.id || 'default';
     const tenantId = query.tenant_id || fallbackTenant;
     if (!canUserAccessTenant(request.auth?.user, tenantId)) {
       return reply.status(403).send({ error: 'Forbidden' });
@@ -5981,7 +8135,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
       tokenId,
       tenantId,
       query.site_id || null,
-      query.role || 'Workstation',
+      query.role || 'Auto',
       getActorUsername(request),
       query.ticket || null,
       osParam,
@@ -5992,8 +8146,11 @@ export async function registerApiRoutes(server: FastifyInstance) {
     const pkg = await installerGenerator.generateInstaller({
       os: osParam,
       tenantId,
+      siteId: query.site_id || undefined,
+      deviceRole: query.role || 'Auto',
       tokenId,
-      mode: 'permanent'
+      mode: installerMode,
+      vitrineServerUrl: resolvePublicBaseUrl(request, settings)
     });
 
     reply.header('Content-Type', pkg.contentType);
@@ -6016,13 +8173,13 @@ export async function registerApiRoutes(server: FastifyInstance) {
       device_role?: string;
       platform?: string;
       os?: string;
-      mode?: 'permanent' | 'quicksupport';
+      mode?: 'permanent' | 'quicksupport' | 'companion_only';
       ticket_number?: string;
       mesh_server_id?: string;
       max_uses?: number;
     };
-    const requestedMode: 'permanent' | 'quicksupport' =
-      body.mode === 'quicksupport' ? 'quicksupport' : 'permanent';
+    const requestedMode: 'permanent' | 'quicksupport' | 'companion_only' =
+      body.mode === 'quicksupport' ? 'quicksupport' : body.mode === 'companion_only' ? 'companion_only' : 'permanent';
 
     if (requestedMode === 'permanent' && settings.installer_require_ticket && !body.ticket_number?.trim()) {
       return reply.status(400).send({ error: 'A PSA ticket number is required by organization security policy.' });
@@ -6031,13 +8188,25 @@ export async function registerApiRoutes(server: FastifyInstance) {
     const rawOs = body.platform || body.os || 'windows';
     const osParam: 'windows' | 'linux' | 'darwin' =
       rawOs === 'linux' ? 'linux' : rawOs === 'darwin' || rawOs === 'macos' ? 'darwin' : 'windows';
-    const firstTenant = (db.prepare('SELECT id FROM tenants ORDER BY created_at ASC LIMIT 1').get() as any)?.id || 'default';
-    const tenantId = body.tenant_id || firstTenant;
-    if (!canUserAccessTenant(request.auth?.user, tenantId)) {
+    const allowedTenants = getAllowedTenantIds(request.auth?.user);
+    const firstTenant =
+      allowedTenants && allowedTenants.length > 0
+        ? allowedTenants[0]
+        : (db.prepare('SELECT id FROM tenants ORDER BY created_at ASC LIMIT 1').get() as any)?.id || 'default';
+    const tenantId =
+      requestedMode === 'quicksupport' && !body.tenant_id && allowedTenants === null
+        ? undefined
+        : body.tenant_id || firstTenant;
+    if (tenantId && !canUserAccessTenant(request.auth?.user, tenantId)) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
 
     if (requestedMode === 'quicksupport') {
+      if (settings.quicksupport_enabled === 0) {
+        return reply.status(403).send({
+          error: 'Public QuickSupport portal is currently disabled by administrator policy.'
+        });
+      }
       const sessionCode = `${crypto.randomInt(100, 1000)}-${crypto.randomInt(100, 1000)}-${crypto.randomInt(100, 1000)}`;
       const qsId = `qs-${crypto.randomUUID().slice(0, 8)}`;
       const qsExpiresAt = new Date(Date.now() + 2 * 3600_000).toISOString();
@@ -6057,15 +8226,13 @@ export async function registerApiRoutes(server: FastifyInstance) {
         qsId,
         sessionCode,
         `QuickSupport (${getActorUsername(request)})`,
-        tenantId,
+        tenantId || null,
         osParam,
         pipeline.allSigned ? 1 : 0,
         body.mesh_server_id || null,
         qsExpiresAt
       );
-      const proto = String(request.headers['x-forwarded-proto'] || request.protocol || 'https');
-      const host = settings.custom_domain || request.headers.host || 'localhost:3001';
-      const baseUrl = `${proto}://${host}`;
+      const baseUrl = resolvePublicBaseUrl(request, settings);
       return {
         success: true,
         mode: 'quicksupport',
@@ -6088,9 +8255,9 @@ export async function registerApiRoutes(server: FastifyInstance) {
     `).run(
       `ia-${crypto.randomUUID().slice(0, 8)}`,
       tokenId,
-      tenantId,
+      tenantId || firstTenant,
       body.site_id || null,
-      body.device_role || 'Workstation',
+      body.device_role || 'Auto',
       getActorUsername(request),
       body.ticket_number || null,
       osParam,
@@ -6100,28 +8267,31 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
     const pipeline = await installerGenerator.runSigningPipeline({
       os: osParam,
-      tenantId,
+      tenantId: tenantId || firstTenant,
+      siteId: body.site_id || undefined,
+      deviceRole: body.device_role || 'Auto',
       tokenId,
-      mode: 'permanent',
+      mode: requestedMode,
       meshServerId: body.mesh_server_id
     });
 
-    const proto = String(request.headers['x-forwarded-proto'] || request.protocol || 'https');
-    const host = settings.custom_domain || request.headers.host || 'localhost:3001';
-    const baseUrl = `${proto}://${host}`;
+    const baseUrl = resolvePublicBaseUrl(request, settings);
+    const modeQuery = requestedMode === 'companion_only' ? '&mode=companion' : '';
 
     return {
       success: true,
       token: tokenId,
+      mode: requestedMode,
       expiresAt,
-      downloadUrl: `/api/agent/download?token=${encodeURIComponent(tokenId)}&os=${osParam}`,
-      deployUrl: `${baseUrl}/api/agent/deploy?token=${encodeURIComponent(tokenId)}&os=${osParam}`,
+      downloadUrl: `/api/agent/download?token=${encodeURIComponent(tokenId)}&os=${osParam}${modeQuery}`,
+      deployUrl: `${baseUrl}/api/agent/deploy?token=${encodeURIComponent(tokenId)}&os=${osParam}${modeQuery}`,
       signingPipeline: pipeline
     };
   });
 
   server.get('/api/installers/audit', async (request) => {
     const user = request.auth?.user;
+    const isGlobalUser = getAllowedTenantIds(user) === null;
     const rows = db
       .prepare(`
         SELECT i.*, t.name as tenant_name
@@ -6131,7 +8301,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
         LIMIT 100
       `)
       .all() as any[];
-    return rows.filter((r) => !r.tenant_id || canUserAccessTenant(user, r.tenant_id));
+    return rows.filter((r) => (r.tenant_id ? canUserAccessTenant(user, r.tenant_id) : isGlobalUser));
   });
 
   const serveTokenAuthenticatedInstaller = async (request: FastifyRequest, reply: FastifyReply) => {
@@ -6142,7 +8312,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
         retryAfterSec: rate.retryAfterSec
       });
     }
-    const query = (request.query || {}) as { token?: string; os?: string };
+    const query = (request.query || {}) as { token?: string; os?: string; mode?: string; deviceId?: string };
     const resolved = resolveValidInstallerToken(query.token);
     if (!resolved) {
       return reply.status(401).send({
@@ -6150,20 +8320,41 @@ export async function registerApiRoutes(server: FastifyInstance) {
       });
     }
 
+    const rawQueryOs = String(query.os || '').trim().toLowerCase();
     const osParam: 'windows' | 'linux' | 'darwin' =
-      query.os === 'linux'
-        ? 'linux'
-        : query.os === 'darwin' || query.os === 'macos'
-          ? 'darwin'
-          : resolved.os;
+      rawQueryOs === 'windows' || rawQueryOs === 'win'
+        ? 'windows'
+        : rawQueryOs === 'linux'
+          ? 'linux'
+          : rawQueryOs === 'darwin' || rawQueryOs === 'macos'
+            ? 'darwin'
+            : resolved.os;
+
+    const requestedMode = String(query.mode || '').trim().toLowerCase();
+    const effectiveMode: 'permanent' | 'quicksupport' | 'companion_only' =
+      resolved.mode === 'permanent' && (requestedMode === 'companion' || requestedMode === 'companion_only')
+        ? 'companion_only'
+        : resolved.mode;
+
+    const targetDeviceId =
+      effectiveMode === 'companion_only' && query.deviceId
+        ? String(query.deviceId).replace(/[^a-zA-Z0-9._-]/g, '').slice(0, 80) || undefined
+        : undefined;
+
+    const dlSettings = (db.prepare('SELECT custom_domain FROM settings WHERE id = 1').get() || {}) as { custom_domain?: string };
+    const vitrineServerUrl = resolvePublicBaseUrl(request, dlSettings);
 
     const pkg = await installerGenerator.generateInstaller({
       os: osParam,
       tenantId: resolved.tenantId,
+      siteId: resolved.siteId,
+      deviceRole: resolved.deviceRole,
       tokenId: 'tokenId' in resolved ? resolved.tokenId : undefined,
-      mode: resolved.mode,
+      mode: effectiveMode,
       sessionCode: 'sessionCode' in resolved ? resolved.sessionCode : undefined,
-      meshServerId: 'meshServerId' in resolved ? resolved.meshServerId : undefined
+      meshServerId: 'meshServerId' in resolved ? resolved.meshServerId : undefined,
+      targetDeviceId,
+      vitrineServerUrl
     });
 
     reply.header('Content-Type', pkg.contentType);
@@ -6174,12 +8365,123 @@ export async function registerApiRoutes(server: FastifyInstance) {
   server.get('/api/agent/deploy', serveTokenAuthenticatedInstaller);
   server.get('/api/agent/download', serveTokenAuthenticatedInstaller);
 
+  server.get('/api/agent/mesh-binary', async (request, reply) => {
+    const rate = checkRateLimit(`mesh-bin:${request.ip}`, 20, 60_000);
+    if (!rate.allowed) {
+      return reply.status(429).send({
+        error: `Too many MeshAgent binary download requests. Try again in ${rate.retryAfterSec}s.`,
+        retryAfterSec: rate.retryAfterSec
+      });
+    }
+
+    const query = (request.query || {}) as { arch?: string; token?: string };
+    const rawToken = String(query.token || request.headers['x-vitrine-enrollment-token'] || '').trim();
+    const isTechAuth = Boolean(request.auth && isTechnicianOrAbove(request.auth.user.role));
+
+    // Support both standard deployment tokens and active QuickSupport session codes
+    const tokenAuthorized = Boolean(rawToken && resolveValidInstallerToken(rawToken));
+
+    if (!tokenAuthorized && !isTechAuth) {
+      return reply.status(401).send({
+        error: 'Valid, non-expired deployment token or authenticated technician session is required.'
+      });
+    }
+
+    const rawArch = String(query.arch || 'x64').trim().toLowerCase();
+    const arch: 'x64' | 'arm64' | 'x86' =
+      rawArch === 'arm64' || rawArch === 'aarch64'
+        ? 'arm64'
+        : rawArch === 'x86' || rawArch === 'ia32' || rawArch === '32'
+          ? 'x86'
+          : 'x64';
+
+    const settings = (db.prepare('SELECT meshcentral_allow_self_signed FROM settings WHERE id = 1').get() || {}) as {
+      meshcentral_allow_self_signed?: number;
+    };
+
+    try {
+      const built = await installerGenerator.getOrBuildSignedMeshBinary(
+        arch,
+        Boolean(settings.meshcentral_allow_self_signed)
+      );
+      reply.header('Content-Type', 'application/octet-stream');
+      reply.header('Content-Disposition', buildSafeContentDisposition(built.filename));
+      reply.header('X-Content-SHA256', built.sha256);
+      reply.header('X-Vitrine-Code-Signed', built.signed ? 'true' : 'false');
+      return reply.send(built.buffer);
+    } catch (err: any) {
+      return reply.status(502).send({
+        error: err?.message || 'Failed to build or fetch MeshCentral agent binary.'
+      });
+    }
+  });
+
+  server.get('/api/agent/binary', async (request, reply) => {
+    const rate = checkRateLimit(`agent-bin:${request.ip}`, 40, 60_000);
+    if (!rate.allowed) {
+      return reply.status(429).send({
+        error: `Too many agent component download requests. Try again in ${rate.retryAfterSec}s.`,
+        retryAfterSec: rate.retryAfterSec
+      });
+    }
+
+    const query = (request.query || {}) as {
+      component?: string;
+      token?: string;
+      deviceId?: string;
+      tenant_id?: string;
+      site_id?: string;
+      role?: string;
+      mode?: string;
+    };
+    const rawToken = String(query.token || request.headers['x-vitrine-enrollment-token'] || '').trim();
+    const isTechAuth = Boolean(request.auth && isTechnicianOrAbove(request.auth.user.role));
+    const resolvedToken = rawToken ? resolveValidInstallerToken(rawToken) : null;
+    const tokenAuthorized = Boolean(resolvedToken);
+
+    if (!tokenAuthorized && !isTechAuth) {
+      return reply.status(401).send({
+        error: 'Valid, non-expired deployment token or authenticated technician session is required.'
+      });
+    }
+
+    const component: 'companion' | 'tray' =
+      String(query.component || '').trim().toLowerCase() === 'tray' ? 'tray' : 'companion';
+
+    try {
+      const requestedMode =
+        resolvedToken?.mode ||
+        (query.mode === 'quicksupport' ? 'quicksupport' : query.mode === 'companion_only' ? 'companion_only' : 'permanent');
+      const effPolicy = resolvePolicyForInstallerScope({
+        mode: requestedMode,
+        tenantId: query.tenant_id || resolvedToken?.tenantId || null,
+        siteId: query.site_id || resolvedToken?.siteId || null,
+        deviceRole: query.role || resolvedToken?.deviceRole || null,
+        deviceId: query.deviceId || null
+      });
+      const built = await installerGenerator.getOrBuildSignedWindowsComponent(component, {
+        brandName: effPolicy.trayBrandName,
+        iconUrl: effPolicy.trayIconUrl
+      });
+      reply.header('Content-Type', 'application/vnd.microsoft.portable-executable');
+      reply.header('Content-Disposition', buildSafeContentDisposition(built.filename));
+      reply.header('X-Content-SHA256', built.sha256);
+      reply.header('X-Vitrine-Code-Signed', built.signed ? 'true' : 'false');
+      return reply.send(built.buffer);
+    } catch (err: any) {
+      return reply.status(502).send({
+        error: err?.message || 'Failed to build or sign Windows agent component executable.'
+      });
+    }
+  });
+
   server.get('/api/quicksupport/sessions', async (request) => {
     const user = request.auth?.user;
+    const isGlobalUser = getAllowedTenantIds(user) === null;
     const rows = db
-      .prepare("SELECT * FROM quicksupport_sessions WHERE expires_at > datetime('now') ORDER BY created_at DESC LIMIT 50")
+      .prepare("SELECT * FROM quicksupport_sessions WHERE julianday(expires_at) > julianday('now') ORDER BY created_at DESC LIMIT 50")
       .all() as any[];
-    return rows.filter((r) => !r.tenant_id || canUserAccessTenant(user, r.tenant_id));
+    return rows.filter((r) => (r.tenant_id ? canUserAccessTenant(user, r.tenant_id) : isGlobalUser));
   });
 
   server.post('/api/quicksupport/sessions', async (request, reply) => {
@@ -6189,6 +8491,16 @@ export async function registerApiRoutes(server: FastifyInstance) {
         error: `Too many QuickSupport requests. Please wait ${rate.retryAfterSec}s.`,
         retryAfterSec: rate.retryAfterSec
       });
+    }
+
+    if (request.auth?.authSource === 'cookie') {
+      const csrfHeader = String(request.headers['x-vitrine-csrf'] || '').trim();
+      if (csrfHeader !== '1') {
+        return reply.status(403).send({
+          error: 'CSRF verification failed: missing X-Vitrine-CSRF header.',
+          code: 'CSRF_REQUIRED'
+        });
+      }
     }
 
     const settings = (db.prepare('SELECT quicksupport_enabled FROM settings WHERE id = 1').get() || {}) as any;
@@ -6204,6 +8516,10 @@ export async function registerApiRoutes(server: FastifyInstance) {
       username?: string;
       tenant_id?: string | null;
     };
+
+    if (body.tenant_id && (!request.auth || !canUserAccessTenant(request.auth.user, body.tenant_id))) {
+      return reply.status(403).send({ error: 'Forbidden for target tenant scope.' });
+    }
 
     const rawOs = body.platform || body.os || 'windows';
     const platform: 'windows' | 'linux' | 'darwin' =
@@ -6241,10 +8557,14 @@ export async function registerApiRoutes(server: FastifyInstance) {
       expiresAt
     );
 
+    const qsSettings = (db.prepare('SELECT custom_domain FROM settings WHERE id = 1').get() || {}) as { custom_domain?: string };
+    const qsBaseUrl = resolvePublicBaseUrl(request, qsSettings);
+
     return {
       success: true,
       session: db.prepare('SELECT * FROM quicksupport_sessions WHERE id = ?').get(id),
       downloadUrl: `/api/agent/download?token=${encodeURIComponent(sessionCode)}&os=${platform}`,
+      deployUrl: `${qsBaseUrl}/api/agent/deploy?token=${encodeURIComponent(sessionCode)}&os=${platform}`,
       signingPipeline
     };
   });
@@ -6269,7 +8589,12 @@ export async function registerApiRoutes(server: FastifyInstance) {
     if (device && !canUserAccessTenant(request.auth?.user, device.tenant_id)) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
-    if (qsSession?.tenant_id && !canUserAccessTenant(request.auth?.user, qsSession.tenant_id)) {
+    if (
+      qsSession &&
+      (qsSession.tenant_id
+        ? !canUserAccessTenant(request.auth?.user, qsSession.tenant_id)
+        : getAllowedTenantIds(request.auth?.user) !== null)
+    ) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
 
@@ -6283,7 +8608,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
         return reply.status(400).send({ error: 'LAPS Vault elevation requires an enrolled managed endpoint.' });
       }
       if (!requireStepUpMfaIfEnforced(request, reply, device.id)) {
-        return;
+        return reply;
       }
       const lapsCred = getLapsCredential(device.id, true, { actorUsername: getActorUsername(request) });
       if (!lapsCred || !lapsCred.password) {
@@ -6303,6 +8628,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
     let execOutput = '';
     let dispatchedLive = false;
+    let actuallyElevated = false;
 
     if (device) {
       const promoteSuffix =
@@ -6326,7 +8652,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
         envVars.VITRINE_ELEV_PASS = resolvedAdminPass;
         elevCmd =
           device.os_type === 'windows'
-            ? `$sec = ConvertTo-SecureString $env:VITRINE_ELEV_PASS -AsPlainText -Force; $cred = New-Object System.Management.Automation.PSCredential($env:VITRINE_ELEV_USER, $sec); Write-Output ("ELEVATED_CONTEXT_READY:" + $cred.UserName)${promoteSuffix}`
+            ? `$sec = ConvertTo-SecureString $env:VITRINE_ELEV_PASS -AsPlainText -Force; $cred = New-Object System.Management.Automation.PSCredential($env:VITRINE_ELEV_USER, $sec); $isAdm = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator); if (-not $isAdm) { Write-Output 'UNVERIFIED_USER_SESSION'; exit 1 }; Write-Output ("ELEVATED_CONTEXT_READY:" + $cred.UserName)${promoteSuffix}`
             : `id -u${promoteSuffix}`;
       }
 
@@ -6342,19 +8668,40 @@ export async function registerApiRoutes(server: FastifyInstance) {
       if (execRes.live && execRes.exitCode !== 0) {
         return reply.status(502).send({
           success: false,
+          elevated: false,
+          privilege_level: device.agent_privilege_mode || 'standard_user',
           error: `Remote elevation failed (exit code ${execRes.exitCode}).`,
           output: execRes.output
         });
       }
+
+      if (dispatchedLive && execRes.exitCode === 0) {
+        if (credSource === 'end_user_uac') {
+          if (device.os_type !== 'windows' && execOutput.trim().split(/\r?\n/)[0]?.trim() === '0') {
+            actuallyElevated = true;
+          }
+        } else if (device.os_type === 'windows') {
+          actuallyElevated = execOutput.includes('ELEVATED_CONTEXT_READY:');
+        } else {
+          actuallyElevated = execOutput.trim().split(/\r?\n/)[0]?.trim() === '0';
+        }
+      }
     }
 
-    const nextPrivLevel =
-      credSource === 'end_user_uac' && !dispatchedLive ? 'uac_pending' : 'elevated_admin';
+    const nextPrivLevel = actuallyElevated
+      ? 'elevated_admin'
+      : credSource === 'end_user_uac'
+        ? 'uac_pending'
+        : !device
+          ? qsSession?.privilege_level || 'standard_user'
+          : !dispatchedLive
+            ? 'pending_offline'
+            : 'standard_user';
 
     if (qsSession) {
       db.prepare('UPDATE quicksupport_sessions SET privilege_level = ?, status = ? WHERE id = ?').run(
         nextPrivLevel,
-        elevationAction === 'promote_permanent_service' ? 'promoted_permanent' : 'connected',
+        actuallyElevated && elevationAction === 'promote_permanent_service' ? 'promoted_permanent' : qsSession.status,
         qsSession.id
       );
     }
@@ -6373,22 +8720,28 @@ export async function registerApiRoutes(server: FastifyInstance) {
       `aud-elev-${crypto.randomUUID()}`,
       getActorUsername(request),
       device?.id || null,
-      `${elevationAction === 'promote_permanent_service' ? 'Promoted permanent service & elevated' : 'Elevated'} ${device?.hostname || qsSession?.client_name || id} via ${sourceLabel}`
+      `${elevationAction === 'promote_permanent_service' ? 'Promote/elevate' : 'Elevate'} ${device?.hostname || qsSession?.client_name || id} via ${sourceLabel} (elevated=${actuallyElevated}, status=${nextPrivLevel})`
     );
 
     return {
       success: true,
+      elevated: actuallyElevated,
       privilege_level: nextPrivLevel,
       elevationAction,
       elevatedUsing: credSource,
       dispatchedLive,
       output: execOutput || undefined,
-      message:
-        elevationAction === 'promote_permanent_service'
+      message: actuallyElevated
+        ? elevationAction === 'promote_permanent_service'
           ? 'Remote session elevated and promoted to permanent unattended service.'
-          : credSource === 'end_user_uac'
-            ? 'Interactive UAC / elevation prompt dispatched to endpoint user.'
-            : 'Remote agent helper elevated to SYSTEM / Root context.'
+          : 'Remote agent helper elevated to SYSTEM / Root context.'
+        : !device
+          ? 'No enrolled live device linked to QuickSupport session; elevation was not executed.'
+          : !dispatchedLive
+            ? 'Endpoint is offline; elevation command queued and not yet verified.'
+            : credSource === 'end_user_uac'
+              ? 'Interactive UAC prompt dispatched; awaiting end-user approval.'
+              : 'Remote session remains unverified user-mode context (elevation not confirmed).'
     };
   };
   server.post('/api/devices/:id/elevate-agent', handleElevateRemoteSession);
@@ -6418,6 +8771,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
       url?: string;
       api_token?: string;
       is_primary?: boolean;
+      allow_self_signed?: boolean;
       local_config_path?: string;
       agent_service_name?: string;
       agent_display_name?: string;
@@ -6429,15 +8783,33 @@ export async function registerApiRoutes(server: FastifyInstance) {
     if (!body.name?.trim() || !body.url?.trim()) {
       return reply.status(400).send({ error: 'MeshCentral instance name and URL are required.' });
     }
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(body.url.trim());
+      if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+        return reply.status(400).send({ error: 'MeshCentral URL must use http:// or https://.' });
+      }
+    } catch {
+      return reply.status(400).send({ error: 'Invalid MeshCentral URL format.' });
+    }
+    const urlSafety = await validateOutboundHostSafety(parsedUrl.toString(), {
+      allowLoopback: true,
+      allowPrivateLan: true
+    });
+    if (!urlSafety.safe) {
+      return reply.status(400).send({ error: urlSafety.reason || 'Blocked unsafe MeshCentral URL.' });
+    }
 
     const id = `ms2-${crypto.randomUUID().slice(0, 8)}`;
     const rawToken = body.api_token && !isMaskedSecret(body.api_token) ? body.api_token.trim() : '';
     const encryptedToken = rawToken ? encryptVaultSecret(rawToken) : '';
+    const allowSelfSigned = Boolean(body.allow_self_signed);
 
     const probe = await meshBridge.discoverServerResources({
       url: body.url.trim(),
       apiToken: rawToken,
-      localConfigPath: body.local_config_path
+      localConfigPath: body.local_config_path,
+      allowSelfSigned
     });
 
     const existingCount = (db.prepare('SELECT COUNT(*) as c FROM mesh_servers').get() as { c: number }).c;
@@ -6446,23 +8818,27 @@ export async function registerApiRoutes(server: FastifyInstance) {
     if (isPrimary) {
       db.prepare('UPDATE mesh_servers SET is_primary = 0').run();
       db.prepare(
-        'UPDATE settings SET meshcentral_url = ?, meshcentral_api_token = COALESCE(NULLIF(?, \'\'), meshcentral_api_token) WHERE id = 1'
-      ).run(body.url.trim(), encryptedToken);
-      meshBridge.checkConfig();
+        `UPDATE settings
+         SET meshcentral_url = ?,
+             meshcentral_api_token = COALESCE(NULLIF(?, ''), meshcentral_api_token),
+             meshcentral_allow_self_signed = COALESCE(?, meshcentral_allow_self_signed)
+         WHERE id = 1`
+      ).run(body.url.trim(), encryptedToken, body.allow_self_signed !== undefined ? (allowSelfSigned ? 1 : 0) : null);
     }
 
     db.prepare(`
       INSERT INTO mesh_servers (
-        id, name, url, api_token, is_primary, status, local_config_path,
+        id, name, url, api_token, is_primary, allow_self_signed, status, local_config_path,
         agent_service_name, agent_display_name, agent_custom_text,
         keep_agents_signed, auto_push_companion, discovered_groups_count, discovered_agents_count, last_synced
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     `).run(
       id,
       body.name.trim(),
       body.url.trim(),
       encryptedToken,
       isPrimary ? 1 : 0,
+      allowSelfSigned ? 1 : 0,
       probe.reachable ? (probe.authenticated ? 'Connected' : 'Reachable (Token Unverified)') : 'Disconnected',
       body.local_config_path || null,
       body.agent_service_name || 'VitrineAgent',
@@ -6473,6 +8849,8 @@ export async function registerApiRoutes(server: FastifyInstance) {
       probe.groups.length,
       probe.agents.length
     );
+
+    await meshBridge.reconnectAndWait(3500);
 
     const created = db.prepare('SELECT * FROM mesh_servers WHERE id = ?').get(id);
     return {
@@ -6488,6 +8866,29 @@ export async function registerApiRoutes(server: FastifyInstance) {
     if (!existing) return reply.status(404).send({ error: 'MeshCentral server entry not found.' });
 
     const body = (request.body || {}) as Record<string, any>;
+    if (body.url !== undefined) {
+      const candidateUrl = String(body.url || '').trim();
+      if (!candidateUrl) {
+        return reply.status(400).send({ error: 'MeshCentral URL cannot be empty.' });
+      }
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(candidateUrl);
+        if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+          return reply.status(400).send({ error: 'MeshCentral URL must use http:// or https://.' });
+        }
+      } catch {
+        return reply.status(400).send({ error: 'Invalid MeshCentral URL format.' });
+      }
+      const urlSafety = await validateOutboundHostSafety(parsedUrl.toString(), {
+        allowLoopback: true,
+        allowPrivateLan: true
+      });
+      if (!urlSafety.safe) {
+        return reply.status(400).send({ error: urlSafety.reason || 'Blocked unsafe MeshCentral URL.' });
+      }
+      body.url = candidateUrl;
+    }
     const nextEncryptedToken =
       body.api_token !== undefined && !isMaskedSecret(String(body.api_token))
         ? String(body.api_token).trim()
@@ -6496,13 +8897,18 @@ export async function registerApiRoutes(server: FastifyInstance) {
         : existing.api_token;
 
     const makePrimary = body.is_primary !== undefined ? Boolean(body.is_primary) : Boolean(existing.is_primary);
+    const nextAllowSelfSigned =
+      body.allow_self_signed != null ? (body.allow_self_signed ? 1 : 0) : null;
+
     if (makePrimary) {
       db.prepare('UPDATE mesh_servers SET is_primary = 0 WHERE id != ?').run(id);
-      db.prepare('UPDATE settings SET meshcentral_url = ?, meshcentral_api_token = ? WHERE id = 1').run(
-        body.url || existing.url,
-        nextEncryptedToken
-      );
-      meshBridge.checkConfig();
+      db.prepare(
+        `UPDATE settings
+         SET meshcentral_url = ?,
+             meshcentral_api_token = ?,
+             meshcentral_allow_self_signed = COALESCE(?, meshcentral_allow_self_signed)
+         WHERE id = 1`
+      ).run(body.url || existing.url, nextEncryptedToken, nextAllowSelfSigned);
     }
 
     db.prepare(`
@@ -6511,6 +8917,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
         url = COALESCE(?, url),
         api_token = ?,
         is_primary = ?,
+        allow_self_signed = COALESCE(?, allow_self_signed),
         local_config_path = COALESCE(?, local_config_path),
         agent_service_name = COALESCE(?, agent_service_name),
         agent_display_name = COALESCE(?, agent_display_name),
@@ -6524,6 +8931,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
       body.url ?? null,
       nextEncryptedToken,
       makePrimary ? 1 : 0,
+      nextAllowSelfSigned,
       body.local_config_path ?? null,
       body.agent_service_name ?? null,
       body.agent_display_name ?? null,
@@ -6533,6 +8941,8 @@ export async function registerApiRoutes(server: FastifyInstance) {
       id
     );
 
+    await meshBridge.reconnectAndWait(3500);
+
     const updated = db.prepare('SELECT * FROM mesh_servers WHERE id = ?').get(id);
     return { success: true, server: sanitizeMeshServerRow(updated) };
   });
@@ -6540,6 +8950,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
   server.delete('/api/mesh-servers/:id', async (request) => {
     const { id } = request.params as { id: string };
     db.prepare('DELETE FROM mesh_servers WHERE id = ?').run(id);
+    await meshBridge.reconnectAndWait(3500);
     return { success: true };
   });
 
@@ -6606,7 +9017,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
   server.post('/api/mesh-servers/local-apply-config', async (request, reply) => {
     const settings = (db.prepare('SELECT * FROM settings WHERE id = 1').get() || {}) as any;
     if (Boolean(settings.is_onboarded) && !requireStepUpMfaIfEnforced(request, reply, null)) {
-      return;
+      return reply;
     }
 
     const body = (request.body || {}) as {
@@ -6658,15 +9069,19 @@ export async function registerApiRoutes(server: FastifyInstance) {
       : null;
     const settings = (db.prepare('SELECT * FROM settings WHERE id = 1').get() || {}) as any;
 
-    const targetUrl = body.url || storedServer?.url || settings.meshcentral_url || '';
+    const targetUrl = String(body.url || storedServer?.url || settings.meshcentral_url || '').trim();
+    const allowStoredCreds =
+      !body.url ||
+      (storedServer?.url ? isSameUrlOrigin(targetUrl, storedServer.url) : isSameUrlOrigin(targetUrl, settings.meshcentral_url));
+
     let rawToken = '';
     if (body.api_token && !isMaskedSecret(body.api_token)) {
       rawToken = body.api_token.trim();
     } else if (body.api_username?.trim() && body.api_password) {
       rawToken = `${body.api_username.trim()}:${body.api_password}`;
-    } else if (storedServer?.api_token) {
+    } else if (allowStoredCreds && storedServer?.api_token) {
       rawToken = decryptVaultSecret(storedServer.api_token);
-    } else if (settings.meshcentral_api_token) {
+    } else if (allowStoredCreds && !storedServer && settings.meshcentral_api_token) {
       rawToken = decryptVaultSecret(settings.meshcentral_api_token);
     }
 
@@ -6674,7 +9089,8 @@ export async function registerApiRoutes(server: FastifyInstance) {
       url: targetUrl,
       apiToken: rawToken,
       localConfigPath: body.local_config_path || storedServer?.local_config_path,
-      allowSelfSigned: body.allowSelfSigned ?? Boolean(settings.meshcentral_allow_self_signed)
+      allowSelfSigned:
+        body.allowSelfSigned ?? Boolean(storedServer ? storedServer.allow_self_signed : settings.meshcentral_allow_self_signed)
     });
 
     if (storedServer) {
@@ -6699,7 +9115,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
     };
   });
 
-  server.post('/api/mesh-servers/import', async (request) => {
+  server.post('/api/mesh-servers/import', async (request, reply) => {
     const body = (request.body || {}) as {
       mesh_server_id?: string;
       url?: string;
@@ -6711,28 +9127,135 @@ export async function registerApiRoutes(server: FastifyInstance) {
       target_tenant_id?: string;
       selected_group_ids?: string[];
       import_agents?: boolean;
+      import_new_groups?: boolean;
       deploy_vitrine_addons?: boolean;
+      auto_deploy_companion?: boolean;
+      enforce_laps_on_import?: boolean;
+      lock_signed_binary_updates?: boolean;
       allowSelfSigned?: boolean;
     };
+
+    if (body.target_tenant_id) {
+      const targetTenantRow = db.prepare('SELECT id FROM tenants WHERE id = ?').get(body.target_tenant_id);
+      if (!targetTenantRow) {
+        return reply.status(404).send({ error: `Target client tenant '${body.target_tenant_id}' not found.` });
+      }
+    }
 
     const storedServer = body.mesh_server_id
       ? (db.prepare('SELECT * FROM mesh_servers WHERE id = ?').get(body.mesh_server_id) as any)
       : null;
     const settings = (db.prepare('SELECT * FROM settings WHERE id = 1').get() || {}) as any;
-    const targetUrl = body.url || storedServer?.url || settings.meshcentral_url || '';
+    const targetUrl = (body.url || storedServer?.url || settings.meshcentral_url || '').trim();
+    const allowStoredCreds =
+      !body.url ||
+      (storedServer?.url ? isSameUrlOrigin(targetUrl, storedServer.url) : isSameUrlOrigin(targetUrl, settings.meshcentral_url));
     const rawToken =
       body.api_token && !isMaskedSecret(body.api_token)
         ? body.api_token.trim()
         : body.api_username?.trim() && body.api_password
           ? `${body.api_username.trim()}:${body.api_password}`
-          : decryptVaultSecret(storedServer?.api_token || settings.meshcentral_api_token);
+          : allowStoredCreds
+            ? decryptVaultSecret(storedServer ? storedServer.api_token : settings.meshcentral_api_token)
+            : '';
+    const allowSelfSigned =
+      body.allowSelfSigned !== undefined
+        ? Boolean(body.allowSelfSigned)
+        : Boolean(storedServer?.allow_self_signed ?? settings.meshcentral_allow_self_signed);
+
+    const autoDeploy =
+      body.auto_deploy_companion !== undefined
+        ? Boolean(body.auto_deploy_companion)
+        : body.deploy_vitrine_addons !== false;
+    const enforceLaps = body.enforce_laps_on_import !== false;
+    const lockSignedUpdates = body.lock_signed_binary_updates !== false;
+    const importNewGroups = body.import_new_groups !== false;
 
     const discovered = await meshBridge.discoverServerResources({
       url: targetUrl,
       apiToken: rawToken,
       localConfigPath: body.local_config_path || storedServer?.local_config_path,
-      allowSelfSigned: body.allowSelfSigned ?? Boolean(settings.meshcentral_allow_self_signed)
+      allowSelfSigned
     });
+
+    // Persist MS2 credentials & OOBE import preferences before syncing fleet
+    const encryptedToken = rawToken ? encryptVaultSecret(rawToken) : storedServer?.api_token || settings.meshcentral_api_token || '';
+    const primaryServerId = storedServer?.id || 'ms2-primary';
+    if (targetUrl) {
+      db.prepare(`
+        UPDATE settings SET
+          meshcentral_url = ?,
+          meshcentral_api_token = COALESCE(NULLIF(?, ''), meshcentral_api_token),
+          meshcentral_allow_self_signed = ?,
+          oobe_auto_deploy_companion = ?,
+          oobe_enforce_laps_on_import = ?,
+          oobe_lock_signed_updates = ?,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = 1
+      `).run(
+        targetUrl,
+        encryptedToken,
+        allowSelfSigned ? 1 : 0,
+        autoDeploy ? 1 : 0,
+        enforceLaps ? 1 : 0,
+        lockSignedUpdates ? 1 : 0
+      );
+
+      const existingMsRow = db.prepare('SELECT id FROM mesh_servers WHERE id = ?').get(primaryServerId);
+      const serverStatus = discovered.reachable
+        ? discovered.authenticated
+          ? 'Connected'
+          : 'Reachable (Token Unverified)'
+        : 'Disconnected';
+      if (existingMsRow) {
+        db.prepare(`
+          UPDATE mesh_servers SET
+            url = ?,
+            api_token = COALESCE(NULLIF(?, ''), api_token),
+            allow_self_signed = ?,
+            status = ?,
+            local_config_path = COALESCE(?, local_config_path),
+            auto_push_companion = ?,
+            keep_agents_signed = ?,
+            discovered_groups_count = ?,
+            discovered_agents_count = ?,
+            last_synced = CURRENT_TIMESTAMP
+          WHERE id = ?
+        `).run(
+          targetUrl,
+          encryptedToken,
+          allowSelfSigned ? 1 : 0,
+          serverStatus,
+          body.local_config_path || null,
+          autoDeploy ? 1 : 0,
+          lockSignedUpdates ? 1 : 0,
+          discovered.groups.length,
+          discovered.agents.length,
+          primaryServerId
+        );
+      } else {
+        db.prepare('UPDATE mesh_servers SET is_primary = 0').run();
+        db.prepare(`
+          INSERT INTO mesh_servers (
+            id, name, url, api_token, is_primary, allow_self_signed, status, local_config_path,
+            keep_agents_signed, auto_push_companion, discovered_groups_count, discovered_agents_count, last_synced
+          ) VALUES (?, 'Primary MeshCentral 2 Engine', ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        `).run(
+          primaryServerId,
+          targetUrl,
+          encryptedToken,
+          allowSelfSigned ? 1 : 0,
+          serverStatus,
+          body.local_config_path || null,
+          lockSignedUpdates ? 1 : 0,
+          autoDeploy ? 1 : 0,
+          discovered.groups.length,
+          discovered.agents.length
+        );
+      }
+    }
+
+    const conn = await meshBridge.reconnectAndWait(3500);
 
     const selectedSet =
       Array.isArray(body.selected_group_ids) && body.selected_group_ids.length > 0
@@ -6749,21 +9272,27 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
     for (const grp of groupsToImport) {
       if (body.group_mapping_mode === 'single_client_sites' && body.target_tenant_id) {
-        const siteId = `s-${crypto.randomUUID().slice(0, 8)}`;
-        db.prepare('INSERT INTO sites (id, tenant_id, name, subnet) VALUES (?, ?, ?, ?)').run(
-          siteId,
-          body.target_tenant_id,
-          grp.name,
-          '0.0.0.0/0'
-        );
-        importedSites++;
-        groupTenantMap.set(grp.meshid, { tenantId: body.target_tenant_id, siteId });
+        const existingSite = db
+          .prepare('SELECT id FROM sites WHERE tenant_id = ? AND LOWER(name) = LOWER(?) LIMIT 1')
+          .get(body.target_tenant_id, grp.name) as { id: string } | undefined;
+        let siteId = existingSite?.id;
+        if (!siteId && importNewGroups) {
+          siteId = `s-${crypto.randomUUID().slice(0, 8)}`;
+          db.prepare('INSERT INTO sites (id, tenant_id, name, subnet) VALUES (?, ?, ?, ?)').run(
+            siteId,
+            body.target_tenant_id,
+            grp.name,
+            '0.0.0.0/0'
+          );
+          importedSites++;
+        }
+        groupTenantMap.set(grp.meshid, { tenantId: body.target_tenant_id, siteId: siteId || null });
       } else {
         const existingTenant = db
           .prepare('SELECT id FROM tenants WHERE mesh_group_id = ? OR LOWER(name) = LOWER(?) LIMIT 1')
           .get(grp.meshid, grp.name) as { id: string } | undefined;
         let tenantId = existingTenant?.id;
-        if (!tenantId) {
+        if (!tenantId && importNewGroups) {
           const baseSlug =
             grp.name
               .toLowerCase()
@@ -6778,40 +9307,180 @@ export async function registerApiRoutes(server: FastifyInstance) {
           `).run(tenantId, grp.name, slug, `ops@${baseSlug}.local`, grp.deviceCount || 0, grp.meshid);
           importedClients++;
         }
-        groupTenantMap.set(grp.meshid, { tenantId, siteId: null });
+        if (tenantId) {
+          groupTenantMap.set(grp.meshid, { tenantId, siteId: null });
+        }
       }
     }
 
+    const deployCandidates: Array<{ id: string; online: boolean }> = [];
+
     if (body.import_agents !== false) {
       for (const ag of discovered.agents) {
-        const mapping = groupTenantMap.get(ag.meshId);
+        let mapping = groupTenantMap.get(ag.meshId);
+        if (!mapping && body.target_tenant_id) {
+          mapping = { tenantId: body.target_tenant_id, siteId: null };
+        }
         if (!mapping) continue;
+
         const existingDev = db
-          .prepare('SELECT id FROM devices WHERE mesh_node_id = ? OR (tenant_id = ? AND LOWER(hostname) = LOWER(?)) LIMIT 1')
-          .get(ag.nodeId, mapping.tenantId, ag.hostname) as { id: string } | undefined;
+          .prepare('SELECT id, companion_installed FROM devices WHERE mesh_node_id = ? OR (tenant_id = ? AND LOWER(hostname) = LOWER(?)) LIMIT 1')
+          .get(ag.nodeId, mapping.tenantId, ag.hostname) as { id: string; companion_installed?: number } | undefined;
 
         if (!existingDev) {
           const devId = `dev-${crypto.randomUUID().slice(0, 8)}`;
           db.prepare(`
             INSERT INTO devices (
               id, mesh_node_id, mesh_server_id, tenant_id, site_id, hostname,
-              os_type, os_version, os_build, cpu_model, ip_address, mac_address, status, companion_installed
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', 'Discovered Node', ?, ?, ?, ?)
+              os_type, os_version, os_build, cpu_model, cpu_cores, ram_total_gb,
+              disk_total_gb, disk_free_gb, ip_address, mac_address, serial_number,
+              manufacturer, model, bios_version, tpm_version, amt_supported,
+              intel_amt_enabled, amt_provisioned, amt_version, edr_name, edr_status,
+              pending_reboot, logged_in_user, agent_privilege_mode,
+              status, companion_installed, companion_deploy_pending, last_seen
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, CURRENT_TIMESTAMP)
           `).run(
             devId,
             ag.nodeId,
-            storedServer?.id || 'ms2-primary',
+            primaryServerId,
             mapping.tenantId,
             mapping.siteId,
             ag.hostname,
             ag.osType,
             ag.osDesc,
-            ag.ipAddress || '0.0.0.0',
-            '00:00:00:00:00:00',
+            ag.osBuild || '',
+            ag.cpuModel || '',
+            Number(ag.cpuCores ?? 0),
+            Number(ag.ramTotalGb ?? 0),
+            Number(ag.diskTotalGb ?? 0),
+            Number(ag.diskFreeGb ?? 0),
+            ag.ipAddress || '',
+            ag.macAddress || '',
+            ag.serialNumber || '',
+            ag.manufacturer || '',
+            ag.model || '',
+            ag.biosVersion || '',
+            ag.tpmVersion || '',
+            ag.amtSupported ? 1 : 0,
+            ag.intelAmtEnabled ? 1 : 0,
+            ag.amtProvisioned ? 1 : 0,
+            ag.amtVersion || '',
+            ag.edrName || '',
+            ag.edrStatus || '',
+            ag.pendingReboot ? 1 : 0,
+            ag.loggedInUser || null,
+            ag.agentPrivilegeMode || 'system_service',
             ag.online ? 'online' : 'offline',
-            body.deploy_vitrine_addons !== false && ag.online ? 1 : 0
+            autoDeploy ? 1 : 0
           );
           importedAgents++;
+          if (autoDeploy) {
+            deployCandidates.push({ id: devId, online: Boolean(ag.online) });
+          }
+        } else {
+          db.prepare(`
+            UPDATE devices SET
+              mesh_node_id = COALESCE(NULLIF(?, ''), mesh_node_id),
+              mesh_server_id = ?,
+              os_type = COALESCE(NULLIF(?, ''), os_type),
+              os_version = COALESCE(NULLIF(?, ''), os_version),
+              os_build = COALESCE(NULLIF(?, ''), os_build),
+              cpu_model = COALESCE(NULLIF(?, ''), CASE WHEN cpu_model = 'Discovered Node' THEN '' ELSE cpu_model END),
+              cpu_cores = CASE WHEN ? > 0 THEN ? ELSE cpu_cores END,
+              ram_total_gb = CASE WHEN ? > 0 THEN ? ELSE ram_total_gb END,
+              disk_total_gb = CASE WHEN ? > 0 THEN ? ELSE disk_total_gb END,
+              disk_free_gb = CASE WHEN ? > 0 THEN ? ELSE disk_free_gb END,
+              ip_address = COALESCE(NULLIF(?, ''), CASE WHEN ip_address = '0.0.0.0' THEN '' ELSE ip_address END),
+              mac_address = COALESCE(NULLIF(?, ''), CASE WHEN mac_address = '00:00:00:00:00:00' THEN '' ELSE mac_address END),
+              serial_number = COALESCE(NULLIF(?, ''), serial_number),
+              manufacturer = COALESCE(NULLIF(?, ''), manufacturer),
+              model = COALESCE(NULLIF(?, ''), model),
+              bios_version = COALESCE(NULLIF(?, ''), bios_version),
+              tpm_version = COALESCE(NULLIF(?, ''), tpm_version),
+              amt_supported = CASE WHEN ? = 1 THEN 1 ELSE amt_supported END,
+              intel_amt_enabled = CASE WHEN ? = 1 THEN 1 ELSE intel_amt_enabled END,
+              amt_provisioned = CASE WHEN ? = 1 THEN 1 ELSE amt_provisioned END,
+              amt_version = COALESCE(NULLIF(?, ''), amt_version),
+              logged_in_user = COALESCE(?, logged_in_user),
+              status = CASE WHEN quarantined = 1 THEN 'isolated' ELSE ? END,
+              companion_deploy_pending = CASE WHEN COALESCE(companion_installed, 0) = 0 AND ? = 1 THEN 1 ELSE COALESCE(companion_deploy_pending, 0) END,
+              last_seen = CURRENT_TIMESTAMP
+            WHERE id = ?
+          `).run(
+            ag.nodeId,
+            primaryServerId,
+            ag.osType,
+            ag.osDesc,
+            ag.osBuild || '',
+            ag.cpuModel || '',
+            Number(ag.cpuCores ?? 0),
+            Number(ag.cpuCores ?? 0),
+            Number(ag.ramTotalGb ?? 0),
+            Number(ag.ramTotalGb ?? 0),
+            Number(ag.diskTotalGb ?? 0),
+            Number(ag.diskTotalGb ?? 0),
+            Number(ag.diskFreeGb ?? 0),
+            Number(ag.diskFreeGb ?? 0),
+            ag.ipAddress || '',
+            ag.macAddress || '',
+            ag.serialNumber || '',
+            ag.manufacturer || '',
+            ag.model || '',
+            ag.biosVersion || '',
+            ag.tpmVersion || '',
+            ag.amtSupported ? 1 : 0,
+            ag.intelAmtEnabled ? 1 : 0,
+            ag.amtProvisioned ? 1 : 0,
+            ag.amtVersion || '',
+            ag.loggedInUser || null,
+            ag.online ? 'online' : 'offline',
+            autoDeploy ? 1 : 0,
+            existingDev.id
+          );
+          if (autoDeploy && !existingDev.companion_installed) {
+            deployCandidates.push({ id: existingDev.id, online: Boolean(ag.online) });
+          }
+        }
+      }
+    }
+
+    const refreshedSettings = (db.prepare('SELECT oobe_completed, is_onboarded, custom_domain FROM settings WHERE id = 1').get() || {}) as any;
+    const isPostOobe = Boolean(refreshedSettings.oobe_completed || refreshedSettings.is_onboarded);
+    let companionsDispatchedOnline = 0;
+    let companionsQueuedPending = 0;
+    let companionDeployTiming: 'after_oobe' | 'immediate' | 'disabled' = 'disabled';
+
+    if (autoDeploy) {
+      if (!isPostOobe) {
+        companionDeployTiming = 'after_oobe';
+        companionsQueuedPending = deployCandidates.length;
+      } else {
+        companionDeployTiming = 'immediate';
+        const { proto: protoHdr, host: hostHdr } = resolveSafeRequestOriginParts(request);
+        const customDom = String(refreshedSettings.custom_domain || '').trim();
+        const reqOrigin = customDom
+          ? customDom.startsWith('http')
+            ? customDom
+            : `https://${customDom}`
+          : hostHdr
+            ? `${protoHdr}://${hostHdr}`
+            : undefined;
+
+        for (const cand of deployCandidates) {
+          if (cand.online && conn) {
+            try {
+              const push = await meshBridge.deployCompanionOverMesh(cand.id, reqOrigin);
+              if (push.dispatched) {
+                companionsDispatchedOnline++;
+              } else {
+                companionsQueuedPending++;
+              }
+            } catch {
+              companionsQueuedPending++;
+            }
+          } else {
+            companionsQueuedPending++;
+          }
         }
       }
     }
@@ -6821,7 +9490,11 @@ export async function registerApiRoutes(server: FastifyInstance) {
       source: discovered.source,
       importedClients,
       importedSites,
-      importedAgents
+      importedAgents,
+      companionsDispatchedOnline,
+      companionsQueuedPending,
+      companionDeployTiming,
+      meshBridgeConnected: conn
     };
   });
 
@@ -6849,12 +9522,12 @@ export async function registerApiRoutes(server: FastifyInstance) {
     }
     reply.header('Content-Type', 'application/gzip');
     reply.header('Content-Disposition', buildSafeContentDisposition(row.filename));
-    return reply.send(fs.readFileSync(row.file_path));
+    return reply.send(fs.createReadStream(row.file_path));
   });
 
   server.post('/api/backups/upload', { bodyLimit: 100 * 1024 * 1024 }, async (request, reply) => {
     if (!requireStepUpMfaIfEnforced(request, reply, null)) {
-      return;
+      return reply;
     }
     const body = (request.body || {}) as {
       filename?: string;
@@ -6876,7 +9549,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.post('/api/backups/:id/restore', async (request, reply) => {
     if (!requireStepUpMfaIfEnforced(request, reply, null)) {
-      return;
+      return reply;
     }
     const { id } = request.params as { id: string };
     const body = (request.body || {}) as {
@@ -6897,7 +9570,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.delete('/api/backups/:id', async (request, reply) => {
     if (!requireStepUpMfaIfEnforced(request, reply, null)) {
-      return;
+      return reply;
     }
     const { id } = request.params as { id: string };
     return backupService.deleteBackup(id);
@@ -6909,7 +9582,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.post('/api/backups/recovery-key', async (request, reply) => {
     if (!requireStepUpMfaIfEnforced(request, reply, null)) {
-      return;
+      return reply;
     }
     const info = backupService.getOrGenerateRecoveryPassphrase(true);
     db.prepare(`
@@ -6935,7 +9608,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.post('/api/laps/break-glass-export', async (request, reply) => {
     if (!requireStepUpMfaIfEnforced(request, reply, null)) {
-      return;
+      return reply;
     }
     const body = (request.body || {}) as { tenantId?: string; includeArchived?: boolean };
     return exportLapsBreakGlassSheet(
@@ -6961,7 +9634,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.post('/api/updater/execute', async (request, reply) => {
     if (!requireStepUpMfaIfEnforced(request, reply, null)) {
-      return;
+      return reply;
     }
     return await systemUpdaterService.executeUpdate({
       actorUsername: getActorUsername(request)
@@ -6977,14 +9650,14 @@ export async function registerApiRoutes(server: FastifyInstance) {
   // ============================================================================
   server.post('/api/devices/:id/offboard', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return reply;
     const body = (request.body || {}) as {
       reason?: string;
       overrideLapsAction?: 'remove_account' | 'disable_account' | 'keep_account_rotate_final' | 'keep_account_as_is';
       forceImmediateArchive?: boolean;
     };
     try {
-      return initiateDeviceOffboard(id, {
+      return await initiateDeviceOffboardAsync(id, {
         reason: body.reason,
         triggerSource: 'explicit_device',
         overrideLapsAction: body.overrideLapsAction,
@@ -6998,10 +9671,10 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.post('/api/devices/:id/force-archive', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return reply;
     const body = (request.body || {}) as { reason?: string };
     try {
-      return initiateDeviceOffboard(id, {
+      return await initiateDeviceOffboardAsync(id, {
         reason: body.reason || 'Administrator forced immediate Archive Vault transition',
         triggerSource: 'explicit_device',
         forceImmediateArchive: true,
@@ -7014,14 +9687,14 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.post('/api/devices/:id/simulate-checkin', async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return;
+    if (!ensureDeviceTenantAccess(request, reply, id).allowed) return reply;
     const body = (request.body || {}) as { triggerType?: 'wake_checkin' | 'reinstall_agent' };
     return handleAgentCheckInOrWake(id, body.triggerType || 'wake_checkin');
   });
 
   server.delete('/api/devices/:id/archive-purge', async (request, reply) => {
     if (!requireStepUpMfaIfEnforced(request, reply, null)) {
-      return;
+      return reply;
     }
     const { id } = request.params as { id: string };
     const dev = db.prepare('SELECT id, hostname, lifecycle_state FROM devices WHERE id = ?').get(id) as any;
@@ -7031,7 +9704,30 @@ export async function registerApiRoutes(server: FastifyInstance) {
         error: 'Only Archived endpoints can be permanently purged. Offboard or archive the endpoint first.'
       });
     }
+    const recRows = db
+      .prepare('SELECT video_path FROM session_recordings WHERE device_id = ?')
+      .all(id) as Array<{ video_path?: string | null }>;
+    for (const rec of recRows) {
+      if (rec.video_path && fs.existsSync(RECORDINGS_DIR_PATH) && fs.existsSync(rec.video_path)) {
+        try {
+          const realRoot = fs.realpathSync(RECORDINGS_DIR_PATH);
+          if (!fs.lstatSync(rec.video_path).isSymbolicLink()) {
+            const resolved = fs.realpathSync(rec.video_path);
+            if (
+              resolved.startsWith(realRoot + path.sep) &&
+              !fs.lstatSync(resolved).isSymbolicLink() &&
+              fs.statSync(resolved).isFile()
+            ) {
+              fs.unlinkSync(resolved);
+            }
+          }
+        } catch {}
+      }
+    }
+
     const purgeTx = db.transaction(() => {
+      db.prepare('DELETE FROM session_recordings WHERE device_id = ?').run(id);
+      db.prepare('DELETE FROM maintenance_windows WHERE device_id = ?').run(id);
       db.prepare('DELETE FROM alert_incidents WHERE device_id = ?').run(id);
       db.prepare('DELETE FROM remediation_logs WHERE device_id = ?').run(id);
       db.prepare('DELETE FROM script_executions WHERE device_id = ?').run(id);
@@ -7057,7 +9753,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
   server.post('/api/tenants/:id/offboard', async (request, reply) => {
     if (!requireStepUpMfaIfEnforced(request, reply, null)) {
-      return;
+      return reply;
     }
     const { id } = request.params as { id: string };
     const body = (request.body || {}) as {
@@ -7067,7 +9763,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
       forceArchiveOfflineDevices?: boolean;
     };
     try {
-      return offboardClientTenant(id, {
+      return await offboardClientTenantAsync(id, {
         mode: body.mode || 'archive_client',
         reason: body.reason,
         overrideLapsAction: body.overrideLapsAction,
@@ -7086,6 +9782,142 @@ export async function registerApiRoutes(server: FastifyInstance) {
     } catch (err: any) {
       return reply.status(400).send({ success: false, error: err?.message || 'Client reactivation failed' });
     }
+  });
+
+  // ============================================================================
+  // Endpoint Companion Deploy, Live MS2 Hardware Sync & Uninstall Companion Cleanup
+  // ============================================================================
+  const resolveServerBaseOrigin = (request: FastifyRequest): string | undefined => {
+    const row = db.prepare('SELECT custom_domain FROM settings WHERE id = 1').get() as { custom_domain?: string } | undefined;
+    const customDom = String(row?.custom_domain || '').trim();
+    if (customDom) {
+      return customDom.startsWith('http') ? customDom : `https://${customDom}`;
+    }
+    const { proto: protoHdr, host: hostHdr } = resolveSafeRequestOriginParts(request);
+    return `${protoHdr}://${hostHdr}`;
+  };
+
+  server.post('/api/devices/:id/deploy-companion', async (request, reply) => {
+    if (!isTechnicianOrAbove(request.auth?.user?.role)) {
+      return reply.status(403).send({ error: 'Technician or Super Admin privileges required.' });
+    }
+    const { id } = request.params as { id: string };
+    const access = ensureDeviceTenantAccess(request, reply, id);
+    if (!access.allowed || !access.device) return reply;
+
+    db.prepare('UPDATE devices SET companion_deploy_pending = 1 WHERE id = ?').run(id);
+    const res = await meshBridge.deployCompanionOverMesh(id, resolveServerBaseOrigin(request));
+    const isLivePush = Boolean(res.dispatched && !res.queuedOffline);
+    db.prepare(`
+      INSERT INTO audit_logs (id, username, device_id, action, details)
+      VALUES (?, ?, ?, 'Vitrine Companion Deployment Dispatched', ?)
+    `).run(
+      `aud-cmp-${crypto.randomUUID()}`,
+      getActorUsername(request),
+      id,
+      `Triggered companion & tray deployment for ${access.device.hostname} (live=${isLivePush}, dispatched=${res.dispatched}, queuedOffline=${Boolean(res.queuedOffline)})`
+    );
+    return {
+      success: res.dispatched,
+      dispatched: res.dispatched,
+      live: isLivePush,
+      queuedOffline: Boolean(res.queuedOffline),
+      output: res.output
+    };
+  });
+
+  server.post('/api/devices/:id/sync-hardware', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const access = ensureDeviceTenantAccess(request, reply, id);
+    if (!access.allowed || !access.device) return reply;
+
+    const enrichRes = await meshBridge.enrichDeviceFromMesh(id);
+    if (access.device.status === 'online' && meshBridge.getStatus().connected) {
+      void meshBridge.sampleLiveTelemetry(id, { includeDetailedHardware: true }).catch(() => {});
+    }
+    const updatedRow = db.prepare('SELECT * FROM devices WHERE id = ?').get(id);
+    return {
+      success: true,
+      updated: enrichRes.updated,
+      fields: enrichRes.fields,
+      device: sanitizeDeviceRowForResponse(updatedRow)
+    };
+  });
+
+  server.post('/api/system/cleanup-vitrine-companions', async (request, reply) => {
+    if (!isSuperAdminRole(request.auth?.user?.role)) {
+      return reply.status(403).send({ error: 'Forbidden: Super Admin privileges required.' });
+    }
+    if (!requireStepUpMfaIfEnforced(request, reply, null)) {
+      return reply;
+    }
+    const body = (request.body || {}) as { removeLapsAccount?: boolean };
+    const candidates = db
+      .prepare(`
+        SELECT id, hostname, status, mesh_node_id
+        FROM devices
+        WHERE mesh_node_id IS NOT NULL
+          AND COALESCE(lifecycle_state, 'active') = 'active'
+          AND (
+            COALESCE(companion_installed, 0) = 1
+            OR COALESCE(companion_deploy_pending, 0) = 1
+            OR agent_auth_token IS NOT NULL
+          )
+      `)
+      .all() as Array<{ id: string; hostname: string; status: string; mesh_node_id: string }>;
+
+    let cleaned = 0;
+    let failed = 0;
+    let skippedOffline = 0;
+    const results: Array<{ deviceId: string; hostname: string; status: string; live: boolean; output: string }> = [];
+
+    for (const dev of candidates) {
+      if (dev.status !== 'online') {
+        skippedOffline++;
+        results.push({
+          deviceId: dev.id,
+          hostname: dev.hostname,
+          status: 'skipped_offline',
+          live: false,
+          output: 'Endpoint offline'
+        });
+        continue;
+      }
+      const res = await meshBridge.removeVitrineCompanionOnlyOverMesh(dev.id, {
+        removeLapsAccount: Boolean(body.removeLapsAccount)
+      });
+      if (res.live) {
+        cleaned++;
+        db.prepare('UPDATE devices SET companion_installed = 0, companion_deploy_pending = 0 WHERE id = ?').run(dev.id);
+      } else {
+        failed++;
+      }
+      results.push({
+        deviceId: dev.id,
+        hostname: dev.hostname,
+        status: res.live ? 'cleaned' : 'failed',
+        live: res.live,
+        output: res.output
+      });
+    }
+
+    db.prepare(`
+      INSERT INTO audit_logs (id, username, action, details)
+      VALUES (?, ?, 'Vitrine Companion Fleet Cleanup', ?)
+    `).run(
+      `aud-cln-${crypto.randomUUID()}`,
+      getActorUsername(request),
+      `Cleaned Vitrine companion software on ${cleaned} online endpoint(s) (${failed} failed, ${skippedOffline} offline). MeshCentral MeshAgents left untouched.`
+    );
+
+    return {
+      success: true,
+      cleaned,
+      failed,
+      skippedOffline,
+      meshAgentTouched: false,
+      results
+    };
   });
 
   // Register NinjaOne Feature Parity Routes (Companion Agent, Automations, Software Packages,

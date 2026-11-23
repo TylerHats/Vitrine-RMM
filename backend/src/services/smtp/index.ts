@@ -107,15 +107,51 @@ export function createGlassmorphicEmailHtml(brandName: string, payload: EmailPay
 </html>`;
 }
 
+const SMTP_EMAIL_REGEX =
+  /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
+
+function validateRecipientEmail(rawTo?: string | null): { valid: boolean; cleaned?: string; error?: string } {
+  const rawStr = String(rawTo ?? '');
+  if (!rawStr.trim() || /[\r\n\0]/.test(rawStr)) {
+    return { valid: false, error: 'Recipient email address is invalid or contains control characters.' };
+  }
+  const trimmed = rawStr.trim();
+  if (/[,;]/.test(trimmed)) {
+    return { valid: false, error: 'Multiple recipient addresses or delimiters are not permitted.' };
+  }
+  const ltCount = (trimmed.match(/</g) || []).length;
+  const gtCount = (trimmed.match(/>/g) || []).length;
+  if (ltCount !== gtCount || ltCount > 1) {
+    return { valid: false, error: 'Invalid recipient email bracket syntax.' };
+  }
+
+  if (ltCount === 1) {
+    const angleMatch = trimmed.match(/^([^<>"]*?)<\s*([^<>\s"]+)\s*>$/);
+    if (!angleMatch) {
+      return { valid: false, error: 'Invalid recipient email address format.' };
+    }
+    const rawDisplay = angleMatch[1].trim();
+    const addr = angleMatch[2].trim();
+    if (/[@,;\\<>"]/.test(rawDisplay) || !SMTP_EMAIL_REGEX.test(addr)) {
+      return { valid: false, error: 'Invalid recipient email address format.' };
+    }
+    return { valid: true, cleaned: rawDisplay ? `"${rawDisplay}" <${addr}>` : addr };
+  }
+
+  if (!SMTP_EMAIL_REGEX.test(trimmed)) {
+    return { valid: false, error: 'Invalid recipient email address format.' };
+  }
+  return { valid: true, cleaned: trimmed };
+}
+
 function formatSafeSenderHeader(rawFrom: string | undefined, fallbackBrand: string): { valid: boolean; formatted?: string; error?: string } {
   const sanitized = sanitizeHeaderValue(rawFrom || 'alerts@vitrine.local');
-  const emailRegex = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
 
   const angleMatch = sanitized.match(/^(.*?)<\s*([^<>"]+)\s*>$/);
   if (angleMatch) {
     const rawDisplay = angleMatch[1].trim().replace(/^"+|"+$/g, '').replace(/[<>"]/g, '').trim();
     const addr = angleMatch[2].trim();
-    if (!emailRegex.test(addr)) {
+    if (!SMTP_EMAIL_REGEX.test(addr)) {
       return { valid: false, error: 'Invalid sender email address in From header.' };
     }
     const display = rawDisplay || `${fallbackBrand} Alerts`;
@@ -123,47 +159,117 @@ function formatSafeSenderHeader(rawFrom: string | undefined, fallbackBrand: stri
   }
 
   const bareAddr = sanitized.replace(/^"+|"+$/g, '').trim();
-  if (!emailRegex.test(bareAddr)) {
+  if (!SMTP_EMAIL_REGEX.test(bareAddr)) {
     return { valid: false, error: 'Invalid sender email address format.' };
   }
   return { valid: true, formatted: `"${fallbackBrand} Alerts" <${bareAddr}>` };
+}
+
+type SmtpTransporter = ReturnType<typeof nodemailer.createTransport>;
+
+async function createValidatedSmtpTransport(
+  config: SmtpConfig
+): Promise<{ ok: true; transporter: SmtpTransporter } | { ok: false; error: string }> {
+  const hostCheck = validateSmtpTargetHost(config.host);
+  if (!hostCheck.valid) {
+    return { ok: false, error: hostCheck.reason || 'Invalid SMTP host.' };
+  }
+  const port = Number(config.port || 587);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return { ok: false, error: 'Invalid SMTP port.' };
+  }
+
+  const cleanHost = config.host.trim().replace(/^\[|\]$/g, '');
+  const urlHost = net.isIPv6(cleanHost) ? `[${cleanHost}]` : cleanHost;
+  const dnsSafety = await validateOutboundHostSafety(`http://${urlHost}:${port}`, {
+    allowLoopback: true,
+    allowPrivateLan: true
+  });
+  if (!dnsSafety.safe) {
+    return { ok: false, error: dnsSafety.reason || 'SMTP host blocked by outbound safety policy.' };
+  }
+
+  const pinnedIp = dnsSafety.resolvedAddresses?.[0];
+  const pinnedFamily: 4 | 6 = pinnedIp && net.isIP(pinnedIp) === 6 ? 6 : 4;
+  const pinnedLookup: net.LookupFunction | undefined = pinnedIp
+    ? (_hostname, opts: any, cb: any) => {
+        const callback = typeof opts === 'function' ? opts : cb;
+        if (opts && typeof opts === 'object' && opts.all) {
+          callback(null, [{ address: pinnedIp, family: pinnedFamily }]);
+        } else {
+          callback(null, pinnedIp, pinnedFamily);
+        }
+      }
+    : undefined;
+
+  const isImplicitTls = config.secure ?? port === 465;
+  const requireStartTls = Boolean(config.tls && port !== 465);
+  const trimmedUser = (config.user || '').trim();
+
+  const transportOpts: any = {
+    host: pinnedIp || cleanHost,
+    port,
+    secure: isImplicitTls,
+    requireTLS: requireStartTls,
+    lookup: pinnedLookup,
+    connectionTimeout: 7000,
+    greetingTimeout: 7000,
+    socketTimeout: 10000,
+    auth: trimmedUser ? { user: trimmedUser, pass: config.pass || '' } : undefined,
+    tls: {
+      servername: net.isIP(cleanHost) === 0 ? cleanHost : undefined,
+      lookup: pinnedLookup,
+      rejectUnauthorized: config.allowSelfSignedTls
+        ? false
+        : process.env.SMTP_ALLOW_SELF_SIGNED === 'true'
+        ? false
+        : true
+    }
+  };
+
+  return { ok: true, transporter: nodemailer.createTransport(transportOpts) };
+}
+
+export async function verifySmtpConnection(
+  config: SmtpConfig
+): Promise<{ success: boolean; latencyMs?: number; error?: string }> {
+  const startedAt = Date.now();
+  let transporter: SmtpTransporter | null = null;
+  try {
+    const built = await createValidatedSmtpTransport(config);
+    if (!built.ok) {
+      return { success: false, error: built.error };
+    }
+    transporter = built.transporter;
+    await transporter.verify();
+    return { success: true, latencyMs: Math.max(1, Date.now() - startedAt) };
+  } catch (err: any) {
+    return { success: false, error: err?.message || 'SMTP connection or authentication failed' };
+  } finally {
+    try {
+      transporter?.close();
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
 }
 
 export async function sendAlertEmail(
   config: SmtpConfig,
   payload: EmailPayload
 ): Promise<{ success: boolean; messageId?: string; error?: string }> {
+  let transporter: SmtpTransporter | null = null;
   try {
-    const hostCheck = validateSmtpTargetHost(config.host);
-    if (!hostCheck.valid) {
-      return { success: false, error: hostCheck.reason };
-    }
-    const port = Number(config.port || 587);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      return { success: false, error: 'Invalid SMTP port.' };
+    const recipientCheck = validateRecipientEmail(payload.to);
+    if (!recipientCheck.valid || !recipientCheck.cleaned) {
+      return { success: false, error: recipientCheck.error || 'Invalid recipient email address format.' };
     }
 
-    const cleanHost = config.host.trim().replace(/^\[|\]$/g, '');
-    const dnsSafety = await validateOutboundHostSafety(`http://${config.host.trim()}:${port}`, {
-      allowLoopback: true,
-      allowPrivateLan: true
-    });
-    if (!dnsSafety.safe) {
-      return { success: false, error: dnsSafety.reason || 'SMTP host blocked by outbound safety policy.' };
+    const built = await createValidatedSmtpTransport(config);
+    if (!built.ok) {
+      return { success: false, error: built.error };
     }
-
-    const pinnedIp = dnsSafety.resolvedAddresses?.[0];
-    const pinnedFamily: 4 | 6 = pinnedIp && net.isIP(pinnedIp) === 6 ? 6 : 4;
-    const pinnedLookup: net.LookupFunction | undefined = pinnedIp
-      ? (_hostname, opts: any, cb: any) => {
-          const callback = typeof opts === 'function' ? opts : cb;
-          if (opts && typeof opts === 'object' && opts.all) {
-            callback(null, [{ address: pinnedIp, family: pinnedFamily }]);
-          } else {
-            callback(null, pinnedIp, pinnedFamily);
-          }
-        }
-      : undefined;
+    transporter = built.transporter;
 
     const settings = db.prepare('SELECT brand_name FROM settings WHERE id = 1').get() as any;
     const brandName = sanitizeHeaderValue(settings?.brand_name || 'Vitrine RMM').replace(/"/g, '');
@@ -172,33 +278,7 @@ export async function sendAlertEmail(
       return { success: false, error: fromParsed.error || 'Invalid SMTP From address.' };
     }
 
-    const isImplicitTls = config.secure ?? port === 465;
-    const requireStartTls = Boolean(config.tls && port !== 465);
-
-    const transportOpts: any = {
-      host: pinnedIp || cleanHost,
-      port,
-      secure: isImplicitTls,
-      requireTLS: requireStartTls,
-      lookup: pinnedLookup,
-      connectionTimeout: 7000,
-      greetingTimeout: 7000,
-      socketTimeout: 10000,
-      auth: config.user && config.pass ? { user: config.user, pass: config.pass } : undefined,
-      tls: {
-        servername: net.isIP(cleanHost) === 0 ? cleanHost : undefined,
-        lookup: pinnedLookup,
-        rejectUnauthorized: config.allowSelfSignedTls
-          ? false
-          : process.env.SMTP_ALLOW_SELF_SIGNED === 'true'
-          ? false
-          : true
-      }
-    };
-
-    const transporter = nodemailer.createTransport(transportOpts);
-
-    const cleanTo = sanitizeHeaderValue(payload.to);
+    const cleanTo = recipientCheck.cleaned;
     const cleanSubject = sanitizeHeaderValue(payload.subject);
 
     const html = createGlassmorphicEmailHtml(brandName, payload);
@@ -222,6 +302,12 @@ export async function sendAlertEmail(
     return { success: true, messageId: info.messageId };
   } catch (err: any) {
     return { success: false, error: err?.message || 'SMTP dispatch failed' };
+  } finally {
+    try {
+      transporter?.close();
+    } catch {
+      // Ignore cleanup errors
+    }
   }
 }
 

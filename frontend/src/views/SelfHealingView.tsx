@@ -8,7 +8,8 @@ import {
   updateSelfHealingMonitor,
   deleteSelfHealingMonitor,
   evaluateSelfHealingMonitors,
-  fetchScripts
+  fetchScripts,
+  fetchPolicies
 } from '../services/api.js';
 import { canMutateFleet } from '../utils/permissions.js';
 
@@ -21,7 +22,9 @@ export const SelfHealingView: React.FC<SelfHealingViewProps> = ({ currentUser })
   const [monitors, setMonitors] = useState<SelfHealingMonitor[]>([]);
   const [logs, setLogs] = useState<RemediationLog[]>([]);
   const [scripts, setScripts] = useState<ScriptItem[]>([]);
+  const [maxHourlyRuns, setMaxHourlyRuns] = useState<number>(3);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [statusIsError, setStatusIsError] = useState(false);
   const [evaluating, setEvaluating] = useState(false);
 
   // Create Monitor Modal
@@ -33,9 +36,17 @@ export const SelfHealingView: React.FC<SelfHealingViewProps> = ({ currentUser })
   const [newCooldown, setNewCooldown] = useState(15);
 
   const loadAll = useCallback(() => {
-    fetchSelfHealing().then(setMonitors);
-    fetchRemediationLogs().then(setLogs);
-    fetchScripts().then(setScripts);
+    fetchSelfHealing().then(setMonitors).catch(() => {});
+    fetchRemediationLogs().then(setLogs).catch(() => {});
+    fetchScripts().then(setScripts).catch(() => {});
+    fetchPolicies()
+      .then((pols) => {
+        const globalPol = pols.find((p) => p.tier === 'global');
+        if (globalPol?.self_healing_max_hourly_runs != null) {
+          setMaxHourlyRuns(Number(globalPol.self_healing_max_hourly_runs) || 3);
+        }
+      })
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -77,9 +88,25 @@ export const SelfHealingView: React.FC<SelfHealingViewProps> = ({ currentUser })
   };
 
   const handleDeleteMonitor = async (id: string) => {
-    await deleteSelfHealingMonitor(id);
-    loadAll();
+    if (!confirm('Delete this self-healing watchdog monitor?')) return;
+    try {
+      const res: any = await deleteSelfHealingMonitor(id);
+      if (res?.success === false) {
+        setStatusIsError(true);
+        setStatusMessage(res.error || 'Failed to delete watchdog monitor.');
+        return;
+      }
+      setStatusIsError(false);
+      setStatusMessage('Watchdog monitor deleted.');
+      loadAll();
+    } catch (err: any) {
+      setStatusIsError(true);
+      setStatusMessage(err?.message || 'Failed to delete watchdog monitor.');
+    }
   };
+
+  const minCooldownMin =
+    monitors.length > 0 ? Math.min(...monitors.map((m) => Number(m.cooldown_min) || 15)) : 15;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1.75rem' }} id="self-healing-view">
@@ -109,13 +136,13 @@ export const SelfHealingView: React.FC<SelfHealingViewProps> = ({ currentUser })
           className="glass-card"
           style={{
             padding: '0.75rem 1.25rem',
-            background: 'rgba(16, 185, 129, 0.12)',
-            borderColor: 'rgba(16, 185, 129, 0.35)',
-            color: '#34d399',
+            background: statusIsError ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+            borderColor: statusIsError ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)',
+            color: statusIsError ? '#f87171' : '#34d399',
             fontSize: '0.85rem'
           }}
         >
-          ✓ {statusMessage}
+          {statusIsError ? '⚠ ' : '✓ '}{statusMessage}
         </div>
       )}
 
@@ -136,14 +163,14 @@ export const SelfHealingView: React.FC<SelfHealingViewProps> = ({ currentUser })
 
         <div className="glass-card">
           <div className="metric-title">WATCHDOG COOLDOWN SAFETY</div>
-          <div className="metric-value">15m</div>
-          <div className="metric-subtext">Prevents script flapping loops</div>
+          <div className="metric-value">{minCooldownMin}m</div>
+          <div className="metric-subtext">Minimum monitor cooldown window</div>
         </div>
 
         <div className="glass-card">
           <div className="metric-title">CIRCUIT BREAKER TRIP RATE</div>
-          <div className="metric-value" style={{ color: '#a855f7' }}>3/hr</div>
-          <div className="metric-subtext">Max hourly runs before PSA ticket trigger</div>
+          <div className="metric-value" style={{ color: '#a855f7' }}>{maxHourlyRuns}/hr</div>
+          <div className="metric-subtext">Policy max hourly runs before PSA ticket trigger</div>
         </div>
       </div>
 

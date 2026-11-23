@@ -1,4 +1,4 @@
-# Multi-stage Docker build for Vitrine RMM v2.6.1 (linux/amd64 & linux/arm64)
+# Multi-stage Docker build for Vitrine RMM v2.7.0 (linux/amd64 & linux/arm64)
 # Stage 1: Build Frontend and Backend (with native better-sqlite3 toolchain)
 FROM node:22-slim AS builder
 
@@ -6,12 +6,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     make \
     g++ \
+    clang \
+    lld \
+    g++-mingw-w64-x86-64 \
+    binutils-mingw-w64-x86-64 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy package manifests & lockfiles for deterministic installation
-COPY package.json package-lock.json* ./
+# Copy workspace package manifests & lockfiles for deterministic installation
 COPY backend/package.json backend/package-lock.json* ./backend/
 COPY frontend/package.json frontend/package-lock.json* ./frontend/
 
@@ -33,7 +36,7 @@ FROM node:22-slim AS runner
 
 WORKDIR /app
 
-ARG VITRINE_GIT_COMMIT=v2.6.1
+ARG VITRINE_GIT_COMMIT=v2.7.0
 ENV NODE_ENV=production
 ENV PORT=8080
 ENV DATA_DIR=/app/data
@@ -41,7 +44,7 @@ ENV BRANDING_DIR=/app/branding
 ENV VITRINE_DOCKER=true
 ENV VITRINE_GIT_COMMIT=${VITRINE_GIT_COMMIT}
 
-# Copy pruned production backend dependencies & compiled artifacts
+# Copy pruned production backend dependencies & compiled artifacts (root-owned read-only)
 COPY backend/package.json ./package.json
 COPY --from=builder /app/backend/node_modules ./node_modules
 COPY --from=builder /app/backend/dist ./dist
@@ -49,10 +52,24 @@ COPY --from=builder /app/frontend/dist ./frontend/dist
 COPY --from=builder /app/branding ./branding
 COPY --from=builder /app/branding ./branding-defaults
 
-RUN mkdir -p /app/data /app/data/backups /app/data/recordings /app/data/packages /app/data/signed-agents /app/branding /app/branding-defaults && \
-    chmod 700 /app/data /app/data/backups /app/data/recordings /app/data/packages && \
+RUN mkdir -p \
+        /app/data \
+        /app/data/backups \
+        /app/data/recordings \
+        /app/data/packages \
+        /app/data/signed-agents \
+        /app/data/signing-staging \
+        /app/branding \
+        /app/branding-defaults && \
+    chmod 700 \
+        /app/data \
+        /app/data/backups \
+        /app/data/recordings \
+        /app/data/packages \
+        /app/data/signed-agents \
+        /app/data/signing-staging && \
     chmod 755 /app/branding /app/branding-defaults && \
-    chown -R node:node /app /app/data /app/branding /app/branding-defaults
+    chown -R node:node /app/data /app/branding
 
 VOLUME ["/app/data", "/app/branding"]
 

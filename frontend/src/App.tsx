@@ -6,6 +6,7 @@ import { LoginView } from './components/LoginView.js';
 import { FleetDashboard } from './views/FleetDashboard.js';
 import { MfaChallengeModal } from './components/MfaChallengeModal.js';
 import { isSuperAdmin as checkIsSuperAdmin, canMutateFleet } from './utils/permissions.js';
+import { sanitizeSafeUrl } from './utils/urlSafety.js';
 
 const DeviceDetailView = lazy(() =>
   import('./views/DeviceDetailView.js').then((m) => ({ default: m.DeviceDetailView }))
@@ -39,6 +40,9 @@ const VirtualizationView = lazy(() =>
 );
 const PsaSyncView = lazy(() =>
   import('./views/PsaSyncView.js').then((m) => ({ default: m.PsaSyncView }))
+);
+const SessionRecordingsView = lazy(() =>
+  import('./views/SessionRecordingsView.js').then((m) => ({ default: m.SessionRecordingsView }))
 );
 const SettingsView = lazy(() =>
   import('./views/SettingsView.js').then((m) => ({ default: m.SettingsView }))
@@ -99,12 +103,86 @@ import {
 import './styles/theme.css';
 import './styles/components.css';
 
+function parseHexRgb(hex: string): [number, number, number] | null {
+  const clean = hex.trim().replace(/^#/, '');
+  if (/^[0-9a-fA-F]{3}$/.test(clean)) {
+    return [
+      parseInt(clean[0] + clean[0], 16),
+      parseInt(clean[1] + clean[1], 16),
+      parseInt(clean[2] + clean[2], 16)
+    ];
+  }
+  if (/^[0-9a-fA-F]{6}$/.test(clean)) {
+    return [
+      parseInt(clean.slice(0, 2), 16),
+      parseInt(clean.slice(2, 4), 16),
+      parseInt(clean.slice(4, 6), 16)
+    ];
+  }
+  return null;
+}
+
+function relativeLuminance([r, g, b]: [number, number, number]): number {
+  const chan = [r, g, b].map((c) => {
+    const s = c / 255;
+    return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+  });
+  return 0.2126 * chan[0] + 0.7152 * chan[1] + 0.0722 * chan[2];
+}
+
+function clampPrimaryForTheme(rawColor: string, effectiveTheme: 'dark' | 'light'): string | null {
+  const trimmed = rawColor.trim();
+  if (!trimmed) return null;
+  if (effectiveTheme === 'dark') return trimmed;
+  if (trimmed.toLowerCase() === '#00f2fe') return '#0284c7';
+  const rgb = parseHexRgb(trimmed);
+  if (!rgb) return '#0284c7';
+  if (relativeLuminance(rgb) <= 0.185) return trimmed;
+  let [r, g, b] = rgb;
+  if (Math.max(r, g, b) - Math.min(r, g, b) < 18) return '#0284c7';
+  for (let i = 0; i < 12 && relativeLuminance([r, g, b]) > 0.185; i++) {
+    r = Math.max(0, Math.round(r * 0.82));
+    g = Math.max(0, Math.round(g * 0.82));
+    b = Math.max(0, Math.round(b * 0.82));
+  }
+  const toHex = (n: number) => n.toString(16).padStart(2, '0');
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+
+function resolveEffectiveTheme(
+  themeOverride: 'dark' | 'light' | null,
+  settingsMode?: string | null,
+  publicMode?: string | null
+): 'dark' | 'light' {
+  const mode = themeOverride || settingsMode || publicMode || 'system';
+  if (mode === 'light') return 'light';
+  if (mode === 'dark') return 'dark';
+  return typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: light)').matches
+    ? 'light'
+    : 'dark';
+}
+
 function applyVisualSettings(
-  sets: { primary_color?: string; glass_blur_level?: string } | null
+  sets: { primary_color?: string; glass_blur_level?: string } | null,
+  effectiveTheme: 'dark' | 'light' = 'dark'
 ) {
-  if (!sets) return;
+  if (!sets) {
+    if (effectiveTheme === 'light') {
+      document.documentElement.style.removeProperty('--primary');
+    }
+    return;
+  }
   if (sets.primary_color) {
-    document.documentElement.style.setProperty('--primary', sets.primary_color);
+    if (effectiveTheme === 'light' && sets.primary_color.trim().toLowerCase() === '#00f2fe') {
+      document.documentElement.style.removeProperty('--primary');
+    } else {
+      const resolvedPrimary = clampPrimaryForTheme(sets.primary_color, effectiveTheme);
+      if (resolvedPrimary) {
+        document.documentElement.style.setProperty('--primary', resolvedPrimary);
+      }
+    }
+  } else if (effectiveTheme === 'light') {
+    document.documentElement.style.removeProperty('--primary');
   }
   if (sets.glass_blur_level) {
     const blurMap: Record<string, string> = {
@@ -224,6 +302,39 @@ export function App() {
         window.location.hostname.toLowerCase() === publicConfig.quicksupport_custom_domain.toLowerCase()
     );
 
+  const purgeSensitiveSessionState = useCallback(() => {
+    setCurrentUser(null);
+    setDevices([]);
+    setTenants([]);
+    setSettings(null);
+    setUpdaterStatus(null);
+    setSelectedDeviceId(null);
+    setSelectedTenantId('all');
+    setSearchQuery('');
+    setCurrentView('dashboard');
+    setIsMobileSidebarOpen(false);
+    setHasAutoCheckedOobe(false);
+    setDismissedUpdateBanner(false);
+    setQsSessions([]);
+    setQsSelectedSession(null);
+    setQsAdminUsername('');
+    setQsAdminPassword('');
+    setQsElevatingDeviceId(null);
+    setQsMessage(null);
+    setQsMessageIsError(false);
+    setRemoteModal({ open: false, device: null, isGhost: false });
+    setBgToolsModal({ open: false, device: null, initialTab: 'terminal' });
+    setLapsModal({ open: false, device: null });
+    setQuarantineModal({ open: false, device: null });
+    setOnboardingOpen(false);
+    setQbrOpen(false);
+    setInstallerModalOpen(false);
+    setGuestAccessModalOpen(false);
+    setQuickSupportQueueOpen(false);
+    setQsElevationMfaOpen(false);
+    setGlobalMfaModal({ open: false, secretType: 'step_up_action' });
+  }, []);
+
   // Check public config & auth status on startup
   const refreshAuthAndPublic = useCallback(async () => {
     try {
@@ -239,23 +350,25 @@ export function App() {
       ]);
       if (pub) {
         setPublicConfig(pub);
-        applyVisualSettings(pub);
+        const effTheme = resolveEffectiveTheme(themeOverride, null, pub.theme_mode);
+        applyVisualSettings(pub, effTheme);
       }
+      const authTyped = auth as { oidcEnabled?: boolean; isOnboarded?: boolean };
       setAuthMeta({
         initialized: auth.initialized,
-        oidcEnabled: Boolean((auth as any).oidcEnabled),
-        isOnboarded: (auth as any).isOnboarded !== undefined ? Boolean((auth as any).isOnboarded) : true
+        oidcEnabled: Boolean(authTyped.oidcEnabled),
+        isOnboarded: authTyped.isOnboarded !== undefined ? Boolean(authTyped.isOnboarded) : true
       });
       setCurrentUser(auth.authenticated && auth.user ? auth.user : null);
     } finally {
       setAuthChecked(true);
     }
-  }, []);
+  }, [themeOverride]);
 
   useEffect(() => {
     refreshAuthAndPublic();
     const onAuthExpired = () => {
-      setCurrentUser(null);
+      purgeSensitiveSessionState();
     };
     const onMfaRequired = (e: Event) => {
       const detail = (e as CustomEvent)?.detail;
@@ -274,24 +387,38 @@ export function App() {
       window.removeEventListener('vitrine:auth-expired', onAuthExpired);
       window.removeEventListener('vitrine:mfa-required', onMfaRequired);
     };
-  }, [refreshAuthAndPublic]);
+  }, [refreshAuthAndPublic, purgeSensitiveSessionState]);
 
   useEffect(() => {
     const mediaQuery = window.matchMedia('(prefers-color-scheme: light)');
     const applyResolvedTheme = () => {
-      const mode = themeOverride || settings?.theme_mode || publicConfig?.theme_mode || 'system';
-      const resolved: 'dark' | 'light' =
-        mode === 'light' ? 'light' : mode === 'dark' ? 'dark' : mediaQuery.matches ? 'light' : 'dark';
+      const resolved = resolveEffectiveTheme(themeOverride, settings?.theme_mode, publicConfig?.theme_mode);
       setTheme(resolved);
       document.documentElement.setAttribute('data-theme', resolved);
+      applyVisualSettings(settings || publicConfig, resolved);
     };
     applyResolvedTheme();
     mediaQuery.addEventListener('change', applyResolvedTheme);
     return () => mediaQuery.removeEventListener('change', applyResolvedTheme);
-  }, [themeOverride, settings?.theme_mode, publicConfig?.theme_mode]);
+  }, [themeOverride, settings, publicConfig]);
+
+  useEffect(() => {
+    const brand = settings?.brand_name || publicConfig?.brand_name || 'Vitrine RMM';
+    document.title = brand;
+    const rawLogoUrl = settings?.brand_logo_url || publicConfig?.brand_logo_url;
+    const safeLogoUrl = sanitizeSafeUrl(rawLogoUrl);
+    if (safeLogoUrl) {
+      const link = document.querySelector<HTMLLinkElement>("link[rel~='icon']");
+      if (link) link.href = safeLogoUrl;
+    }
+  }, [settings?.brand_name, settings?.brand_logo_url, publicConfig?.brand_name, publicConfig?.brand_logo_url]);
+
+  const needsInitialMfaConfirm = Boolean(
+    currentUser && currentUser.totp_enabled && currentUser.totp_confirmed === false
+  );
 
   const loadData = useCallback(async () => {
-    if (guestGrantId || isQuickSupportRoute || !currentUser) return;
+    if (guestGrantId || isQuickSupportRoute || !currentUser || needsInitialMfaConfirm) return;
     try {
       const [devs, tens, sets, upd] = await Promise.all([
         fetchDevices(),
@@ -303,7 +430,8 @@ export function App() {
       setTenants(tens);
       if (sets) {
         setSettings(sets);
-        applyVisualSettings(sets);
+        const effTheme = resolveEffectiveTheme(themeOverride, sets.theme_mode, publicConfig?.theme_mode);
+        applyVisualSettings(sets, effTheme);
         if (
           !hasAutoCheckedOobe &&
           checkIsSuperAdmin(currentUser) &&
@@ -318,14 +446,32 @@ export function App() {
     } catch (err) {
       console.error('Error loading fleet data:', err);
     }
-  }, [guestGrantId, isQuickSupportRoute, currentUser, hasAutoCheckedOobe]);
+  }, [guestGrantId, isQuickSupportRoute, currentUser, needsInitialMfaConfirm, hasAutoCheckedOobe, themeOverride, publicConfig?.theme_mode]);
 
   useEffect(() => {
     loadData();
-    if (!currentUser || guestGrantId || isQuickSupportRoute) return;
+    if (!currentUser || needsInitialMfaConfirm || guestGrantId || isQuickSupportRoute) return;
     const interval = setInterval(loadData, 15000);
     return () => clearInterval(interval);
-  }, [loadData, currentUser, guestGrantId, isQuickSupportRoute]);
+  }, [loadData, currentUser, needsInitialMfaConfirm, guestGrantId, isQuickSupportRoute]);
+
+  const activeDeviceForDetail = selectedDeviceId ? devices.find((d) => d.id === selectedDeviceId) || null : null;
+
+  useEffect(() => {
+    if (!authChecked || !currentUser || needsInitialMfaConfirm || guestGrantId || isQuickSupportRoute) return;
+    if (currentView === 'device-detail' && !activeDeviceForDetail) {
+      setSelectedDeviceId(null);
+      setCurrentView('dashboard');
+    }
+  }, [
+    authChecked,
+    currentUser,
+    needsInitialMfaConfirm,
+    guestGrantId,
+    isQuickSupportRoute,
+    currentView,
+    activeDeviceForDetail
+  ]);
   const loadQuickSupportQueue = async () => {
     try {
       const list = await fetchQuickSupportSessions();
@@ -391,9 +537,9 @@ export function App() {
         setQsMessageIsError(true);
         setQsMessage(res.error || 'Elevation failed.');
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       setQsMessageIsError(true);
-      setQsMessage(err?.message || 'Elevation failed.');
+      setQsMessage(err instanceof Error ? err.message : 'Elevation failed.');
     } finally {
       setQsElevatingDeviceId(null);
     }
@@ -403,7 +549,7 @@ export function App() {
     return (
       <Suspense
         fallback={
-          <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#090d16', color: '#f8fafc' }}>
+          <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--surface-base)', color: 'var(--text-main)' }}>
             Loading Guest Portal...
           </div>
         }
@@ -417,49 +563,66 @@ export function App() {
     return (
       <Suspense
         fallback={
-          <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#090d16', color: '#f8fafc' }}>
+          <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--surface-base)', color: 'var(--text-main)' }}>
             Loading QuickSupport Portal...
           </div>
         }
       >
-        <QuickSupportPortalView onBackToAdmin={() => navigatePath('/')} />
+        <QuickSupportPortalView />
       </Suspense>
     );
   }
 
   if (!authChecked) {
     return (
-      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#090d16', color: '#f8fafc' }}>
+      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--surface-base)', color: 'var(--text-main)' }}>
         <div style={{ textAlign: 'center' }}>
           <div className="pulse-dot" style={{ margin: '0 auto 1rem', width: '14px', height: '14px' }} />
-          <div style={{ fontSize: '0.9rem', opacity: 0.85 }}>Initializing Vitrine Control Plane...</div>
+          <div style={{ fontSize: '0.9rem', opacity: 0.85 }}>
+            Loading {publicConfig?.brand_name || 'Vitrine RMM'}...
+          </div>
         </div>
       </div>
     );
   }
 
-  if (!currentUser) {
+  const handleLogout = async () => {
+    try {
+      await logoutSession();
+    } catch {
+      // Ignore network errors during logout cleanup
+    } finally {
+      purgeSensitiveSessionState();
+      await refreshAuthAndPublic();
+    }
+  };
+
+  if (!currentUser || needsInitialMfaConfirm) {
     return (
       <LoginView
         authStatus={{
           initialized: authMeta.initialized,
-          authenticated: false,
-          user: null,
+          authenticated: Boolean(currentUser),
+          user: currentUser,
           mfaVerified: false,
           mfaVerifiedUntil: null,
           isOnboarded: authMeta.isOnboarded || Boolean(settings?.is_onboarded),
           oidcEnabled: authMeta.oidcEnabled,
           branding: {
-            brand_name: publicConfig?.brand_name || 'Vitrine RMM',
-            brand_logo_url: publicConfig?.brand_logo_url || '/branding/logo.png',
-            primary_color: publicConfig?.primary_color || '#00f2fe',
-            theme_mode: publicConfig?.theme_mode || 'system'
+            brand_name: settings?.brand_name || publicConfig?.brand_name || 'Vitrine RMM',
+            brand_logo_url: settings?.brand_logo_url || publicConfig?.brand_logo_url || '/branding/logo.png',
+            primary_color: settings?.primary_color || publicConfig?.primary_color || '#00f2fe',
+            theme_mode: settings?.theme_mode || publicConfig?.theme_mode || 'system'
           }
         }}
+        pendingMfaUser={needsInitialMfaConfirm ? currentUser : null}
+        onSignOutPendingMfa={handleLogout}
         onAuthenticated={(user, triggerOobe) => {
           setAuthMeta((prev) => ({ ...prev, initialized: true }));
           setCurrentUser(user);
-          if (triggerOobe && checkIsSuperAdmin(user)) setOnboardingOpen(true);
+          if (triggerOobe && checkIsSuperAdmin(user) && user.totp_confirmed !== false) {
+            setOnboardingOpen(true);
+          }
         }}
         onOpenQuickSupport={() => navigatePath(configuredQsPath || '/remote')}
       />
@@ -471,21 +634,13 @@ export function App() {
     setThemeOverride(nextTheme);
     setTheme(nextTheme);
     document.documentElement.setAttribute('data-theme', nextTheme);
+    applyVisualSettings(settings || publicConfig, nextTheme);
     try {
       localStorage.setItem('vitrine_theme_override', nextTheme);
     } catch {
       // Ignore storage error
     }
   };
-
-  const handleLogout = async () => {
-    await logoutSession();
-    setCurrentUser(null);
-    setSelectedDeviceId(null);
-    setCurrentView('dashboard');
-  };
-
-  const activeDeviceForDetail = selectedDeviceId ? devices.find((d) => d.id === selectedDeviceId) || null : null;
 
   const handleDeviceSelect = (dev: Device) => {
     setSelectedDeviceId(dev.id);
@@ -511,7 +666,29 @@ export function App() {
 
   const handleSettingsUpdated = (s: Settings) => {
     setSettings(s);
-    applyVisualSettings(s);
+    const effTheme = resolveEffectiveTheme(themeOverride, s.theme_mode, publicConfig?.theme_mode);
+    applyVisualSettings(s, effTheme);
+    setPublicConfig((prev) => ({
+      brand_name: s.brand_name || prev?.brand_name || 'Vitrine RMM',
+      brand_logo_url: s.brand_logo_url || prev?.brand_logo_url || '/branding/logo.png',
+      primary_color: s.primary_color || prev?.primary_color || '#00f2fe',
+      glass_blur_level: s.glass_blur_level || prev?.glass_blur_level || 'high',
+      theme_mode: (s.theme_mode || prev?.theme_mode || 'system') as 'system' | 'dark' | 'light',
+      quicksupport_enabled:
+        s.quicksupport_enabled !== undefined
+          ? Boolean(s.quicksupport_enabled)
+          : (prev?.quicksupport_enabled ?? true),
+      quicksupport_url_path: s.quicksupport_url_path || prev?.quicksupport_url_path || '/remote',
+      quicksupport_custom_domain: s.quicksupport_custom_domain ?? prev?.quicksupport_custom_domain ?? '',
+      code_signing_enabled: Boolean(s.code_signing_enabled)
+    }));
+    const hasOidcConfig = Boolean(String(s.oidc_issuer_url || '').trim() && String(s.oidc_client_id || '').trim());
+    setAuthMeta((prev) => ({
+      ...prev,
+      isOnboarded: Boolean(s.is_onboarded || s.oobe_completed || prev.isOnboarded),
+      oidcEnabled: Boolean(hasOidcConfig && Boolean(s.oidc_enabled))
+    }));
+    void refreshAuthAndPublic();
     loadData();
   };
 
@@ -534,7 +711,7 @@ export function App() {
         onCloseMobile={() => setIsMobileSidebarOpen(false)}
         currentUser={currentUser}
         meshConnected={Boolean(settings?.meshcentral_connected)}
-        appVersion={updaterStatus?.installedVersion || '2.6.1'}
+        appVersion={updaterStatus?.installedVersion || '2.7.0'}
       />
 
       <div className="main-wrapper">
@@ -632,6 +809,7 @@ export function App() {
               onOpenInstaller={() => setInstallerModalOpen(true)}
               onOpenOnboarding={() => setOnboardingOpen(true)}
               onRefreshFleet={loadData}
+              onResetTenantFilter={() => setSelectedTenantId('all')}
               currentUser={currentUser}
             />
           )}
@@ -654,6 +832,7 @@ export function App() {
                 onOpenLaps={(device) => setLapsModal({ open: true, device })}
                 onOpenQuarantine={(device) => setQuarantineModal({ open: true, device })}
                 currentUser={currentUser}
+                settings={settings}
                 onRefreshFleet={loadData}
               />
             )}
@@ -696,6 +875,15 @@ export function App() {
             {currentView === 'virtualization' && currentUser.role !== 'client_admin' && (
               <VirtualizationView currentUser={currentUser} />
             )}
+            {currentView === 'recordings' && currentUser.role !== 'client_admin' && (
+              <SessionRecordingsView
+                tenants={tenants}
+                devices={devices}
+                selectedTenantId={selectedTenantId}
+                currentUser={currentUser}
+                onSelectDevice={handleDeviceSelect}
+              />
+            )}
             {currentView === 'psa' && currentUser.role !== 'client_admin' && (
               <PsaSyncView tenants={tenants} devices={devices} currentUser={currentUser} />
             )}
@@ -731,6 +919,7 @@ export function App() {
         {lapsModal.open && lapsModal.device && (
           <LapsModal
             device={devices.find((d) => d.id === lapsModal.device!.id) || lapsModal.device}
+            currentUser={currentUser}
             onClose={() => setLapsModal({ open: false, device: null })}
           />
         )}
@@ -746,6 +935,7 @@ export function App() {
         {onboardingOpen && checkIsSuperAdmin(currentUser) && (
           <OnboardingWizardModal
             settings={settings || ({} as Settings)}
+            adminEmail={currentUser?.email || ''}
             onClose={() => setOnboardingOpen(false)}
             onSaved={(updated) => {
               setAuthMeta((prev) => ({ ...prev, isOnboarded: true }));

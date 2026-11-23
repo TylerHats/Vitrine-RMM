@@ -19,6 +19,9 @@ import {
   Download,
   Upload
 } from 'lucide-react';
+import { Terminal as XTerm } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+import '@xterm/xterm/css/xterm.css';
 import { Device, ProcessItem, ServiceItem, EventLogItem } from '../types/index.js';
 import {
   fetchProcesses,
@@ -37,12 +40,6 @@ import {
   fetchWsTicket
 } from '../services/api.js';
 
-// eslint-disable-next-line no-control-regex
-const ANSI_ESCAPE_REGEX = /\x1b\[[0-9;]*[a-zA-Z]/g;
-function stripAnsi(str: string): string {
-  return String(str || '').replace(ANSI_ESCAPE_REGEX, '');
-}
-
 interface BackgroundToolsModalProps {
   device: Device;
   initialTab?: string;
@@ -57,9 +54,7 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
   const [activeTab, setActiveTab] = useState(initialTab);
   const osType = device.os_type || 'windows';
 
-  // Terminal state (Supports SYSTEM/root vs Logged-In User context & Multi-Shell selection)
-  const [terminalOutput, setTerminalOutput] = useState<string[]>([]);
-  const [terminalInput, setTerminalInput] = useState('');
+  // Interactive PTY Terminal state (@xterm/xterm attached to /ws/terminal -> MS2 meshrelay.ashx)
   const [runAsContext, setRunAsContext] = useState<'system' | 'user'>('system');
   const [shellType, setShellType] = useState<string>(
     osType === 'macos' ? 'zsh' : osType === 'linux' ? 'bash' : 'powershell'
@@ -69,39 +64,49 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
   runAsContextRef.current = runAsContext;
   shellTypeRef.current = shellType;
   const [ws, setWs] = useState<WebSocket | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
   const [wsState, setWsState] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
+  const [terminalMode, setTerminalMode] = useState<'pty' | 'line_fallback' | 'connecting' | 'unconnected'>('connecting');
+  const [terminalModeReason, setTerminalModeReason] = useState<string | null>(null);
   const [reconnectSeq, setReconnectSeq] = useState(0);
   const [toolError, setToolError] = useState<string | null>(null);
+
+  const xtermContainerRef = useRef<HTMLDivElement | null>(null);
+  const xtermRef = useRef<XTerm | null>(null);
+  const fitAddonRef = useRef<FitAddon | null>(null);
 
   // Process state
   const [processes, setProcesses] = useState<ProcessItem[]>([]);
   const [procFilter, setProcFilter] = useState('');
-  const [, setLoadingProcs] = useState(false);
+  const [loadingProcs, setLoadingProcs] = useState(false);
 
   // Services state
   const [services, setServices] = useState<ServiceItem[]>([]);
   const [svcFilter, setSvcFilter] = useState('');
-  const [, setLoadingSvcs] = useState(false);
+  const [loadingSvcs, setLoadingSvcs] = useState(false);
 
   // Registry / sysctl / plist state
   const [regPath, setRegPath] = useState(
     osType === 'windows'
-      ? 'HKLM\\SOFTWARE\\VitrineRMM'
+      ? 'HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion'
       : osType === 'macos'
-        ? '/Library/Preferences/com.vitrine.agent.plist'
-        : '/etc/sysctl.d/99-vitrine-hardening.conf'
+        ? '/Library/Preferences/com.apple.SoftwareUpdate.plist'
+        : 'kernel.'
   );
   const [regData, setRegData] = useState<{ subkeys: string[]; values: Array<{ path: string; name: string; type: string; value: string }> }>({ subkeys: [], values: [] });
+  const [loadingReg, setLoadingReg] = useState(false);
   const [newRegName, setNewRegName] = useState('');
   const [newRegType, setNewRegType] = useState('REG_SZ');
   const [newRegVal, setNewRegVal] = useState('');
 
   // Tasks state
   const [tasks, setTasks] = useState<Array<{ name: string; path: string; state: string; lastRunTime: string; nextRunTime: string; lastResult: string }>>([]);
+  const [loadingTasks, setLoadingTasks] = useState(false);
 
   // Files state
   const [currentPath, setCurrentPath] = useState(osType === 'windows' ? 'C:\\' : '/');
   const [files, setFiles] = useState<Array<{ name: string; path: string; size: number; isDirectory: boolean; modified: string; permissions: string }>>([]);
+  const [loadingFiles, setLoadingFiles] = useState(false);
   const [newFolderName, setNewFolderName] = useState('');
 
   // Event Viewer state
@@ -110,18 +115,68 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
   const [eventLevel, setEventLevel] = useState('all');
   const [eventFilter, setEventFilter] = useState('');
   const [loadingEvents, setLoadingEvents] = useState(false);
-  const terminalWindowRef = useRef<HTMLDivElement | null>(null);
   const fileUploadInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Connect WebSocket for terminal only when on terminal tab, using HttpOnly cookie + single-use WS ticket
+  // Mount @xterm/xterm & connect WebSocket when on terminal tab
   useEffect(() => {
     if (activeTab !== 'terminal') return;
+    const container = xtermContainerRef.current;
+    if (!container) return;
+
     let cancelled = false;
     let activeSocket: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
+    const term = new XTerm({
+      cursorBlink: true,
+      fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+      fontSize: 13,
+      lineHeight: 1.35,
+      scrollback: 5000,
+      theme: {
+        background: '#0a0f1c',
+        foreground: '#e2e8f0',
+        cursor: '#00f2fe',
+        selectionBackground: 'rgba(0, 242, 254, 0.25)'
+      }
+    });
+    const fitAddon = new FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(container);
+    try {
+      fitAddon.fit();
+    } catch {
+      // Ignore fit timing errors before container layout settles
+    }
+    term.focus();
+
+    xtermRef.current = term;
+    fitAddonRef.current = fitAddon;
+
+    const dataDisposable = term.onData((data) => {
+      const s = wsRef.current;
+      if (s && s.readyState === WebSocket.OPEN) {
+        s.send(JSON.stringify({ type: 'data', data }));
+      }
+    });
+
+    const resizeObserver = new ResizeObserver(() => {
+      try {
+        fitAddon.fit();
+        const s = wsRef.current;
+        if (s && s.readyState === WebSocket.OPEN) {
+          s.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+        }
+      } catch {
+        // Ignore resize race on unmount
+      }
+    });
+    resizeObserver.observe(container);
+
     const connectSocket = async () => {
       setWsState('connecting');
+      setTerminalMode('connecting');
+      setTerminalModeReason(null);
       let ticketParam = '';
       try {
         const tRes = await fetchWsTicket();
@@ -135,42 +190,47 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
 
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const host = window.location.host;
+      const cols = Math.max(40, term.cols || 120);
+      const rows = Math.max(10, term.rows || 32);
       const socket = new WebSocket(
-        `${protocol}//${host}/ws/terminal?deviceId=${encodeURIComponent(device.id)}&runAs=${runAsContextRef.current}&shell=${encodeURIComponent(shellTypeRef.current)}${ticketParam}`
+        `${protocol}//${host}/ws/terminal?deviceId=${encodeURIComponent(device.id)}&runAs=${runAsContextRef.current}&shell=${encodeURIComponent(shellTypeRef.current)}&cols=${cols}&rows=${rows}${ticketParam}`
       );
       activeSocket = socket;
 
       socket.onopen = () => {
         if (!cancelled) {
+          wsRef.current = socket;
+          setWs(socket);
           setWsState('connected');
           try {
-            socket.send(
-              JSON.stringify({
-                type: 'switch_context',
-                deviceId: device.id,
-                runAs: runAsContextRef.current,
-                shell: shellTypeRef.current
-              })
-            );
-          } catch {}
+            fitAddon.fit();
+            socket.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+          } catch {
+            // Ignore fit race during socket open
+          }
+          term.focus();
         }
       };
 
       socket.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data);
-          if (msg.type === 'output') {
-            const clean = stripAnsi(msg.data);
-            setTerminalOutput((prev) => [...prev, clean]);
+          if (msg.type === 'output' && typeof msg.data === 'string') {
+            term.write(msg.data);
+          } else if (msg.type === 'status' && msg.mode) {
+            setTerminalMode(msg.mode);
+            if (msg.reason) setTerminalModeReason(String(msg.reason));
           }
         } catch {
-          setTerminalOutput((prev) => [...prev, stripAnsi(String(event.data))]);
+          term.write(String(event.data || ''));
         }
       };
 
       socket.onclose = (ev) => {
         if (cancelled) return;
+        wsRef.current = null;
         setWsState('disconnected');
+        setTerminalMode('unconnected');
         setWs(null);
         if (ev.code !== 1000 && ev.code !== 1008) {
           reconnectTimer = setTimeout(() => {
@@ -191,34 +251,44 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
     return () => {
       cancelled = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      resizeObserver.disconnect();
+      dataDisposable.dispose();
+      wsRef.current = null;
       if (activeSocket) {
         try {
           activeSocket.close(1000, 'Modal closed');
-        } catch {}
+        } catch {
+          // Ignore close error on already-closed socket
+        }
       }
       setWs(null);
+      try {
+        term.dispose();
+      } catch {
+        // Ignore xterm dispose error
+      }
+      xtermRef.current = null;
+      fitAddonRef.current = null;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [device.id, activeTab, reconnectSeq]);
-
-  useEffect(() => {
-    if (terminalWindowRef.current) {
-      terminalWindowRef.current.scrollTop = terminalWindowRef.current.scrollHeight;
-    }
-  }, [terminalOutput]);
 
   const handleSwitchTerminalContext = (nextRunAs: 'system' | 'user', nextShell: string) => {
     setRunAsContext(nextRunAs);
     setShellType(nextShell);
+    setTerminalMode('connecting');
+    setTerminalModeReason(null);
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(
         JSON.stringify({
           type: 'switch_context',
           deviceId: device.id,
           runAs: nextRunAs,
-          shell: nextShell
+          shell: nextShell,
+          cols: xtermRef.current?.cols || 120,
+          rows: xtermRef.current?.rows || 32
         })
       );
+      xtermRef.current?.focus();
     }
   };
 
@@ -230,6 +300,7 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
       const data = await fetchProcesses(device.id);
       setProcesses(Array.isArray(data) ? data : []);
     } catch (err: any) {
+      setProcesses([]);
       setToolError(err?.message || 'Failed to query remote processes.');
     } finally {
       setLoadingProcs(false);
@@ -244,6 +315,7 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
       const data = await fetchServices(device.id);
       setServices(Array.isArray(data) ? data : []);
     } catch (err: any) {
+      setServices([]);
       setToolError(err?.message || 'Failed to query remote services.');
     } finally {
       setLoadingSvcs(false);
@@ -252,6 +324,7 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
 
   // Load registry
   const loadRegistry = async (path: string) => {
+    setLoadingReg(true);
     setToolError(null);
     try {
       const data = await fetchRegistry(device.id, path);
@@ -261,30 +334,41 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
       });
       setRegPath(path);
     } catch (err: any) {
+      setRegData({ subkeys: [], values: [] });
       setToolError(err?.message || 'Failed to read remote registry/configuration path.');
+    } finally {
+      setLoadingReg(false);
     }
   };
 
   // Load tasks
   const loadTasks = async () => {
+    setLoadingTasks(true);
     setToolError(null);
     try {
       const data = await fetchScheduledTasks(device.id);
       setTasks(Array.isArray(data) ? data : []);
     } catch (err: any) {
+      setTasks([]);
       setToolError(err?.message || 'Failed to load scheduled tasks.');
+    } finally {
+      setLoadingTasks(false);
     }
   };
 
   // Load files
   const loadFiles = async (path: string) => {
+    setLoadingFiles(true);
     setToolError(null);
     try {
       const data = await fetchFiles(device.id, path);
       setFiles(Array.isArray(data) ? data : []);
       setCurrentPath(path);
     } catch (err: any) {
+      setFiles([]);
       setToolError(err?.message || 'Failed to list remote directory.');
+    } finally {
+      setLoadingFiles(false);
     }
   };
 
@@ -296,6 +380,7 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
       const data = await fetchEventLogs(device.id, channel, level, 100);
       setEventLogs(Array.isArray(data) ? data : []);
     } catch (err: any) {
+      setEventLogs([]);
       setToolError(err?.message || 'Failed to load endpoint event logs.');
     } finally {
       setLoadingEvents(false);
@@ -310,10 +395,12 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
       const parent = parts.length === 0 ? '/' : '/' + parts.join('/');
       loadFiles(parent);
     } else {
-      if (currentPath === 'C:\\' || currentPath === 'C:/' || !currentPath) return;
-      const normalized = currentPath.replace(/\\/g, '/');
+      const trimmedPath = currentPath.trim();
+      if (!trimmedPath || /^[a-zA-Z]:[\\/]?$/.test(trimmedPath)) return;
+      const normalized = trimmedPath.replace(/\\/g, '/');
       const parts = normalized.split('/').filter(Boolean);
       parts.pop();
+      if (parts.length === 0) return;
       const parent = parts.length === 1 ? parts[0] + '\\' : parts.join('\\');
       loadFiles(parent);
     }
@@ -330,53 +417,32 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab]);
 
-  const promptLabel =
-    osType === 'windows'
-      ? shellType === 'cmd'
-        ? runAsContext === 'system'
-          ? 'C:\\Windows\\System32>'
-          : 'C:\\Users\\ConsoleUser>'
-        : runAsContext === 'system'
-          ? 'PS C:\\Windows\\System32>'
-          : 'PS C:\\Users\\ConsoleUser>'
-      : osType === 'macos'
-        ? `${runAsContext === 'system' ? 'root' : 'localuser'}@${device.hostname.toLowerCase()} ${runAsContext === 'system' ? '#' : '%'}`
-        : `${runAsContext === 'system' ? 'root' : 'ubuntu'}@${device.hostname.toLowerCase()}:${runAsContext === 'system' ? '#' : '$'}`;
-
+  const interactiveLabel = device.logged_in_user
+    ? `${device.logged_in_user} (Interactive User)`
+    : 'Interactive User';
   const identityBadge =
     osType === 'windows'
       ? runAsContext === 'system'
         ? 'NT AUTHORITY\\SYSTEM'
-        : 'Interactive User'
+        : interactiveLabel
       : osType === 'macos'
         ? runAsContext === 'system'
           ? 'root (UID 0 LaunchDaemon)'
-          : 'localuser (UID 501 User)'
+          : interactiveLabel
         : runAsContext === 'system'
           ? 'root (UID 0 systemd)'
-          : 'ubuntu (UID 1000 User)';
-
-  const handleTerminalSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!terminalInput.trim() || !ws) return;
-    if (terminalInput.trim().toLowerCase() === 'clear' || terminalInput.trim().toLowerCase() === 'cls') {
-      setTerminalOutput([]);
-      setTerminalInput('');
-      return;
-    }
-    setTerminalOutput((prev) => [...prev, `\n${promptLabel} ${terminalInput}\n`]);
-    ws.send(JSON.stringify({ type: 'input', data: terminalInput }));
-    setTerminalInput('');
-  };
+          : interactiveLabel;
 
   const handleSnippet = (cmd: string) => {
     if (cmd === 'clear') {
-      setTerminalOutput([]);
+      xtermRef.current?.clear();
+      xtermRef.current?.focus();
       return;
     }
-    if (!ws) return;
-    setTerminalOutput((prev) => [...prev, `\n${promptLabel} ${cmd}\n`]);
-    ws.send(JSON.stringify({ type: 'input', data: cmd }));
+    const active = wsRef.current;
+    if (!active || active.readyState !== WebSocket.OPEN) return;
+    active.send(JSON.stringify({ type: 'data', data: `${cmd}\r` }));
+    xtermRef.current?.focus();
   };
 
   const handleKillProcess = async (pid: number) => {
@@ -410,13 +476,22 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
   };
 
   const handleDownloadFile = (filePath: string) => {
-    window.open(getRemoteFileDownloadUrl(device.id, filePath), '_blank');
+    window.open(getRemoteFileDownloadUrl(device.id, filePath), '_blank', 'noopener,noreferrer');
   };
 
   const handleUploadFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (file.size > 10 * 1024 * 1024) {
+      setToolError('File exceeds the 10 MB remote upload limit.');
+      if (fileUploadInputRef.current) fileUploadInputRef.current.value = '';
+      return;
+    }
     const reader = new FileReader();
+    reader.onerror = () => {
+      setToolError('Failed to read selected file for upload.');
+      if (fileUploadInputRef.current) fileUploadInputRef.current.value = '';
+    };
     reader.onload = async () => {
       setToolError(null);
       try {
@@ -539,48 +614,61 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
             >
               {identityBadge}
             </span>
-            <span className="status-pill status-isolated" style={{ fontSize: '0.7rem', background: 'rgba(56, 189, 248, 0.15)', color: '#38bdf8' }}>
-              {osType.toUpperCase()} Parity Engine
+            <span className="status-pill status-info" style={{ fontSize: '0.7rem' }}>
+              {osType.toUpperCase()} Live Tools
             </span>
             {activeTab === 'terminal' && (
-              <span
-                className={`status-pill ${
-                  wsState === 'connected'
-                    ? 'status-online'
-                    : wsState === 'connecting'
-                      ? 'status-reboot'
-                      : 'status-offline'
-                }`}
-                style={{ fontSize: '0.7rem', display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}
-              >
-                <span>
-                  {wsState === 'connected'
-                    ? 'WS Connected'
-                    : wsState === 'connecting'
-                      ? 'WS Connecting...'
-                      : 'WS Disconnected'}
+              <>
+                <span
+                  className={`status-pill ${
+                    wsState === 'connected'
+                      ? 'status-online'
+                      : wsState === 'connecting'
+                        ? 'status-reboot'
+                        : 'status-offline'
+                  }`}
+                  style={{ fontSize: '0.7rem', display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}
+                >
+                  <span>
+                    {wsState === 'connected'
+                      ? terminalMode === 'pty'
+                        ? 'Live MS2 PTY'
+                        : terminalMode === 'line_fallback'
+                          ? 'Command Relay Mode'
+                          : 'Connecting PTY...'
+                      : wsState === 'connecting'
+                        ? 'WS Connecting...'
+                        : 'WS Disconnected'}
+                  </span>
+                  {wsState === 'disconnected' && (
+                    <button
+                      type="button"
+                      onClick={() => setReconnectSeq((n) => n + 1)}
+                      style={{
+                        background: 'transparent',
+                        border: 'none',
+                        color: 'inherit',
+                        textDecoration: 'underline',
+                        cursor: 'pointer',
+                        fontSize: '0.7rem',
+                        padding: 0
+                      }}
+                    >
+                      Reconnect
+                    </button>
+                  )}
                 </span>
-                {wsState === 'disconnected' && (
-                  <button
-                    type="button"
-                    onClick={() => setReconnectSeq((n) => n + 1)}
-                    style={{
-                      background: 'transparent',
-                      border: 'none',
-                      color: 'inherit',
-                      textDecoration: 'underline',
-                      cursor: 'pointer',
-                      fontSize: '0.7rem',
-                      padding: 0
-                    }}
-                  >
-                    Reconnect
-                  </button>
-                )}
-              </span>
+              </>
             )}
           </div>
-          <button className="btn-glass btn-icon" onClick={onClose} id="close-bg-tools-btn">
+          <button
+            type="button"
+            className="btn-glass btn-icon"
+            onClick={onClose}
+            id="close-bg-tools-btn"
+            aria-label="Close background tools"
+            title="Close"
+          >
             <X size={18} />
           </button>
         </div>
@@ -811,9 +899,11 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                 <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('whoami')}>
                   whoami
                 </button>
-                <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('id')}>
-                  id / token
-                </button>
+                {osType !== 'windows' && (
+                  <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('id')}>
+                    id
+                  </button>
+                )}
                 {osType === 'windows' ? (
                   <>
                     <button className="btn-glass" style={{ padding: '0.25rem 0.6rem', fontSize: '0.75rem' }} onClick={() => handleSnippet('Get-Process')}>
@@ -866,29 +956,22 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
               </div>
 
               <div
-                ref={terminalWindowRef}
-                className="terminal-window"
-                style={{ flex: 1, minHeight: '350px', overflowY: 'auto', whiteSpace: 'pre-wrap' }}
+                ref={xtermContainerRef}
+                className="xterm-terminal-host"
+                onClick={() => xtermRef.current?.focus()}
                 id="terminal-window-output"
-              >
-                {terminalOutput.join('')}
-              </div>
+              />
 
-              <form onSubmit={handleTerminalSubmit} className="terminal-input-row">
-                <span className="terminal-prompt">{promptLabel}</span>
-                <input
-                  type="text"
-                  className="terminal-input"
-                  placeholder={`Execute ${shellType.toUpperCase()} command as ${identityBadge}...`}
-                  value={terminalInput}
-                  onChange={(e) => setTerminalInput(e.target.value)}
-                  autoFocus
-                  id="terminal-cli-input"
-                />
-                <button type="submit" className="btn-glass btn-primary" style={{ padding: '0.35rem 0.85rem' }}>
-                  Execute
-                </button>
-              </form>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.74rem', color: 'var(--text-dim)', flexWrap: 'wrap', gap: '0.5rem' }}>
+                <span>
+                  Click inside the terminal above and type directly (full Ctrl+C, Tab autocomplete, ANSI/ConPTY support as {identityBadge}).
+                </span>
+                {terminalMode === 'line_fallback' && (
+                  <span style={{ color: '#fbbf24' }}>
+                    Command relay fallback active ({terminalModeReason || 'PTY tunnel unavailable'}) — commands execute on Enter.
+                  </span>
+                )}
+              </div>
             </div>
           )}
 
@@ -904,8 +987,8 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                   value={procFilter}
                   onChange={(e) => setProcFilter(e.target.value)}
                 />
-                <button className="btn-glass" onClick={loadProcesses}>
-                  <RefreshCw size={14} /> Refresh
+                <button className="btn-glass" onClick={loadProcesses} disabled={loadingProcs}>
+                  <RefreshCw size={14} className={loadingProcs ? 'spin' : ''} /> {loadingProcs ? 'Loading...' : 'Refresh'}
                 </button>
               </div>
 
@@ -923,7 +1006,19 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                     </tr>
                   </thead>
                   <tbody>
-                    {processes
+                    {loadingProcs && processes.length === 0 ? (
+                      <tr>
+                        <td colSpan={7} style={{ textAlign: 'center', padding: '1.5rem', color: 'var(--text-dim)' }}>
+                          Querying live processes from {device.hostname}...
+                        </td>
+                      </tr>
+                    ) : processes.filter((p) => p.name.toLowerCase().includes(procFilter.toLowerCase()) || p.pid.toString().includes(procFilter)).length === 0 ? (
+                      <tr>
+                        <td colSpan={7} style={{ textAlign: 'center', padding: '1.5rem', color: 'var(--text-dim)' }}>
+                          No running processes returned{procFilter ? ' matching filter' : ''}.
+                        </td>
+                      </tr>
+                    ) : processes
                       .filter((p) => p.name.toLowerCase().includes(procFilter.toLowerCase()) || p.pid.toString().includes(procFilter))
                       .map((p) => (
                         <tr key={p.pid}>
@@ -962,12 +1057,12 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                   type="text"
                   className="glass-input"
                   style={{ width: '280px' }}
-                  placeholder="Filter Windows services..."
+                  placeholder={osType === 'windows' ? 'Filter Windows services...' : 'Filter services / daemons...'}
                   value={svcFilter}
                   onChange={(e) => setSvcFilter(e.target.value)}
                 />
-                <button className="btn-glass" onClick={loadServices}>
-                  <RefreshCw size={14} /> Refresh
+                <button className="btn-glass" onClick={loadServices} disabled={loadingSvcs}>
+                  <RefreshCw size={14} className={loadingSvcs ? 'spin' : ''} /> {loadingSvcs ? 'Loading...' : 'Refresh'}
                 </button>
               </div>
 
@@ -983,7 +1078,19 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                     </tr>
                   </thead>
                   <tbody>
-                    {services
+                    {loadingSvcs && services.length === 0 ? (
+                      <tr>
+                        <td colSpan={5} style={{ textAlign: 'center', padding: '1.5rem', color: 'var(--text-dim)' }}>
+                          Querying live services from {device.hostname}...
+                        </td>
+                      </tr>
+                    ) : services.filter((s) => s.displayName.toLowerCase().includes(svcFilter.toLowerCase()) || s.name.toLowerCase().includes(svcFilter.toLowerCase())).length === 0 ? (
+                      <tr>
+                        <td colSpan={5} style={{ textAlign: 'center', padding: '1.5rem', color: 'var(--text-dim)' }}>
+                          No services returned{svcFilter ? ' matching filter' : ''}.
+                        </td>
+                      </tr>
+                    ) : services
                       .filter((s) => s.displayName.toLowerCase().includes(svcFilter.toLowerCase()) || s.name.toLowerCase().includes(svcFilter.toLowerCase()))
                       .map((s) => (
                         <tr key={s.name}>
@@ -1097,7 +1204,7 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                 </div>
 
                 <button className="btn-glass" onClick={() => loadEvents(eventChannel, eventLevel)} disabled={loadingEvents}>
-                  <RefreshCw size={14} /> Refresh Events
+                  <RefreshCw size={14} className={loadingEvents ? 'spin' : ''} /> {loadingEvents ? 'Loading...' : 'Refresh Events'}
                 </button>
               </div>
 
@@ -1113,7 +1220,27 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                     </tr>
                   </thead>
                   <tbody>
-                    {eventLogs
+                    {loadingEvents && eventLogs.length === 0 ? (
+                      <tr>
+                        <td colSpan={5} style={{ textAlign: 'center', padding: '1.5rem', color: 'var(--text-dim)' }}>
+                          Querying live logs from {device.hostname}...
+                        </td>
+                      </tr>
+                    ) : eventLogs.filter((ev) => {
+                        if (!eventFilter.trim()) return true;
+                        const q = eventFilter.toLowerCase();
+                        return (
+                          ev.eventId.toString().includes(q) ||
+                          ev.source.toLowerCase().includes(q) ||
+                          ev.message.toLowerCase().includes(q)
+                        );
+                      }).length === 0 ? (
+                      <tr>
+                        <td colSpan={5} style={{ textAlign: 'center', padding: '1.5rem', color: 'var(--text-dim)' }}>
+                          No endpoint event logs returned for this filter.
+                        </td>
+                      </tr>
+                    ) : eventLogs
                       .filter((ev) => {
                         if (!eventFilter.trim()) return true;
                         const q = eventFilter.toLowerCase();
@@ -1160,10 +1287,10 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                   className="glass-input"
                   value={regPath}
                   onChange={(e) => setRegPath(e.target.value)}
-                  placeholder="Registry Hive Path..."
+                  placeholder="Registry Hive Path / sysctl prefix / plist path..."
                 />
-                <button className="btn-glass btn-primary" onClick={() => loadRegistry(regPath)}>
-                  Browse
+                <button className="btn-glass btn-primary" onClick={() => loadRegistry(regPath)} disabled={loadingReg}>
+                  <RefreshCw size={14} className={loadingReg ? 'spin' : ''} /> {loadingReg ? 'Reading...' : 'Browse'}
                 </button>
               </div>
 
@@ -1171,18 +1298,28 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                 <div className="glass-card" style={{ padding: '1rem' }}>
                   <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-dim)', marginBottom: '0.5rem' }}>SUBKEYS</div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
-                    {regData.subkeys.map((sub) => (
+                    {loadingReg && regData.subkeys.length === 0 ? (
+                      <div style={{ fontSize: '0.76rem', color: 'var(--text-dim)' }}>Loading subkeys...</div>
+                    ) : regData.subkeys.length === 0 ? (
+                      <div style={{ fontSize: '0.76rem', color: 'var(--text-dim)' }}>No subkeys at this path.</div>
+                    ) : regData.subkeys.map((sub) => (
                       <button
                         key={sub}
                         className="btn-glass"
                         style={{ textAlign: 'left', justifyContent: 'flex-start', padding: '0.4rem 0.65rem', fontSize: '0.78rem' }}
-                        onClick={() =>
-                          loadRegistry(
-                            sub.startsWith('/') ? sub : `${regPath.replace(/\\+$/, '')}\\${sub}`
-                          )
-                        }
+                        onClick={() => {
+                          if (sub.startsWith('/')) {
+                            loadRegistry(sub);
+                          } else if (osType === 'windows') {
+                            loadRegistry(`${regPath.replace(/\\+$/, '')}\\${sub}`);
+                          } else if (osType === 'macos') {
+                            loadRegistry(`${regPath.replace(/\/+$/, '')}/${sub}`);
+                          } else {
+                            loadRegistry(regPath ? `${regPath.replace(/\.+$/, '')}.${sub}` : sub);
+                          }
+                        }}
                       >
-                        <Folder size={14} color="#00f2fe" />
+                        <Folder size={14} color="var(--primary)" />
                         <span>{sub}</span>
                       </button>
                     ))}
@@ -1190,32 +1327,34 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                 </div>
 
                 <div className="table-wrapper" style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-                  <form onSubmit={handleSaveRegValue} style={{ display: 'flex', gap: '0.5rem', padding: '0.75rem', background: 'rgba(255,255,255,0.02)', borderBottom: '1px solid var(--glass-border)' }}>
-                    <input
-                      type="text"
-                      className="glass-input"
-                      placeholder="Value Name (e.g. MaxTelemetryQueue)"
-                      value={newRegName}
-                      onChange={(e) => setNewRegName(e.target.value)}
-                      style={{ flex: 1 }}
-                    />
-                    <select className="glass-select" value={newRegType} onChange={(e) => setNewRegType(e.target.value)} style={{ width: '140px' }}>
-                      <option value="REG_SZ">REG_SZ</option>
-                      <option value="REG_DWORD">REG_DWORD</option>
-                      <option value="REG_MULTI_SZ">REG_MULTI_SZ</option>
-                    </select>
-                    <input
-                      type="text"
-                      className="glass-input"
-                      placeholder="Value Data..."
-                      value={newRegVal}
-                      onChange={(e) => setNewRegVal(e.target.value)}
-                      style={{ flex: 1 }}
-                    />
-                    <button type="submit" className="btn-glass btn-primary" style={{ fontSize: '0.78rem' }}>
-                      + Set Value
-                    </button>
-                  </form>
+                  {osType === 'windows' && (
+                    <form onSubmit={handleSaveRegValue} style={{ display: 'flex', gap: '0.5rem', padding: '0.75rem', background: 'rgba(255,255,255,0.02)', borderBottom: '1px solid var(--glass-border)' }}>
+                      <input
+                        type="text"
+                        className="glass-input"
+                        placeholder="Value Name (e.g. MaxTelemetryQueue)"
+                        value={newRegName}
+                        onChange={(e) => setNewRegName(e.target.value)}
+                        style={{ flex: 1 }}
+                      />
+                      <select className="glass-select" value={newRegType} onChange={(e) => setNewRegType(e.target.value)} style={{ width: '140px' }}>
+                        <option value="REG_SZ">REG_SZ</option>
+                        <option value="REG_DWORD">REG_DWORD</option>
+                        <option value="REG_MULTI_SZ">REG_MULTI_SZ</option>
+                      </select>
+                      <input
+                        type="text"
+                        className="glass-input"
+                        placeholder="Value Data..."
+                        value={newRegVal}
+                        onChange={(e) => setNewRegVal(e.target.value)}
+                        style={{ flex: 1 }}
+                      />
+                      <button type="submit" className="btn-glass btn-primary" style={{ fontSize: '0.78rem' }}>
+                        + Set Value
+                      </button>
+                    </form>
+                  )}
                   <table className="glass-table">
                     <thead>
                       <tr>
@@ -1226,7 +1365,19 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                       </tr>
                     </thead>
                     <tbody>
-                      {regData.values.map((v, idx) => (
+                      {loadingReg && regData.values.length === 0 ? (
+                        <tr>
+                          <td colSpan={4} style={{ textAlign: 'center', padding: '1.25rem', color: 'var(--text-dim)' }}>
+                            Reading values from {device.hostname}...
+                          </td>
+                        </tr>
+                      ) : regData.values.length === 0 ? (
+                        <tr>
+                          <td colSpan={4} style={{ textAlign: 'center', padding: '1.25rem', color: 'var(--text-dim)' }}>
+                            No values found at {regPath || 'this path'}.
+                          </td>
+                        </tr>
+                      ) : regData.values.map((v, idx) => (
                         <tr key={idx}>
                           <td><strong>{v.name}</strong></td>
                           <td><span className="status-pill status-reboot" style={{ fontSize: '0.7rem' }}>{v.type}</span></td>
@@ -1272,8 +1423,8 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                   value={currentPath}
                   onChange={(e) => setCurrentPath(e.target.value)}
                 />
-                <button className="btn-glass btn-primary" onClick={() => loadFiles(currentPath)}>
-                  Go
+                <button className="btn-glass btn-primary" onClick={() => loadFiles(currentPath)} disabled={loadingFiles}>
+                  {loadingFiles ? 'Loading...' : 'Go'}
                 </button>
                 <input
                   type="text"
@@ -1312,7 +1463,19 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                     </tr>
                   </thead>
                   <tbody>
-                    {files.map((f, i) => (
+                    {loadingFiles && files.length === 0 ? (
+                      <tr>
+                        <td colSpan={5} style={{ textAlign: 'center', padding: '1.5rem', color: 'var(--text-dim)' }}>
+                          Listing directory {currentPath} on {device.hostname}...
+                        </td>
+                      </tr>
+                    ) : files.length === 0 ? (
+                      <tr>
+                        <td colSpan={5} style={{ textAlign: 'center', padding: '1.5rem', color: 'var(--text-dim)' }}>
+                          Directory is empty or inaccessible.
+                        </td>
+                      </tr>
+                    ) : files.map((f, i) => (
                       <tr key={i}>
                         <td style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                           {f.isDirectory ? <Folder size={16} color="#00f2fe" /> : <File size={16} color="#94a3b8" />}
@@ -1357,6 +1520,11 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
           {/* TAB 7: TASKS */}
           {activeTab === 'tasks' && (
             <div>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '0.85rem' }}>
+                <button className="btn-glass" onClick={loadTasks} disabled={loadingTasks}>
+                  <RefreshCw size={14} className={loadingTasks ? 'spin' : ''} /> {loadingTasks ? 'Loading...' : 'Refresh Tasks'}
+                </button>
+              </div>
               <div className="table-wrapper">
                 <table className="glass-table">
                   <thead>
@@ -1371,7 +1539,19 @@ export const BackgroundToolsModal: React.FC<BackgroundToolsModalProps> = ({
                     </tr>
                   </thead>
                   <tbody>
-                    {tasks.map((t, i) => (
+                    {loadingTasks && tasks.length === 0 ? (
+                      <tr>
+                        <td colSpan={7} style={{ textAlign: 'center', padding: '1.5rem', color: 'var(--text-dim)' }}>
+                          Querying scheduled tasks from {device.hostname}...
+                        </td>
+                      </tr>
+                    ) : tasks.length === 0 ? (
+                      <tr>
+                        <td colSpan={7} style={{ textAlign: 'center', padding: '1.5rem', color: 'var(--text-dim)' }}>
+                          No scheduled tasks returned by endpoint.
+                        </td>
+                      </tr>
+                    ) : tasks.map((t, i) => (
                       <tr key={i}>
                         <td><strong>{t.name}</strong></td>
                         <td>{t.path}</td>

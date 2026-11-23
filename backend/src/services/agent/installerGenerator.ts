@@ -3,18 +3,35 @@ import path from 'path';
 import crypto from 'crypto';
 import { db, DATA_DIR_PATH } from '../../db/index.js';
 import { CodeSigningService } from '../signing/index.js';
+import { safeOutboundFetch } from '../vault/index.js';
+import {
+  buildStampedWindowsPe,
+  resolveBrandingIconBuffer,
+  resolveWindowsTemplatePath,
+  type WindowsTemplateName
+} from './windowsPeBuilder.js';
+import {
+  getDefaultTrayMenuItems,
+  resolveEffectiveDevicePolicy,
+  resolvePolicyForInstallerScope,
+  type TrayMenuItem
+} from '../policy/index.js';
+import { buildLinuxCompanionPy, buildLinuxTrayPy } from './linuxAgentTemplates.js';
 
 export interface InstallerOptions {
   os: 'windows' | 'linux' | 'darwin' | 'macos';
   tenantId?: string;
+  siteId?: string;
+  deviceRole?: string;
   serverUrl?: string;
   vitrineServerUrl?: string;
   meshGroupId?: string;
   tokenId?: string;
-  mode?: 'permanent' | 'quicksupport';
+  mode?: 'permanent' | 'quicksupport' | 'companion_only';
   sessionCode?: string;
   meshServerId?: string;
   allowSelfSignedTls?: boolean;
+  targetDeviceId?: string;
 }
 
 export interface SigningStageReport {
@@ -53,6 +70,14 @@ function sanitizeIdentifier(raw: string | undefined, fallback: string, maxLen = 
   return cleaned || fallback;
 }
 
+function sanitizeSingleLine(raw: unknown, fallback = '', maxLen = 160): string {
+  const cleaned = String(raw ?? '')
+    .replace(/[\r\n\0]+/g, ' ')
+    .trim()
+    .slice(0, maxLen);
+  return cleaned || fallback;
+}
+
 function sanitizeHexColor(raw: string | undefined): string {
   const val = String(raw || '').trim();
   return /^#[0-9a-fA-F]{6}$/.test(val) ? val : '#00f2fe';
@@ -78,6 +103,443 @@ export class InstallerGeneratorService {
     this.signer = new CodeSigningService();
   }
 
+  public async getOrBuildSignedMeshBinary(
+    arch: 'x64' | 'arm64' | 'x86' = 'x64',
+    allowSelfSignedTls = false
+  ): Promise<{ buffer: Buffer; filename: string; sha256: string; signed: boolean }> {
+    const settings = (db.prepare('SELECT * FROM settings WHERE id = 1').get() || {}) as any;
+    const primaryRow = db
+      .prepare('SELECT url, allow_self_signed FROM mesh_servers ORDER BY is_primary DESC, created_at ASC LIMIT 1')
+      .get() as { url?: string; allow_self_signed?: number } | undefined;
+
+    const rawServerUrl = String(primaryRow?.url || settings.meshcentral_url || '').trim();
+    if (
+      !rawServerUrl ||
+      rawServerUrl === 'https://mesh.vitrine.local' ||
+      rawServerUrl === 'https://mesh.yourdomain.com'
+    ) {
+      throw new Error('Primary MeshCentral server URL is not configured.');
+    }
+
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(rawServerUrl);
+    } catch {
+      throw new Error('Configured MeshCentral server URL is invalid.');
+    }
+    if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+      throw new Error('MeshCentral server URL must use http:// or https://.');
+    }
+
+    const cleanHost = parsedUrl.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    const isLoopback = cleanHost === 'localhost' || cleanHost === '127.0.0.1' || cleanHost === '::1';
+    const allowInsecure = Boolean(
+      allowSelfSignedTls ||
+        primaryRow?.allow_self_signed ||
+        settings.meshcentral_allow_self_signed ||
+        process.env.MESHCENTRAL_ALLOW_SELF_SIGNED === 'true' ||
+        isLoopback
+    );
+
+    const agentMeta =
+      arch === 'arm64'
+        ? { agentId: 43, filename: 'MeshServiceARM64.exe' }
+        : arch === 'x86'
+          ? { agentId: 3, filename: 'MeshService32.exe' }
+          : { agentId: 4, filename: 'MeshService64.exe' };
+
+    const downloadUrl = `${parsedUrl.origin}/meshagents?id=${agentMeta.agentId}`;
+    const res = await safeOutboundFetch(downloadUrl, {
+      method: 'GET',
+      timeoutMs: 30000,
+      maxBytes: 32 * 1024 * 1024,
+      allowInsecureTls: allowInsecure,
+      safety: { allowLoopback: true, allowPrivateLan: true }
+    });
+
+    if (res.status < 200 || res.status >= 300 || !res.body || res.body.length < 1024) {
+      throw new Error(`Failed to fetch MeshCentral agent binary (${agentMeta.filename}, HTTP ${res.status}).`);
+    }
+    if (res.body[0] !== 0x4d || res.body[1] !== 0x5a) {
+      throw new Error(`Downloaded ${agentMeta.filename} is not a valid Windows PE executable.`);
+    }
+
+    const rawSha256 = crypto.createHash('sha256').update(res.body).digest('hex');
+    const sha16 = rawSha256.slice(0, 16);
+    const signingEnabled = Boolean(settings.code_signing_enabled && settings.code_signing_url);
+    const signMs2 = Boolean(settings.code_signing_sign_ms2_binary ?? 1);
+    const strictVerify = Boolean(settings.code_signing_enabled && (settings.code_signing_strict_verify ?? 1));
+
+    if (!signingEnabled || !signMs2) {
+      return { buffer: res.body, filename: agentMeta.filename, sha256: rawSha256, signed: false };
+    }
+
+    const signedCacheDir = path.join(DATA_DIR_PATH, 'signed-agents');
+    if (!fs.existsSync(signedCacheDir)) {
+      fs.mkdirSync(signedCacheDir, { recursive: true, mode: 0o700 });
+    }
+
+    const cachedSignedPath = path.join(signedCacheDir, `meshagent-${arch}-${sha16}.signed.exe`);
+    const cachedMetaPath = path.join(signedCacheDir, `meshagent-${arch}-${sha16}.signed.meta.json`);
+    const latestArchMetaPath = path.join(signedCacheDir, `meshagent-${arch}.signed.meta.json`);
+
+    if (fs.existsSync(cachedSignedPath) && fs.existsSync(cachedMetaPath)) {
+      try {
+        const meta = JSON.parse(fs.readFileSync(cachedMetaPath, 'utf8'));
+        if (
+          meta?.rawSha256 === rawSha256 &&
+          meta?.signed === true &&
+          meta?.signingEndpoint === settings.code_signing_url &&
+          fs.statSync(cachedSignedPath).size > 1024
+        ) {
+          const cachedBuf = fs.readFileSync(cachedSignedPath);
+          const cachedSha = crypto.createHash('sha256').update(cachedBuf).digest('hex');
+          return { buffer: cachedBuf, filename: agentMeta.filename, sha256: cachedSha, signed: true };
+        }
+      } catch {}
+    }
+
+    const rawStagePath = path.join(signedCacheDir, `meshagent-${arch}-${sha16}.exe`);
+    try {
+      fs.writeFileSync(rawStagePath, res.body, { mode: 0o600 });
+      const signRes = await this.signer.signFile(rawStagePath);
+      if (signRes.success && signRes.signedFilePath && fs.existsSync(signRes.signedFilePath)) {
+        const signedBuf = fs.readFileSync(signRes.signedFilePath);
+        const signedSha = crypto.createHash('sha256').update(signedBuf).digest('hex');
+        const metaPayload = JSON.stringify(
+          {
+            arch,
+            filename: agentMeta.filename,
+            cachedFile: path.basename(cachedSignedPath),
+            rawSha256,
+            sha256: signedSha,
+            signed: true,
+            endpointVerified: true,
+            signingEndpoint: settings.code_signing_url,
+            recordedAt: new Date().toISOString(),
+            disableUnsignedAutoUpdate: Boolean(strictVerify)
+          },
+          null,
+          2
+        );
+        fs.writeFileSync(cachedMetaPath, metaPayload, { mode: 0o600 });
+        fs.writeFileSync(latestArchMetaPath, metaPayload, { mode: 0o600 });
+        return { buffer: signedBuf, filename: agentMeta.filename, sha256: signedSha, signed: true };
+      }
+
+      if (strictVerify) {
+        throw new Error(
+          `Strict Authenticode signing failed for ${agentMeta.filename}: ${signRes.error || 'Unknown signing error'}`
+        );
+      }
+      return { buffer: res.body, filename: agentMeta.filename, sha256: rawSha256, signed: false };
+    } finally {
+      try {
+        if (fs.existsSync(rawStagePath)) fs.unlinkSync(rawStagePath);
+      } catch {}
+    }
+  }
+
+  private resolveInstallerContext(options: InstallerOptions) {
+    const settings = (db.prepare('SELECT * FROM settings WHERE id = 1').get() || {}) as any;
+
+    const tenantId = sanitizeIdentifier(options.tenantId, options.mode === 'quicksupport' ? 'quicksupport' : 'default', 64);
+    const siteId = options.siteId ? sanitizeIdentifier(options.siteId, '', 64) : undefined;
+    const rawDeviceRole = options.deviceRole ? sanitizeSingleLine(options.deviceRole, '', 64) : undefined;
+    const deviceRole =
+      rawDeviceRole && !['auto', 'auto-detect'].includes(rawDeviceRole.toLowerCase()) ? rawDeviceRole : undefined;
+    const tenantRow =
+      tenantId && tenantId !== 'quicksupport'
+        ? ((db.prepare('SELECT * FROM tenants WHERE id = ?').get(tenantId) || {}) as any)
+        : {};
+    const meshServerRow = options.meshServerId
+      ? ((db.prepare('SELECT * FROM mesh_servers WHERE id = ?').get(options.meshServerId) || {}) as any)
+      : ((db.prepare('SELECT * FROM mesh_servers ORDER BY is_primary DESC LIMIT 1').get() || {}) as any);
+
+    const isCompanionOnly = options.mode === 'companion_only';
+    const isQuickSupport = !isCompanionOnly && options.mode === 'quicksupport';
+
+    const effectivePolicy = resolvePolicyForInstallerScope({
+      mode: options.mode || 'permanent',
+      tenantId: tenantId === 'quicksupport' ? null : tenantId,
+      siteId: siteId || null,
+      deviceRole: deviceRole || null,
+      deviceId: options.targetDeviceId || null
+    });
+
+    const brandName = sanitizeSingleLine(settings.brand_name, 'Vitrine RMM', 64);
+    const primaryColor = sanitizeHexColor(settings.primary_color);
+
+    const meshServerUrl = sanitizeServerUrl(
+      meshServerRow?.url || settings.meshcentral_url || options.serverUrl,
+      'https://127.0.0.1:4430'
+    );
+    const customDomainUrl = settings.custom_domain
+      ? settings.custom_domain.startsWith('http')
+        ? settings.custom_domain
+        : `https://${settings.custom_domain}`
+      : undefined;
+    const vitrineServerUrl = sanitizeServerUrl(
+      options.vitrineServerUrl || options.serverUrl || customDomainUrl,
+      'http://127.0.0.1:8080'
+    );
+    const meshGroupId = String(options.meshGroupId || tenantRow?.mesh_group_id || '').replace(/[\r\n\0]/g, '').slice(0, 160);
+    const enrollmentToken = sanitizeIdentifier(options.tokenId, '', 96);
+
+    const resolvedTrayBrand = sanitizeSingleLine(effectivePolicy.trayBrandName || brandName, 'Vitrine RMM', 64);
+    const resolvedTrayIconUrl = sanitizeSingleLine(effectivePolicy.trayIconUrl || settings.brand_logo_url || '', '', 512);
+    const resolvedTrayTheme = effectivePolicy.trayThemeMode || 'system';
+    const resolvedTrayEnabled = effectivePolicy.trayEnabled !== false;
+    const resolvedTrayTooltip = sanitizeSingleLine(effectivePolicy.trayTooltip || '', '', 63);
+    const resolvedTraySupportUrl = sanitizeSingleLine(effectivePolicy.traySupportUrl || '', '', 256);
+    const resolvedTraySupportPhone = sanitizeSingleLine(effectivePolicy.traySupportPhone || '', '', 64);
+    const resolvedTraySupportEmail = sanitizeSingleLine(effectivePolicy.traySupportEmail || '', '', 128);
+    const resolvedMenuItems: TrayMenuItem[] = effectivePolicy.trayMenuItems || getDefaultTrayMenuItems();
+
+    const customSvc = settings.installer_service_name || resolvedTrayBrand.replace(/[^a-zA-Z0-9]/g, '') + 'Agent';
+    const serviceName = sanitizeIdentifier(customSvc, 'VitrineAgent', 40).replace(/\./g, '');
+    const welcomeText = sanitizeSingleLine(
+      settings.installer_welcome_text,
+      'Installing Enterprise IT Support & Endpoint Protection',
+      160
+    );
+    const guiStyle: 'modern_glass' | 'silent_headless' | 'native_ms2' =
+      settings.installer_gui_style === 'silent_headless' || settings.installer_gui_style === 'native_ms2'
+        ? settings.installer_gui_style
+        : 'modern_glass';
+    const sessionCode = sanitizeIdentifier(options.sessionCode, '', 24);
+
+    const maxSnoozeHours = Math.max(0, Math.min(168, Number(effectivePolicy.maxSnoozeHours ?? 8)));
+    const forceRebootEnabled = effectivePolicy.forceRebootAfterSnooze ? 1 : 0;
+    const finalCountdownSec = Math.max(30, Math.min(3600, Number(effectivePolicy.finalCountdownSec ?? 300)));
+    const telemetryIntervalSec = Math.max(10, Math.min(3600, Number(effectivePolicy.telemetryIntervalSec ?? 30)));
+    const lapsAutoCreate = effectivePolicy.lapsAutoCreateAccount !== false ? 1 : 0;
+    const lapsAccountName = sanitizeIdentifier(effectivePolicy.lapsAccountName, 'LocalAdmin', 20);
+    const strictVerify = Boolean(settings.code_signing_enabled && (settings.code_signing_strict_verify ?? 1));
+    const allowSelfSignedTls = Boolean(
+      options.allowSelfSignedTls ??
+        (meshServerRow?.allow_self_signed != null
+          ? Boolean(meshServerRow.allow_self_signed)
+          : settings.meshcentral_allow_self_signed != null
+            ? Boolean(settings.meshcentral_allow_self_signed)
+            : meshServerUrl.includes('127.0.0.1'))
+    );
+
+    return {
+      settings,
+      tenantId,
+      siteId,
+      deviceRole,
+      brandName,
+      primaryColor,
+      meshServerUrl,
+      vitrineServerUrl,
+      meshGroupId,
+      enrollmentToken,
+      serviceName,
+      welcomeText,
+      trayThemeMode: resolvedTrayTheme,
+      guiStyle,
+      isQuickSupport,
+      isCompanionOnly,
+      targetDeviceId: options.targetDeviceId,
+      sessionCode,
+      maxSnoozeHours,
+      forceRebootEnabled,
+      finalCountdownSec,
+      telemetryIntervalSec,
+      lapsAutoCreate,
+      lapsAccountName,
+      strictVerify,
+      allowSelfSignedTls,
+      resolvedTrayBrand,
+      resolvedTrayIconUrl,
+      resolvedTrayTheme,
+      resolvedTrayEnabled,
+      resolvedTrayTooltip,
+      resolvedTraySupportUrl,
+      resolvedTraySupportPhone,
+      resolvedTraySupportEmail,
+      resolvedMenuItems
+    };
+  }
+
+  private buildWindowsRuntimeSpec(ctx: ReturnType<InstallerGeneratorService['resolveInstallerContext']>): {
+    templateName: WindowsTemplateName;
+    outputFilename: string;
+    fileDescription: string;
+    configJson: Record<string, unknown>;
+    customIcon: Buffer | null;
+  } {
+    const safeBrand = sanitizeSingleLine(ctx.resolvedTrayBrand || ctx.brandName, 'Vitrine RMM', 64);
+    const safeWelcome = sanitizeSingleLine(
+      ctx.welcomeText,
+      'Installing Enterprise IT Support & Endpoint Protection',
+      160
+    );
+    const sleepSec = Math.max(10, Math.min(3600, Math.round(Number(ctx.telemetryIntervalSec || 30))));
+
+    const companionConfig = {
+      BrandName: safeBrand,
+      ServiceName: ctx.serviceName,
+      VitrineServerUrl: ctx.vitrineServerUrl,
+      MaxSnoozeHours: ctx.maxSnoozeHours,
+      ForceRebootEnabled: ctx.forceRebootEnabled === 1,
+      FinalCountdownSec: ctx.finalCountdownSec,
+      TelemetryIntervalSec: sleepSec,
+      AllowSelfSignedTls: Boolean(ctx.allowSelfSignedTls),
+      IconUrl: ctx.resolvedTrayIconUrl || '',
+      EmbeddedIconUrl: ctx.resolvedTrayIconUrl || '',
+      ThemeMode: ctx.resolvedTrayTheme || 'system',
+      TrayEnabled: ctx.resolvedTrayEnabled !== false,
+      Tooltip: ctx.resolvedTrayTooltip || '',
+      SupportUrl: ctx.resolvedTraySupportUrl || '',
+      SupportPhone: ctx.resolvedTraySupportPhone || '',
+      SupportEmail: ctx.resolvedTraySupportEmail || '',
+      MenuItems: ctx.resolvedMenuItems || getDefaultTrayMenuItems()
+    };
+
+    const templateName: WindowsTemplateName = ctx.isQuickSupport
+      ? 'vitrine-quicksupport-template.exe'
+      : ctx.isCompanionOnly
+        ? 'vitrine-companion-setup-template.exe'
+        : 'vitrine-installer-template.exe';
+
+    const prefix = ctx.isQuickSupport
+      ? `QuickSupport-${ctx.serviceName}`
+      : ctx.isCompanionOnly
+        ? `CompanionSetup-${ctx.serviceName}`
+        : `Install-${ctx.serviceName}`;
+
+    const fileDescription = ctx.isQuickSupport
+      ? `${safeBrand} QuickSupport On-Demand Launcher`
+      : ctx.isCompanionOnly
+        ? `${safeBrand} Companion Service Setup`
+        : `${safeBrand} Endpoint Agent Installer`;
+
+    return {
+      templateName,
+      outputFilename: `${prefix}.exe`,
+      fileDescription,
+      customIcon: resolveBrandingIconBuffer(ctx.resolvedTrayIconUrl),
+      configJson: {
+        brandName: safeBrand,
+        serviceName: ctx.serviceName,
+        welcomeText: safeWelcome,
+        meshServerUrl: ctx.meshServerUrl,
+        vitrineServerUrl: ctx.vitrineServerUrl,
+        meshGroupId: ctx.meshGroupId,
+        enrollmentToken: ctx.enrollmentToken,
+        sessionCode: ctx.sessionCode || '',
+        tenantId: ctx.tenantId,
+        targetDeviceId: ctx.targetDeviceId || '',
+        guiStyle: ctx.guiStyle,
+        trayThemeMode: ctx.resolvedTrayTheme,
+        isQuickSupport: ctx.isQuickSupport,
+        companionOnly: ctx.isCompanionOnly,
+        strictAuthenticodeVerify: ctx.strictVerify,
+        allowSelfSignedTls: ctx.allowSelfSignedTls,
+        lapsAutoCreate: ctx.lapsAutoCreate === 1,
+        lapsAccountName: ctx.lapsAccountName,
+        trayEnabled: ctx.resolvedTrayEnabled !== false,
+        companionConfig
+      }
+    };
+  }
+
+  public async getOrBuildSignedWindowsComponent(
+    component: 'companion' | 'tray',
+    opts?: { brandName?: string; iconUrl?: string }
+  ): Promise<{ buffer: Buffer; filename: string; sha256: string; signed: boolean }> {
+    const settings = (db.prepare('SELECT * FROM settings WHERE id = 1').get() || {}) as any;
+    const policy = (db.prepare("SELECT tray_brand_name, tray_icon_url FROM policies WHERE tier = 'global' LIMIT 1").get() || {}) as any;
+    const brandName = sanitizeSingleLine(opts?.brandName || policy.tray_brand_name || settings.brand_name, 'Vitrine RMM', 64);
+    const iconUrl = String(opts?.iconUrl || policy.tray_icon_url || settings.brand_logo_url || '').trim();
+    const customIcon = resolveBrandingIconBuffer(iconUrl);
+
+    const templateName: WindowsTemplateName =
+      component === 'tray' ? 'vitrine-tray-template.exe' : 'vitrine-companion-template.exe';
+    const targetFilename = component === 'tray' ? 'vitrine-tray.exe' : 'vitrine-companion.exe';
+    const fileDescription =
+      component === 'tray' ? `${brandName} Desktop Support Tray` : `${brandName} Background Companion Service`;
+
+    const stampedBuf = buildStampedWindowsPe(templateName, {
+      companyName: brandName,
+      productName: brandName,
+      fileDescription,
+      originalFilename: targetFilename,
+      internalName: targetFilename,
+      customIconBuffer: customIcon
+    });
+
+    const rawSha256 = crypto.createHash('sha256').update(stampedBuf).digest('hex');
+    const sha16 = rawSha256.slice(0, 16);
+    const signingEnabled = Boolean(settings.code_signing_enabled && settings.code_signing_url);
+    const signAgents = Boolean(settings.code_signing_sign_agents ?? 1);
+    const strictVerify = Boolean(settings.code_signing_enabled && (settings.code_signing_strict_verify ?? 1));
+
+    if (!signingEnabled || !signAgents) {
+      return { buffer: stampedBuf, filename: targetFilename, sha256: rawSha256, signed: false };
+    }
+
+    const signedCacheDir = path.join(DATA_DIR_PATH, 'signed-agents');
+    if (!fs.existsSync(signedCacheDir)) {
+      fs.mkdirSync(signedCacheDir, { recursive: true, mode: 0o700 });
+    }
+
+    const cachedSignedPath = path.join(signedCacheDir, `vitrine-${component}-${sha16}.signed.exe`);
+    const cachedMetaPath = path.join(signedCacheDir, `vitrine-${component}-${sha16}.signed.meta.json`);
+    if (fs.existsSync(cachedSignedPath) && fs.existsSync(cachedMetaPath)) {
+      try {
+        const meta = JSON.parse(fs.readFileSync(cachedMetaPath, 'utf8'));
+        if (
+          meta?.rawSha256 === rawSha256 &&
+          meta?.signed === true &&
+          meta?.signingEndpoint === settings.code_signing_url &&
+          fs.statSync(cachedSignedPath).size > 1024
+        ) {
+          const cachedBuf = fs.readFileSync(cachedSignedPath);
+          const cachedSha = crypto.createHash('sha256').update(cachedBuf).digest('hex');
+          return { buffer: cachedBuf, filename: targetFilename, sha256: cachedSha, signed: true };
+        }
+      } catch {}
+    }
+
+    const rawStagePath = path.join(signedCacheDir, `vitrine-${component}-${sha16}.exe`);
+    try {
+      fs.writeFileSync(rawStagePath, stampedBuf, { mode: 0o600 });
+      const signRes = await this.signer.signFile(rawStagePath);
+      if (signRes.success && signRes.signedFilePath && fs.existsSync(signRes.signedFilePath)) {
+        const signedBuf = fs.readFileSync(signRes.signedFilePath);
+        const signedSha = crypto.createHash('sha256').update(signedBuf).digest('hex');
+        const metaPayload = JSON.stringify(
+          {
+            component,
+            filename: targetFilename,
+            cachedFile: path.basename(cachedSignedPath),
+            rawSha256,
+            sha256: signedSha,
+            signed: true,
+            signingEndpoint: settings.code_signing_url,
+            recordedAt: new Date().toISOString()
+          },
+          null,
+          2
+        );
+        fs.writeFileSync(cachedMetaPath, metaPayload, { mode: 0o600 });
+        return { buffer: signedBuf, filename: targetFilename, sha256: signedSha, signed: true };
+      }
+      if (strictVerify) {
+        throw new Error(`Strict Authenticode signing failed for ${targetFilename}: ${signRes.error || 'Unknown signing error'}`);
+      }
+      return { buffer: stampedBuf, filename: targetFilename, sha256: rawSha256, signed: false };
+    } finally {
+      try {
+        if (fs.existsSync(rawStagePath)) fs.unlinkSync(rawStagePath);
+      } catch {}
+    }
+  }
+
   public async runSigningPipeline(options: InstallerOptions): Promise<{
     allSigned: boolean;
     signed?: boolean;
@@ -85,10 +547,10 @@ export class InstallerGeneratorService {
     strictVerified: boolean;
     stages: SigningStageReport[];
   }> {
-    const settings = (db.prepare('SELECT * FROM settings WHERE id = 1').get() || {}) as any;
+    const ctx = this.resolveInstallerContext(options);
+    const settings = ctx.settings;
     const signingEnabled = Boolean(settings.code_signing_enabled && settings.code_signing_url);
     const signMs2 = Boolean(settings.code_signing_sign_ms2_binary ?? 1);
-    const signScripts = Boolean(settings.code_signing_sign_scripts ?? 1);
     const signAgents = Boolean(settings.code_signing_sign_agents ?? 1);
     const strictVerify = Boolean(settings.code_signing_strict_verify ?? 1);
 
@@ -97,109 +559,203 @@ export class InstallerGeneratorService {
       fs.mkdirSync(signedCacheDir, { recursive: true, mode: 0o700 });
     }
 
-    let endpointReachable = false;
+    let endpointReady = false;
     let probeLatency = 0;
+    let probeError = '';
     if (signingEnabled) {
       const probe = await this.signer.testConnection(settings.code_signing_url);
-      endpointReachable = probe.reachable;
+      endpointReady = Boolean(probe.reachable && probe.authenticated !== false);
       probeLatency = probe.latencyMs;
+      probeError = probe.error || '';
     }
 
     const stages: SigningStageReport[] = [];
-
-    // Stage 1: Native MeshCentral 2 Core Agent Binary
-    const stage1Start = Date.now();
     const safeOs =
       options.os === 'linux' ? 'linux' : options.os === 'darwin' || options.os === 'macos' ? 'macos' : 'windows';
-    const ms2Hash = crypto
-      .createHash('sha256')
-      .update(`meshagent:${safeOs}:${options.meshServerId || 'ms2-primary'}:${settings.installed_version || '2.6.1'}`)
-      .digest('hex');
 
-    const signedMarkerPath = path.join(signedCacheDir, `meshagent-${safeOs}.signed.meta.json`);
-    fs.writeFileSync(
-      signedMarkerPath,
-      JSON.stringify(
-        {
-          os: safeOs,
-          sha256: ms2Hash,
-          signed: false,
-          endpointVerified: Boolean(signingEnabled && signMs2 && endpointReachable),
-          recordedAt: new Date().toISOString(),
-          signingEndpoint: signingEnabled ? settings.code_signing_url : null,
-          disableUnsignedAutoUpdate: Boolean(signingEnabled && strictVerify)
-        },
-        null,
-        2
-      ),
-      { mode: 0o600 }
-    );
-
-    // `runSigningPipeline` only probes endpoint connectivity; stages are marked `'verified'`
-    // until `this.signer.signFile(...)` cryptographically signs actual bytes.
     const resolveStatus = (stageFlag: boolean): SigningStageReport['status'] => {
       if (!signingEnabled || !stageFlag) return 'bypassed';
-      return endpointReachable ? 'verified' : 'unreachable';
+      return endpointReady ? 'verified' : 'unreachable';
     };
 
     const resolveAuthority = (stageFlag: boolean): string => {
       if (!signingEnabled || !stageFlag) return 'Unsigned (Signing Disabled in Settings)';
-      return endpointReachable
-        ? `Signing Endpoint Verified (${settings.code_signing_url})`
+      if (endpointReady) return `Signing Endpoint Verified (${settings.code_signing_url})`;
+      return probeError
+        ? `Signing API Unreachable (${probeError})`
         : `Signing API Unreachable (${settings.code_signing_url})`;
     };
 
+    // Stage 1: Native MeshCentral 2 Core Agent Binary
+    const stage1Start = Date.now();
+    let stage1Status: SigningStageReport['status'] = resolveStatus(signMs2);
+    let stage1Authority = resolveAuthority(signMs2);
+    let stage1Sha256 = '';
+    if (safeOs === 'windows') {
+      const cachedMetaPath = path.join(signedCacheDir, 'meshagent-x64.signed.meta.json');
+      if (fs.existsSync(cachedMetaPath)) {
+        try {
+          const cachedMeta = JSON.parse(fs.readFileSync(cachedMetaPath, 'utf8'));
+          const cachedExe = cachedMeta?.cachedFile ? path.join(signedCacheDir, path.basename(cachedMeta.cachedFile)) : '';
+          if (
+            cachedMeta?.signed === true &&
+            cachedExe &&
+            fs.existsSync(cachedExe) &&
+            (!signingEnabled || cachedMeta?.signingEndpoint === settings.code_signing_url)
+          ) {
+            stage1Sha256 = crypto.createHash('sha256').update(fs.readFileSync(cachedExe)).digest('hex');
+            if (signingEnabled && signMs2) {
+              stage1Status = 'signed';
+              stage1Authority = `Authenticode + RFC 3161 (${settings.code_signing_url})`;
+            }
+          }
+        } catch {}
+      }
+    }
+
     stages.push({
       stepNumber: 1,
-      component: `MeshCentral 2 Core Agent (${safeOs === 'windows' ? 'meshagent64.exe' : 'meshagent'})`,
+      component: `MeshCentral 2 Core Agent (${safeOs === 'windows' ? 'MeshService64.exe' : 'meshagent'})`,
       description: 'Authenticode PE header verification & signed-agents/ update cache lock',
-      status: resolveStatus(signMs2),
-      sha256: ms2Hash,
-      timestampAuthority: resolveAuthority(signMs2),
+      status: stage1Status,
+      sha256: stage1Sha256,
+      timestampAuthority: stage1Authority,
       durationMs: Math.max(1, probeLatency || Date.now() - stage1Start)
     });
 
-    // Stage 2: Vitrine End-User Companion & Self-Elevation Helper
+    // Stage 2 & Stage 3: Component & Outer Package Verification / Digest
     const stage2Start = Date.now();
-    const companionHash = crypto
-      .createHash('sha256')
-      .update(`vitrine-companion:${safeOs}:${sanitizeIdentifier(options.tenantId, 'default')}`)
-      .digest('hex');
+    let companionHash = '';
+    let companionStatus: SigningStageReport['status'] = resolveStatus(signAgents);
+    let companionAuthority = resolveAuthority(signAgents);
+    let installerHash = '';
+
+    if (safeOs === 'windows') {
+      if (signingEnabled && signAgents && endpointReady) {
+        try {
+          const comp = await this.getOrBuildSignedWindowsComponent('companion', {
+            brandName: ctx.resolvedTrayBrand,
+            iconUrl: ctx.resolvedTrayIconUrl
+          });
+          await this.getOrBuildSignedWindowsComponent('tray', {
+            brandName: ctx.resolvedTrayBrand,
+            iconUrl: ctx.resolvedTrayIconUrl
+          });
+          companionHash = comp.sha256;
+          if (comp.signed) {
+            companionStatus = 'signed';
+            companionAuthority = `Authenticode + RFC 3161 (${settings.code_signing_url})`;
+          }
+        } catch {
+          companionHash = crypto
+            .createHash('sha256')
+            .update(fs.readFileSync(resolveWindowsTemplatePath('vitrine-companion-template.exe')))
+            .digest('hex');
+        }
+      } else {
+        try {
+          companionHash = crypto
+            .createHash('sha256')
+            .update(fs.readFileSync(resolveWindowsTemplatePath('vitrine-companion-template.exe')))
+            .digest('hex');
+        } catch {}
+      }
+
+      const spec = this.buildWindowsRuntimeSpec(ctx);
+      const previewPe = buildStampedWindowsPe(spec.templateName, {
+        companyName: ctx.resolvedTrayBrand || ctx.brandName,
+        productName: ctx.resolvedTrayBrand || ctx.brandName,
+        fileDescription: spec.fileDescription,
+        originalFilename: spec.outputFilename,
+        internalName: spec.outputFilename,
+        configJson: spec.configJson,
+        customIconBuffer: spec.customIcon
+      });
+      installerHash = crypto.createHash('sha256').update(previewPe).digest('hex');
+    } else if (safeOs === 'linux') {
+      const linuxSrc = this.generateLinuxInstaller({
+        brandName: ctx.resolvedTrayBrand || ctx.brandName,
+        primaryColor: ctx.primaryColor,
+        meshServerUrl: ctx.meshServerUrl,
+        vitrineServerUrl: ctx.vitrineServerUrl,
+        meshGroupId: ctx.meshGroupId,
+        enrollmentToken: ctx.enrollmentToken,
+        tenantId: ctx.tenantId,
+        serviceName: ctx.serviceName.toLowerCase(),
+        trayThemeMode: ctx.resolvedTrayTheme,
+        trayEnabled: ctx.resolvedTrayEnabled,
+        trayTooltip: ctx.resolvedTrayTooltip,
+        trayIconUrl: ctx.resolvedTrayIconUrl,
+        traySupportUrl: ctx.resolvedTraySupportUrl,
+        traySupportPhone: ctx.resolvedTraySupportPhone,
+        traySupportEmail: ctx.resolvedTraySupportEmail,
+        trayMenuItems: ctx.resolvedMenuItems,
+        isQuickSupport: ctx.isQuickSupport,
+        sessionCode: ctx.sessionCode,
+        lapsAutoCreate: ctx.lapsAutoCreate,
+        lapsAccountName: ctx.lapsAccountName,
+        allowSelfSignedTls: ctx.allowSelfSignedTls,
+        telemetryIntervalSec: ctx.telemetryIntervalSec
+      });
+      companionHash = crypto.createHash('sha256').update(linuxSrc, 'utf8').digest('hex');
+      installerHash = companionHash;
+    } else {
+      const macSrc = this.generateMacInstaller({
+        brandName: ctx.brandName,
+        primaryColor: ctx.primaryColor,
+        meshServerUrl: ctx.meshServerUrl,
+        vitrineServerUrl: ctx.vitrineServerUrl,
+        meshGroupId: ctx.meshGroupId,
+        enrollmentToken: ctx.enrollmentToken,
+        tenantId: ctx.tenantId,
+        serviceName: ctx.serviceName,
+        trayThemeMode: ctx.trayThemeMode,
+        isQuickSupport: ctx.isQuickSupport,
+        lapsAutoCreate: ctx.lapsAutoCreate,
+        lapsAccountName: ctx.lapsAccountName,
+        allowSelfSignedTls: ctx.allowSelfSignedTls,
+        telemetryIntervalSec: ctx.telemetryIntervalSec
+      });
+      companionHash = crypto.createHash('sha256').update(macSrc, 'utf8').digest('hex');
+      installerHash = companionHash;
+    }
 
     stages.push({
       stepNumber: 2,
-      component: 'Vitrine Desktop Companion & Telemetry Agent',
-      description: 'System Tray HUD, Check-in Task Runner, Reboot Countdown & LAPS/Elevation RPC module',
-      status: resolveStatus(signScripts),
+      component:
+        safeOs === 'windows'
+          ? 'Vitrine Desktop Companion & Tray Executables (vitrine-companion.exe / vitrine-tray.exe)'
+          : 'Vitrine Desktop Companion & Telemetry Agent',
+      description: 'Native Windows Service, Tray HUD, Check-in Task Runner & LAPS module',
+      status: companionStatus,
       sha256: companionHash,
-      timestampAuthority: resolveAuthority(signScripts),
+      timestampAuthority: companionAuthority,
       durationMs: Math.max(1, Date.now() - stage2Start)
     });
 
-    // Stage 3: Modern Glassmorphic GUI Bootstrapper Package
     const stage3Start = Date.now();
-    const guiHash = crypto
-      .createHash('sha256')
-      .update(`vitrine-gui-installer:${safeOs}:${options.mode || 'permanent'}`)
-      .digest('hex');
-
     stages.push({
       stepNumber: 3,
       component:
         options.mode === 'quicksupport'
-          ? 'Vitrine QuickSupport On-Demand Launcher (Standard User)'
-          : 'Vitrine Modern GUI Installer (PE Manifest + SmartScreen Metadata)',
-      description: 'Outer installer package with clean PE VersionInfo headers & digital signature check',
+          ? 'Vitrine QuickSupport On-Demand Launcher (.exe, asInvoker)'
+          : options.mode === 'companion_only'
+            ? 'Vitrine Companion Setup Executable (.exe, requireAdministrator)'
+            : 'Vitrine Modern GUI Installer (.exe, requireAdministrator)',
+      description: 'Native Win32 PE32+ executable with VS_VERSION_INFO, Manifest, Brand Icon & digital signature',
       status: resolveStatus(signAgents),
-      sha256: guiHash,
+      sha256: installerHash,
       timestampAuthority: resolveAuthority(signAgents),
       durationMs: Math.max(1, Date.now() - stage3Start)
     });
 
+    const hasSignedOrVerified = stages.some((s) => s.status === 'signed' || s.status === 'verified');
     return {
-      allSigned: false,
-      signed: false,
-      endpointVerified: Boolean(signingEnabled && endpointReachable),
+      allSigned:
+        hasSignedOrVerified &&
+        stages.every((s) => s.status === 'signed' || s.status === 'verified' || s.status === 'bypassed'),
+      signed: hasSignedOrVerified,
+      endpointVerified: Boolean(signingEnabled && endpointReady),
       strictVerified: strictVerify,
       stages
     };
@@ -217,84 +773,20 @@ export class InstallerGeneratorService {
       stages: SigningStageReport[];
     };
   }> {
-    const settings = (db.prepare('SELECT * FROM settings WHERE id = 1').get() || {}) as any;
-    const policy = (db.prepare("SELECT * FROM policies WHERE tier = 'global' LIMIT 1").get() || {}) as any;
-
-    const tenantId = sanitizeIdentifier(options.tenantId, 'default', 64);
-    const tenantRow = (db.prepare('SELECT * FROM tenants WHERE id = ?').get(tenantId) || {}) as any;
-    const meshServerRow = options.meshServerId
-      ? ((db.prepare('SELECT * FROM mesh_servers WHERE id = ?').get(options.meshServerId) || {}) as any)
-      : ((db.prepare('SELECT * FROM mesh_servers ORDER BY is_primary DESC LIMIT 1').get() || {}) as any);
-
-    const brandName = String(settings.brand_name || 'Vitrine RMM').slice(0, 64);
-    const primaryColor = sanitizeHexColor(settings.primary_color);
-
-    const meshServerUrl = sanitizeServerUrl(
-      meshServerRow?.url || settings.meshcentral_url || options.serverUrl,
-      'https://127.0.0.1:4430'
-    );
-    const customDomainUrl = settings.custom_domain
-      ? settings.custom_domain.startsWith('http')
-        ? settings.custom_domain
-        : `https://${settings.custom_domain}`
-      : undefined;
-    const vitrineServerUrl = sanitizeServerUrl(
-      options.vitrineServerUrl || options.serverUrl || customDomainUrl,
-      'http://127.0.0.1:3001'
-    );
-    const meshGroupId = String(options.meshGroupId || tenantRow?.mesh_group_id || '').replace(/[\r\n]/g, '').slice(0, 160);
-    const enrollmentToken = sanitizeIdentifier(options.tokenId, '', 96);
-
-    const customSvc = settings.installer_service_name || brandName.replace(/[^a-zA-Z0-9]/g, '') + 'Agent';
-    const serviceName = sanitizeIdentifier(customSvc, 'VitrineAgent', 40).replace(/\./g, '');
-    const welcomeText = String(
-      settings.installer_welcome_text || 'Installing Enterprise IT Support & Endpoint Protection'
-    ).slice(0, 160);
-    const trayThemeMode: 'system' | 'dark' | 'light' =
-      settings.tray_theme_mode === 'light' || settings.tray_theme_mode === 'dark'
-        ? settings.tray_theme_mode
-        : settings.theme_mode === 'light' || settings.theme_mode === 'dark'
-        ? settings.theme_mode
-        : 'system';
-    const guiStyle: 'modern_glass' | 'silent_headless' | 'native_ms2' =
-      settings.installer_gui_style === 'silent_headless' || settings.installer_gui_style === 'native_ms2'
-        ? settings.installer_gui_style
-        : 'modern_glass';
-    const isQuickSupport = options.mode === 'quicksupport';
-    const sessionCode = sanitizeIdentifier(options.sessionCode, '', 24);
-
-    const maxSnoozeHours = Math.max(0, Math.min(168, Number(policy.max_snooze_hours ?? 8)));
-    const forceRebootEnabled = policy.force_reboot_after_snooze != null ? Number(policy.force_reboot_after_snooze) : 1;
-    const finalCountdownSec = Math.max(30, Math.min(3600, Number(policy.final_countdown_sec ?? 300)));
-    const lapsAutoCreate = policy.laps_auto_create_account != null ? Number(policy.laps_auto_create_account) : 1;
-    const lapsAccountName = sanitizeIdentifier(policy.laps_account_name, 'LocalAdmin', 20);
-    const strictVerify = Boolean(settings.code_signing_enabled && settings.code_signing_strict_verify);
-    const allowSelfSignedTls = Boolean(options.allowSelfSignedTls ?? meshServerUrl.includes('127.0.0.1') ?? false);
-
+    const ctx = this.resolveInstallerContext(options);
+    const settings = ctx.settings;
     const signingPipeline = await this.runSigningPipeline(options);
 
     if (options.os === 'windows') {
-      let script = this.generateWindowsPowerShellInstaller({
-        brandName,
-        primaryColor,
-        meshServerUrl,
-        vitrineServerUrl,
-        meshGroupId,
-        enrollmentToken,
-        tenantId,
-        serviceName,
-        welcomeText,
-        trayThemeMode,
-        guiStyle,
-        isQuickSupport,
-        sessionCode,
-        maxSnoozeHours,
-        forceRebootEnabled,
-        finalCountdownSec,
-        lapsAutoCreate,
-        lapsAccountName,
-        strictAuthenticodeVerify: strictVerify,
-        allowSelfSignedTls
+      const spec = this.buildWindowsRuntimeSpec(ctx);
+      let finalPe: Buffer = buildStampedWindowsPe(spec.templateName, {
+        companyName: ctx.resolvedTrayBrand || ctx.brandName,
+        productName: ctx.resolvedTrayBrand || ctx.brandName,
+        fileDescription: spec.fileDescription,
+        originalFilename: spec.outputFilename,
+        internalName: spec.outputFilename,
+        configJson: spec.configJson,
+        customIconBuffer: spec.customIcon
       });
 
       if (settings.code_signing_enabled && settings.code_signing_sign_agents && settings.code_signing_url) {
@@ -302,37 +794,36 @@ export class InstallerGeneratorService {
         if (!fs.existsSync(stagingDir)) {
           fs.mkdirSync(stagingDir, { recursive: true, mode: 0o700 });
         }
-        const tmpFile = path.join(stagingDir, `vitrine-inst-${crypto.randomUUID()}.ps1`);
+        const tmpExe = path.join(stagingDir, `vitrine-inst-${crypto.randomUUID()}.exe`);
         let signedPathToClean: string | undefined;
         try {
-          fs.writeFileSync(tmpFile, script, { encoding: 'utf8', mode: 0o600 });
-          const signRes = await this.signer.signFile(tmpFile);
+          fs.writeFileSync(tmpExe, finalPe, { mode: 0o600 });
+          const signRes = await this.signer.signFile(tmpExe);
           signedPathToClean = signRes.signedFilePath;
           if (signRes.success && signRes.signedFilePath && fs.existsSync(signRes.signedFilePath)) {
-            script = fs.readFileSync(signRes.signedFilePath, 'utf8');
-            const signedSha = crypto.createHash('sha256').update(script, 'utf8').digest('hex');
+            finalPe = fs.readFileSync(signRes.signedFilePath);
+            const signedSha = crypto.createHash('sha256').update(finalPe).digest('hex');
             signingPipeline.signed = true;
-            for (const stg of signingPipeline.stages) {
-              if (stg.stepNumber === 3 || stg.stepNumber === 2) {
-                if (stg.status !== 'bypassed') {
-                  stg.status = 'signed';
-                  stg.sha256 = signedSha;
-                  stg.timestampAuthority = `Authenticode + RFC 3161 (${settings.code_signing_url})`;
-                  if (signRes.durationMs) stg.durationMs = signRes.durationMs;
-                }
-              }
+            const stg3 = signingPipeline.stages.find((s) => s.stepNumber === 3);
+            if (stg3 && stg3.status !== 'bypassed') {
+              stg3.status = 'signed';
+              stg3.sha256 = signedSha;
+              stg3.timestampAuthority = `Authenticode + RFC 3161 (${settings.code_signing_url})`;
+              if (signRes.durationMs) stg3.durationMs = signRes.durationMs;
             }
-            signingPipeline.allSigned = signingPipeline.stages.every(
-              (s) => s.status === 'signed' || s.status === 'bypassed'
-            );
-          } else if (strictVerify) {
+            signingPipeline.allSigned =
+              signingPipeline.stages.some((s) => s.status === 'signed' || s.status === 'verified') &&
+              signingPipeline.stages.every(
+                (s) => s.status === 'signed' || s.status === 'verified' || s.status === 'bypassed'
+              );
+          } else if (ctx.strictVerify) {
             throw new Error(
               `Strict code signing is enforced, and signing server failed: ${signRes.error || 'Unknown error'}`
             );
           }
         } finally {
           try {
-            if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
+            if (fs.existsSync(tmpExe)) fs.unlinkSync(tmpExe);
           } catch {}
           try {
             if (signedPathToClean && fs.existsSync(signedPathToClean)) fs.unlinkSync(signedPathToClean);
@@ -340,59 +831,68 @@ export class InstallerGeneratorService {
         }
       }
 
-      const prefix = isQuickSupport ? `QuickSupport-${serviceName}` : `Install-${serviceName}`;
       return {
-        filename: `${prefix}.ps1`,
-        contentType: 'text/plain; charset=utf-8',
-        content: script,
+        filename: spec.outputFilename,
+        contentType: 'application/vnd.microsoft.portable-executable',
+        content: finalPe,
         signingPipeline
       };
     } else if (options.os === 'linux') {
       const script = this.generateLinuxInstaller({
-        brandName,
-        primaryColor,
-        meshServerUrl,
-        vitrineServerUrl,
-        meshGroupId,
-        enrollmentToken,
-        tenantId,
-        serviceName: serviceName.toLowerCase(),
-        trayThemeMode,
-        isQuickSupport,
-        lapsAutoCreate,
-        lapsAccountName,
-        allowSelfSignedTls
+        brandName: ctx.resolvedTrayBrand || ctx.brandName,
+        primaryColor: ctx.primaryColor,
+        meshServerUrl: ctx.meshServerUrl,
+        vitrineServerUrl: ctx.vitrineServerUrl,
+        meshGroupId: ctx.meshGroupId,
+        enrollmentToken: ctx.enrollmentToken,
+        tenantId: ctx.tenantId,
+        serviceName: ctx.serviceName.toLowerCase(),
+        trayThemeMode: ctx.resolvedTrayTheme,
+        trayEnabled: ctx.resolvedTrayEnabled,
+        trayTooltip: ctx.resolvedTrayTooltip,
+        trayIconUrl: ctx.resolvedTrayIconUrl,
+        traySupportUrl: ctx.resolvedTraySupportUrl,
+        traySupportPhone: ctx.resolvedTraySupportPhone,
+        traySupportEmail: ctx.resolvedTraySupportEmail,
+        trayMenuItems: ctx.resolvedMenuItems,
+        isQuickSupport: ctx.isQuickSupport,
+        sessionCode: ctx.sessionCode,
+        lapsAutoCreate: ctx.lapsAutoCreate,
+        lapsAccountName: ctx.lapsAccountName,
+        allowSelfSignedTls: ctx.allowSelfSignedTls,
+        telemetryIntervalSec: ctx.telemetryIntervalSec
       });
 
       return {
-        filename: isQuickSupport
-          ? `quicksupport-${serviceName.toLowerCase()}.sh`
-          : `install-${serviceName.toLowerCase()}.sh`,
+        filename: ctx.isQuickSupport
+          ? `quicksupport-${ctx.serviceName.toLowerCase()}.sh`
+          : `install-${ctx.serviceName.toLowerCase()}.sh`,
         contentType: 'text/x-shellscript; charset=utf-8',
         content: script,
         signingPipeline
       };
     } else {
       const script = this.generateMacInstaller({
-        brandName,
-        primaryColor,
-        meshServerUrl,
-        vitrineServerUrl,
-        meshGroupId,
-        enrollmentToken,
-        tenantId,
-        serviceName,
-        trayThemeMode,
-        isQuickSupport,
-        lapsAutoCreate,
-        lapsAccountName,
-        allowSelfSignedTls
+        brandName: ctx.brandName,
+        primaryColor: ctx.primaryColor,
+        meshServerUrl: ctx.meshServerUrl,
+        vitrineServerUrl: ctx.vitrineServerUrl,
+        meshGroupId: ctx.meshGroupId,
+        enrollmentToken: ctx.enrollmentToken,
+        tenantId: ctx.tenantId,
+        serviceName: ctx.serviceName,
+        trayThemeMode: ctx.trayThemeMode,
+        isQuickSupport: ctx.isQuickSupport,
+        lapsAutoCreate: ctx.lapsAutoCreate,
+        lapsAccountName: ctx.lapsAccountName,
+        allowSelfSignedTls: ctx.allowSelfSignedTls,
+        telemetryIntervalSec: ctx.telemetryIntervalSec
       });
 
       return {
-        filename: isQuickSupport
-          ? `quicksupport-${serviceName.toLowerCase()}-mac.sh`
-          : `install-${serviceName.toLowerCase()}-mac.sh`,
+        filename: ctx.isQuickSupport
+          ? `quicksupport-${ctx.serviceName.toLowerCase()}-mac.sh`
+          : `install-${ctx.serviceName.toLowerCase()}-mac.sh`,
         contentType: 'text/x-shellscript; charset=utf-8',
         content: script,
         signingPipeline
@@ -400,405 +900,103 @@ export class InstallerGeneratorService {
     }
   }
 
-  private generateWindowsPowerShellInstaller(vars: {
-    brandName: string;
-    primaryColor: string;
-    meshServerUrl: string;
-    vitrineServerUrl: string;
-    meshGroupId: string;
-    enrollmentToken: string;
+  public async generateCompanionOnlyBootstrap(options: {
+    os: 'windows' | 'linux' | 'macos';
+    deviceId: string;
     tenantId: string;
-    serviceName: string;
-    welcomeText: string;
-    trayThemeMode: 'system' | 'dark' | 'light';
-    guiStyle: 'modern_glass' | 'silent_headless' | 'native_ms2';
-    isQuickSupport: boolean;
-    sessionCode?: string;
-    maxSnoozeHours: number;
-    forceRebootEnabled: number;
-    finalCountdownSec: number;
-    lapsAutoCreate: number;
-    lapsAccountName: string;
-    strictAuthenticodeVerify: boolean;
-    allowSelfSignedTls: boolean;
-  }): string {
-    const reqAdminLine = vars.isQuickSupport
-      ? '# Mode: QuickSupport On-Demand (Standard User Launch Supported; Tech Remote Self-Elevation Ready)'
-      : '#Requires -RunAsAdministrator';
+    enrollmentToken: string;
+    vitrineServerUrl: string;
+    allowSelfSignedTls?: boolean;
+  }): Promise<string> {
+    const settings = (db.prepare('SELECT * FROM settings WHERE id = 1').get() || {}) as any;
+    let eff: ReturnType<typeof resolveEffectiveDevicePolicy> | null = null;
+    try {
+      eff = resolveEffectiveDevicePolicy(options.deviceId);
+    } catch {
+      eff = null;
+    }
 
-    const safeCommentBrand = vars.brandName.replace(/[\r\n#]/g, '');
+    const brandName = sanitizeSingleLine(eff?.trayBrandName || settings.brand_name, 'Vitrine RMM', 64);
+    const customSvc = settings.installer_service_name || brandName.replace(/[^a-zA-Z0-9]/g, '') + 'Agent';
+    const serviceName = sanitizeIdentifier(customSvc, 'VitrineAgent', 40).replace(/\./g, '');
+    const vitrineServerUrl = sanitizeServerUrl(options.vitrineServerUrl, 'http://127.0.0.1:8080');
+    const enrollmentToken = sanitizeIdentifier(options.enrollmentToken, '', 96);
+    const tenantId = sanitizeIdentifier(options.tenantId, 'default', 64);
+    const allowSelfSignedTls = Boolean(options.allowSelfSignedTls);
 
-    const lines = [
-      '# ==============================================================================',
-      `# ${safeCommentBrand} - Modern Endpoint Installer & Companion Suite`,
-      '# Architecture: Windows 10 / 11 / Server 2016-2025 (x64 / ARM64)',
-      '# ==============================================================================',
-      reqAdminLine,
-      'param([switch]$Silent = $false)',
-      '$ErrorActionPreference = "Stop"',
-      '[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13',
-      '',
-      `$BrandName = ${quotePowerShellLiteral(vars.brandName)}`,
-      `$ServiceName = ${quotePowerShellLiteral(vars.serviceName)}`,
-      `$MeshServerUrl = ${quotePowerShellLiteral(vars.meshServerUrl)}`,
-      `$VitrineServerUrl = ${quotePowerShellLiteral(vars.vitrineServerUrl)}`,
-      `$MeshGroupId = ${quotePowerShellLiteral(vars.meshGroupId)}`,
-      `$EnrollmentToken = ${quotePowerShellLiteral(vars.enrollmentToken)}`,
-      `$TenantId = ${quotePowerShellLiteral(vars.tenantId)}`,
-      `$WelcomeText = ${quotePowerShellLiteral(vars.welcomeText)}`,
-      `$ConfiguredThemeMode = ${quotePowerShellLiteral(vars.trayThemeMode)}`,
-      `$GuiStyle = ${quotePowerShellLiteral(vars.guiStyle)}`,
-      `$IsQuickSupport = ${vars.isQuickSupport ? '$true' : '$false'}`,
-      `$SessionCode = ${quotePowerShellLiteral(vars.sessionCode || '')}`,
-      `$StrictSignatureVerify = ${vars.strictAuthenticodeVerify ? '$true' : '$false'}`,
-      `$AllowSelfSignedTls = ${vars.allowSelfSignedTls ? '$true' : '$false'}`,
-      '$InstallDir = if ($IsQuickSupport) { Join-Path $env:LocalAppData "$ServiceName-QuickSupport" } else { Join-Path $env:ProgramFiles $ServiceName }',
-      `$AccentColor = ${quotePowerShellLiteral(vars.primaryColor)}`,
-      `$MaxSnoozeHours = ${vars.maxSnoozeHours}`,
-      `$ForceRebootEnabled = ${vars.forceRebootEnabled === 1 ? '$true' : '$false'}`,
-      `$FinalCountdownSec = ${vars.finalCountdownSec}`,
-      `$LapsAutoCreate = ${vars.lapsAutoCreate === 1 ? '$true' : '$false'}`,
-      `$LapsAccountName = ${quotePowerShellLiteral(vars.lapsAccountName)}`,
-      '',
-      'if ($AllowSelfSignedTls) {',
-      '    try {',
-      '        if (-not ("TrustLocalDevCertsPolicy" -as [type])) {',
-      '            Add-Type @"',
-      'using System.Net;',
-      'using System.Security.Cryptography.X509Certificates;',
-      'public class TrustLocalDevCertsPolicy : ICertificatePolicy {',
-      '    public bool CheckValidationResult(ServicePoint srvPoint, X509Certificate certificate, WebRequest request, int certificateProblem) { return true; }',
-      '}',
-      '"@',
-      '        }',
-      '        [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustLocalDevCertsPolicy',
-      '    } catch {}',
-      '}',
-      '',
-      'function Get-EffectiveTheme {',
-      '    if ($ConfiguredThemeMode -eq "light") { return "light" }',
-      '    if ($ConfiguredThemeMode -eq "dark") { return "dark" }',
-      '    try {',
-      '        $reg = Get-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize" -Name "AppsUseLightTheme" -ErrorAction SilentlyContinue',
-      '        if ($null -ne $reg -and $reg.AppsUseLightTheme -eq 1) { return "light" }',
-      '    } catch {}',
-      '    return "dark"',
-      '}',
-      '$ActiveTheme = Get-EffectiveTheme',
-      '',
-      'if (!(Test-Path -LiteralPath $InstallDir)) {',
-      '    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null',
-      '}',
-      '',
-      '# Download MeshCentral 2 Core Agent & Group Policy (.msh)',
-      '$AgentExe = Join-Path $InstallDir "$ServiceName.exe"',
-      '$AgentMsh = Join-Path $InstallDir "$ServiceName.msh"',
-      '$MeshIdQuery = if ($MeshGroupId) { "&id=$([uri]::EscapeDataString($MeshGroupId))" } else { "" }',
-      'try {',
-      '    if ($MeshGroupId) {',
-      '        Invoke-WebRequest -Uri "$MeshServerUrl/meshsettings?id=$([uri]::EscapeDataString($MeshGroupId))" -OutFile $AgentMsh -UseBasicParsing -ErrorAction SilentlyContinue',
-      '    }',
-      '    $ArchType = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "43" } else { "4" }',
-      '    $AgentUri = "$MeshServerUrl/meshagents?id=$ArchType$MeshIdQuery"',
-      '    Invoke-WebRequest -Uri $AgentUri -OutFile $AgentExe -UseBasicParsing',
-      '} catch {',
-      '    Write-Warning "MeshAgent binary download skipped or unreachable ($($_.Exception.Message)); continuing with Vitrine Companion Agent enrollment."',
-      '}',
-      '',
-      'if (Test-Path -LiteralPath $AgentExe) {',
-      '    $sig = Get-AuthenticodeSignature -FilePath $AgentExe -ErrorAction SilentlyContinue',
-      '    if ($StrictSignatureVerify -and ($null -eq $sig -or $sig.Status -ne "Valid")) {',
-      '        Remove-Item -LiteralPath $AgentExe -Force -ErrorAction SilentlyContinue',
-      '        throw "Strict Authenticode verification failed for downloaded agent binary (Status: $($sig.Status))."',
-      '    }',
-      '    if ($IsQuickSupport) {',
-      '        Start-Process -FilePath $AgentExe -ArgumentList @("-connect") -WindowStyle Hidden',
-      '    } else {',
-      '        Start-Process -FilePath $AgentExe -ArgumentList @("-install", "--meshServiceName=$ServiceName") -Wait -WindowStyle Hidden',
-      '    }',
-      '}',
-      '',
-      '# Provision Managed Local Administrator Account (PowerShell 5.1 & 7+ CSPRNG compatible)',
-      'if (-not $IsQuickSupport -and $LapsAutoCreate) {',
-      '    try {',
-      '        $existingUser = Get-LocalUser -Name $LapsAccountName -ErrorAction SilentlyContinue',
-      '        if (-not $existingUser) {',
-      '            $randBytes = New-Object byte[] 18',
-      '            [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($randBytes)',
-      '            $initEntropy = [Convert]::ToBase64String($randBytes) + "!9vR"',
-      '            $secPass = ConvertTo-SecureString $initEntropy -AsPlainText -Force',
-      '            New-LocalUser -Name $LapsAccountName -Password $secPass -FullName "$BrandName Managed Admin" -Description "Managed by $BrandName LAPS Vault" -PasswordNeverExpires:$false | Out-Null',
-      '            Add-LocalGroupMember -Group "Administrators" -Member $LapsAccountName -ErrorAction SilentlyContinue',
-      '        }',
-      '    } catch {}',
-      '}',
-      '',
-      '# Enroll Endpoint with VitrineRMM Control Plane & Obtain Device Agent Token',
-      '$IdentityPath = Join-Path $InstallDir "agent-identity.json"',
-      'try {',
-      '    $osInfo = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue',
-      '    $ipAddr = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*" } | Select-Object -First 1).IPAddress',
-      '    $macAddr = (Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq "Up" } | Select-Object -First 1).MacAddress',
-      '    $enrollBody = @{',
-      '        token = $EnrollmentToken',
-      '        enrollmentToken = $EnrollmentToken',
-      '        tenantId = $TenantId',
-      '        hostname = $env:COMPUTERNAME',
-      '        osType = "windows"',
-      '        osVersion = if ($osInfo) { $osInfo.Caption } else { "Windows" }',
-      '        ipAddress = if ($ipAddr) { $ipAddr } else { "127.0.0.1" }',
-      '        macAddress = if ($macAddr) { $macAddr } else { "" }',
-      '    } | ConvertTo-Json',
-      '    $enrollRes = Invoke-RestMethod -Method Post -Uri "$VitrineServerUrl/api/agent/enroll" -ContentType "application/json" -Body $enrollBody -TimeoutSec 15',
-      '    $agentTok = if ($enrollRes -and $enrollRes.agentToken) { $enrollRes.agentToken } elseif ($enrollRes -and $enrollRes.agentAuthToken) { $enrollRes.agentAuthToken } else { $null }',
-      '    if ($agentTok) {',
-      '        $identObj = @{',
-      '            deviceId = $enrollRes.deviceId',
-      '            agentToken = $agentTok',
-      '            agentAuthToken = $agentTok',
-      '            vitrineServerUrl = $VitrineServerUrl',
-      '            tenantId = $TenantId',
-      '            serviceName = $ServiceName',
-      '        } | ConvertTo-Json',
-      '        Set-Content -LiteralPath $IdentityPath -Value $identObj -Encoding UTF8 -Force',
-      '    }',
-      '} catch {',
-      '    Write-Warning "Vitrine enrollment note: $($_.Exception.Message)"',
-      '}',
-      '',
-      '# Write companion config safely as JSON (no script code interpolation)',
-      '$CompanionConfig = @{',
-      '    BrandName = $BrandName',
-      '    ServiceName = $ServiceName',
-      '    VitrineServerUrl = $VitrineServerUrl',
-      '    ThemeMode = $ConfiguredThemeMode',
-      '    MaxSnoozeHours = $MaxSnoozeHours',
-      '    ForceRebootEnabled = $ForceRebootEnabled',
-      '    FinalCountdownSec = $FinalCountdownSec',
-      '} | ConvertTo-Json',
-      'Set-Content -LiteralPath (Join-Path $InstallDir "companion-config.json") -Value $CompanionConfig -Encoding UTF8 -Force',
-      '',
-      '# Install Vitrine Background Telemetry & Task Runner Companion',
-      '$CompanionWorkerScript = @\'',
-      '$ErrorActionPreference = "SilentlyContinue"',
-      '$idPath = Join-Path $PSScriptRoot "agent-identity.json"',
-      '$cfgPath = Join-Path $PSScriptRoot "companion-config.json"',
-      '$inboxPath = Join-Path $PSScriptRoot "tray-inbox.json"',
-      'while ($true) {',
-      '    if (Test-Path -LiteralPath $idPath) {',
-      '        $id = Get-Content -LiteralPath $idPath -Raw | ConvertFrom-Json',
-      '        $tok = if ($id.agentToken) { $id.agentToken } else { $id.agentAuthToken }',
-      '        if ($tok -and $id.vitrineServerUrl) {',
-      '            $cpu = [int]((Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average)',
-      '            $os = Get-CimInstance Win32_OperatingSystem',
-      '            $ram = if ($os -and $os.TotalVisibleMemorySize -gt 0) { [int]([Math]::Round((($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / $os.TotalVisibleMemorySize) * 100)) } else { 25 }',
-      '            $ramTotalGb = if ($os -and $os.TotalVisibleMemorySize -gt 0) { [Math]::Round($os.TotalVisibleMemorySize / 1048576, 2) } else { 8 }',
-      '            $ramUsedGb = if ($os -and $os.TotalVisibleMemorySize -gt 0) { [Math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1048576, 2) } else { 2 }',
-      '            $diskObj = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID=\'C:\'"',
-      '            $disk = if ($diskObj -and $diskObj.Size -gt 0) { [int]([Math]::Round((($diskObj.Size - $diskObj.FreeSpace) / $diskObj.Size) * 100)) } else { 30 }',
-      '            $diskTotalGb = if ($diskObj -and $diskObj.Size -gt 0) { [Math]::Round($diskObj.Size / 1GB, 2) } else { 256 }',
-      '            $diskFreeGb = if ($diskObj -and $diskObj.Size -gt 0) { [Math]::Round($diskObj.FreeSpace / 1GB, 2) } else { 180 }',
-      '            $mp = Get-MpComputerStatus',
-      '            $bl = Get-BitLockerVolume -MountPoint "C:"',
-      '            $edrState = if ($mp -and $mp.RealTimeProtectionEnabled) { "Healthy" } else { "Warning" }',
-      '            $blEncrypted = [bool]($bl -and ($bl.ProtectionStatus -eq "On" -or $bl.ProtectionStatus -eq 1))',
-      '            $blStatus = if ($blEncrypted) { "Encrypted" } else { "Unencrypted" }',
-      '            $rebootPending = [bool]((Test-Path "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Component Based Servicing\\RebootPending") -or (Test-Path "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired"))',
-      '            $neighbors = @()',
-      '            try {',
-      '                $neighbors = @(Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.LinkLayerAddress -and $_.LinkLayerAddress -ne "00-00-00-00-00-00" -and $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*" } | Select-Object -First 64 | ForEach-Object { @{ ip = $_.IPAddress; mac = ($_.LinkLayerAddress -replace "-", ":").ToLower() } })',
-      '            } catch {}',
-      '            $headers = @{ "x-vitrine-agent-token" = $tok }',
-      '            $payload = @{',
-      '                deviceId = $id.deviceId',
-      '                hostname = $env:COMPUTERNAME',
-      '                osType = "windows"',
-      '                osVersion = if ($os) { $os.Caption } else { "Windows" }',
-      '                cpuUsage = $cpu',
-      '                ramUsage = $ram',
-      '                ramUsedGb = $ramUsedGb',
-      '                ramTotalGb = $ramTotalGb',
-      '                diskUsage = $disk',
-      '                diskFreeGb = $diskFreeGb',
-      '                diskTotalGb = $diskTotalGb',
-      '                loggedInUser = (Get-CimInstance Win32_ComputerSystem).UserName',
-      '                rebootPending = $rebootPending',
-      '                rebootRequired = $rebootPending',
-      '                avStatus = $edrState',
-      '                edrStatus = $edrState',
-      '                bitlockerEncrypted = $blEncrypted',
-      '                bitlockerStatus = $blStatus',
-      '                arpNeighbors = $neighbors',
-      '            } | ConvertTo-Json -Depth 5',
-      '            $resp = Invoke-RestMethod -Method Post -Uri "$($id.vitrineServerUrl)/api/agent/checkin" -Headers $headers -ContentType "application/json" -Body $payload -TimeoutSec 20',
-      '            if ($resp -and $resp.tasks) {',
-      '                foreach ($t in $resp.tasks) {',
-      '                    $ttype = if ($t.type) { $t.type } else { $t.task_type }',
-      '                    $pObj = if ($t.payload -and $t.payload -isnot [string]) { $t.payload } elseif ($t.payload_json) { $t.payload_json | ConvertFrom-Json } else { @{} }',
-      '                    $safeTaskId = ([string]$t.id -replace "[^a-zA-Z0-9_-]", "")',
-      '                    if (-not $safeTaskId) { $safeTaskId = [guid]::NewGuid().ToString("N") }',
-      '                    $uriTaskId = [uri]::EscapeDataString([string]$t.id)',
-      '                    if ($ttype -eq "tray_notify" -or $ttype -eq "reboot_prompt") {',
-      '                        Set-Content -LiteralPath $inboxPath -Value ($t | ConvertTo-Json -Depth 6) -Encoding UTF8 -Force',
-      '                        Invoke-RestMethod -Method Post -Uri "$($id.vitrineServerUrl)/api/agent/tasks/$uriTaskId/result" -Headers $headers -ContentType "application/json" -Body (@{ deviceId = $id.deviceId; exitCode = 0; stdout = "Delivered to user tray"; stderr = "" } | ConvertTo-Json) | Out-Null',
-      '                    } elseif ($ttype -eq "wol_relay") {',
-      '                        $macHex = ([string]$pObj.mac -replace "[:\\-]", "").Trim()',
-      '                        $ec = 0; $out = ""; $errOut = ""',
-      '                        if ($macHex -match "^[0-9A-Fa-f]{12}$") {',
-      '                            try {',
-      '                                $macBytes = New-Object byte[] 6',
-      '                                for ($i = 0; $i -lt 6; $i++) { $macBytes[$i] = [Convert]::ToByte($macHex.Substring($i * 2, 2), 16) }',
-      '                                $pkt = New-Object byte[] 102',
-      '                                for ($i = 0; $i -lt 6; $i++) { $pkt[$i] = 0xFF }',
-      '                                for ($i = 1; $i -le 16; $i++) { [Array]::Copy($macBytes, 0, $pkt, $i * 6, 6) }',
-      '                                $bcast = if ($pObj.broadcastIp) { [string]$pObj.broadcastIp } else { "255.255.255.255" }',
-      '                                $wport = if ($pObj.port) { [int]$pObj.port } else { 9 }',
-      '                                $udp = New-Object System.Net.Sockets.UdpClient',
-      '                                $udp.EnableBroadcast = $true',
-      '                                [void]$udp.Send($pkt, $pkt.Length, $bcast, $wport)',
-      '                                $udp.Close()',
-      '                                $out = "Magic packet relayed to $macHex"',
-      '                            } catch {',
-      '                                $ec = 1; $errOut = $_.Exception.Message',
-      '                            }',
-      '                        } else {',
-      '                            $ec = 1; $errOut = "Invalid MAC address"',
-      '                        }',
-      '                        Invoke-RestMethod -Method Post -Uri "$($id.vitrineServerUrl)/api/agent/tasks/$uriTaskId/result" -Headers $headers -ContentType "application/json" -Body (@{ deviceId = $id.deviceId; exitCode = $ec; stdout = $out; stderr = $errOut } | ConvertTo-Json) | Out-Null',
-      '                    } elseif ($ttype -eq "self_uninstall") {',
-      '                        Invoke-RestMethod -Method Post -Uri "$($id.vitrineServerUrl)/api/agent/tasks/$uriTaskId/result" -Headers $headers -ContentType "application/json" -Body (@{ deviceId = $id.deviceId; exitCode = 0; stdout = "Self-uninstall initiated"; stderr = "" } | ConvertTo-Json) | Out-Null',
-      '                        $cfgLocal = if (Test-Path -LiteralPath $cfgPath) { Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json } else { @{ ServiceName = "VitrineAgent" } }',
-      '                        $svcLocal = if ($pObj.serviceName) { [string]$pObj.serviceName } elseif ($id.serviceName) { [string]$id.serviceName } elseif ($cfgLocal.ServiceName) { [string]$cfgLocal.ServiceName } else { "VitrineAgent" }',
-      '                        $svcLocal = ($svcLocal -replace "[^a-zA-Z0-9_-]", "")',
-      '                        if (-not $svcLocal) { $svcLocal = "VitrineAgent" }',
-      '                        Remove-ItemProperty -Path "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run" -Name "$svcLocal-Tray" -ErrorAction SilentlyContinue',
-      '                        Remove-ItemProperty -Path "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run" -Name "VitrineAgent-Tray" -ErrorAction SilentlyContinue',
-      '                        Unregister-ScheduledTask -TaskName "$svcLocal-Companion" -Confirm:$false -ErrorAction SilentlyContinue',
-      '                        if ($pObj.lapsAccountName -and ($pObj.lapsAccountName -match "^[a-zA-Z0-9._-]{1,20}$")) {',
-      '                            if ($pObj.lapsAction -eq "remove_account" -or $pObj.lapsAction -eq "disable_account") {',
-      '                                if (-not (Get-CimInstance Win32_ComputerSystem).PartOfDomain) {',
-      '                                    $s500 = Get-LocalUser | Where-Object { $_.SID.Value -like "*-500" }',
-      '                                    if ($s500) { Enable-LocalUser -Name $s500.Name -ErrorAction SilentlyContinue }',
-      '                                }',
-      '                                if ($pObj.lapsAction -eq "remove_account") { Remove-LocalUser -Name ([string]$pObj.lapsAccountName) -ErrorAction SilentlyContinue }',
-      '                                else { Disable-LocalUser -Name ([string]$pObj.lapsAccountName) -ErrorAction SilentlyContinue }',
-      '                            }',
-      '                        }',
-      '                        $localMesh = Join-Path $PSScriptRoot "$svcLocal.exe"',
-      '                        if (Test-Path -LiteralPath $localMesh) { Start-Process -FilePath $localMesh -ArgumentList "-fulluninstall" -WindowStyle Hidden }',
-      '                        if (Test-Path "C:\\Program Files\\Mesh Agent\\MeshAgent.exe") { Start-Process -FilePath "C:\\Program Files\\Mesh Agent\\MeshAgent.exe" -ArgumentList "-fulluninstall" -WindowStyle Hidden }',
-      '                        Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-WindowStyle", "Hidden", "-Command", ("Start-Sleep -Seconds 3; Remove-Item -LiteralPath \'" + ($PSScriptRoot -replace "\'", "\'\'") + "\' -Recurse -Force -ErrorAction SilentlyContinue")) -WindowStyle Hidden',
-      '                        exit 0',
-      '                    } elseif ($ttype -in @("script", "run_script", "patch_scan", "patch_install", "software_deploy", "backup_job")) {',
-      '                        $scriptBody = if ($pObj.code) { [string]$pObj.code } elseif ($pObj.command) { [string]$pObj.command } elseif ($ttype -eq "software_deploy" -and ($pObj.packageId -match "^[a-zA-Z0-9._-]+$")) { "winget install --id $($pObj.packageId) --silent --accept-package-agreements --accept-source-agreements" } elseif ($ttype -eq "backup_job") { "vssadmin create shadow /for=C:" } else { "Write-Output ok" }',
-      '                        $tmpPs1 = Join-Path $env:TEMP "vitrine-task-$safeTaskId.ps1"',
-      '                        $savedEnv = @{}',
-      '                        $addedEnv = New-Object System.Collections.Generic.List[string]',
-      '                        $ec = 0; $out = ""; $errOut = ""',
-      '                        try {',
-      '                            if ($pObj.env) {',
-      '                                foreach ($prop in $pObj.env.PSObject.Properties) {',
-      '                                    if ($prop.Name -match "^VITRINE_PARAM_[A-Z0-9_]+$") {',
-      '                                        if (Test-Path "Env:$($prop.Name)") { $savedEnv[$prop.Name] = (Get-Item "Env:$($prop.Name)").Value }',
-      '                                        [void]$addedEnv.Add($prop.Name)',
-      '                                        Set-Item -Path "Env:$($prop.Name)" -Value ([string]$prop.Value)',
-      '                                    }',
-      '                                }',
-      '                            }',
-      '                            Set-Content -LiteralPath $tmpPs1 -Value $scriptBody -Encoding UTF8 -Force',
-      '                            $out = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tmpPs1 2>&1 | Out-String)',
-      '                            $ec = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }',
-      '                        } catch {',
-      '                            $ec = 1; $errOut = $_.Exception.Message',
-      '                        } finally {',
-      '                            foreach ($envKey in $addedEnv) {',
-      '                                if ($savedEnv.ContainsKey($envKey)) { Set-Item -Path "Env:$envKey" -Value $savedEnv[$envKey] }',
-      '                                else { Remove-Item -Path "Env:$envKey" -ErrorAction SilentlyContinue }',
-      '                            }',
-      '                            if (Test-Path -LiteralPath $tmpPs1) { Remove-Item -LiteralPath $tmpPs1 -Force -ErrorAction SilentlyContinue }',
-      '                        }',
-      '                        $resBody = @{ deviceId = $id.deviceId; exitCode = $ec; stdout = $out; stderr = $errOut; backupJobId = $pObj.backupJobId } | ConvertTo-Json',
-      '                        Invoke-RestMethod -Method Post -Uri "$($id.vitrineServerUrl)/api/agent/tasks/$uriTaskId/result" -Headers $headers -ContentType "application/json" -Body $resBody | Out-Null',
-      '                    }',
-      '                }',
-      '            }',
-      '        }',
-      '    }',
-      '    Start-Sleep -Seconds 30',
-      '}',
-      '\'@',
-      '$WorkerPath = Join-Path $InstallDir "vitrine-companion.ps1"',
-      'Set-Content -LiteralPath $WorkerPath -Value $CompanionWorkerScript -Encoding UTF8 -Force',
-      '',
-      '$TrayAppScript = @\'',
-      'Add-Type -AssemblyName System.Drawing, System.Windows.Forms, Microsoft.VisualBasic',
-      '$cfgPath = Join-Path $PSScriptRoot "companion-config.json"',
-      '$idPath = Join-Path $PSScriptRoot "agent-identity.json"',
-      '$inboxPath = Join-Path $PSScriptRoot "tray-inbox.json"',
-      '$cfg = if (Test-Path -LiteralPath $cfgPath) { Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json } else { @{ BrandName = "Vitrine RMM"; ServiceName = "VitrineAgent" } }',
-      '$notifyIcon = New-Object System.Windows.Forms.NotifyIcon',
-      '$notifyIcon.Text = ($cfg.BrandName + " Support").Substring(0, [Math]::Min(63, ($cfg.BrandName + " Support").Length))',
-      '$notifyIcon.Icon = [System.Drawing.SystemIcons]::Shield',
-      '$menu = New-Object System.Windows.Forms.ContextMenuStrip',
-      '$statusItem = $menu.Items.Add(($cfg.BrandName + " Protected"))',
-      '$statusItem.Enabled = $false',
-      '$menu.Items.Add("-") | Out-Null',
-      '$chatItem = $menu.Items.Add("Message IT Support")',
-      '$chatItem.Add_Click({',
-      '    try {',
-      '        $userMsg = [Microsoft.VisualBasic.Interaction]::InputBox("Describe your IT issue or message for support:", "$($cfg.BrandName) Live Support", "")',
-      '        if ($userMsg -and (Test-Path -LiteralPath $idPath)) {',
-      '            $id = Get-Content -LiteralPath $idPath -Raw | ConvertFrom-Json',
-      '            $tok = if ($id.agentToken) { $id.agentToken } else { $id.agentAuthToken }',
-      '            if ($tok -and $id.vitrineServerUrl) {',
-      '                $chatPayload = @{ deviceId = $id.deviceId; sender = $env:USERNAME; message = $userMsg } | ConvertTo-Json',
-      '                Invoke-RestMethod -Method Post -Uri "$($id.vitrineServerUrl)/api/agent/chat" -Headers @{ "x-vitrine-agent-token" = $tok } -ContentType "application/json" -Body $chatPayload -TimeoutSec 10 | Out-Null',
-      '                $notifyIcon.BalloonTipTitle = $cfg.BrandName',
-      '                $notifyIcon.BalloonTipText = "Your message has been sent to IT Support."',
-      '                $notifyIcon.ShowBalloonTip(5000)',
-      '            }',
-      '        }',
-      '    } catch {}',
-      '})',
-      '$helpItem = $menu.Items.Add("Endpoint Status")',
-      '$helpItem.Add_Click({ [System.Windows.Forms.MessageBox]::Show("Managed by $($cfg.BrandName). Endpoint protection and telemetry active.", $cfg.BrandName) })',
-      '$notifyIcon.ContextMenuStrip = $menu',
-      '$notifyIcon.Visible = $true',
-      '$timer = New-Object System.Windows.Forms.Timer',
-      '$timer.Interval = 4000',
-      '$timer.Add_Tick({',
-      '    if (Test-Path -LiteralPath $inboxPath) {',
-      '        try {',
-      '            $msg = Get-Content -LiteralPath $inboxPath -Raw | ConvertFrom-Json',
-      '            Remove-Item -LiteralPath $inboxPath -Force -ErrorAction SilentlyContinue',
-      '            $p = if ($msg.payload -and $msg.payload -isnot [string]) { $msg.payload } elseif ($msg.payload_json) { $msg.payload_json | ConvertFrom-Json } else { @{} }',
-      '            $notifyIcon.BalloonTipTitle = if ($p.title) { $p.title } else { $cfg.BrandName }',
-      '            $notifyIcon.BalloonTipText = if ($p.message) { $p.message } else { "IT Support Notification" }',
-      '            $notifyIcon.ShowBalloonTip(8000)',
-      '        } catch {}',
-      '    }',
-      '})',
-      '$timer.Start()',
-      '[System.Windows.Forms.Application]::Run()',
-      '\'@',
-      '',
-      '$TrayPath = Join-Path $InstallDir "vitrine-tray.ps1"',
-      'Set-Content -LiteralPath $TrayPath -Value $TrayAppScript -Encoding UTF8 -Force',
-      'if (-not $IsQuickSupport) {',
-      '    $RunKey = "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"',
-      '    Set-ItemProperty -Path $RunKey -Name "$ServiceName-Tray" -Value "powershell.exe -NoProfile -WindowStyle Hidden -File `"$TrayPath`"" -Force',
-      '    try {',
-      '        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$WorkerPath`""',
-      '        $trigger = New-ScheduledTaskTrigger -AtStartup',
-      '        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest',
-      '        Register-ScheduledTask -TaskName "$ServiceName-Companion" -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null',
-      '        Start-ScheduledTask -TaskName "$ServiceName-Companion" -ErrorAction SilentlyContinue',
-      '    } catch {}',
-      '}',
-      'Write-Host "[OK] $BrandName deployment finished (Theme: $ActiveTheme)." -ForegroundColor Cyan'
-    ];
+    if (options.os === 'windows') {
+      const setupUrl = `${vitrineServerUrl}/api/agent/download?token=${encodeURIComponent(enrollmentToken)}&os=windows&mode=companion&deviceId=${encodeURIComponent(options.deviceId)}`;
+      const strictVerify = Boolean(settings.code_signing_enabled && (settings.code_signing_strict_verify ?? 1));
+      return [
+        '$ErrorActionPreference = "Stop"',
+        '[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13',
+        ...(allowSelfSignedTls ? ['[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }'] : []),
+        `$exeUrl = ${quotePowerShellLiteral(setupUrl)}`,
+        `$tmpExe = Join-Path $env:TEMP ('CompanionSetup-' + [guid]::NewGuid().ToString('N') + '.exe')`,
+        'try {',
+        '    Invoke-WebRequest -Uri $exeUrl -OutFile $tmpExe -UseBasicParsing -TimeoutSec 45',
+        ...(strictVerify
+          ? [
+              '$sig = Get-AuthenticodeSignature -FilePath $tmpExe -ErrorAction SilentlyContinue',
+              'if ($null -eq $sig -or $sig.Status -ne "Valid") { throw "Strict Authenticode check failed for CompanionSetup executable ($($sig.Status))" }'
+            ]
+          : []),
+        '    $proc = Start-Process -FilePath $tmpExe -ArgumentList @("/S") -Wait -PassThru -WindowStyle Hidden',
+        '    if ($proc.ExitCode -ne 0) { throw "CompanionSetup exited with code $($proc.ExitCode)" }',
+        '    Write-Output "COMPANION_DEPLOY_OK"',
+        '} finally {',
+        '    if (Test-Path -LiteralPath $tmpExe) { Remove-Item -LiteralPath $tmpExe -Force -ErrorAction SilentlyContinue }',
+        '}'
+      ].join('\r\n');
+    }
 
-    return lines.join('\r\n');
+    const telemetryIntervalSec = Math.max(10, Math.min(3600, Number(eff?.telemetryIntervalSec ?? 30)));
+    const full =
+      options.os === 'linux'
+        ? this.generateLinuxInstaller({
+            brandName,
+            primaryColor: sanitizeHexColor(settings.primary_color),
+            meshServerUrl: vitrineServerUrl,
+            vitrineServerUrl,
+            meshGroupId: '',
+            enrollmentToken,
+            tenantId,
+            serviceName: serviceName.toLowerCase(),
+            trayThemeMode: eff?.trayThemeMode || 'system',
+            trayEnabled: eff?.trayEnabled !== false,
+            trayTooltip: eff?.trayTooltip || '',
+            trayIconUrl: eff?.trayIconUrl || settings.brand_logo_url || '',
+            traySupportUrl: eff?.traySupportUrl || '',
+            traySupportPhone: eff?.traySupportPhone || '',
+            traySupportEmail: eff?.traySupportEmail || '',
+            trayMenuItems: eff?.trayMenuItems || getDefaultTrayMenuItems(),
+            isQuickSupport: false,
+            lapsAutoCreate: 0,
+            lapsAccountName: 'LocalAdmin',
+            allowSelfSignedTls,
+            skipMeshAgentDownload: true,
+            targetDeviceId: options.deviceId,
+            telemetryIntervalSec
+          })
+        : this.generateMacInstaller({
+            brandName,
+            primaryColor: sanitizeHexColor(settings.primary_color),
+            meshServerUrl: vitrineServerUrl,
+            vitrineServerUrl,
+            meshGroupId: '',
+            enrollmentToken,
+            tenantId,
+            serviceName,
+            trayThemeMode: eff?.trayThemeMode || 'system',
+            isQuickSupport: false,
+            lapsAutoCreate: 0,
+            lapsAccountName: 'LocalAdmin',
+            allowSelfSignedTls,
+            skipMeshAgentDownload: true,
+            targetDeviceId: options.deviceId,
+            telemetryIntervalSec
+          });
+    return `${full}\necho "COMPANION_DEPLOY_OK"`;
   }
 
   private generateLinuxInstaller(vars: {
@@ -811,19 +1009,55 @@ export class InstallerGeneratorService {
     tenantId: string;
     serviceName: string;
     trayThemeMode: 'system' | 'dark' | 'light';
+    trayEnabled?: boolean;
+    trayTooltip?: string;
+    trayIconUrl?: string;
+    traySupportUrl?: string;
+    traySupportPhone?: string;
+    traySupportEmail?: string;
+    trayMenuItems?: TrayMenuItem[];
     isQuickSupport: boolean;
+    sessionCode?: string;
     lapsAutoCreate: number;
     lapsAccountName: string;
     allowSelfSignedTls?: boolean;
+    skipMeshAgentDownload?: boolean;
+    targetDeviceId?: string;
+    telemetryIntervalSec?: number;
   }): string {
-    const safeCommentBrand = vars.brandName.replace(/[\r\n#]/g, '');
+    const cleanBrand = sanitizeSingleLine(vars.brandName, 'Vitrine RMM', 64);
+    const safeServiceName = sanitizeIdentifier(vars.serviceName, 'vitrineagent', 40).toLowerCase();
+    const safeCommentBrand = cleanBrand.replace(/#/g, '');
+    const safeUnitBrand = cleanBrand.replace(/["\\]/g, '').trim() || 'Vitrine RMM';
     const curlTlsFlag = vars.allowSelfSignedTls ? '--insecure ' : '';
+    const sleepSec = Math.max(10, Math.min(3600, Math.round(Number(vars.telemetryIntervalSec || 25))));
+    const companionConfigJson = JSON.stringify({
+      BrandName: cleanBrand,
+      ServiceName: safeServiceName,
+      serviceSlug: safeServiceName,
+      VitrineServerUrl: vars.vitrineServerUrl,
+      TelemetryIntervalSec: sleepSec,
+      AllowSelfSignedTls: Boolean(vars.allowSelfSignedTls),
+      IconUrl: vars.trayIconUrl || '',
+      ThemeMode: vars.trayThemeMode || 'system',
+      TrayEnabled: vars.trayEnabled !== false,
+      Tooltip: vars.trayTooltip || `${cleanBrand} Support`,
+      SupportUrl: vars.traySupportUrl || '',
+      SupportPhone: vars.traySupportPhone || '',
+      SupportEmail: vars.traySupportEmail || '',
+      MenuItems: vars.trayMenuItems || getDefaultTrayMenuItems(),
+      isQuickSupport: Boolean(vars.isQuickSupport),
+      SessionCode: vars.sessionCode || ''
+    });
+    const companionPy = buildLinuxCompanionPy(sleepSec);
+    const trayPy = buildLinuxTrayPy();
 
     const lines = [
       '#!/usr/bin/env bash',
       '# ==============================================================================',
-      `# ${safeCommentBrand} - Linux Endpoint Agent & Telemetry Companion`,
-      `# Mode: ${vars.isQuickSupport ? 'QuickSupport On-Demand (User Space)' : 'Permanent Systemd Service'}`,
+      `# ${safeCommentBrand} - Linux Cross-Distro Agent, Companion & Desktop Tray`,
+      `# Distros: Debian / Ubuntu / RHEL / Fedora / Rocky / Alma / Arch`,
+      `# Mode: ${vars.isQuickSupport ? 'QuickSupport On-Demand (User Space)' : 'Permanent Systemd Service + Desktop Tray'}`,
       '# ==============================================================================',
       'set -euo pipefail',
       '',
@@ -836,62 +1070,144 @@ export class InstallerGeneratorService {
             'fi'
           ]),
       '',
-      `BRAND_NAME=${quoteBashLiteral(vars.brandName)}`,
-      `SERVICE_NAME=${quoteBashLiteral(vars.serviceName)}`,
+      `BRAND_NAME=${quoteBashLiteral(cleanBrand)}`,
+      `SAFE_UNIT_BRAND=${quoteBashLiteral(safeUnitBrand)}`,
+      `SERVICE_NAME=${quoteBashLiteral(safeServiceName)}`,
       `MESH_SERVER_URL=${quoteBashLiteral(vars.meshServerUrl)}`,
       `VITRINE_SERVER_URL=${quoteBashLiteral(vars.vitrineServerUrl)}`,
-      `MESH_GROUP_ID=${quoteBashLiteral(vars.meshGroupId)}`,
+      `MESH_GROUP_ID=${quoteBashLiteral(vars.meshGroupId.replace(/^mesh\/\//, ''))}`,
       `ENROLLMENT_TOKEN=${quoteBashLiteral(vars.enrollmentToken)}`,
       `TENANT_ID=${quoteBashLiteral(vars.tenantId)}`,
       `TRAY_THEME=${quoteBashLiteral(vars.trayThemeMode)}`,
+      `TRAY_ICON_URL=${quoteBashLiteral(vars.trayIconUrl || '')}`,
+      `SESSION_CODE=${quoteBashLiteral(vars.sessionCode || '')}`,
       `LAPS_AUTO_CREATE=${quoteBashLiteral(String(vars.lapsAutoCreate))}`,
-      `LAPS_USER=${quoteBashLiteral(vars.lapsAccountName)}`,
+      `LAPS_USER=${quoteBashLiteral(sanitizeIdentifier(vars.lapsAccountName, 'LocalAdmin', 20))}`,
       `CURL_TLS_FLAG=${quoteBashLiteral(vars.allowSelfSignedTls ? '--insecure' : '')}`,
       vars.isQuickSupport
         ? 'INSTALL_DIR="$HOME/.local/share/${SERVICE_NAME}-quicksupport"'
         : 'INSTALL_DIR="/opt/${SERVICE_NAME}"',
+      vars.isQuickSupport
+        ? 'TRAY_DIR="$INSTALL_DIR/tray"'
+        : 'TRAY_DIR="/var/lib/${SERVICE_NAME}/tray"',
       '',
-      'umask 077',
-      'mkdir -p "$INSTALL_DIR"',
-      'chmod 700 "$INSTALL_DIR"',
+      'http_get_file() {',
+      '  if command -v curl >/dev/null 2>&1; then',
+      '    if [ -n "$CURL_TLS_FLAG" ]; then curl --insecure -fsSL "$1" -o "$2"; else curl -fsSL "$1" -o "$2"; fi',
+      '  else',
+      '    python3 -c \'import ssl,sys,urllib.request; ctx=ssl._create_unverified_context() if sys.argv[3]=="--insecure" else ssl.create_default_context(); r=urllib.request.urlopen(urllib.request.Request(sys.argv[1],method="GET"),timeout=30,context=ctx); open(sys.argv[2],"wb").write(r.read())\' "$1" "$2" "$CURL_TLS_FLAG"',
+      '  fi',
+      '}',
+      'http_post_json() {',
+      '  if command -v curl >/dev/null 2>&1; then',
+      '    if [ -n "$CURL_TLS_FLAG" ]; then curl --insecure -fsSL -X POST "$1" -H "Content-Type: application/json" -d "$2"; else curl -fsSL -X POST "$1" -H "Content-Type: application/json" -d "$2"; fi',
+      '  else',
+      '    python3 -c \'import ssl,sys,urllib.request; ctx=ssl._create_unverified_context() if sys.argv[3]=="--insecure" else ssl.create_default_context(); req=urllib.request.Request(sys.argv[1],data=sys.argv[2].encode("utf-8"),method="POST",headers={"Content-Type":"application/json"}); sys.stdout.write(urllib.request.urlopen(req,timeout=30,context=ctx).read().decode("utf-8"))\' "$1" "$2" "$CURL_TLS_FLAG"',
+      '  fi',
+      '}',
+      '',
+      vars.isQuickSupport ? 'umask 077' : 'umask 022',
+      'mkdir -p "$INSTALL_DIR" "$TRAY_DIR/inbox" "$TRAY_DIR/outbox"',
+      ...(vars.isQuickSupport
+        ? ['chmod 700 "$INSTALL_DIR" "$TRAY_DIR" "$TRAY_DIR/inbox" "$TRAY_DIR/outbox"']
+        : [
+            'chmod 755 "$INSTALL_DIR" "/var/lib/${SERVICE_NAME}" "$TRAY_DIR" "$TRAY_DIR/inbox"',
+            'chmod 1777 "$TRAY_DIR/outbox"'
+          ]),
       '',
       'ARCH="$(uname -m)"',
       'MESH_TYPE=6',
       'if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then MESH_TYPE=25; fi',
       '',
       'if [ -n "$MESH_GROUP_ID" ]; then',
-      `  curl ${curlTlsFlag}-fsSL "$MESH_SERVER_URL/meshsettings?id=$MESH_GROUP_ID" -o "$INSTALL_DIR/meshagent.msh" || true`,
+      '  http_get_file "$MESH_SERVER_URL/meshsettings?id=$MESH_GROUP_ID" "$INSTALL_DIR/meshagent.msh" || true',
       'fi',
       '',
-      `if curl ${curlTlsFlag}-fsSL "$MESH_SERVER_URL/meshagents?id=$MESH_TYPE" -o "$INSTALL_DIR/meshagent"; then`,
-      '  if [ -s "$INSTALL_DIR/meshagent" ]; then',
-      '    chmod 755 "$INSTALL_DIR/meshagent"',
-      vars.isQuickSupport
-        ? '    "$INSTALL_DIR/meshagent" -connect >/dev/null 2>&1 &'
-        : '    "$INSTALL_DIR/meshagent" -install --installPath="$INSTALL_DIR/meshcore" || true',
-      '  fi',
-      'else',
-      '  echo "[!] MeshCentral binary download skipped or unreachable; proceeding with Vitrine Companion Agent." >&2',
-      'fi',
+      ...(vars.skipMeshAgentDownload
+        ? ['# Companion-only deployment over live MeshCentral tunnel (leaving existing MeshAgent untouched)']
+        : [
+            'if http_get_file "$MESH_SERVER_URL/meshagents?id=$MESH_TYPE" "$INSTALL_DIR/meshagent" 2>/dev/null; then',
+            '  if [ -s "$INSTALL_DIR/meshagent" ]; then',
+            '    chmod 755 "$INSTALL_DIR/meshagent"',
+            ...(vars.isQuickSupport
+              ? ['    "$INSTALL_DIR/meshagent" -connect >/dev/null 2>&1 &']
+              : [
+                  '    mkdir -p "$INSTALL_DIR/meshcore"',
+                  '    if [ -s "$INSTALL_DIR/meshagent.msh" ]; then cp "$INSTALL_DIR/meshagent.msh" "$INSTALL_DIR/meshcore/meshagent.msh" && chmod 600 "$INSTALL_DIR/meshcore/meshagent.msh"; fi',
+                  '    (cd "$INSTALL_DIR" && "$INSTALL_DIR/meshagent" -install --installPath="$INSTALL_DIR/meshcore") || true',
+                  '    if [ -s "$INSTALL_DIR/meshagent.msh" ]; then cp "$INSTALL_DIR/meshagent.msh" "$INSTALL_DIR/meshcore/meshagent.msh" && chmod 600 "$INSTALL_DIR/meshcore/meshagent.msh" && (systemctl restart meshagent 2>/dev/null || true); fi'
+                ]),
+            '  fi',
+            'else',
+            '  echo "[!] MeshCentral binary download skipped or unreachable; proceeding with Vitrine Companion Agent." >&2',
+            'fi'
+          ]),
       '',
-      '# Provision Managed Local Admin Account with cryptographically random initial password',
+      '# Provision Managed Local Admin Account (Debian sudo vs RHEL/Arch wheel)',
       'if [ "${EUID:-$(id -u)}" -eq 0 ] && [ "$LAPS_AUTO_CREATE" = "1" ]; then',
       '  if ! id "$LAPS_USER" >/dev/null 2>&1; then',
       '    useradd -m -s /bin/bash "$LAPS_USER"',
       '    INIT_PASS="$(head -c 24 /dev/urandom | base64 | tr -dc "A-Za-z0-9" | head -c 24)!9vR"',
       '    printf "%s:%s\\n" "$LAPS_USER" "$INIT_PASS" | chpasswd',
-      '    usermod -aG sudo "$LAPS_USER" 2>/dev/null || usermod -aG wheel "$LAPS_USER" 2>/dev/null || true',
+      '    if getent group sudo >/dev/null 2>&1; then',
+      '      usermod -aG sudo "$LAPS_USER" 2>/dev/null || true',
+      '    elif getent group wheel >/dev/null 2>&1; then',
+      '      usermod -aG wheel "$LAPS_USER" 2>/dev/null || true',
+      '    fi',
+      '    if [ -d /etc/sudoers.d ]; then',
+      '      printf "%s ALL=(ALL:ALL) ALL\\n" "$LAPS_USER" > "/etc/sudoers.d/90-vitrine-laps"',
+      '      chmod 0440 "/etc/sudoers.d/90-vitrine-laps"',
+      '      if command -v visudo >/dev/null 2>&1 && ! visudo -cf "/etc/sudoers.d/90-vitrine-laps" >/dev/null 2>&1; then',
+      '        rm -f "/etc/sudoers.d/90-vitrine-laps"',
+      '      fi',
+      '    fi',
       '  fi',
       'fi',
       '',
-      '# Enroll with VitrineRMM Control Plane',
-      'HOSTNAME_VAL="$(hostname)"',
-      'OS_VER="$(. /etc/os-release 2>/dev/null && printf "%s" "${PRETTY_NAME:-Linux}" || uname -sr)"',
-      'IP_ADDR="$(hostname -I 2>/dev/null | awk "{print \\$1}")"',
-      'MAC_ADDR="$(ip link show 2>/dev/null | awk "/link\\/ether/ {print \\$2; exit}")"',
+      '# Write Tray/Companion Policy Configuration',
+      "cat > \"$INSTALL_DIR/companion-config.json\" <<'VITRINE_CFG_EOF'",
+      companionConfigJson,
+      'VITRINE_CFG_EOF',
+      vars.isQuickSupport
+        ? 'chmod 600 "$INSTALL_DIR/companion-config.json"'
+        : 'chmod 644 "$INSTALL_DIR/companion-config.json"',
       '',
-      'ENROLL_JSON="$(python3 -c \'import json,sys; print(json.dumps({"token":sys.argv[1],"enrollmentToken":sys.argv[1],"tenantId":sys.argv[2],"hostname":sys.argv[3],"osType":"linux","osVersion":sys.argv[4],"ipAddress":sys.argv[5] or "127.0.0.1","macAddress":sys.argv[6] or ""}))\' "$ENROLLMENT_TOKEN" "$TENANT_ID" "$HOSTNAME_VAL" "$OS_VER" "$IP_ADDR" "$MAC_ADDR")"',
-      `if ENROLL_RESP="$(curl ${curlTlsFlag}-fsSL -X POST "$VITRINE_SERVER_URL/api/agent/enroll" -H "Content-Type: application/json" -d "$ENROLL_JSON" 2>/dev/null)"; then`,
+      'if [ -n "$TRAY_ICON_URL" ]; then',
+      '  ICON_DL="$TRAY_ICON_URL"',
+      '  case "$ICON_DL" in',
+      '    http://*|https://*) ;;',
+      '    /*) ICON_DL="${VITRINE_SERVER_URL%/}$ICON_DL" ;;',
+      '    *) ICON_DL="${VITRINE_SERVER_URL%/}/$ICON_DL" ;;',
+      '  esac',
+      '  if http_get_file "$ICON_DL" "$TRAY_DIR/tray-icon.png" 2>/dev/null; then',
+      '    chmod 644 "$TRAY_DIR/tray-icon.png" 2>/dev/null || true',
+      '    printf "%s" "$TRAY_ICON_URL" > "$TRAY_DIR/tray-icon.url" && chmod 644 "$TRAY_DIR/tray-icon.url" 2>/dev/null || true',
+      '  else',
+      '    rm -f "$TRAY_DIR/tray-icon.png"',
+      '  fi',
+      'fi',
+      '',
+      '# Write Cross-Distro Companion Worker & Theme-Aware Desktop Tray',
+      "cat > \"$INSTALL_DIR/vitrine-companion.py\" <<'PYAGENT'",
+      companionPy,
+      'PYAGENT',
+      'chmod 700 "$INSTALL_DIR/vitrine-companion.py"',
+      '',
+      "cat > \"$INSTALL_DIR/vitrine-tray.py\" <<'PYTRAY'",
+      trayPy,
+      'PYTRAY',
+      vars.isQuickSupport
+        ? 'chmod 700 "$INSTALL_DIR/vitrine-tray.py"'
+        : 'chmod 755 "$INSTALL_DIR/vitrine-tray.py"',
+      '',
+      '# Enroll with VitrineRMM Control Plane (including full hardware/role telemetry)',
+      'HOSTNAME_VAL="$(hostname)"',
+      'IP_ADDR="$(hostname -I 2>/dev/null | awk \'{print $1}\')"',
+      'MAC_ADDR="$(ip link show 2>/dev/null | awk \'/link\\/ether/ {print $2; exit}\')"',
+      'HW_ENROLL_JSON="$(python3 "$INSTALL_DIR/vitrine-companion.py" --print-enroll-hw 2>/dev/null || echo \'{}\')"',
+      '',
+      'ENROLL_JSON="$(python3 -c \'import json,sys; hw=json.loads(sys.argv[8]) if sys.argv[8].strip().startswith("{") else {}; d={"token":sys.argv[1],"enrollmentToken":sys.argv[1],"tenantId":sys.argv[2],"hostname":sys.argv[3],"osType":"linux","ipAddress":sys.argv[4] or "127.0.0.1","macAddress":sys.argv[5] or "","deviceId":sys.argv[6] or None,"trayThemeMode":sys.argv[7] or "system"}; d.update(hw); print(json.dumps(d))\' "$ENROLLMENT_TOKEN" "$TENANT_ID" "$HOSTNAME_VAL" "$IP_ADDR" "$MAC_ADDR" ' + quoteBashLiteral(vars.targetDeviceId || '') + ' "$TRAY_THEME" "$HW_ENROLL_JSON")"',
+      'if ENROLL_RESP="$(http_post_json "$VITRINE_SERVER_URL/api/agent/enroll" "$ENROLL_JSON" 2>/dev/null)"; then',
       '  python3 - "$ENROLL_RESP" "$VITRINE_SERVER_URL" "$TENANT_ID" "$INSTALL_DIR/agent-identity.json" "$CURL_TLS_FLAG" "$SERVICE_NAME" <<\'PYEOF\'',
       'import json, os, sys',
       'resp = json.loads(sys.argv[1])',
@@ -912,262 +1228,77 @@ export class InstallerGeneratorService {
       'PYEOF',
       'fi',
       '',
-      '# Write Python3 Vitrine Companion Agent (Telemetry, Patch/Software Inventory, Subnet Probe & Task Executor)',
-      'cat > "$INSTALL_DIR/vitrine-companion.py" <<\'PYAGENT\'',
-      '#!/usr/bin/env python3',
-      'import getpass, json, os, platform, re, shutil, socket, ssl, subprocess, sys, time, urllib.parse, urllib.request',
-      '',
-      'BASE_DIR = os.path.dirname(os.path.abspath(__file__))',
-      'ID_PATH = os.path.join(BASE_DIR, "agent-identity.json")',
-      'PARAM_KEY_RE = re.compile(r"^VITRINE_PARAM_[A-Z0-9_]+$")',
-      'SAFE_ACC_RE = re.compile(r"^[a-zA-Z0-9._-]{1,20}$")',
-      '',
-      'def post_json(url, payload, token, insecure=False):',
-      '    data = json.dumps(payload).encode("utf-8")',
-      '    req = urllib.request.Request(url, data=data, method="POST")',
-      '    req.add_header("Content-Type", "application/json")',
-      '    req.add_header("x-vitrine-agent-token", token)',
-      '    ctx = ssl._create_unverified_context() if insecure else ssl.create_default_context()',
-      '    with urllib.request.urlopen(req, timeout=20, context=ctx) as resp:',
-      '        return json.loads(resp.read().decode("utf-8"))',
-      '',
-      'def send_chat(ident, message):',
-      '    token = ident.get("agentToken") or ident.get("agentAuthToken")',
-      '    srv = (ident.get("vitrineServerUrl") or "").rstrip("/")',
-      '    if not token or not srv:',
-      '        return',
-      '    post_json(f"{srv}/api/agent/chat", {',
-      '        "deviceId": ident.get("deviceId"),',
-      '        "sender": getpass.getuser(),',
-      '        "message": str(message)',
-      '    }, token, bool(ident.get("insecureTls")))',
-      '',
-      'def collect_metrics(device_id=None):',
-      '    cpu_pct = 10',
-      '    try:',
-      '        load1 = os.getloadavg()[0]',
-      '        cores = max(1, os.cpu_count() or 1)',
-      '        cpu_pct = min(100, max(1, int(round((load1 / cores) * 100))))',
-      '    except Exception:',
-      '        pass',
-      '    ram_pct = 25',
-      '    ram_total_gb = 8.0',
-      '    ram_used_gb = 2.0',
-      '    try:',
-      '        mem = {}',
-      '        with open("/proc/meminfo", "r") as f:',
-      '            for line in f:',
-      '                parts = line.split(":", 1)',
-      '                if len(parts) == 2:',
-      '                    mem[parts[0].strip()] = int(parts[1].strip().split()[0])',
-      '        total = mem.get("MemTotal", 0)',
-      '        avail = mem.get("MemAvailable", mem.get("MemFree", 0))',
-      '        if total > 0:',
-      '            used_kb = max(0, total - avail)',
-      '            ram_pct = min(100, max(1, int(round((used_kb / total) * 100))))',
-      '            ram_total_gb = round(total / (1024.0 * 1024.0), 2)',
-      '            ram_used_gb = round(used_kb / (1024.0 * 1024.0), 2)',
-      '    except Exception:',
-      '        pass',
-      '    disk_pct = 20',
-      '    disk_total_gb = 64.0',
-      '    disk_free_gb = 48.0',
-      '    try:',
-      '        st = os.statvfs("/")',
-      '        if st.f_blocks > 0:',
-      '            disk_pct = min(100, max(1, int(round(((st.f_blocks - st.f_bavail) / st.f_blocks) * 100))))',
-      '            disk_total_gb = round((st.f_blocks * st.f_frsize) / (1024.0 ** 3), 2)',
-      '            disk_free_gb = round((st.f_bavail * st.f_frsize) / (1024.0 ** 3), 2)',
-      '    except Exception:',
-      '        pass',
-      '    os_ver = platform.platform()',
-      '    try:',
-      '        with open("/etc/os-release", "r") as f:',
-      '            for line in f:',
-      '                if line.startswith("PRETTY_NAME="):',
-      '                    os_ver = line.split("=", 1)[1].strip().strip(\'"\')',
-      '                    break',
-      '    except Exception:',
-      '        pass',
-      '    edr_status = "Healthy" if (os.path.exists("/sys/module/apparmor") or os.path.exists("/sys/fs/selinux")) else "Unmonitored"',
-      '    luks_encrypted = False',
-      '    try:',
-      '        if os.path.exists("/etc/crypttab"):',
-      '            with open("/etc/crypttab", "r") as cf:',
-      '                luks_encrypted = any(ln.strip() and not ln.strip().startswith("#") for ln in cf)',
-      '    except Exception:',
-      '        pass',
-      '    reboot_req = bool(os.path.exists("/var/run/reboot-required"))',
-      '    arp_neighbors = []',
-      '    try:',
-      '        out = subprocess.check_output(["ip", "neigh", "show"], text=True, timeout=4)',
-      '        for line in out.splitlines():',
-      '            cols = line.split()',
-      '            if len(cols) >= 5 and "lladdr" in cols:',
-      '                idx = cols.index("lladdr")',
-      '                if idx + 1 < len(cols):',
-      '                    arp_neighbors.append({"ip": cols[0], "mac": cols[idx + 1]})',
-      '    except Exception:',
-      '        pass',
-      '    return {',
-      '        "deviceId": device_id,',
-      '        "hostname": socket.gethostname(),',
-      '        "osType": "linux",',
-      '        "osVersion": os_ver,',
-      '        "cpuUsage": cpu_pct,',
-      '        "ramUsage": ram_pct,',
-      '        "ramUsedGb": ram_used_gb,',
-      '        "ramTotalGb": ram_total_gb,',
-      '        "diskUsage": disk_pct,',
-      '        "diskFreeGb": disk_free_gb,',
-      '        "diskTotalGb": disk_total_gb,',
-      '        "edrStatus": edr_status,',
-      '        "avStatus": edr_status,',
-      '        "bitlockerEncrypted": luks_encrypted,',
-      '        "bitlockerStatus": "Encrypted" if luks_encrypted else "Unencrypted",',
-      '        "rebootPending": reboot_req,',
-      '        "rebootRequired": reboot_req,',
-      '        "arpNeighbors": arp_neighbors[:64]',
-      '    }',
-      '',
-      'def execute_task(t, server_url, token, insecure, ident):',
-      '    tid = str(t.get("id") or "")',
-      '    uri_tid = urllib.parse.quote(tid, safe="")',
-      '    ttype = t.get("type") or t.get("task_type") or ""',
-      '    try:',
-      '        payload = t.get("payload") if isinstance(t.get("payload"), dict) else json.loads(t.get("payload_json") or "{}")',
-      '    except Exception:',
-      '        payload = {}',
-      '    if not isinstance(payload, dict):',
-      '        payload = {}',
-      '    exit_code = 0',
-      '    stdout_str = ""',
-      '    stderr_str = ""',
-      '    if ttype == "self_uninstall":',
-      '        try:',
-      '            post_json(f"{server_url}/api/agent/tasks/{uri_tid}/result", {',
-      '                "deviceId": ident.get("deviceId"),',
-      '                "exitCode": 0,',
-      '                "stdout": "Self-uninstall initiated",',
-      '                "stderr": ""',
-      '            }, token, insecure)',
-      '        except Exception:',
-      '            pass',
-      '        acc = str(payload.get("lapsAccountName") or "")',
-      '        act = str(payload.get("lapsAction") or "")',
-      '        if SAFE_ACC_RE.match(acc):',
-      '            if act == "remove_account":',
-      '                subprocess.run(["userdel", "-r", acc], capture_output=True)',
-      '            elif act == "disable_account":',
-      '                subprocess.run(["usermod", "-L", acc], capture_output=True)',
-      '        slug = re.sub(r"[^a-z0-9_-]", "", str(payload.get("serviceName") or ident.get("serviceSlug") or "vitrineagent").lower()) or "vitrineagent"',
-      '        mesh_bin = os.path.join(BASE_DIR, "meshagent")',
-      '        if os.path.exists(mesh_bin):',
-      '            subprocess.run([mesh_bin, "-uninstall"], capture_output=True)',
-      '        subprocess.run(["systemctl", "disable", "--now", f"{slug}-companion.service"], capture_output=True)',
-      '        try:',
-      '            unit_path = f"/etc/systemd/system/{slug}-companion.service"',
-      '            if os.path.exists(unit_path):',
-      '                os.remove(unit_path)',
-      '            shutil.rmtree(BASE_DIR, ignore_errors=True)',
-      '        except Exception:',
-      '            pass',
-      '        sys.exit(0)',
-      '    try:',
-      '        if ttype in ("script", "run_script", "patch_scan", "patch_install", "software_deploy", "backup_job"):',
-      '            code = payload.get("code") or payload.get("command") or "echo ok"',
-      '            env = os.environ.copy()',
-      '            for k, v in (payload.get("env") or {}).items():',
-      '                if isinstance(k, str) and PARAM_KEY_RE.match(k):',
-      '                    env[k] = str(v)',
-      '            timeout_s = max(5, min(3600, int(payload.get("timeoutSec") or 120)))',
-      '            proc = subprocess.run(["/bin/bash", "-c", code], env=env, capture_output=True, text=True, timeout=timeout_s)',
-      '            exit_code = proc.returncode',
-      '            stdout_str = (proc.stdout or "")[-32000:]',
-      '            stderr_str = (proc.stderr or "")[-16000:]',
-      '        elif ttype == "wol_relay":',
-      '            mac_hex = (payload.get("mac") or "").replace(":", "").replace("-", "").strip()',
-      '            if len(mac_hex) == 12:',
-      '                pkt = bytes.fromhex("FF" * 6 + mac_hex * 16)',
-      '                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)',
-      '                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)',
-      '                s.sendto(pkt, (payload.get("broadcastIp") or "255.255.255.255", int(payload.get("port") or 9)))',
-      '                s.close()',
-      '                stdout_str = f"Magic packet relayed to {mac_hex}"',
-      '            else:',
-      '                exit_code = 1',
-      '                stderr_str = "Invalid MAC address"',
-      '        elif ttype in ("tray_notify", "reboot_prompt"):',
-      '            title = str(payload.get("title") or "IT Support")',
-      '            msg = str(payload.get("message") or "")',
-      '            subprocess.run(["wall", f"[{title}] {msg}"], capture_output=True, timeout=5)',
-      '            stdout_str = "Broadcast delivered"',
-      '    except Exception as exc:',
-      '        exit_code = 1',
-      '        stderr_str = str(exc)',
-      '    try:',
-      '        post_json(f"{server_url}/api/agent/tasks/{uri_tid}/result", {',
-      '            "deviceId": ident.get("deviceId"),',
-      '            "exitCode": exit_code,',
-      '            "stdout": stdout_str,',
-      '            "stderr": stderr_str,',
-      '            "backupJobId": payload.get("backupJobId")',
-      '        }, token, insecure)',
-      '    except Exception:',
-      '        pass',
-      '',
-      'def main():',
-      '    if len(sys.argv) >= 3 and sys.argv[1] == "--chat":',
-      '        if os.path.exists(ID_PATH):',
-      '            with open(ID_PATH, "r") as f:',
-      '                send_chat(json.load(f), sys.argv[2])',
-      '        return',
-      '    once = "--once" in sys.argv',
-      '    while True:',
-      '        try:',
-      '            if os.path.exists(ID_PATH):',
-      '                with open(ID_PATH, "r") as f:',
-      '                    ident = json.load(f)',
-      '                token = ident.get("agentToken") or ident.get("agentAuthToken")',
-      '                srv = (ident.get("vitrineServerUrl") or "").rstrip("/")',
-      '                insec = bool(ident.get("insecureTls"))',
-      '                if token and srv:',
-      '                    resp = post_json(f"{srv}/api/agent/checkin", collect_metrics(ident.get("deviceId")), token, insec)',
-      '                    for task in (resp.get("tasks") or []):',
-      '                        execute_task(task, srv, token, insec, ident)',
-      '        except Exception:',
-      '            pass',
-      '        if once:',
-      '            break',
-      '        time.sleep(25)',
-      '',
-      'if __name__ == "__main__":',
-      '    main()',
-      'PYAGENT',
-      'chmod 700 "$INSTALL_DIR/vitrine-companion.py"',
-      '',
       ...(vars.isQuickSupport
-        ? ['nohup python3 "$INSTALL_DIR/vitrine-companion.py" >/dev/null 2>&1 &']
+        ? [
+            'nohup python3 "$INSTALL_DIR/vitrine-companion.py" >/dev/null 2>&1 &',
+            'if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then',
+            '  nohup python3 "$INSTALL_DIR/vitrine-tray.py" --quicksupport --code "${SESSION_CODE:-$ENROLLMENT_TOKEN}" >/dev/null 2>&1 &',
+            'fi'
+          ]
         : [
             'if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then',
-            '  cat > "/etc/systemd/system/${SERVICE_NAME}-companion.service" <<EOF',
+            '  UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}-companion.service"',
+            '  cat > "$UNIT_PATH" <<\'EOF\'',
             '[Unit]',
-            'Description=${BRAND_NAME} Endpoint Telemetry & Task Companion',
+            'Description=__VITRINE_DESC__',
             'After=network-online.target',
             '',
             '[Service]',
             'Type=simple',
-            'ExecStart=/usr/bin/env python3 ${INSTALL_DIR}/vitrine-companion.py',
+            'ExecStart=/usr/bin/env python3 __VITRINE_EXEC__',
             'Restart=always',
             'RestartSec=10',
             '',
             '[Install]',
             'WantedBy=multi-user.target',
             'EOF',
+            '  python3 - "$UNIT_PATH" "$SAFE_UNIT_BRAND Endpoint Telemetry & Task Companion" "${INSTALL_DIR}/vitrine-companion.py" <<\'PYUNIT\'',
+            'import sys',
+            'p, desc, exec_p = sys.argv[1], sys.argv[2].replace("\\n", " ").replace("\\r", " "), sys.argv[3].replace("\\n", "").replace("\\r", "")',
+            'with open(p, "r") as f: data = f.read()',
+            'data = data.replace("__VITRINE_DESC__", desc).replace("__VITRINE_EXEC__", exec_p)',
+            'with open(p, "w") as f: f.write(data)',
+            'PYUNIT',
+            '  chmod 644 "$UNIT_PATH"',
             '  systemctl daemon-reload || true',
-            '  systemctl enable --now "${SERVICE_NAME}-companion.service" || nohup python3 "$INSTALL_DIR/vitrine-companion.py" >/dev/null 2>&1 &',
+            '  (systemctl enable "${SERVICE_NAME}-companion.service" && systemctl restart "${SERVICE_NAME}-companion.service") || nohup python3 "$INSTALL_DIR/vitrine-companion.py" >/dev/null 2>&1 &',
             'else',
             '  nohup python3 "$INSTALL_DIR/vitrine-companion.py" >/dev/null 2>&1 &',
+            'fi',
+            '',
+            '# Install XDG Autostart entry & launch theme-aware Desktop Tray if a graphical session is active',
+            'if [ -d /etc/xdg/autostart ] || mkdir -p /etc/xdg/autostart 2>/dev/null; then',
+            '  cat > "/etc/xdg/autostart/${SERVICE_NAME}-tray.desktop" <<DESKEOF',
+            '[Desktop Entry]',
+            'Type=Application',
+            'Name=${SAFE_UNIT_BRAND} Support Tray',
+            'Exec=/usr/bin/env python3 ${INSTALL_DIR}/vitrine-tray.py',
+            'Terminal=false',
+            'X-GNOME-Autostart-enabled=true',
+            'DESKEOF',
+            '  chmod 644 "/etc/xdg/autostart/${SERVICE_NAME}-tray.desktop"',
+            'fi',
+            'pkill -f "${INSTALL_DIR}/vitrine-tray.py" >/dev/null 2>&1 || true',
+            'GUI_USER="${SUDO_USER:-}"',
+            'if [ -z "$GUI_USER" ] || [ "$GUI_USER" = "root" ]; then',
+            '  GUI_USER="$(who | awk \'{print $1; exit}\' || true)"',
+            'fi',
+            'if [ -n "$GUI_USER" ] && [ "$GUI_USER" != "root" ] && id "$GUI_USER" >/dev/null 2>&1; then',
+            '  GUI_UID="$(id -u "$GUI_USER")"',
+            '  GUI_RT="/run/user/$GUI_UID"',
+            '  if [ -d "$GUI_RT" ]; then',
+            '    GUI_DISP=""',
+            '    GUI_WL=""',
+            '    for s in "$GUI_RT"/wayland-[0-9]*; do [ -S "$s" ] && GUI_WL="$(basename "$s")" && break; done',
+            '    if [ -n "${DISPLAY:-}" ]; then GUI_DISP="$DISPLAY"; elif [ -S /tmp/.X11-unix/X0 ]; then GUI_DISP=":0"; elif [ -S /tmp/.X11-unix/X1 ]; then GUI_DISP=":1"; fi',
+            '    if [ -n "$GUI_DISP" ] || [ -n "$GUI_WL" ]; then',
+            '      GUI_CMD=(env "XDG_RUNTIME_DIR=$GUI_RT")',
+            '      [ -n "$GUI_DISP" ] && GUI_CMD+=("DISPLAY=$GUI_DISP")',
+            '      [ -n "$GUI_WL" ] && GUI_CMD+=("WAYLAND_DISPLAY=$GUI_WL")',
+            '      [ -S "$GUI_RT/bus" ] && GUI_CMD+=("DBUS_SESSION_BUS_ADDRESS=unix:path=$GUI_RT/bus")',
+            '      nohup su -s /bin/sh "$GUI_USER" -c "${GUI_CMD[*]} python3 ${INSTALL_DIR}/vitrine-tray.py >/dev/null 2>&1 &" >/dev/null 2>&1 || true',
+            '    fi',
+            '  fi',
             'fi'
           ]),
       '',
@@ -1191,11 +1322,16 @@ export class InstallerGeneratorService {
     lapsAutoCreate?: number;
     lapsAccountName?: string;
     allowSelfSignedTls?: boolean;
+    skipMeshAgentDownload?: boolean;
+    targetDeviceId?: string;
+    telemetryIntervalSec?: number;
   }): string {
-    const safeCommentBrand = vars.brandName.replace(/[\r\n#]/g, '');
+    const cleanBrand = sanitizeSingleLine(vars.brandName, 'Vitrine RMM', 64);
+    const safeCommentBrand = cleanBrand.replace(/#/g, '');
     const curlTlsFlag = vars.allowSelfSignedTls ? '--insecure ' : '';
     const safeService = vars.serviceName.toLowerCase().replace(/[^a-z0-9_-]/g, '') || 'vitrineagent';
     const plistLabel = `com.${safeService}.companion`;
+    const sleepSec = Math.max(10, Math.min(3600, Math.round(Number(vars.telemetryIntervalSec || 25))));
 
     const lines = [
       '#!/usr/bin/env bash',
@@ -1214,17 +1350,17 @@ export class InstallerGeneratorService {
             'fi'
           ]),
       '',
-      `BRAND_NAME=${quoteBashLiteral(vars.brandName)}`,
+      `BRAND_NAME=${quoteBashLiteral(cleanBrand)}`,
       `MESH_SERVER_URL=${quoteBashLiteral(vars.meshServerUrl)}`,
       `VITRINE_SERVER_URL=${quoteBashLiteral(vars.vitrineServerUrl)}`,
-      `MESH_GROUP_ID=${quoteBashLiteral(vars.meshGroupId)}`,
+      `MESH_GROUP_ID=${quoteBashLiteral(vars.meshGroupId.replace(/^mesh\/\//, ''))}`,
       `ENROLLMENT_TOKEN=${quoteBashLiteral(vars.enrollmentToken)}`,
       `TENANT_ID=${quoteBashLiteral(vars.tenantId)}`,
       `TRAY_THEME=${quoteBashLiteral(vars.trayThemeMode)}`,
       `SERVICE_SLUG=${quoteBashLiteral(safeService)}`,
       `PLIST_LABEL=${quoteBashLiteral(plistLabel)}`,
       `LAPS_AUTO_CREATE=${quoteBashLiteral(String(vars.lapsAutoCreate ?? 1))}`,
-      `LAPS_USER=${quoteBashLiteral(vars.lapsAccountName || 'LocalAdmin')}`,
+      `LAPS_USER=${quoteBashLiteral(sanitizeIdentifier(vars.lapsAccountName, 'LocalAdmin', 20))}`,
       `CURL_TLS_FLAG=${quoteBashLiteral(vars.allowSelfSignedTls ? '--insecure' : '')}`,
       vars.isQuickSupport
         ? 'INSTALL_DIR="$HOME/Library/Application Support/${SERVICE_SLUG}-quicksupport"'
@@ -1241,16 +1377,25 @@ export class InstallerGeneratorService {
       `  curl ${curlTlsFlag}-fsSL "$MESH_SERVER_URL/meshsettings?id=$MESH_GROUP_ID" -o "$INSTALL_DIR/meshagent.msh" || true`,
       'fi',
       '',
-      `if curl ${curlTlsFlag}-fsSL "$MESH_SERVER_URL/meshagents?id=$MESH_TYPE" -o "$INSTALL_DIR/meshagent"; then`,
-      '  if [ -s "$INSTALL_DIR/meshagent" ]; then',
-      '    chmod 755 "$INSTALL_DIR/meshagent"',
-      vars.isQuickSupport
-        ? '    "$INSTALL_DIR/meshagent" -connect >/dev/null 2>&1 &'
-        : '    "$INSTALL_DIR/meshagent" -install --installPath="$INSTALL_DIR/meshcore" || true',
-      '  fi',
-      'else',
-      '  echo "[!] MeshCentral binary download skipped or unreachable; proceeding with Vitrine Companion Agent." >&2',
-      'fi',
+      ...(vars.skipMeshAgentDownload
+        ? ['# Companion-only deployment over live MeshCentral tunnel (leaving existing MeshAgent untouched)']
+        : [
+            `if curl ${curlTlsFlag}-fsSL "$MESH_SERVER_URL/meshagents?id=$MESH_TYPE" -o "$INSTALL_DIR/meshagent"; then`,
+            '  if [ -s "$INSTALL_DIR/meshagent" ]; then',
+            '    chmod 755 "$INSTALL_DIR/meshagent"',
+            ...(vars.isQuickSupport
+              ? ['    "$INSTALL_DIR/meshagent" -connect >/dev/null 2>&1 &']
+              : [
+                  '    mkdir -p "$INSTALL_DIR/meshcore"',
+                  '    if [ -s "$INSTALL_DIR/meshagent.msh" ]; then cp "$INSTALL_DIR/meshagent.msh" "$INSTALL_DIR/meshcore/meshagent.msh" && chmod 600 "$INSTALL_DIR/meshcore/meshagent.msh"; fi',
+                  '    (cd "$INSTALL_DIR" && "$INSTALL_DIR/meshagent" -install --installPath="$INSTALL_DIR/meshcore") || true',
+                  '    if [ -s "$INSTALL_DIR/meshagent.msh" ]; then cp "$INSTALL_DIR/meshagent.msh" "$INSTALL_DIR/meshcore/meshagent.msh" && chmod 600 "$INSTALL_DIR/meshcore/meshagent.msh"; fi'
+                ]),
+            '  fi',
+            'else',
+            '  echo "[!] MeshCentral binary download skipped or unreachable; proceeding with Vitrine Companion Agent." >&2',
+            'fi'
+          ]),
       '',
       'if [ "${EUID:-$(id -u)}" -eq 0 ] && [ "$LAPS_AUTO_CREATE" = "1" ]; then',
       '  if ! id "$LAPS_USER" >/dev/null 2>&1; then',
@@ -1264,7 +1409,7 @@ export class InstallerGeneratorService {
       'DEF_IFACE="$(route -n get default 2>/dev/null | awk \'/interface:/ {print $2; exit}\')"',
       'IP_ADDR="$(ipconfig getifaddr "${DEF_IFACE:-en0}" 2>/dev/null || echo "")"',
       'MAC_ADDR="$(ifconfig "${DEF_IFACE:-en0}" 2>/dev/null | awk \'/ether / {print $2; exit}\')"',
-      'ENROLL_JSON="$(python3 -c \'import json,sys; print(json.dumps({"token":sys.argv[1],"enrollmentToken":sys.argv[1],"tenantId":sys.argv[2],"hostname":sys.argv[3],"osType":"macos","osVersion":sys.argv[4],"ipAddress":sys.argv[5] or "127.0.0.1","macAddress":sys.argv[6] or ""}))\' "$ENROLLMENT_TOKEN" "$TENANT_ID" "$HOSTNAME_VAL" "$OS_VER" "$IP_ADDR" "$MAC_ADDR")"',
+      'ENROLL_JSON="$(python3 -c \'import json,sys; print(json.dumps({"token":sys.argv[1],"enrollmentToken":sys.argv[1],"tenantId":sys.argv[2],"hostname":sys.argv[3],"osType":"macos","osVersion":sys.argv[4],"ipAddress":sys.argv[5] or "127.0.0.1","macAddress":sys.argv[6] or "","deviceId":sys.argv[7] or None}))\' "$ENROLLMENT_TOKEN" "$TENANT_ID" "$HOSTNAME_VAL" "$OS_VER" "$IP_ADDR" "$MAC_ADDR" ' + quoteBashLiteral(vars.targetDeviceId || '') + ')"',
       `if ENROLL_RESP="$(curl ${curlTlsFlag}-fsSL -X POST "$VITRINE_SERVER_URL/api/agent/enroll" -H "Content-Type: application/json" -d "$ENROLL_JSON" 2>/dev/null)"; then`,
       '  python3 - "$ENROLL_RESP" "$VITRINE_SERVER_URL" "$TENANT_ID" "$INSTALL_DIR/agent-identity.json" "$CURL_TLS_FLAG" "$SERVICE_SLUG" <<\'PYEOF\'',
       'import json, os, sys',
@@ -1357,6 +1502,20 @@ export class InstallerGeneratorService {
       '    except Exception:',
       '        pass',
       '    os_ver = f"macOS {platform.mac_ver()[0] or platform.release()}"',
+      '    mac_model = ""; has_battery = False; is_vm = False',
+      '    try:',
+      '        mac_model = subprocess.check_output(["sysctl", "-n", "hw.model"], text=True, timeout=2).strip()',
+      '    except Exception: pass',
+      '    try:',
+      '        batt_out = subprocess.check_output(["pmset", "-g", "batt"], text=True, timeout=2)',
+      '        has_battery = "InternalBattery" in batt_out',
+      '    except Exception: pass',
+      '    try:',
+      '        vmm = subprocess.check_output(["sysctl", "-n", "kern.hv_vmm_present"], text=True, timeout=2).strip()',
+      '        if vmm == "1": is_vm = True',
+      '    except Exception: pass',
+      '    if "virtualmac" in mac_model.lower() or "vmware" in mac_model.lower() or "parallels" in mac_model.lower(): is_vm = True',
+      '    hw_sys = {"manufacturer": "Apple Inc.", "model": mac_model, "hasBattery": has_battery, "isVirtualMachine": is_vm, "osProductType": "server" if mac_model.lower().startswith("xserve") else "workstation"}',
       '    fv_active = False',
       '    try:',
       '        fv = subprocess.run(["fdesetup", "isactive"], capture_output=True, text=True, timeout=4)',
@@ -1365,6 +1524,38 @@ export class InstallerGeneratorService {
       '        pass',
       '    edr_status = "Healthy" if os.path.exists("/Library/Apple/System/Library/CoreServices/XProtect.bundle") else "Unmonitored"',
       '    reboot_req = bool(os.path.exists("/Library/Updates/ProductMetadata.plist") or os.path.exists("/var/db/.AppleUpgrade"))',
+      '    uptime_sec = 0',
+      '    try:',
+      '        bt = subprocess.check_output(["sysctl", "-n", "kern.boottime"], text=True, timeout=3)',
+      '        m_bt = re.search(r"sec\\s*=\\s*(\\d+)", bt)',
+      '        if m_bt:',
+      '            uptime_sec = max(0, int(time.time() - int(m_bt.group(1))))',
+      '    except Exception:',
+      '        pass',
+      '    net_rx_mbps = 0.0',
+      '    net_tx_mbps = 0.0',
+      '    try:',
+      '        def _read_mac_net():',
+      '            rx = tx = 0',
+      '            out_ns = subprocess.check_output(["netstat", "-ib"], text=True, timeout=4)',
+      '            seen = set()',
+      '            for ln in out_ns.splitlines()[1:]:',
+      '                cols = ln.split()',
+      '                if len(cols) >= 10 and not cols[0].startswith("lo") and cols[2].startswith("<Link#"):',
+      '                    if cols[0] in seen: continue',
+      '                    seen.add(cols[0])',
+      '                    try:',
+      '                        rx += int(cols[6]); tx += int(cols[9])',
+      '                    except Exception:',
+      '                        pass',
+      '            return rx, tx',
+      '        r1, t1 = _read_mac_net()',
+      '        time.sleep(1.0)',
+      '        r2, t2 = _read_mac_net()',
+      '        net_rx_mbps = round(max(0, r2 - r1) * 8 / 1000000.0, 3)',
+      '        net_tx_mbps = round(max(0, t2 - t1) * 8 / 1000000.0, 3)',
+      '    except Exception:',
+      '        pass',
       '    arp_neighbors = []',
       '    try:',
       '        arp_out = subprocess.check_output(["arp", "-an"], text=True, timeout=4)',
@@ -1386,12 +1577,16 @@ export class InstallerGeneratorService {
       '        "diskUsage": disk_pct,',
       '        "diskFreeGb": disk_free_gb,',
       '        "diskTotalGb": disk_total_gb,',
+      '        "netRxMbps": net_rx_mbps,',
+      '        "netTxMbps": net_tx_mbps,',
+      '        "uptimeSeconds": uptime_sec,',
       '        "edrStatus": edr_status,',
       '        "avStatus": edr_status,',
       '        "bitlockerEncrypted": fv_active,',
       '        "bitlockerStatus": "Encrypted" if fv_active else "Unencrypted",',
       '        "rebootPending": reboot_req,',
       '        "rebootRequired": reboot_req,',
+      '        "hardwareDetails": {"system": hw_sys},',
       '        "arpNeighbors": arp_neighbors[:64]',
       '    }',
       '',
@@ -1427,9 +1622,10 @@ export class InstallerGeneratorService {
       '                subprocess.run(["pwpolicy", "-u", acc, "-disableuser"], capture_output=True)',
       '        slug = re.sub(r"[^a-z0-9_-]", "", str(payload.get("serviceName") or ident.get("serviceSlug") or "vitrineagent").lower()) or "vitrineagent"',
       '        plist_path = f"/Library/LaunchDaemons/com.{slug}.companion.plist"',
-      '        mesh_bin = os.path.join(BASE_DIR, "meshagent")',
-      '        if os.path.exists(mesh_bin):',
-      '            subprocess.run([mesh_bin, "-uninstall"], capture_output=True)',
+      '        if not payload.get("preserveMeshAgent"):',
+      '            mesh_bin = os.path.join(BASE_DIR, "meshagent")',
+      '            if os.path.exists(mesh_bin):',
+      '                subprocess.run([mesh_bin, "-uninstall"], capture_output=True)',
       '        subprocess.run(["launchctl", "bootout", "system", plist_path], capture_output=True)',
       '        try:',
       '            if os.path.exists(plist_path):',
@@ -1446,8 +1642,11 @@ export class InstallerGeneratorService {
       '                if isinstance(k, str) and PARAM_KEY_RE.match(k):',
       '                    env[k] = str(v)',
       '            timeout_s = max(5, min(3600, int(payload.get("timeoutSec") or 120)))',
-      '            shell_bin = "/bin/zsh" if os.path.exists("/bin/zsh") else "/bin/bash"',
-      '            proc = subprocess.run([shell_bin, "-c", code], env=env, capture_output=True, text=True, timeout=timeout_s)',
+      '            if payload.get("shell") == "python" or payload.get("language") == "python":',
+      '                proc = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=timeout_s)',
+      '            else:',
+      '                shell_bin = "/bin/zsh" if os.path.exists("/bin/zsh") else "/bin/bash"',
+      '                proc = subprocess.run([shell_bin, "-c", code], env=env, capture_output=True, text=True, timeout=timeout_s)',
       '            exit_code = proc.returncode',
       '            stdout_str = (proc.stdout or "")[-32000:]',
       '            stderr_str = (proc.stderr or "")[-16000:]',
@@ -1464,9 +1663,9 @@ export class InstallerGeneratorService {
       '                exit_code = 1',
       '                stderr_str = "Invalid MAC address"',
       '        elif ttype in ("tray_notify", "reboot_prompt"):',
-      '            title = str(payload.get("title") or "IT Support").replace(\'"\', "\'")',
-      '            msg = str(payload.get("message") or "").replace(\'"\', "\'")',
-      '            subprocess.run(["osascript", "-e", f\'display notification "{msg}" with title "{title}"\'], capture_output=True, timeout=5)',
+      '            title = str(payload.get("title") or "IT Support")',
+      '            msg = str(payload.get("message") or "")',
+      '            subprocess.run(["osascript", "-e", "on run argv", "-e", "display notification (item 1 of argv) with title (item 2 of argv)", "-e", "end run", msg, title], capture_output=True, timeout=5)',
       '            stdout_str = "Notification delivered"',
       '    except Exception as exc:',
       '        exit_code = 1',
@@ -1505,7 +1704,7 @@ export class InstallerGeneratorService {
       '            pass',
       '        if once:',
       '            break',
-      '        time.sleep(25)',
+      `        time.sleep(${sleepSec})`,
       '',
       'if __name__ == "__main__":',
       '    main()',
@@ -1553,3 +1752,10 @@ export class InstallerGeneratorService {
 }
 
 export const installerGenerator = new InstallerGeneratorService();
+
+export async function getOrBuildSignedMeshBinary(
+  arch: 'x64' | 'arm64' | 'x86' = 'x64',
+  allowSelfSignedTls = false
+) {
+  return installerGenerator.getOrBuildSignedMeshBinary(arch, allowSelfSignedTls);
+}

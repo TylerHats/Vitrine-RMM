@@ -101,7 +101,7 @@ export const BRANDING_DIR_PATH = BRANDING_DIR;
 export const RECORDINGS_DIR_PATH = RECORDINGS_DIR;
 export const PACKAGES_DIR_PATH = PACKAGES_DIR;
 export const DB_FILE_PATH = DB_PATH;
-export const APP_VERSION = '2.6.1';
+export const APP_VERSION = '2.7.0';
 export const APP_SCHEMA_VERSION = 18;
 
 function detectInstalledCommit(): string {
@@ -140,7 +140,7 @@ function detectInstalledCommit(): string {
   } catch {
     // Git binary or repo unavailable
   }
-  return 'v2.5.0';
+  return 'v2.7.0';
 }
 
 export const APP_INSTALLED_COMMIT = detectInstalledCommit();
@@ -704,9 +704,9 @@ export function initDatabase() {
       file_path TEXT NOT NULL,
       size_bytes INTEGER NOT NULL DEFAULT 0,
       trigger_type TEXT NOT NULL DEFAULT 'manual',
-      app_version TEXT NOT NULL DEFAULT '2.5.0',
-      git_commit TEXT NOT NULL DEFAULT 'v2.5.0',
-      db_schema_version INTEGER NOT NULL DEFAULT 15,
+      app_version TEXT NOT NULL DEFAULT '2.7.0',
+      git_commit TEXT NOT NULL DEFAULT 'v2.7.0',
+      db_schema_version INTEGER NOT NULL DEFAULT 18,
       sha256_hash TEXT NOT NULL,
       includes_branding INTEGER NOT NULL DEFAULT 1,
       includes_mesh_config INTEGER NOT NULL DEFAULT 1,
@@ -991,6 +991,24 @@ export function initDatabase() {
       last_synced_at TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS device_telemetry_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      device_id TEXT NOT NULL,
+      cpu_usage REAL NOT NULL DEFAULT 0,
+      ram_used_gb REAL NOT NULL DEFAULT 0,
+      ram_total_gb REAL NOT NULL DEFAULT 0,
+      disk_used_pct REAL NOT NULL DEFAULT 0,
+      disk_free_gb REAL NOT NULL DEFAULT 0,
+      disk_total_gb REAL NOT NULL DEFAULT 0,
+      net_rx_mbps REAL NOT NULL DEFAULT 0,
+      net_tx_mbps REAL NOT NULL DEFAULT 0,
+      recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_telemetry_history_device_time
+      ON device_telemetry_history (device_id, recorded_at DESC);
   `);
 
   runDatabaseMigrations();
@@ -1112,10 +1130,11 @@ export function runDatabaseMigrations() {
   safeAddColumn('devices', "mdm_compliance_status TEXT NOT NULL DEFAULT 'Unmanaged'");
   safeAddColumn('devices', "last_backup_status TEXT NOT NULL DEFAULT 'Unconfigured'");
   safeAddColumn('devices', 'last_backup_at TEXT');
-  safeAddColumn('devices', "companion_version TEXT NOT NULL DEFAULT '2.6.1'");
+  safeAddColumn('devices', "companion_version TEXT NOT NULL DEFAULT '2.7.0'");
   safeAddColumn('devices', 'logged_in_user TEXT');
   safeAddColumn('devices', 'reboot_required INTEGER NOT NULL DEFAULT 0');
   safeAddColumn('devices', 'uptime_seconds INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('devices', 'device_role_manual INTEGER NOT NULL DEFAULT 0');
 
   // Patches, Hardware & Network History
   safeAddColumn('patches', 'cve_id TEXT');
@@ -1221,8 +1240,8 @@ export function runDatabaseMigrations() {
   safeAddColumn('settings', "reverse_proxy_type TEXT NOT NULL DEFAULT 'nginx'");
   safeAddColumn('settings', "letsencrypt_email TEXT NOT NULL DEFAULT ''");
   safeAddColumn('settings', "update_channel TEXT NOT NULL DEFAULT 'stable'");
-  safeAddColumn('settings', "installed_version TEXT NOT NULL DEFAULT '2.6.1'");
-  safeAddColumn('settings', "installed_commit TEXT NOT NULL DEFAULT 'v2.6.1'");
+  safeAddColumn('settings', "installed_version TEXT NOT NULL DEFAULT '2.7.0'");
+  safeAddColumn('settings', "installed_commit TEXT NOT NULL DEFAULT 'v2.7.0'");
   safeAddColumn('settings', 'db_schema_version INTEGER NOT NULL DEFAULT 18');
   safeAddColumn('settings', 'update_auto_backup INTEGER NOT NULL DEFAULT 1');
   safeAddColumn('settings', 'update_auto_rollback INTEGER NOT NULL DEFAULT 1');
@@ -1286,7 +1305,10 @@ export function runDatabaseMigrations() {
   safeAddColumn('network_appliances', "snmp_v3_priv_proto TEXT DEFAULT 'AES'");
   safeAddColumn('network_appliances', 'snmp_v3_priv_key_encrypted TEXT');
   safeAddColumn('network_appliances', 'snmp_port INTEGER NOT NULL DEFAULT 161');
+  safeAddColumn('network_appliances', 'manufacturer TEXT');
+  safeAddColumn('network_appliances', 'model TEXT');
 
+  safeAddColumn('virtualization_hosts', 'tenant_id TEXT');
   safeAddColumn('virtualization_hosts', 'api_port INTEGER NOT NULL DEFAULT 8006');
   safeAddColumn('virtualization_hosts', 'api_username TEXT');
   safeAddColumn('virtualization_hosts', 'api_token_encrypted TEXT');
@@ -1371,6 +1393,31 @@ export function runDatabaseMigrations() {
   safeAddColumn('deleted_tenant_device_tombstones', 'agent_token_hash TEXT');
   safeAddColumn('agent_tasks', "stdout TEXT NOT NULL DEFAULT ''");
   safeAddColumn('agent_tasks', "stderr TEXT NOT NULL DEFAULT ''");
+
+  // 4-tier policy branding & agent tray popup menu customization + MS2/OOBE sync state
+  safeAddColumn('policies', "tray_brand_name TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('policies', "tray_icon_url TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('policies', "tray_theme_mode TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('policies', 'tray_enabled INTEGER NOT NULL DEFAULT 1');
+  safeAddColumn('policies', "tray_tooltip TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('policies', "tray_support_url TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('policies', "tray_support_phone TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('policies', "tray_support_email TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('policies', 'tray_menu_items_json TEXT');
+  safeAddColumn('policies', 'companion_auto_deploy INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('devices', 'companion_deploy_pending INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('devices', "logged_in_user TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('devices', "hardware_details_json TEXT NOT NULL DEFAULT '{}'");
+  safeAddColumn('devices', 'net_rx_mbps REAL NOT NULL DEFAULT 0.0');
+  safeAddColumn('devices', 'net_tx_mbps REAL NOT NULL DEFAULT 0.0');
+  safeAddColumn('mesh_servers', 'allow_self_signed INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('settings', 'oobe_auto_deploy_companion INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('settings', 'oobe_enforce_laps_on_import INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('settings', 'oobe_lock_signed_updates INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('settings', 'session_idle_timeout_min INTEGER NOT NULL DEFAULT 720');
+  safeAddColumn('settings', 'session_timeout_min INTEGER NOT NULL DEFAULT 720');
+  safeAddColumn('self_healing_monitors', 'tenant_id TEXT');
+  safeAddColumn('custom_field_definitions', 'tenant_id TEXT');
 
   // Deduplicate custom_field_values before enforcing UNIQUE(field_id, entity_id)
   try {
@@ -1513,6 +1560,28 @@ function seedProductionBaseline() {
         'pol-global', 'Global MSP Baseline', 'global', NULL, 30, 1,
         30, 'cancel', 1,
         'Tuesdays @ 02:00 AM', 'Prompt 4h, then force reboot', 1
+      )
+    `).run();
+  }
+
+  // 1b. Dedicated Built-In QuickSupport On-Demand Branding & Tray Profile (inherits Global until customized)
+  const qsPolCount = (
+    db.prepare("SELECT COUNT(*) as c FROM policies WHERE id = 'pol-quicksupport' OR tier = 'quicksupport'").get() as {
+      c: number;
+    }
+  ).c;
+  if (qsPolCount === 0) {
+    db.prepare(`
+      INSERT INTO policies (
+        id, name, tier, target_id, telemetry_interval_sec, require_remote_consent,
+        consent_timeout_sec, consent_timeout_action, auto_lock_on_disconnect,
+        patch_schedule, patch_reboot_enforcement, self_healing_enabled,
+        tray_brand_name, tray_icon_url, tray_theme_mode, tray_enabled, tray_tooltip, overrides_json
+      ) VALUES (
+        'pol-quicksupport', 'QuickSupport On-Demand Profile', 'quicksupport', 'quicksupport', 30, 1,
+        30, 'cancel', 0,
+        'On-Demand Only', 'Standard', 0,
+        '', '', '', 1, '', '[]'
       )
     `).run();
   }
@@ -1767,6 +1836,27 @@ df -h /`,
       JSON.stringify(['devices:read', 'remote:connect', 'alerts:triage'])
     );
   }
+
+  // Ensure built-in Client Administrator system role template always exists with minimal read-only permissions
+  try {
+    const clientAdminExists = (
+      db
+        .prepare("SELECT COUNT(*) as c FROM custom_roles WHERE id = 'role-client-admin'")
+        .get() as { c: number }
+    ).c;
+    if (clientAdminExists === 0) {
+      db.prepare(`
+        INSERT OR IGNORE INTO custom_roles (id, name, description, base_tier, permissions_json, allowed_tenant_ids_json, is_system)
+        VALUES ('role-client-admin', 'Client Administrator', 'Scoped single-tenant device visibility for client contacts.', 'client_admin', '["devices:read"]', '[]', 1)
+      `).run();
+    } else {
+      db.prepare(`
+        UPDATE custom_roles
+        SET permissions_json = '["devices:read"]'
+        WHERE id = 'role-client-admin' AND is_system = 1
+      `).run();
+    }
+  } catch {}
 
   // 6. Baseline Cross-Platform Software Package Catalog
   const pkgCount = (db.prepare('SELECT COUNT(*) as c FROM software_packages').get() as { c: number }).c;

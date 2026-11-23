@@ -1,25 +1,19 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   ShieldCheck,
   Download,
   Lock,
   Sparkles,
-  CheckCircle2,
-  Monitor,
   Sun,
   Moon,
-  ArrowLeft,
   Terminal,
   KeyRound
 } from 'lucide-react';
 import { createQuickSupportSession, fetchPublicPortalConfig } from '../services/api.js';
 import { PublicPortalConfig, SigningStageReport } from '../types/index.js';
+import { sanitizeSafeUrl } from '../utils/urlSafety.js';
 
-interface QuickSupportPortalViewProps {
-  onBackToAdmin?: () => void;
-}
-
-export const QuickSupportPortalView: React.FC<QuickSupportPortalViewProps> = ({ onBackToAdmin }) => {
+export const QuickSupportPortalView: React.FC = () => {
   const [portalConfig, setPortalConfig] = useState<PublicPortalConfig | null>(null);
   const [themePref, setThemePref] = useState<'system' | 'dark' | 'light'>('system');
   const [effectiveTheme, setEffectiveTheme] = useState<'dark' | 'light'>('dark');
@@ -29,12 +23,11 @@ export const QuickSupportPortalView: React.FC<QuickSupportPortalViewProps> = ({ 
   const [platform, setPlatform] = useState<'windows' | 'macos' | 'linux'>(() => {
     const ua = navigator.userAgent.toLowerCase();
     if (ua.includes('mac')) return 'macos';
-    if (ua.includes('linux')) return 'linux';
+    if (ua.includes('linux') && !ua.includes('android')) return 'linux';
     return 'windows';
   });
 
   const [preparing, setPreparing] = useState(false);
-  const [activeStageIdx, setActiveStageIdx] = useState(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [sessionResult, setSessionResult] = useState<{
     sessionCode: string;
@@ -42,25 +35,13 @@ export const QuickSupportPortalView: React.FC<QuickSupportPortalViewProps> = ({ 
     allSigned: boolean;
     stages: SigningStageReport[];
   } | null>(null);
-  const timersRef = useRef<Array<ReturnType<typeof setTimeout>>>([]);
-
-  const clearAllTimers = () => {
-    timersRef.current.forEach(clearTimeout);
-    timersRef.current = [];
-  };
-
-  useEffect(() => {
-    return () => {
-      timersRef.current.forEach(clearTimeout);
-      timersRef.current = [];
-    };
-  }, []);
 
   useEffect(() => {
     fetchPublicPortalConfig()
       .then((cfg) => {
         setPortalConfig(cfg);
-        if (cfg?.theme_mode) setThemePref(cfg.theme_mode);
+        const preferredTheme = cfg?.quicksupport_theme_mode || cfg?.theme_mode;
+        if (preferredTheme) setThemePref(preferredTheme);
       })
       .catch(() => {});
   }, []);
@@ -81,14 +62,9 @@ export const QuickSupportPortalView: React.FC<QuickSupportPortalViewProps> = ({ 
 
   const handleStartQuickSupport = async (e: React.FormEvent) => {
     e.preventDefault();
-    clearAllTimers();
     setPreparing(true);
     setErrorMsg(null);
     setSessionResult(null);
-    setActiveStageIdx(1);
-
-    timersRef.current.push(setTimeout(() => setActiveStageIdx(2), 300));
-    timersRef.current.push(setTimeout(() => setActiveStageIdx(3), 600));
 
     try {
       const res = await createQuickSupportSession({
@@ -98,39 +74,32 @@ export const QuickSupportPortalView: React.FC<QuickSupportPortalViewProps> = ({ 
       });
 
       if (!res.success || !res.session) {
-        clearAllTimers();
-        setPreparing(false);
-        setActiveStageIdx(0);
         setErrorMsg(res.error || 'Unable to generate QuickSupport launcher at this time.');
         return;
       }
 
-      const confirmedSession = res.session;
-      timersRef.current.push(
-        setTimeout(() => {
-          setPreparing(false);
-          setActiveStageIdx(4);
-          setSessionResult({
-            sessionCode: confirmedSession.session_code,
-            downloadUrl: res.downloadUrl,
-            allSigned: Boolean(res.signingPipeline?.allSigned),
-            stages: res.signingPipeline?.stages || []
-          });
-        }, 400)
-      );
+      setSessionResult({
+        sessionCode: res.session.session_code,
+        downloadUrl: res.downloadUrl,
+        allSigned: Boolean(res.signingPipeline?.allSigned),
+        stages: res.signingPipeline?.stages || []
+      });
     } catch (err: any) {
-      clearAllTimers();
-      setPreparing(false);
-      setActiveStageIdx(0);
       setErrorMsg(err?.message || 'Network error generating QuickSupport launcher.');
+    } finally {
+      setPreparing(false);
     }
   };
 
   const isLight = effectiveTheme === 'light';
-  const brandName = portalConfig?.brand_name || 'Vitrine RMM';
-  const brandLogo = portalConfig?.brand_logo_url || '/branding/logo.png';
-  const accent = portalConfig?.primary_color || '#00f2fe';
+  const brandName = portalConfig?.quicksupport_brand_name || portalConfig?.brand_name || 'Vitrine RMM';
+  const brandLogo =
+    sanitizeSafeUrl(portalConfig?.quicksupport_icon_url) ||
+    sanitizeSafeUrl(portalConfig?.brand_logo_url) ||
+    '/branding/logo.png';
+  const accent = isLight ? '#0284c7' : portalConfig?.primary_color || '#00f2fe';
   const isPortalDisabled = portalConfig !== null && portalConfig.quicksupport_enabled === false;
+  const safeDownloadUrl = sanitizeSafeUrl(sessionResult?.downloadUrl);
 
   return (
     <div
@@ -187,18 +156,6 @@ export const QuickSupportPortalView: React.FC<QuickSupportPortalViewProps> = ({ 
             {effectiveTheme === 'light' ? <Sun size={14} /> : <Moon size={14} />}
             <span>Theme: {themePref.toUpperCase()}</span>
           </button>
-
-          {onBackToAdmin && (
-            <button
-              type="button"
-              className="btn-glass"
-              onClick={onBackToAdmin}
-              style={{ fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.35rem' }}
-            >
-              <ArrowLeft size={14} />
-              <span>Admin Console</span>
-            </button>
-          )}
         </div>
       </div>
 
@@ -239,8 +196,7 @@ export const QuickSupportPortalView: React.FC<QuickSupportPortalViewProps> = ({ 
         <>
         <p style={{ fontSize: '0.85rem', opacity: 0.78, marginBottom: '1.5rem', lineHeight: 1.5 }}>
           Connect with an authorized support technician in seconds. This launcher runs in temporary user mode
-          without requiring local administrator permissions, and every component is cryptographically code-signed
-          before download.
+          without requiring local administrator permissions.
         </p>
 
         <form onSubmit={handleStartQuickSupport} style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
@@ -261,7 +217,7 @@ export const QuickSupportPortalView: React.FC<QuickSupportPortalViewProps> = ({ 
               <input
                 type="text"
                 className="glass-input"
-                placeholder="Auto-generated if blank (e.g. 849-204)"
+                placeholder="Optional (e.g. 849-204)"
                 value={sessionCodeInput}
                 onChange={(e) => setSessionCodeInput(e.target.value)}
               />
@@ -273,9 +229,9 @@ export const QuickSupportPortalView: React.FC<QuickSupportPortalViewProps> = ({ 
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.75rem' }}>
               {(
                 [
-                  { id: 'windows', label: 'Windows 10 / 11', sub: 'Modern WPF QuickConnect' },
-                  { id: 'macos', label: 'macOS (Apple / Intel)', sub: 'Universal QuickConnect' },
-                  { id: 'linux', label: 'Linux Desktop', sub: 'User-Space QuickConnect' }
+                  { id: 'windows', label: 'Windows 10 / 11', sub: 'Signed Windows App (.exe)' },
+                  { id: 'macos', label: 'macOS', sub: 'macOS Quick Support (.sh)' },
+                  { id: 'linux', label: 'Linux', sub: 'Linux Support Client (.sh)' }
                 ] as const
               ).map((p) => (
                 <div
@@ -312,69 +268,66 @@ export const QuickSupportPortalView: React.FC<QuickSupportPortalViewProps> = ({ 
             </div>
           )}
 
-          {/* Live 3-Stage Code Signing Progress Indicator */}
+          {/* Honest Server Package & Signing Status */}
           {(preparing || sessionResult) && (
             <div
               style={{
                 padding: '1rem 1.25rem',
                 borderRadius: '10px',
                 background: isLight ? 'rgba(15, 23, 42, 0.04)' : 'rgba(0, 0, 0, 0.35)',
-                border: '1px solid rgba(0, 242, 254, 0.25)',
+                border: `1px solid ${
+                  preparing
+                    ? 'rgba(56, 189, 248, 0.28)'
+                    : sessionResult?.allSigned
+                      ? 'rgba(16, 185, 129, 0.32)'
+                      : 'rgba(245, 158, 11, 0.32)'
+                }`,
                 display: 'flex',
                 flexDirection: 'column',
                 gap: '0.65rem'
               }}
             >
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span style={{ fontSize: '0.8rem', fontWeight: 700, color: accent, display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                <span
+                  style={{
+                    fontSize: '0.8rem',
+                    fontWeight: 700,
+                    color: preparing ? accent : sessionResult?.allSigned ? '#10b981' : '#f59e0b',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.4rem'
+                  }}
+                >
                   <ShieldCheck size={16} />
                   {preparing
-                    ? 'Preparing QuickSupport Package (3-Stage Pipeline)...'
+                    ? 'Preparing your QuickSupport launcher...'
                     : sessionResult?.allSigned
-                      ? 'All 3 Package Components Cryptographically Signed & Verified'
-                      : 'QuickSupport Package Ready for Download'}
-                </span>
-                <span style={{ fontSize: '0.75rem', fontWeight: 600 }}>
-                  {preparing ? `${Math.min(95, activeStageIdx * 32)}%` : '100% Ready'}
+                      ? 'Verified & Signed Support Package Ready'
+                      : 'Support Download Ready (Unsigned / Partial Verification)'}
                 </span>
               </div>
 
-              <div style={{ width: '100%', height: '6px', background: 'rgba(148, 163, 184, 0.2)', borderRadius: '999px', overflow: 'hidden' }}>
-                <div
-                  style={{
-                    width: preparing ? `${Math.min(95, activeStageIdx * 32)}%` : '100%',
-                    height: '100%',
-                    background: 'linear-gradient(90deg, #00f2fe, #10b981)',
-                    transition: 'width 0.3s ease'
-                  }}
-                />
-              </div>
-
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', fontSize: '0.75rem' }}>
-                {sessionResult && sessionResult.stages.length > 0 ? (
-                  sessionResult.stages.map((st, idx) => (
-                    <div key={st.stepNumber || idx}>
-                      {st.status === 'signed' || st.status === 'verified' ? '✓' : '•'}{' '}
-                      <strong>Stage {st.stepNumber || idx + 1} ({st.component}):</strong> {st.description}
-                    </div>
-                  ))
-                ) : (
-                  <>
-                    <div>
-                      {activeStageIdx >= 1 ? '✓' : '○'}{' '}
-                      <strong>Stage 1:</strong> MeshCentral 2 Core Binary (<code>-connect</code> mode) check
-                    </div>
-                    <div>
-                      {activeStageIdx >= 2 ? '✓' : '○'}{' '}
-                      <strong>Stage 2:</strong> Vitrine Companion &amp; Tech Remote Self-Elevation Helper check
-                    </div>
-                    <div>
-                      {activeStageIdx >= 3 ? '✓' : '○'}{' '}
-                      <strong>Stage 3:</strong> Modern QuickSupport Launcher packaging
-                    </div>
-                  </>
-                )}
-              </div>
+              {sessionResult && sessionResult.stages.length > 0 && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', fontSize: '0.75rem' }}>
+                  {sessionResult.stages.map((st, idx) => {
+                    const isOk = st.status === 'signed' || st.status === 'verified';
+                    const isWarn = st.status === 'bypassed';
+                    const marker = isOk ? '✓' : isWarn ? '○' : '✕';
+                    const markerColor = isOk ? '#10b981' : isWarn ? '#f59e0b' : '#ef4444';
+                    return (
+                      <div key={st.stepNumber || idx} style={{ display: 'flex', justifyContent: 'space-between', gap: '0.5rem' }}>
+                        <span>
+                          <span style={{ color: markerColor, fontWeight: 700, marginRight: '0.35rem' }}>{marker}</span>
+                          <strong>Step {st.stepNumber || idx + 1}:</strong> {st.description}
+                        </span>
+                        <span style={{ color: markerColor, textTransform: 'uppercase', fontSize: '0.68rem', fontWeight: 700, whiteSpace: 'nowrap' }}>
+                          {st.status}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
 
@@ -387,7 +340,7 @@ export const QuickSupportPortalView: React.FC<QuickSupportPortalViewProps> = ({ 
             >
               <Download size={18} />
               <span>
-                {preparing ? 'Signing & Preparing Launcher...' : `Generate & Download Signed ${platform.toUpperCase()} QuickSupport`}
+                {preparing ? 'Preparing Support Download...' : `Download Quick Support (${platform === 'windows' ? 'Windows .exe' : platform === 'macos' ? 'macOS .sh' : 'Linux .sh'})`}
               </span>
             </button>
           ) : (
@@ -415,14 +368,16 @@ export const QuickSupportPortalView: React.FC<QuickSupportPortalViewProps> = ({ 
                   </div>
                 </div>
 
-                <a
-                  href={sessionResult.downloadUrl}
-                  download
-                  className="btn-glass btn-primary"
-                  style={{ textDecoration: 'none', padding: '0.85rem 1.4rem', fontWeight: 700 }}
-                >
-                  <Download size={16} /> Download Signed Launcher
-                </a>
+                {safeDownloadUrl && (
+                  <a
+                    href={safeDownloadUrl}
+                    download
+                    className="btn-glass btn-primary"
+                    style={{ textDecoration: 'none', padding: '0.85rem 1.4rem', fontWeight: 700 }}
+                  >
+                    <Download size={16} /> Download Quick Support ({platform === 'windows' ? '.exe' : '.sh'})
+                  </a>
+                )}
               </div>
             </div>
           )}
@@ -430,7 +385,7 @@ export const QuickSupportPortalView: React.FC<QuickSupportPortalViewProps> = ({ 
         </>
         )}
 
-        {/* Security & Elevation Footnote */}
+        {/* Security Footnote */}
         <div
           style={{
             marginTop: '1.5rem',
@@ -445,15 +400,15 @@ export const QuickSupportPortalView: React.FC<QuickSupportPortalViewProps> = ({ 
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
             <Lock size={14} color="#10b981" />
-            <span>Zero Admin Rights Needed to Start</span>
+            <span>No Admin Password Needed</span>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
             <KeyRound size={14} color={accent} />
-            <span>Tech-Side Credential / LAPS Self-Elevation Ready</span>
+            <span>Encrypted Remote Connection</span>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
             <Terminal size={14} color="#f59e0b" />
-            <span>3-Stage Authenticode &amp; RFC 3161 Signed</span>
+            <span>One-Time Enrollment Token</span>
           </div>
         </div>
       </div>

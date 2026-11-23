@@ -1,7 +1,7 @@
 {
   "name": "Vitrine Unified Endpoint Management & RMM",
   "short_name": "Vitrine RMM",
-  "description": "Self-Hosted Multi-TenantMSP RMM & Endpoint Security Control Plane",
+  "description": "Self-Hosted Multi-Tenant MSP RMM & Endpoint Security Control Plane",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#070b14",

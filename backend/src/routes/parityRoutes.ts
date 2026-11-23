@@ -16,7 +16,8 @@ import {
   isSuperAdminRole,
   isTechnicianOrAbove,
   canUserAccessTenant,
-  getScopedTenantFilter,
+  getAllowedTenantIds,
+  canUserRunScriptRole,
   getActorUsername,
   hasUserPermission,
   normalizePermissionScopes,
@@ -31,6 +32,7 @@ import { handleAgentCheckInOrWake } from '../services/offboarding/index.js';
 import { meshBridge } from '../services/meshcentral/index.js';
 import {
   dispatchAlertToNotificationChannels,
+  resolveEffectiveDevicePolicy,
   syncTicketWithExternalPsas
 } from '../services/policy/index.js';
 import {
@@ -39,6 +41,7 @@ import {
   evaluateSmartGroupDevices
 } from '../services/automation/index.js';
 import { backupService } from '../services/backup/index.js';
+import { recordDeviceTelemetrySample } from '../services/telemetry/index.js';
 
 function constantTimeEquals(a: string, b: string): boolean {
   if (!a || !b) return false;
@@ -68,6 +71,73 @@ function buildSafeAttachmentDisposition(rawFilename: string): string {
       .replace(/[\r\n"\\<>|?*:\0]/g, '_')
       .trim() || 'package.bin';
   return `attachment; filename="${cleaned}"; filename*=UTF-8''${encodeURIComponent(cleaned)}`;
+}
+
+function resolveSafeParityBaseUrl(request: FastifyRequest): string {
+  if (process.env.VITRINE_PUBLIC_URL && process.env.VITRINE_PUBLIC_URL.trim()) {
+    return process.env.VITRINE_PUBLIC_URL.trim().replace(/\/+$/, '');
+  }
+  const settings = (db.prepare('SELECT custom_domain FROM settings WHERE id = 1').get() || {}) as {
+    custom_domain?: string;
+  };
+  const customDomain = String(settings.custom_domain || '').trim();
+  if (customDomain) {
+    if (/^https?:\/\//i.test(customDomain)) {
+      try {
+        return new URL(customDomain).origin;
+      } catch {}
+    }
+    const cleanDom = customDomain.split('/')[0].trim();
+    if (/^[a-zA-Z0-9.:[\]-]+$/.test(cleanDom)) {
+      return `https://${cleanDom}`;
+    }
+  }
+  const trustProxy = process.env.VITRINE_TRUST_PROXY === 'true';
+  const protoHdr = trustProxy ? String(request.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase() : '';
+  const proto = protoHdr === 'https' || protoHdr === 'http' ? protoHdr : request.protocol === 'https' ? 'https' : 'http';
+  const rawHost = String((trustProxy ? request.headers['x-forwarded-host'] : '') || request.headers.host || 'localhost:8080')
+    .split(',')[0]
+    .trim();
+  const safeHost = /^[a-zA-Z0-9.:[\]-]+$/.test(rawHost) ? rawHost : 'localhost:8080';
+  return `${proto}://${safeHost}`;
+}
+
+const EPHEMERAL_PKG_SIGNING_FALLBACK = crypto.randomBytes(32).toString('hex');
+
+function getPackageDownloadSigningKey(): string {
+  try {
+    const row = db.prepare('SELECT agent_enrollment_secret FROM settings WHERE id = 1').get() as
+      | { agent_enrollment_secret?: string }
+      | undefined;
+    if (row?.agent_enrollment_secret) {
+      const dec = decryptVaultSecret(row.agent_enrollment_secret);
+      if (dec) return dec;
+    }
+  } catch {}
+  return process.env.VITRINE_HMAC_SECRET || process.env.VITRINE_MASTER_KEY || EPHEMERAL_PKG_SIGNING_FALLBACK;
+}
+
+function createSignedPackageDownloadUrl(baseUrl: string, rawPath: string, pkgId: string, devId: string): string {
+  const exp = Date.now() + 15 * 60_000;
+  const sig = crypto
+    .createHmac('sha256', getPackageDownloadSigningKey())
+    .update(`${pkgId}:${devId}:${exp}`)
+    .digest('hex');
+  const sep = rawPath.includes('?') ? '&' : '?';
+  return `${baseUrl}${rawPath}${sep}sig=${encodeURIComponent(sig)}&exp=${exp}&devId=${encodeURIComponent(devId)}`;
+}
+
+function verifyPackageDownloadSignature(pkgId: string, devId?: string, expStr?: string, sig?: string): boolean {
+  if (!pkgId || !devId || !expStr || !sig) return false;
+  const exp = Number(expStr);
+  if (!Number.isFinite(exp) || exp <= Date.now()) return false;
+  const dev = db.prepare('SELECT id FROM devices WHERE id = ?').get(devId);
+  if (!dev) return false;
+  const expectedSig = crypto
+    .createHmac('sha256', getPackageDownloadSigningKey())
+    .update(`${pkgId}:${devId}:${exp}`)
+    .digest('hex');
+  return constantTimeEquals(String(sig).trim(), expectedSig);
 }
 
 function requireParityStepUpMfa(req: FastifyRequest, reply: FastifyReply): boolean {
@@ -159,6 +229,8 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       hostname?: string;
       osType?: string;
       osVersion?: string;
+      macAddress?: string;
+      serialNumber?: string;
       cpuUsage?: number;
       ramUsedGb?: number;
       ramUsage?: number;
@@ -175,6 +247,10 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       rebootRequired?: boolean;
       rebootPending?: boolean;
       uptimeSeconds?: number;
+      netRxMbps?: number;
+      netTxMbps?: number;
+      networkMbps?: number;
+      hardwareDetails?: Record<string, any>;
       companionVersion?: string;
       ipAddress?: string;
       gatewayIp?: string;
@@ -190,7 +266,8 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
 
     if (auth.tombstoned && !auth.device) {
       const uninstallPayload = {
-        lapsAction: auth.tombstoned.laps_offboard_action || 'remove_account',
+        lapsAction: auth.tombstoned.laps_action || 'remove_account',
+        lapsAccountName: auth.tombstoned.laps_account_name || 'LocalAdmin',
         reason: 'Parent client tenant was permanently deleted'
       };
       return {
@@ -264,6 +341,20 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     const rawReboot = body.rebootRequired !== undefined ? body.rebootRequired : body.rebootPending;
     const rebootInt = rawReboot != null ? (rawReboot ? 1 : 0) : null;
 
+    const hwSys = body.hardwareDetails?.system;
+    const hwCpu = body.hardwareDetails?.cpu;
+    const hwNet = body.hardwareDetails?.network;
+    const resolvedSerial = String(hwSys?.serialNumber || body.serialNumber || '').trim();
+    const resolvedManufacturer = String(hwSys?.manufacturer || '').trim();
+    const resolvedModel = String(hwSys?.model || '').trim();
+    const resolvedBiosVer = String(hwSys?.biosVersion || '').trim();
+    const resolvedCpuModel = String(hwCpu?.model || '').trim();
+    const resolvedCpuCores =
+      hwCpu?.logicalCores != null && Number.isFinite(Number(hwCpu.logicalCores)) && Number(hwCpu.logicalCores) > 0
+        ? Math.floor(Number(hwCpu.logicalCores))
+        : null;
+    const resolvedMac = String(body.macAddress || hwNet?.primaryMac || '').trim();
+
     db.prepare(`
       UPDATE devices SET
         status = CASE WHEN quarantined = 1 THEN 'isolated' ELSE 'online' END,
@@ -271,6 +362,13 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
         companion_version = COALESCE(?, companion_version),
         os_version = COALESCE(?, os_version),
         ip_address = COALESCE(?, ip_address),
+        mac_address = COALESCE(NULLIF(?, ''), mac_address),
+        serial_number = COALESCE(NULLIF(?, ''), serial_number),
+        manufacturer = COALESCE(NULLIF(?, ''), manufacturer),
+        model = COALESCE(NULLIF(?, ''), model),
+        bios_version = COALESCE(NULLIF(?, ''), bios_version),
+        cpu_model = COALESCE(NULLIF(?, ''), cpu_model),
+        cpu_cores = COALESCE(?, cpu_cores),
         cpu_usage = COALESCE(?, cpu_usage),
         ram_used_gb = COALESCE(?, ram_used_gb),
         ram_total_gb = COALESCE(?, ram_total_gb),
@@ -291,9 +389,16 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
         last_seen = CURRENT_TIMESTAMP
       WHERE id = ?
     `).run(
-      body.companionVersion || '2.6.1',
+      body.companionVersion || '2.7.0',
       body.osVersion ?? null,
       safeCheckinIp,
+      resolvedMac,
+      resolvedSerial,
+      resolvedManufacturer,
+      resolvedModel,
+      resolvedBiosVer,
+      resolvedCpuModel,
+      resolvedCpuCores,
       body.cpuUsage != null && Number.isFinite(Number(body.cpuUsage)) ? Number(body.cpuUsage) : null,
       resolvedRamUsedGb,
       body.ramTotalGb != null && Number.isFinite(Number(body.ramTotalGb)) ? Number(body.ramTotalGb) : null,
@@ -310,6 +415,33 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       body.uptimeSeconds != null && Number.isFinite(Number(body.uptimeSeconds)) ? Math.floor(Number(body.uptimeSeconds)) : null,
       dev.id
     );
+
+    const parsedNetRx =
+      body.netRxMbps != null && Number.isFinite(Number(body.netRxMbps))
+        ? Number(body.netRxMbps)
+        : body.networkMbps != null && Number.isFinite(Number(body.networkMbps))
+          ? Number(body.networkMbps)
+          : null;
+    const parsedNetTx =
+      body.netTxMbps != null && Number.isFinite(Number(body.netTxMbps))
+        ? Number(body.netTxMbps)
+        : null;
+
+    recordDeviceTelemetrySample(dev.id, {
+      cpuUsage: body.cpuUsage != null && Number.isFinite(Number(body.cpuUsage)) ? Number(body.cpuUsage) : null,
+      ramUsedGb: resolvedRamUsedGb,
+      ramTotalGb: body.ramTotalGb != null && Number.isFinite(Number(body.ramTotalGb)) ? Number(body.ramTotalGb) : null,
+      diskFreeGb: resolvedDiskFreeGb,
+      diskTotalGb: body.diskTotalGb != null && Number.isFinite(Number(body.diskTotalGb)) ? Number(body.diskTotalGb) : null,
+      netRxMbps: parsedNetRx,
+      netTxMbps: parsedNetTx,
+      uptimeSeconds:
+        body.uptimeSeconds != null && Number.isFinite(Number(body.uptimeSeconds))
+          ? Math.floor(Number(body.uptimeSeconds))
+          : null,
+      loggedInUser: body.loggedInUser ?? null,
+      hardwareDetails: body.hardwareDetails ?? null
+    });
 
     if (body.gatewayIp || safeCheckinIp) {
       const lastNet = db
@@ -397,17 +529,56 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       db.prepare("UPDATE chat_messages SET read_status = 1 WHERE device_id = ? AND sender_role = 'technician'").run(dev.id);
     }
 
+    let trayConfig: Record<string, unknown> | null = null;
+    try {
+      const effPolicy = resolveEffectiveDevicePolicy(dev.id);
+      trayConfig = {
+        brandName: effPolicy.trayBrandName,
+        iconUrl: effPolicy.trayIconUrl,
+        themeMode: effPolicy.trayThemeMode,
+        enabled: effPolicy.trayEnabled,
+        tooltip: effPolicy.trayTooltip,
+        supportUrl: effPolicy.traySupportUrl,
+        supportPhone: effPolicy.traySupportPhone,
+        supportEmail: effPolicy.traySupportEmail,
+        menuItems: effPolicy.trayMenuItems
+      };
+    } catch {
+      trayConfig = null;
+    }
+
+    const signingRow =
+      pendingTasks.length > 0
+        ? ((db.prepare('SELECT code_signing_enabled FROM settings WHERE id = 1').get() || {}) as {
+            code_signing_enabled?: number;
+          })
+        : null;
+    const isSigningEnabled = Boolean(signingRow?.code_signing_enabled);
+
     return {
       success: true,
       deviceId: dev.id,
       lifecycle,
-      tasks: pendingTasks.map((t) => ({
-        id: t.id,
-        type: t.task_type,
-        task_type: t.task_type,
-        payload: safeJsonParse<Record<string, any>>(t.payload_json, {}),
-        payload_json: t.payload_json || '{}'
-      })),
+      trayConfig,
+      tasks: pendingTasks.map((t) => {
+        const payload = safeJsonParse<Record<string, any>>(t.payload_json, {});
+        if (
+          !isSigningEnabled &&
+          !payload.executionPolicy &&
+          ['script', 'run_script', 'patch_scan', 'patch_install', 'software_deploy', 'backup_job'].includes(
+            String(t.task_type || '')
+          )
+        ) {
+          payload.executionPolicy = 'Bypass';
+        }
+        return {
+          id: t.id,
+          type: t.task_type,
+          task_type: t.task_type,
+          payload,
+          payload_json: JSON.stringify(payload)
+        };
+      }),
       unreadChats,
       timestamp: new Date().toISOString()
     };
@@ -554,28 +725,60 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
   // ============================================================================
   // 2. Scheduled Automations Engine (Cron + Smart Group / Tenant / Device Targets)
   // ============================================================================
-  const resolveAutomationTenantId = (
+  const resolveAutomationTargetScope = (
     explicitTenantId?: string | null,
     targetType?: string | null,
     targetId?: string | null
-  ): string | null => {
-    if (explicitTenantId && explicitTenantId !== 'all') return explicitTenantId;
-    if (!targetType || targetType === 'all') return null;
-    if (targetType === 'tenant') return targetId || null;
-    if (targetType === 'site' && targetId) {
-      return (db.prepare('SELECT tenant_id FROM sites WHERE id = ?').get(targetId) as any)?.tenant_id || null;
+  ): { tenantId: string | null; notFound?: string; conflict?: string } => {
+    const cleanExplicit = explicitTenantId && explicitTenantId !== 'all' ? explicitTenantId : null;
+    const normType = (targetType || 'all').trim().toLowerCase();
+
+    if (normType === 'tenant') {
+      const tid = targetId || cleanExplicit;
+      if (!tid) return { tenantId: null, notFound: 'Target tenant ID is required.' };
+      if (cleanExplicit && cleanExplicit !== tid) {
+        return { tenantId: tid, conflict: 'tenant_id conflicts with target_id.' };
+      }
+      return { tenantId: tid };
     }
-    if (targetType === 'smart_group' && targetId) {
-      return (db.prepare('SELECT tenant_id FROM smart_groups WHERE id = ?').get(targetId) as any)?.tenant_id || null;
+    if (normType === 'site') {
+      if (!targetId) return { tenantId: null, notFound: 'Target site ID is required.' };
+      const site = db.prepare('SELECT tenant_id FROM sites WHERE id = ?').get(targetId) as { tenant_id?: string } | undefined;
+      if (!site) return { tenantId: null, notFound: 'Target site not found.' };
+      if (cleanExplicit && cleanExplicit !== site.tenant_id) {
+        return { tenantId: site.tenant_id || null, conflict: 'tenant_id conflicts with site tenant.' };
+      }
+      return { tenantId: site.tenant_id || null };
     }
-    if (targetType === 'device' && targetId) {
-      return (db.prepare('SELECT tenant_id FROM devices WHERE id = ?').get(targetId) as any)?.tenant_id || null;
+    if (normType === 'smart_group') {
+      if (!targetId) return { tenantId: null, notFound: 'Target smart group ID is required.' };
+      const sg = db.prepare('SELECT tenant_id FROM smart_groups WHERE id = ?').get(targetId) as
+        | { tenant_id?: string | null }
+        | undefined;
+      if (!sg) return { tenantId: null, notFound: 'Target smart group not found.' };
+      if (cleanExplicit && sg.tenant_id && cleanExplicit !== sg.tenant_id) {
+        return { tenantId: sg.tenant_id, conflict: 'tenant_id conflicts with smart group tenant.' };
+      }
+      return { tenantId: sg.tenant_id || null };
     }
-    return null;
+    if (normType === 'device') {
+      if (!targetId) return { tenantId: null, notFound: 'Target device ID is required.' };
+      const dev = db.prepare('SELECT tenant_id FROM devices WHERE id = ?').get(targetId) as
+        | { tenant_id?: string }
+        | undefined;
+      if (!dev) return { tenantId: null, notFound: 'Target device not found.' };
+      if (cleanExplicit && cleanExplicit !== dev.tenant_id) {
+        return { tenantId: dev.tenant_id || null, conflict: 'tenant_id conflicts with device tenant.' };
+      }
+      return { tenantId: dev.tenant_id || null };
+    }
+    // 'all' or 'global'
+    return { tenantId: cleanExplicit };
   };
 
   server.get('/api/automations', async (request) => {
     const user = request.auth?.user;
+    const isGlobalUser = getAllowedTenantIds(user) === null;
     const rows = db
       .prepare(`
         SELECT a.*, s.name as script_name, s.language as script_language
@@ -587,8 +790,8 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
 
     return rows
       .filter((r) => {
-        const tid = resolveAutomationTenantId(r.tenant_id, r.target_type, r.target_id);
-        return tid ? canUserAccessTenant(user, tid) : !getScopedTenantFilter(user);
+        const scope = resolveAutomationTargetScope(r.tenant_id, r.target_type, r.target_id);
+        return scope.tenantId ? canUserAccessTenant(user, scope.tenantId) : isGlobalUser;
       })
       .map((r) => ({
         ...r,
@@ -599,12 +802,14 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
   });
 
   server.post('/api/automations', async (request, reply) => {
+    const user = request.auth?.user;
+    const isGlobalUser = getAllowedTenantIds(user) === null;
     const body = (request.body || {}) as {
       name?: string;
       description?: string;
       script_id?: string;
       tenant_id?: string | null;
-      target_type?: 'all' | 'tenant' | 'site' | 'smart_group' | 'device';
+      target_type?: 'all' | 'global' | 'tenant' | 'site' | 'smart_group' | 'device';
       target_id?: string | null;
       cron_expr?: string;
       run_as?: 'system' | 'user';
@@ -615,12 +820,25 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     if (!body.name?.trim() || !body.script_id) {
       return reply.status(400).send({ error: 'Automation name and script_id are required.' });
     }
+    const scriptRow = db.prepare('SELECT * FROM scripts WHERE id = ?').get(body.script_id) as any;
+    if (!scriptRow) return reply.status(404).send({ error: 'Referenced script not found.' });
+    if (!canUserRunScriptRole(user?.role || '', scriptRow.required_role)) {
+      return reply.status(403).send({
+        error: `Forbidden: Script "${scriptRow.name}" requires role '${scriptRow.required_role}'.`
+      });
+    }
+    if (scriptRow.tenant_id && scriptRow.tenant_id !== 'all' && !canUserAccessTenant(user, scriptRow.tenant_id)) {
+      return reply.status(403).send({ error: 'Forbidden: script belongs to another client tenant.' });
+    }
+
     const targetType = body.target_type || 'all';
-    const resolvedTenantId = resolveAutomationTenantId(body.tenant_id, targetType, body.target_id);
-    if (!resolvedTenantId && getScopedTenantFilter(request.auth?.user)) {
+    const scope = resolveAutomationTargetScope(body.tenant_id, targetType, body.target_id);
+    if (scope.notFound) return reply.status(404).send({ error: scope.notFound });
+    if (scope.conflict) return reply.status(400).send({ error: scope.conflict });
+    if (!scope.tenantId && !isGlobalUser) {
       return reply.status(403).send({ error: 'Scoped accounts cannot create global fleet-wide automations.' });
     }
-    if (resolvedTenantId && !canUserAccessTenant(request.auth?.user, resolvedTenantId)) {
+    if (scope.tenantId && !canUserAccessTenant(user, scope.tenantId)) {
       return reply.status(403).send({ error: 'Forbidden for target tenant scope.' });
     }
 
@@ -637,7 +855,7 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       id,
       body.name.trim(),
       body.description || '',
-      resolvedTenantId,
+      scope.tenantId,
       body.script_id,
       targetType,
       body.target_id || null,
@@ -667,26 +885,44 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     const { id } = request.params as { id: string };
     const existing = db.prepare('SELECT * FROM scheduled_automations WHERE id = ?').get(id) as any;
     if (!existing) return reply.status(404).send({ error: 'Scheduled automation not found.' });
-    const existingTid = resolveAutomationTenantId(existing.tenant_id, existing.target_type, existing.target_id);
-    if (existingTid && !canUserAccessTenant(request.auth?.user, existingTid)) {
-      return reply.status(403).send({ error: 'Forbidden' });
+    const user = request.auth?.user;
+    const isGlobalUser = getAllowedTenantIds(user) === null;
+
+    const existingScript = db.prepare('SELECT * FROM scripts WHERE id = ?').get(existing.script_id) as any;
+    if (existingScript && !canUserRunScriptRole(user?.role || '', existingScript.required_role)) {
+      return reply.status(403).send({ error: 'Forbidden: insufficient role for automation script.' });
     }
-    if (!existingTid && getScopedTenantFilter(request.auth?.user)) {
+    const existingScope = resolveAutomationTargetScope(existing.tenant_id, existing.target_type, existing.target_id);
+    if (existingScope.tenantId ? !canUserAccessTenant(user, existingScope.tenantId) : !isGlobalUser) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
 
     const body = (request.body || {}) as Record<string, any>;
+    const nextScriptId = body.script_id || existing.script_id;
+    const nextScript = db.prepare('SELECT * FROM scripts WHERE id = ?').get(nextScriptId) as any;
+    if (!nextScript) return reply.status(404).send({ error: 'Referenced script not found.' });
+    if (!canUserRunScriptRole(user?.role || '', nextScript.required_role)) {
+      return reply.status(403).send({
+        error: `Forbidden: Script "${nextScript.name}" requires role '${nextScript.required_role}'.`
+      });
+    }
+    if (nextScript.tenant_id && nextScript.tenant_id !== 'all' && !canUserAccessTenant(user, nextScript.tenant_id)) {
+      return reply.status(403).send({ error: 'Forbidden: script belongs to another client tenant.' });
+    }
+
     const nextTargetType = body.target_type ?? existing.target_type;
     const nextTargetId = body.target_id !== undefined ? body.target_id : existing.target_id;
-    const nextTenantId = resolveAutomationTenantId(
+    const nextScope = resolveAutomationTargetScope(
       body.tenant_id !== undefined ? body.tenant_id : existing.tenant_id,
       nextTargetType,
       nextTargetId
     );
-    if (!nextTenantId && getScopedTenantFilter(request.auth?.user)) {
+    if (nextScope.notFound) return reply.status(404).send({ error: nextScope.notFound });
+    if (nextScope.conflict) return reply.status(400).send({ error: nextScope.conflict });
+    if (!nextScope.tenantId && !isGlobalUser) {
       return reply.status(403).send({ error: 'Scoped accounts cannot retarget automations globally.' });
     }
-    if (nextTenantId && !canUserAccessTenant(request.auth?.user, nextTenantId)) {
+    if (nextScope.tenantId && !canUserAccessTenant(user, nextScope.tenantId)) {
       return reply.status(403).send({ error: 'Forbidden for target tenant scope.' });
     }
 
@@ -713,7 +949,7 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     `).run(
       body.name ?? null,
       body.description ?? null,
-      nextTenantId,
+      nextScope.tenantId,
       body.script_id ?? null,
       body.target_type ?? null,
       nextTargetId,
@@ -737,11 +973,16 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
   server.delete('/api/automations/:id', async (request, reply) => {
     const { id } = request.params as { id: string };
     const existing = db.prepare('SELECT * FROM scheduled_automations WHERE id = ?').get(id) as any;
-    if (existing) {
-      const tid = resolveAutomationTenantId(existing.tenant_id, existing.target_type, existing.target_id);
-      if ((tid && !canUserAccessTenant(request.auth?.user, tid)) || (!tid && getScopedTenantFilter(request.auth?.user))) {
-        return reply.status(403).send({ error: 'Forbidden' });
-      }
+    if (!existing) return reply.status(404).send({ error: 'Scheduled automation not found.' });
+    const user = request.auth?.user;
+    const isGlobalUser = getAllowedTenantIds(user) === null;
+    const existingScript = db.prepare('SELECT * FROM scripts WHERE id = ?').get(existing.script_id) as any;
+    if (existingScript && !canUserRunScriptRole(user?.role || '', existingScript.required_role)) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
+    const scope = resolveAutomationTargetScope(existing.tenant_id, existing.target_type, existing.target_id);
+    if (scope.tenantId ? !canUserAccessTenant(user, scope.tenantId) : !isGlobalUser) {
+      return reply.status(403).send({ error: 'Forbidden' });
     }
     db.prepare('DELETE FROM scheduled_automations WHERE id = ?').run(id);
     return { success: true };
@@ -751,8 +992,20 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     const { id } = request.params as { id: string };
     const existing = db.prepare('SELECT * FROM scheduled_automations WHERE id = ?').get(id) as any;
     if (!existing) return reply.status(404).send({ success: false, error: 'Scheduled automation not found.' });
-    const tid = resolveAutomationTenantId(existing.tenant_id, existing.target_type, existing.target_id);
-    if ((tid && !canUserAccessTenant(request.auth?.user, tid)) || (!tid && getScopedTenantFilter(request.auth?.user))) {
+    const user = request.auth?.user;
+    const isGlobalUser = getAllowedTenantIds(user) === null;
+    const scriptRow = db.prepare('SELECT * FROM scripts WHERE id = ?').get(existing.script_id) as any;
+    if (scriptRow && !canUserRunScriptRole(user?.role || '', scriptRow.required_role)) {
+      return reply.status(403).send({
+        success: false,
+        error: `Forbidden: Script "${scriptRow.name}" requires role '${scriptRow.required_role}'.`
+      });
+    }
+    if (scriptRow?.tenant_id && scriptRow.tenant_id !== 'all' && !canUserAccessTenant(user, scriptRow.tenant_id)) {
+      return reply.status(403).send({ success: false, error: 'Forbidden' });
+    }
+    const scope = resolveAutomationTargetScope(existing.tenant_id, existing.target_type, existing.target_id);
+    if (scope.tenantId ? !canUserAccessTenant(user, scope.tenantId) : !isGlobalUser) {
       return reply.status(403).send({ success: false, error: 'Forbidden' });
     }
     try {
@@ -847,13 +1100,15 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
   });
 
   server.get('/api/software-packages/:id/download', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const query = (request.query || {}) as { sig?: string; exp?: string; devId?: string };
     const userAuthed = Boolean(request.auth && hasUserPermission(request.auth.user, 'devices:read'));
-    const agentAuthed = userAuthed ? false : authenticateAgentRequest(request).valid;
-    if (!userAuthed && !agentAuthed) {
-      return reply.status(401).send({ error: 'Authentication required to download software package.' });
+    const signedValid = verifyPackageDownloadSignature(id, query.devId, query.exp, query.sig);
+    const agentAuthed = userAuthed || signedValid ? false : authenticateAgentRequest(request).valid;
+    if (!userAuthed && !signedValid && !agentAuthed) {
+      return reply.status(401).send({ error: 'Authentication or valid signed download token required to download software package.' });
     }
 
-    const { id } = request.params as { id: string };
     const pkg = db.prepare('SELECT * FROM software_packages WHERE id = ?').get(id) as any;
     if (!pkg || !pkg.local_file_path) {
       return reply.status(404).send({ error: 'Uploaded software package artifact not found.' });
@@ -915,8 +1170,9 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
         LIMIT 200
       `)
       .all() as any[];
+    const isGlobalUser = getAllowedTenantIds(request.auth?.user) === null;
     return rows
-      .filter((r) => (r.device_tenant_id ? canUserAccessTenant(request.auth?.user, r.device_tenant_id) : !getScopedTenantFilter(request.auth?.user)))
+      .filter((r) => (r.device_tenant_id ? canUserAccessTenant(request.auth?.user, r.device_tenant_id) : isGlobalUser))
       .slice(0, 100)
       .map(({ device_tenant_id: _unused, ...rest }) => rest);
   });
@@ -932,10 +1188,11 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       action?: 'install' | 'upgrade' | 'uninstall';
     };
 
-    let targetIds = Array.isArray(body.deviceIds) ? body.deviceIds.filter(Boolean) : [];
+    const explicitIds = Array.isArray(body.deviceIds) ? body.deviceIds.filter(Boolean) : [];
+    let targetIds = [...explicitIds];
     if (body.smartGroupId) {
       const sg = db.prepare('SELECT * FROM smart_groups WHERE id = ?').get(body.smartGroupId) as any;
-      if (sg && (!sg.tenant_id || canUserAccessTenant(request.auth?.user, sg.tenant_id))) {
+      if (sg && (sg.tenant_id ? canUserAccessTenant(request.auth?.user, sg.tenant_id) : getAllowedTenantIds(request.auth?.user) === null)) {
         const matched = evaluateSmartGroupDevices(sg.criteria_json, sg.tenant_id);
         targetIds = Array.from(new Set([...targetIds, ...matched.map((d) => d.id)]));
       }
@@ -948,29 +1205,61 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       body.action === 'uninstall' ? 'uninstall' : body.action === 'upgrade' ? 'upgrade' : 'install';
     const actor = getActorUsername(request);
     const pkgMgr = String(pkg.package_manager || pkg.package_type || 'winget');
+    const rawPkgOs = String(pkg.os_type || pkg.platform || '').trim().toLowerCase();
+    const pkgOs = rawPkgOs === 'darwin' ? 'macos' : rawPkgOs;
     const rawIdentifier = String(pkg.package_identifier || '').trim();
     const safeId = rawIdentifier.replace(/[^a-zA-Z0-9._/@+-]/g, '');
     if (['winget', 'choco', 'apt', 'dnf', 'brew'].includes(pkgMgr) && (!safeId || safeId.startsWith('-'))) {
       return reply.status(400).send({ error: 'Invalid or unsafe package_identifier (cannot be empty or start with "-").' });
     }
 
-    const protoHeader = String(request.headers['x-forwarded-proto'] || '').split(',')[0].trim();
-    const hostHeader = String(request.headers['x-forwarded-host'] || request.headers.host || 'localhost:3000').split(',')[0].trim();
-    const baseControlUrl = (
-      process.env.VITRINE_PUBLIC_URL ||
-      `${protoHeader || (request.protocol === 'https' ? 'https' : 'http')}://${hostHeader}`
-    ).replace(/\/+$/, '');
+    const isCompatibleDeviceOs = (devOsRaw: string): boolean => {
+      const devOs = devOsRaw === 'darwin' ? 'macos' : String(devOsRaw || 'windows').toLowerCase();
+      if (pkgOs && pkgOs !== 'cross_platform' && pkgOs !== 'all' && pkgOs !== devOs) {
+        return false;
+      }
+      if (['winget', 'choco', 'msi_url'].includes(pkgMgr) && devOs !== 'windows') return false;
+      if (['apt', 'dnf', 'deb_upload'].includes(pkgMgr) && devOs !== 'linux') return false;
+      if (pkgMgr === 'brew' && devOs !== 'macos') return false;
+      return true;
+    };
 
+    const authorizedDevices: any[] = [];
+    for (const devId of targetIds) {
+      const dev = db.prepare('SELECT * FROM devices WHERE id = ?').get(devId) as any;
+      if (!dev) continue;
+      if (!canUserAccessTenant(request.auth?.user, dev.tenant_id)) {
+        if (explicitIds.includes(devId)) {
+          return reply.status(403).send({ error: 'Forbidden: target endpoint is outside your tenant scope.' });
+        }
+        continue;
+      }
+      if (!isCompatibleDeviceOs(dev.os_type)) {
+        if (explicitIds.includes(devId) || targetIds.length === 1) {
+          return reply.status(400).send({
+            error: `OS mismatch: package '${pkg.name}' (${pkgOs || pkgMgr}/${pkgMgr}) cannot be deployed to '${dev.hostname}' (${dev.os_type}).`
+          });
+        }
+        continue;
+      }
+      authorizedDevices.push(dev);
+    }
+
+    if (authorizedDevices.length === 0) {
+      return reply.status(400).send({
+        error: `No compatible endpoints matched package OS/manager (${pkgOs || pkgMgr}/${pkgMgr}).`
+      });
+    }
+
+    const baseControlUrl = resolveSafeParityBaseUrl(request);
     const rawInstallerUrl = String(pkg.installer_url || pkg.download_url || '').trim();
-    const resolvedInstallerUrl = rawInstallerUrl.startsWith('/')
-      ? `${baseControlUrl}${rawInstallerUrl}`
-      : rawInstallerUrl;
     const expectedSha256 = String(pkg.sha256_hash || '').trim().toLowerCase();
     const results: any[] = [];
 
-    for (const devId of targetIds) {
-      const dev = db.prepare('SELECT * FROM devices WHERE id = ?').get(devId) as any;
-      if (!dev || !canUserAccessTenant(request.auth?.user, dev.tenant_id)) continue;
+    for (const dev of authorizedDevices) {
+      const resolvedInstallerUrl = rawInstallerUrl.startsWith('/')
+        ? createSignedPackageDownloadUrl(baseControlUrl, rawInstallerUrl, pkg.id, dev.id)
+        : rawInstallerUrl;
 
       const psId = quotePowerShellLiteral(safeId);
       const shId = quotePosixLiteral(safeId);
@@ -997,13 +1286,13 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
         const shaCheck = /^[a-f0-9]{64}$/.test(expectedSha256)
           ? `$actual = (Get-FileHash -Path $tmpMsi -Algorithm SHA256).Hash.ToLower(); if ($actual -ne '${expectedSha256}') { Remove-Item -Force $tmpMsi -ErrorAction SilentlyContinue; throw "SHA-256 mismatch ($actual)" }; `
           : '';
-        cmd = `$ErrorActionPreference = 'Stop'; $tmpMsi = Join-Path $env:TEMP ('vitrine-' + [guid]::NewGuid().ToString() + '.msi'); $hdrs = @{}; if ($env:VITRINE_AGENT_TOKEN) { $hdrs['x-vitrine-agent-token'] = $env:VITRINE_AGENT_TOKEN }; Invoke-WebRequest -Uri ${psUrl} -Headers $hdrs -UseBasicParsing -OutFile $tmpMsi; ${shaCheck}$p = Start-Process -FilePath 'msiexec.exe' -ArgumentList (@('/i', $tmpMsi) + @(${quotePowerShellLiteral(psExtra)} -split ' ')) -Wait -PassThru; Remove-Item -Force $tmpMsi -ErrorAction SilentlyContinue; exit $p.ExitCode`;
+        cmd = `$ErrorActionPreference = 'Stop'; $tmpMsi = Join-Path $env:TEMP ('vitrine-' + [guid]::NewGuid().ToString() + '.msi'); Invoke-WebRequest -Uri ${psUrl} -UseBasicParsing -OutFile $tmpMsi; ${shaCheck}$p = Start-Process -FilePath 'msiexec.exe' -ArgumentList (@('/i', $tmpMsi) + @(${quotePowerShellLiteral(psExtra)} -split ' ')) -Wait -PassThru; Remove-Item -Force $tmpMsi -ErrorAction SilentlyContinue; exit $p.ExitCode`;
       } else if (pkgMgr === 'deb_upload' && action !== 'uninstall' && resolvedInstallerUrl) {
         const shUrl = quotePosixLiteral(resolvedInstallerUrl);
         const shaCheck = /^[a-f0-9]{64}$/.test(expectedSha256)
           ? `echo "${expectedSha256}  $TMP_DEB" | sha256sum -c - || { rm -f "$TMP_DEB"; exit 1; }; `
           : '';
-        cmd = `set -e; TMP_DEB="/tmp/vitrine-${pkg.id}-$$.deb"; if [ -n "\${VITRINE_AGENT_TOKEN:-}" ]; then curl -fsSL -H "x-vitrine-agent-token: $VITRINE_AGENT_TOKEN" ${shUrl} -o "$TMP_DEB"; else curl -fsSL ${shUrl} -o "$TMP_DEB"; fi; ${shaCheck}DEBIAN_FRONTEND=noninteractive dpkg -i "$TMP_DEB" || DEBIAN_FRONTEND=noninteractive apt-get install -f -y; rm -f "$TMP_DEB"`;
+        cmd = `set -e; TMP_DEB="/tmp/vitrine-${pkg.id}-$$.deb"; curl -fsSL ${shUrl} -o "$TMP_DEB"; ${shaCheck}DEBIAN_FRONTEND=noninteractive dpkg -i "$TMP_DEB" || DEBIAN_FRONTEND=noninteractive apt-get install -f -y; rm -f "$TMP_DEB"`;
       } else {
         cmd = action === 'uninstall' ? String(pkg.uninstall_args || '') : String(pkg.install_args || '');
       }
@@ -1090,13 +1379,21 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
   server.get('/api/alerts', async (request) => {
     const query = (request.query || {}) as { status?: string; severity?: string; tenant_id?: string };
     const user = request.auth?.user;
-    const scopedTenant = getScopedTenantFilter(user);
+    const allowedTenants = getAllowedTenantIds(user);
+    if (allowedTenants !== null && allowedTenants.length === 0) {
+      return [];
+    }
     const clauses: string[] = [];
     const params: any[] = [];
 
-    if (scopedTenant) {
-      clauses.push('a.tenant_id = ?');
-      params.push(scopedTenant);
+    if (allowedTenants !== null) {
+      clauses.push(`a.tenant_id IN (${allowedTenants.map(() => '?').join(',')})`);
+      params.push(...allowedTenants);
+      if (query.tenant_id && query.tenant_id !== 'all') {
+        if (!canUserAccessTenant(user, query.tenant_id)) return [];
+        clauses.push('a.tenant_id = ?');
+        params.push(query.tenant_id);
+      }
     } else if (query.tenant_id && query.tenant_id !== 'all') {
       clauses.push('a.tenant_id = ?');
       params.push(query.tenant_id);
@@ -1124,8 +1421,8 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       `)
       .all(...params) as any[];
 
-    const hasRestrictedTenants = Boolean(scopedTenant || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0));
-    return rows.filter((r) => (r.tenant_id ? canUserAccessTenant(user, r.tenant_id) : !hasRestrictedTenants));
+    const isGlobalUser = allowedTenants === null;
+    return rows.filter((r) => (r.tenant_id ? canUserAccessTenant(user, r.tenant_id) : isGlobalUser));
   });
 
   server.post('/api/alerts/:id/acknowledge', async (request, reply) => {
@@ -1133,10 +1430,7 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     const inc = db.prepare('SELECT * FROM alert_incidents WHERE id = ?').get(id) as any;
     if (!inc) return reply.status(404).send({ error: 'Alert incident not found.' });
     const user = request.auth?.user;
-    if (
-      (inc.tenant_id && !canUserAccessTenant(user, inc.tenant_id)) ||
-      (!inc.tenant_id && (getScopedTenantFilter(user) || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0)))
-    ) {
+    if (inc.tenant_id ? !canUserAccessTenant(user, inc.tenant_id) : getAllowedTenantIds(user) !== null) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
     const actor = getActorUsername(request);
@@ -1157,10 +1451,7 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     const inc = db.prepare('SELECT * FROM alert_incidents WHERE id = ?').get(id) as any;
     if (!inc) return reply.status(404).send({ error: 'Alert incident not found.' });
     const user = request.auth?.user;
-    if (
-      (inc.tenant_id && !canUserAccessTenant(user, inc.tenant_id)) ||
-      (!inc.tenant_id && (getScopedTenantFilter(user) || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0)))
-    ) {
+    if (inc.tenant_id ? !canUserAccessTenant(user, inc.tenant_id) : getAllowedTenantIds(user) !== null) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
     const mins = Math.max(5, Math.min(10080, Number(body.minutes || 60)));
@@ -1178,10 +1469,7 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     const inc = db.prepare('SELECT * FROM alert_incidents WHERE id = ?').get(id) as any;
     if (!inc) return reply.status(404).send({ error: 'Alert incident not found.' });
     const user = request.auth?.user;
-    if (
-      (inc.tenant_id && !canUserAccessTenant(user, inc.tenant_id)) ||
-      (!inc.tenant_id && (getScopedTenantFilter(user) || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0)))
-    ) {
+    if (inc.tenant_id ? !canUserAccessTenant(user, inc.tenant_id) : getAllowedTenantIds(user) !== null) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
     db.prepare(`
@@ -1189,8 +1477,9 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `).run(id);
-    if (inc.psa_ticket_number) {
-      db.prepare("UPDATE psa_tickets SET status = 'Resolved' WHERE ticket_number = ?").run(inc.psa_ticket_number);
+    const ticketRef = inc.psa_ticket_id || inc.psa_ticket_number;
+    if (ticketRef) {
+      db.prepare("UPDATE psa_tickets SET status = 'Resolved' WHERE id = ? OR ticket_number = ?").run(ticketRef, ticketRef);
     }
     return { success: true };
   });
@@ -1201,10 +1490,7 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     const inc = db.prepare('SELECT * FROM alert_incidents WHERE id = ?').get(id) as any;
     if (!inc) return reply.status(404).send({ error: 'Alert incident not found.' });
     const user = request.auth?.user;
-    if (
-      (inc.tenant_id && !canUserAccessTenant(user, inc.tenant_id)) ||
-      (!inc.tenant_id && (getScopedTenantFilter(user) || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0)))
-    ) {
+    if (inc.tenant_id ? !canUserAccessTenant(user, inc.tenant_id) : getAllowedTenantIds(user) !== null) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
     db.prepare('UPDATE alert_incidents SET assigned_to = ? WHERE id = ?').run(
@@ -1228,10 +1514,10 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
 
   server.get('/api/notification-channels', async (request) => {
     const user = request.auth?.user;
-    const hasRestrictedTenants = Boolean(getScopedTenantFilter(user) || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0));
+    const isGlobalUser = getAllowedTenantIds(user) === null;
     const rows = db.prepare('SELECT * FROM notification_channels ORDER BY created_at DESC').all() as any[];
     return rows
-      .filter((r) => (r.tenant_id ? canUserAccessTenant(user, r.tenant_id) : !hasRestrictedTenants))
+      .filter((r) => (r.tenant_id ? canUserAccessTenant(user, r.tenant_id) : isGlobalUser))
       .map(sanitizeChannel);
   });
 
@@ -1256,10 +1542,7 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     }
     const targetTenantId = body.tenant_id && body.tenant_id !== 'all' ? body.tenant_id : null;
     const user = request.auth?.user;
-    if (
-      (targetTenantId && !canUserAccessTenant(user, targetTenantId)) ||
-      (!targetTenantId && (getScopedTenantFilter(user) || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0)))
-    ) {
+    if (targetTenantId ? !canUserAccessTenant(user, targetTenantId) : getAllowedTenantIds(user) !== null) {
       return reply.status(403).send({ error: 'Forbidden for target tenant scope.' });
     }
     if (body.webhook_url) {
@@ -1282,7 +1565,7 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       body.webhook_url ? encryptVaultSecret(body.webhook_url.trim()) : '',
       body.signing_secret ? encryptVaultSecret(body.signing_secret.trim()) : '',
       body.routing_key ? encryptVaultSecret(body.routing_key.trim()) : null,
-      body.min_severity || 'Warning',
+      String(body.min_severity || 'warning').trim().toLowerCase(),
       targetTenantId,
       JSON.stringify(body.events || ['all']),
       body.enabled !== false ? 1 : 0
@@ -1297,10 +1580,7 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     const existing = db.prepare('SELECT * FROM notification_channels WHERE id = ?').get(id) as any;
     if (!existing) return reply.status(404).send({ error: 'Notification channel not found.' });
     const user = request.auth?.user;
-    if (
-      (existing.tenant_id && !canUserAccessTenant(user, existing.tenant_id)) ||
-      (!existing.tenant_id && (getScopedTenantFilter(user) || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0)))
-    ) {
+    if (existing.tenant_id ? !canUserAccessTenant(user, existing.tenant_id) : getAllowedTenantIds(user) !== null) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
     db.prepare('DELETE FROM notification_channels WHERE id = ?').run(id);
@@ -1312,25 +1592,88 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     const ch = db.prepare('SELECT * FROM notification_channels WHERE id = ?').get(id) as any;
     if (!ch) return reply.status(404).send({ error: 'Notification channel not found.' });
     const user = request.auth?.user;
-    if (
-      (ch.tenant_id && !canUserAccessTenant(user, ch.tenant_id)) ||
-      (!ch.tenant_id && (getScopedTenantFilter(user) || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0)))
-    ) {
+    if (ch.tenant_id ? !canUserAccessTenant(user, ch.tenant_id) : getAllowedTenantIds(user) !== null) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
 
-    const dispatched = await dispatchAlertToNotificationChannels({
-      incidentId: `test-${Date.now()}`,
-      entityName: 'vitrine-control-plane',
-      clientName: 'Global MSP Control Plane',
-      conditionId: 'webhook_test',
-      label: `Vitrine RMM Test Alert (${ch.name})`,
-      detail: `Outbound webhook verification triggered by ${getActorUsername(request)}.`,
-      severity: 'critical',
-      tenantId: ch.tenant_id
-    });
+    const webhookUrl = ch.webhook_url_encrypted ? decryptVaultSecret(ch.webhook_url_encrypted) : '';
+    const signingSecret = ch.signing_secret_encrypted ? decryptVaultSecret(ch.signing_secret_encrypted) : '';
+    const routingKey = ch.routing_key_encrypted ? decryptVaultSecret(ch.routing_key_encrypted) : '';
+    const targetUrl =
+      ch.channel_type === 'pagerduty' && !webhookUrl ? 'https://events.pagerduty.com/v2/enqueue' : webhookUrl;
 
-    return { success: dispatched.length > 0, dispatched };
+    if (!targetUrl) {
+      return reply.status(400).send({ success: false, error: 'Notification channel has no webhook URL configured.' });
+    }
+
+    const urlSafety = await validateOutboundHostSafety(targetUrl, { allowLoopback: false });
+    if (!urlSafety.safe) {
+      const msg = urlSafety.reason || 'Blocked by SSRF guard.';
+      db.prepare('UPDATE notification_channels SET last_status = ?, last_error = ? WHERE id = ?').run(
+        `Blocked: ${msg}`,
+        msg,
+        ch.id
+      );
+      return reply.status(400).send({ success: false, error: msg });
+    }
+
+    const label = `Vitrine RMM Test Alert (${ch.name})`;
+    const detail = `Outbound webhook verification triggered by ${getActorUsername(request)}.`;
+    const payloadObj =
+      ch.channel_type === 'pagerduty'
+        ? {
+            routing_key: routingKey,
+            event_action: 'trigger',
+            dedup_key: `vitrine-test-${ch.id}-${Date.now()}`,
+            payload: {
+              summary: label,
+              source: 'vitrine-control-plane',
+              severity: 'info',
+              custom_details: { detail, channelId: ch.id }
+            }
+          }
+        : ch.channel_type === 'discord'
+          ? { content: `**[TEST] ${label}**\n${detail}` }
+          : ch.channel_type === 'slack' || ch.channel_type === 'teams'
+            ? { text: `[TEST] ${label} — ${detail}`, title: label }
+            : {
+                event: 'channel_test',
+                channelId: ch.id,
+                channelName: ch.name,
+                title: label,
+                detail,
+                severity: 'info',
+                timestamp: new Date().toISOString()
+              };
+
+    const bodyStr = JSON.stringify(payloadObj);
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (signingSecret) {
+      headers['X-Vitrine-Signature'] = crypto.createHmac('sha256', signingSecret).update(bodyStr).digest('hex');
+    }
+
+    try {
+      const res = await safeOutboundFetch(targetUrl, {
+        method: 'POST',
+        headers,
+        body: bodyStr,
+        timeoutMs: 8000,
+        allowLoopback: false
+      });
+      const statusStr = `HTTP ${res.status}`;
+      db.prepare(
+        'UPDATE notification_channels SET last_triggered_at = CURRENT_TIMESTAMP, last_status = ?, last_error = ? WHERE id = ?'
+      ).run(statusStr, res.ok ? null : statusStr, ch.id);
+      return { success: res.ok, dispatched: res.ok ? [ch.id] : [], status: res.status };
+    } catch (err: any) {
+      const msg = err?.message || 'Test webhook delivery failed';
+      db.prepare('UPDATE notification_channels SET last_status = ?, last_error = ? WHERE id = ?').run(
+        `Error: ${msg.slice(0, 80)}`,
+        msg.slice(0, 240),
+        ch.id
+      );
+      return { success: false, dispatched: [], error: msg };
+    }
   });
 
   // ============================================================================
@@ -1339,22 +1682,25 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
   server.get('/api/documentation', async (request) => {
     const query = (request.query || {}) as { tenant_id?: string; category?: string; search?: string };
     const user = request.auth?.user;
-    const scopedTenant = getScopedTenantFilter(user);
-    const hasRestrictedTenants = Boolean(scopedTenant || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0));
+    const allowedTenants = getAllowedTenantIds(user);
+    if (allowedTenants !== null && allowedTenants.length === 0) {
+      return [];
+    }
+    const isGlobalUser = allowedTenants === null;
     const clauses: string[] = [];
     const params: any[] = [];
 
-    if (scopedTenant) {
-      clauses.push('(d.tenant_id = ?)');
-      params.push(scopedTenant);
-    } else if (query.tenant_id && query.tenant_id !== 'all') {
-      if (hasRestrictedTenants) {
-        clauses.push('(d.tenant_id = ?)');
-        params.push(query.tenant_id);
-      } else {
-        clauses.push('(d.tenant_id = ? OR d.tenant_id IS NULL)');
+    if (allowedTenants !== null) {
+      clauses.push(`d.tenant_id IN (${allowedTenants.map(() => '?').join(',')})`);
+      params.push(...allowedTenants);
+      if (query.tenant_id && query.tenant_id !== 'all') {
+        if (!canUserAccessTenant(user, query.tenant_id)) return [];
+        clauses.push('d.tenant_id = ?');
         params.push(query.tenant_id);
       }
+    } else if (query.tenant_id && query.tenant_id !== 'all') {
+      clauses.push('(d.tenant_id = ? OR d.tenant_id IS NULL)');
+      params.push(query.tenant_id);
     }
 
     if (query.category && query.category !== 'all') {
@@ -1362,9 +1708,9 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       params.push(query.category);
     }
     if (query.search?.trim()) {
-      clauses.push('(d.title LIKE ? OR d.content_markdown LIKE ?)');
+      clauses.push('(d.title LIKE ? OR d.content_markdown LIKE ? OR d.tags_json LIKE ?)');
       const term = `%${query.search.trim()}%`;
-      params.push(term, term);
+      params.push(term, term, term);
     }
 
     const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -1380,7 +1726,7 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       .all(...params) as any[];
 
     return rows
-      .filter((r) => (r.tenant_id ? canUserAccessTenant(user, r.tenant_id) : !hasRestrictedTenants))
+      .filter((r) => (r.tenant_id ? canUserAccessTenant(user, r.tenant_id) : isGlobalUser))
       .map((r) => ({
         ...r,
         is_pinned: Boolean(r.is_pinned),
@@ -1404,15 +1750,16 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     if (!body.title?.trim()) return reply.status(400).send({ error: 'Article title is required.' });
 
     const user = request.auth?.user;
-    const scopedTenant = getScopedTenantFilter(user);
-    const hasRestrictedTenants = Boolean(scopedTenant || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0));
+    const allowedTenants = getAllowedTenantIds(user);
+    const isGlobalUser = allowedTenants === null;
     const resolvedTenantId =
-      body.tenant_id && body.tenant_id !== 'all' ? body.tenant_id : scopedTenant && scopedTenant !== '__DENY_ALL__' ? scopedTenant : null;
+      body.tenant_id && body.tenant_id !== 'all'
+        ? body.tenant_id
+        : allowedTenants && allowedTenants.length === 1
+          ? allowedTenants[0]
+          : null;
 
-    if (
-      (resolvedTenantId && !canUserAccessTenant(user, resolvedTenantId)) ||
-      (!resolvedTenantId && hasRestrictedTenants)
-    ) {
+    if (resolvedTenantId ? !canUserAccessTenant(user, resolvedTenantId) : !isGlobalUser) {
       return reply.status(403).send({ error: 'Forbidden for target tenant scope.' });
     }
 
@@ -1461,21 +1808,15 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     if (!existing) return reply.status(404).send({ error: 'Documentation article not found.' });
 
     const user = request.auth?.user;
-    const hasRestrictedTenants = Boolean(getScopedTenantFilter(user) || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0));
-    if (
-      (existing.tenant_id && !canUserAccessTenant(user, existing.tenant_id)) ||
-      (!existing.tenant_id && hasRestrictedTenants)
-    ) {
+    const isGlobalUser = getAllowedTenantIds(user) === null;
+    if (existing.tenant_id ? !canUserAccessTenant(user, existing.tenant_id) : !isGlobalUser) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
 
     const body = (request.body || {}) as Record<string, any>;
     const nextTenantId =
       body.tenant_id !== undefined ? (body.tenant_id === 'all' ? null : body.tenant_id) : existing.tenant_id;
-    if (
-      (nextTenantId && !canUserAccessTenant(user, nextTenantId)) ||
-      (!nextTenantId && hasRestrictedTenants)
-    ) {
+    if (nextTenantId ? !canUserAccessTenant(user, nextTenantId) : !isGlobalUser) {
       return reply.status(403).send({ error: 'Forbidden for target tenant scope.' });
     }
 
@@ -1534,11 +1875,8 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     const { id } = request.params as { id: string };
     const row = db.prepare('SELECT * FROM documentation_articles WHERE id = ?').get(id) as any;
     if (!row) return reply.status(404).send({ error: 'Documentation article not found.' });
-    const hasRestrictedTenants = Boolean(getScopedTenantFilter(user) || (user.allowed_tenant_ids && user.allowed_tenant_ids.length > 0));
-    if (
-      (row.tenant_id && !canUserAccessTenant(user, row.tenant_id)) ||
-      (!row.tenant_id && hasRestrictedTenants)
-    ) {
+    const isGlobalUser = getAllowedTenantIds(user) === null;
+    if (row.tenant_id ? !canUserAccessTenant(user, row.tenant_id) : !isGlobalUser) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
 
@@ -1577,11 +1915,7 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     const existing = db.prepare('SELECT * FROM documentation_articles WHERE id = ?').get(id) as any;
     if (!existing) return reply.status(404).send({ error: 'Documentation article not found.' });
     const user = request.auth?.user;
-    const hasRestrictedTenants = Boolean(getScopedTenantFilter(user) || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0));
-    if (
-      (existing.tenant_id && !canUserAccessTenant(user, existing.tenant_id)) ||
-      (!existing.tenant_id && hasRestrictedTenants)
-    ) {
+    if (existing.tenant_id ? !canUserAccessTenant(user, existing.tenant_id) : getAllowedTenantIds(user) !== null) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
     db.prepare('DELETE FROM documentation_articles WHERE id = ?').run(id);
@@ -1733,10 +2067,7 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     if (!tkt) return reply.status(404).send({ error: 'PSA ticket not found.' });
     const tid = resolveTicketTenantId(tkt);
     const user = request.auth?.user;
-    if (
-      (tid && !canUserAccessTenant(user, tid)) ||
-      (!tid && (getScopedTenantFilter(user) || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0)))
-    ) {
+    if (tid ? !canUserAccessTenant(user, tid) : getAllowedTenantIds(user) !== null) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
     return db.prepare('SELECT * FROM psa_time_entries WHERE ticket_id = ? ORDER BY created_at DESC').all(id);
@@ -1748,10 +2079,7 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     if (!tkt) return reply.status(404).send({ error: 'PSA ticket not found.' });
     const tid = resolveTicketTenantId(tkt);
     const user = request.auth?.user;
-    if (
-      (tid && !canUserAccessTenant(user, tid)) ||
-      (!tid && (getScopedTenantFilter(user) || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0)))
-    ) {
+    if (tid ? !canUserAccessTenant(user, tid) : getAllowedTenantIds(user) !== null) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
 
@@ -1791,10 +2119,7 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     const tkt = db.prepare('SELECT * FROM psa_tickets WHERE id = ?').get(entry.ticket_id) as any;
     const tid = resolveTicketTenantId(tkt);
     const user = request.auth?.user;
-    if (
-      (tid && !canUserAccessTenant(user, tid)) ||
-      (!tid && (getScopedTenantFilter(user) || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0)))
-    ) {
+    if (tid ? !canUserAccessTenant(user, tid) : getAllowedTenantIds(user) !== null) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
     db.prepare('DELETE FROM psa_time_entries WHERE id = ?').run(entryId);
@@ -1881,10 +2206,10 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
 
   server.get('/api/backup-policies', async (request) => {
     const user = request.auth?.user;
-    const hasRestrictedTenants = Boolean(getScopedTenantFilter(user) || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0));
+    const isGlobalUser = getAllowedTenantIds(user) === null;
     const rows = db.prepare('SELECT * FROM backup_policies ORDER BY created_at DESC').all() as any[];
     return rows
-      .filter((r) => (r.tenant_id ? canUserAccessTenant(user, r.tenant_id) : !hasRestrictedTenants))
+      .filter((r) => (r.tenant_id ? canUserAccessTenant(user, r.tenant_id) : isGlobalUser))
       .map(sanitizeBackupPolicy);
   });
 
@@ -1905,14 +2230,15 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       return reply.status(400).send({ error: 'Backup policy name and target repository URL/path are required.' });
     }
     const user = request.auth?.user;
-    const scopedTenant = getScopedTenantFilter(user);
-    const hasRestrictedTenants = Boolean(scopedTenant || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0));
+    const allowedTenants = getAllowedTenantIds(user);
+    const isGlobalUser = allowedTenants === null;
     const resolvedTenantId =
-      body.tenant_id && body.tenant_id !== 'all' ? body.tenant_id : scopedTenant && scopedTenant !== '__DENY_ALL__' ? scopedTenant : null;
-    if (
-      (resolvedTenantId && !canUserAccessTenant(user, resolvedTenantId)) ||
-      (!resolvedTenantId && hasRestrictedTenants)
-    ) {
+      body.tenant_id && body.tenant_id !== 'all'
+        ? body.tenant_id
+        : allowedTenants && allowedTenants.length === 1
+          ? allowedTenants[0]
+          : null;
+    if (resolvedTenantId ? !canUserAccessTenant(user, resolvedTenantId) : !isGlobalUser) {
       return reply.status(403).send({ error: 'Forbidden for target tenant scope.' });
     }
 
@@ -1946,16 +2272,81 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     };
   });
 
+  server.put('/api/backup-policies/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const existing = db.prepare('SELECT * FROM backup_policies WHERE id = ?').get(id) as any;
+    if (!existing) return reply.status(404).send({ error: 'Backup policy not found.' });
+    const user = request.auth?.user;
+    if (existing.tenant_id ? !canUserAccessTenant(user, existing.tenant_id) : getAllowedTenantIds(user) !== null) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
+
+    const body = (request.body || {}) as {
+      name?: string;
+      engine?: 'restic' | 'borg' | 'vss_wbadmin' | 'timemachine';
+      repository_url?: string;
+      repository_password?: string;
+      include_paths?: string[];
+      exclude_paths?: string[];
+      schedule_cron?: string;
+      retention_days?: number;
+      enabled?: boolean;
+    };
+
+    const nextName = body.name !== undefined ? String(body.name).trim() : existing.name;
+    if (!nextName) return reply.status(400).send({ error: 'Backup policy name cannot be empty.' });
+    const nextRepo =
+      body.repository_url !== undefined
+        ? String(body.repository_url).trim()
+        : existing.repository_url || existing.target_repo || '';
+    const nextPassEnc =
+      body.repository_password !== undefined && !isMaskedSecret(body.repository_password)
+        ? body.repository_password.trim()
+          ? encryptVaultSecret(body.repository_password.trim())
+          : null
+        : existing.repository_password_encrypted;
+
+    db.prepare(`
+      UPDATE backup_policies
+      SET name = ?,
+          engine = ?,
+          target_repo = ?,
+          repository_url = ?,
+          repository_password_encrypted = ?,
+          include_paths_json = ?,
+          exclude_paths_json = ?,
+          schedule_cron = ?,
+          retention_days = ?,
+          enabled = ?
+      WHERE id = ?
+    `).run(
+      nextName,
+      body.engine || existing.engine,
+      nextRepo,
+      nextRepo,
+      nextPassEnc,
+      Array.isArray(body.include_paths) ? JSON.stringify(body.include_paths) : existing.include_paths_json,
+      Array.isArray(body.exclude_paths) ? JSON.stringify(body.exclude_paths) : existing.exclude_paths_json,
+      body.schedule_cron !== undefined ? String(body.schedule_cron).trim() || existing.schedule_cron : existing.schedule_cron,
+      body.retention_days != null && Number.isFinite(Number(body.retention_days))
+        ? Math.max(1, Number(body.retention_days))
+        : existing.retention_days,
+      body.enabled !== undefined ? (body.enabled ? 1 : 0) : existing.enabled,
+      id
+    );
+
+    return {
+      success: true,
+      policy: sanitizeBackupPolicy(db.prepare('SELECT * FROM backup_policies WHERE id = ?').get(id))
+    };
+  });
+
   server.delete('/api/backup-policies/:id', async (request, reply) => {
     const { id } = request.params as { id: string };
     const existing = db.prepare('SELECT * FROM backup_policies WHERE id = ?').get(id) as any;
     if (!existing) return reply.status(404).send({ error: 'Backup policy not found.' });
     const user = request.auth?.user;
-    const hasRestrictedTenants = Boolean(getScopedTenantFilter(user) || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0));
-    if (
-      (existing.tenant_id && !canUserAccessTenant(user, existing.tenant_id)) ||
-      (!existing.tenant_id && hasRestrictedTenants)
-    ) {
+    if (existing.tenant_id ? !canUserAccessTenant(user, existing.tenant_id) : getAllowedTenantIds(user) !== null) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
     db.prepare('DELETE FROM backup_policies WHERE id = ?').run(id);
@@ -1986,12 +2377,12 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       `)
       .all() as any[];
     return rows
-      .filter((r) => (r.device_tenant_id ? canUserAccessTenant(user, r.device_tenant_id) : !getScopedTenantFilter(user)))
+      .filter((r) => (r.device_tenant_id ? canUserAccessTenant(user, r.device_tenant_id) : getAllowedTenantIds(user) === null))
       .slice(0, 100)
       .map(({ device_tenant_id: _unused, ...rest }) => rest);
   });
 
-  server.post('/api/devices/:id/backup/run', async (request, reply) => {
+  const handleRunDeviceBackup = async (request: FastifyRequest, reply: FastifyReply) => {
     const { id } = request.params as { id: string };
     const dev = db.prepare('SELECT * FROM devices WHERE id = ?').get(id) as any;
     if (!dev) return reply.status(404).send({ error: 'Device not found.' });
@@ -2003,42 +2394,129 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     const bpol = body.policy_id
       ? (db.prepare('SELECT * FROM backup_policies WHERE id = ?').get(body.policy_id) as any)
       : (db
-          .prepare('SELECT * FROM backup_policies WHERE (tenant_id = ? OR tenant_id IS NULL) AND enabled = 1 LIMIT 1')
-          .get(dev.tenant_id) as any);
+          .prepare(
+            'SELECT * FROM backup_policies WHERE (tenant_id = ? OR tenant_id IS NULL) AND enabled = 1 ORDER BY CASE WHEN tenant_id = ? THEN 0 ELSE 1 END, created_at DESC LIMIT 1'
+          )
+          .get(dev.tenant_id || '', dev.tenant_id || '') as any);
+    if (body.policy_id && !bpol) {
+      return reply.status(404).send({ error: 'Backup policy not found.' });
+    }
     if (bpol?.tenant_id && !canUserAccessTenant(request.auth?.user, bpol.tenant_id)) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
 
-    const engine = bpol?.engine || (dev.os_type === 'windows' ? 'vss_wbadmin' : 'restic');
-    const rawPaths = safeJsonParse<string[]>(bpol?.include_paths_json, dev.os_type === 'windows' ? ['C:\\Users'] : ['/etc']);
+    const engine = String(
+      bpol?.engine || (dev.os_type === 'windows' ? 'wbadmin' : dev.os_type === 'macos' ? 'timemachine' : 'restic')
+    )
+      .trim()
+      .toLowerCase();
+    const repo = String(bpol?.repository_url || bpol?.target_repo || '').trim();
+    const repoPass = bpol?.repository_password_encrypted
+      ? decryptVaultSecret(String(bpol.repository_password_encrypted))
+      : '';
+    const defaultPath = dev.os_type === 'windows' ? 'C:\\Users' : dev.os_type === 'macos' ? '/Users' : '/etc';
+    const rawPaths = safeJsonParse<string[]>(bpol?.include_paths_json, [defaultPath]);
     const safePaths = (Array.isArray(rawPaths) ? rawPaths : [])
       .map((p) => String(p || '').trim())
       .filter((p) => p.length > 0 && !p.startsWith('-'));
     if (safePaths.length === 0) {
-      safePaths.push(dev.os_type === 'windows' ? 'C:\\Users' : '/etc');
+      safePaths.push(defaultPath);
     }
+    const rawExcludes = safeJsonParse<string[]>(bpol?.exclude_paths_json, []);
+    const safeExcludes = (Array.isArray(rawExcludes) ? rawExcludes : [])
+      .map((p) => String(p || '').trim())
+      .filter((p) => p.length > 0 && !p.startsWith('-'));
 
     const jobId = `bjob-${crypto.randomUUID().slice(0, 8)}`;
-    const shell = dev.os_type === 'windows' ? 'powershell' : 'bash';
-    const snapFile = `/tmp/vitrine-endpoint-snap-${jobId}.tar.gz`;
-    const quotedPosixPaths = safePaths.map((p) => quotePosixLiteral(p)).join(' ');
-    const cmd =
-      dev.os_type === 'windows'
-        ? `vssadmin list shadows`
-        : `tar -czf ${quotePosixLiteral(snapFile)} -- ${quotedPosixPaths} 2>/dev/null && (stat -c%s ${quotePosixLiteral(snapFile)} 2>/dev/null || stat -f%z ${quotePosixLiteral(snapFile)}) && rm -f ${quotePosixLiteral(snapFile)}`;
+    const recordFailure = (errorMessage: string) => {
+      db.prepare(`
+        INSERT INTO device_backup_jobs (
+          id, policy_id, device_id, hostname, engine, status, snapshot_id, bytes_processed, output, completed_at
+        ) VALUES (?, ?, ?, ?, ?, 'failed', ?, 0, ?, CURRENT_TIMESTAMP)
+      `).run(
+        jobId,
+        bpol?.id || null,
+        dev.id,
+        dev.hostname,
+        engine,
+        null,
+        errorMessage
+      );
+      return reply.status(422).send({
+        success: false,
+        error: errorMessage,
+        job: db.prepare('SELECT * FROM device_backup_jobs WHERE id = ?').get(jobId)
+      });
+    };
+
+    if (engine !== 'timemachine' && engine !== 'tmutil' && !repo) {
+      return recordFailure('Backup policy has no repository URL/target configured.');
+    }
+
+    const isWindows = dev.os_type === 'windows';
+    const isMacos = dev.os_type === 'macos';
+    const shell = isWindows ? 'powershell' : 'bash';
+    let cmd = '';
+
+    if (engine === 'restic') {
+      if (isWindows) {
+        const psExcludes = safeExcludes.map((ex) => `--exclude ${quotePowerShellLiteral(ex)}`).join(' ');
+        const psPaths = safePaths.map((p) => quotePowerShellLiteral(p)).join(' ');
+        cmd = [
+          `$env:RESTIC_REPOSITORY = ${quotePowerShellLiteral(repo)}`,
+          `$env:RESTIC_PASSWORD = ${quotePowerShellLiteral(repoPass)}`,
+          `if (-not (Get-Command restic -ErrorAction SilentlyContinue)) { Write-Error 'restic binary not installed on endpoint'; exit 127 }`,
+          `restic backup --json ${psExcludes} -- ${psPaths}`.replace(/\s+/g, ' ').trim()
+        ].join('; ');
+      } else {
+        const posixExcludes = safeExcludes.map((ex) => `--exclude ${quotePosixLiteral(ex)}`).join(' ');
+        const posixPaths = safePaths.map((p) => quotePosixLiteral(p)).join(' ');
+        cmd = `command -v restic >/dev/null 2>&1 || { echo 'restic binary not installed on endpoint' >&2; exit 127; }; RESTIC_REPOSITORY=${quotePosixLiteral(repo)} RESTIC_PASSWORD=${quotePosixLiteral(repoPass)} restic backup --json ${posixExcludes} -- ${posixPaths}`;
+      }
+    } else if (engine === 'borg') {
+      if (isWindows) {
+        return recordFailure('BorgBackup is not supported on Windows endpoints.');
+      }
+      const posixExcludes = safeExcludes.map((ex) => `--exclude ${quotePosixLiteral(ex)}`).join(' ');
+      const posixPaths = safePaths.map((p) => quotePosixLiteral(p)).join(' ');
+      cmd = `command -v borg >/dev/null 2>&1 || { echo 'borg binary not installed on endpoint' >&2; exit 127; }; BORG_REPO=${quotePosixLiteral(repo)} BORG_PASSPHRASE=${quotePosixLiteral(repoPass)} borg create --stats --json ::${quotePosixLiteral(`vitrine-${jobId}`)} ${posixExcludes} -- ${posixPaths}`;
+    } else if (engine === 'timemachine' || engine === 'tmutil') {
+      if (!isMacos) {
+        return recordFailure('Time Machine backup requires a macOS endpoint.');
+      }
+      cmd = repo
+        ? `tmutil startbackup --block --destination ${quotePosixLiteral(repo)}`
+        : `tmutil startbackup --block`;
+    } else if (engine === 'wbadmin' || engine === 'vss_wbadmin' || engine === 'windows_backup') {
+      if (!isWindows) {
+        return recordFailure(`Backup engine '${engine}' requires a Windows endpoint.`);
+      }
+      cmd = `wbadmin start backup -backupTarget:${quotePowerShellLiteral(repo)} -include:${quotePowerShellLiteral(safePaths.join(','))} -quiet`;
+    } else {
+      return recordFailure(`Unsupported backup engine: ${engine}`);
+    }
 
     const execRes = await meshBridge.executeCommandOnNode(id, cmd, {
       runAs: 'system',
       shell,
-      timeoutMs: 25_000
+      timeoutMs: 30_000
     });
 
-    const bytesMatch = execRes.output.trim().match(/(\d+)\s*$/);
-    const bytesProcessed = bytesMatch ? Number(bytesMatch[1]) : 0;
-    const status = execRes.live ? (execRes.exitCode === 0 ? 'completed' : 'failed') : 'queued';
+    const sanitizedOutput = repoPass ? String(execRes.output || '').split(repoPass).join('***') : String(execRes.output || '');
+    const resticBytesMatch = sanitizedOutput.match(/"total_bytes_processed"\s*:\s*(\d+)/);
+    const borgBytesMatch = sanitizedOutput.match(/"original_size"\s*:\s*(\d+)/);
+    const bytesProcessed = resticBytesMatch
+      ? Number(resticBytesMatch[1])
+      : borgBytesMatch
+        ? Number(borgBytesMatch[1])
+        : 0;
+    const snapMatch = sanitizedOutput.match(/"snapshot_id"\s*:\s*"([a-fA-F0-9_-]{6,64})"/);
+
     const queuedViaMeshBridge = Boolean(
-      execRes.queued || execRes.taskId || execRes.output.startsWith('[Vitrine Companion Queue]')
+      execRes.queued || execRes.taskId || sanitizedOutput.startsWith('[Vitrine Companion Queue]')
     );
+    const isQueued = !execRes.live && (queuedViaMeshBridge || Boolean(dev.companion_installed));
+    const status = execRes.live ? (execRes.exitCode === 0 ? 'completed' : 'failed') : isQueued ? 'queued' : 'failed';
 
     if (!execRes.live && queuedViaMeshBridge) {
       const existingQueued = execRes.taskId
@@ -2066,10 +2544,11 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       `).run(taskId, dev.id, JSON.stringify({ backupJobId: jobId, language: shell, shell, code: cmd, runAs: 'system' }));
     }
 
-    if (bpol?.id) {
+    if (bpol?.id && status !== 'failed') {
       db.prepare('UPDATE backup_policies SET last_run_at = CURRENT_TIMESTAMP WHERE id = ?').run(bpol.id);
     }
 
+    const snapshotId = status === 'failed' ? null : snapMatch ? snapMatch[1] : `snap-${crypto.randomBytes(4).toString('hex')}`;
     db.prepare(`
       INSERT INTO device_backup_jobs (
         id, policy_id, device_id, hostname, engine, status, snapshot_id, bytes_processed, output, completed_at
@@ -2081,25 +2560,38 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       dev.hostname,
       engine,
       status,
-      `snap-${crypto.randomBytes(4).toString('hex')}`,
+      snapshotId,
       bytesProcessed,
-      execRes.output,
+      sanitizedOutput,
       status
     );
 
+    const savedJob = db.prepare('SELECT * FROM device_backup_jobs WHERE id = ?').get(jobId);
+    if (status === 'failed') {
+      return reply.status(422).send({
+        success: false,
+        error: sanitizedOutput || 'Backup execution failed on endpoint.',
+        job: savedJob
+      });
+    }
+
     return {
       success: true,
-      job: db.prepare('SELECT * FROM device_backup_jobs WHERE id = ?').get(jobId)
+      queued: status === 'queued',
+      job: savedJob
     };
-  });
+  };
+
+  server.post('/api/devices/:id/backup/run', handleRunDeviceBackup);
+  server.post('/api/devices/:id/backups', handleRunDeviceBackup);
 
   // MDM Compliance & Configuration Profiles (macOS mobileconfig / Windows CSP / Linux Policy)
   server.get('/api/mdm-profiles', async (request) => {
     const user = request.auth?.user;
-    const hasRestrictedTenants = Boolean(getScopedTenantFilter(user) || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0));
+    const isGlobalUnrestricted = getAllowedTenantIds(user) === null;
     const rows = db.prepare('SELECT * FROM mdm_profiles ORDER BY created_at DESC').all() as any[];
     return rows
-      .filter((r) => (r.tenant_id ? canUserAccessTenant(user, r.tenant_id) : !hasRestrictedTenants))
+      .filter((r) => (r.tenant_id ? canUserAccessTenant(user, r.tenant_id) : isGlobalUnrestricted))
       .map((r) => ({
         ...r,
         enabled: Boolean(r.enabled),
@@ -2119,13 +2611,13 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     };
     if (!body.name?.trim()) return reply.status(400).send({ error: 'MDM profile name is required.' });
     const user = request.auth?.user;
-    const scopedTenant = getScopedTenantFilter(user);
-    const hasRestrictedTenants = Boolean(scopedTenant || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0));
+    const allowedTenants = getAllowedTenantIds(user);
+    const rawTenantId = body.tenant_id && body.tenant_id !== 'all' ? String(body.tenant_id).trim() : null;
     const resolvedTenantId =
-      body.tenant_id && body.tenant_id !== 'all' ? body.tenant_id : scopedTenant && scopedTenant !== '__DENY_ALL__' ? scopedTenant : null;
+      rawTenantId || (allowedTenants !== null && allowedTenants.length === 1 ? allowedTenants[0] : null);
     if (
       (resolvedTenantId && !canUserAccessTenant(user, resolvedTenantId)) ||
-      (!resolvedTenantId && hasRestrictedTenants)
+      (!resolvedTenantId && allowedTenants !== null)
     ) {
       return reply.status(403).send({ error: 'Forbidden for target tenant scope.' });
     }
@@ -2143,9 +2635,65 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       JSON.stringify(body.settings || {}),
       body.enabled !== false ? 1 : 0
     );
+    const created = db.prepare('SELECT * FROM mdm_profiles WHERE id = ?').get(id) as any;
     return {
       success: true,
-      profile: db.prepare('SELECT * FROM mdm_profiles WHERE id = ?').get(id)
+      profile: {
+        ...created,
+        enabled: Boolean(created.enabled),
+        settings: safeJsonParse<Record<string, any>>(created.settings_json, {})
+      }
+    };
+  });
+
+  server.put('/api/mdm-profiles/:id', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const existing = db.prepare('SELECT * FROM mdm_profiles WHERE id = ?').get(id) as any;
+    if (!existing) return reply.status(404).send({ error: 'MDM profile not found.' });
+    const user = request.auth?.user;
+    if (existing.tenant_id ? !canUserAccessTenant(user, existing.tenant_id) : getAllowedTenantIds(user) !== null) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
+
+    const body = (request.body || {}) as {
+      name?: string;
+      platform?: 'macos' | 'windows' | 'linux';
+      profile_type?: string;
+      payload_xml?: string;
+      settings?: Record<string, any>;
+      enabled?: boolean;
+    };
+
+    const nextName = body.name !== undefined ? String(body.name).trim() : existing.name;
+    if (!nextName) return reply.status(400).send({ error: 'MDM profile name cannot be empty.' });
+
+    db.prepare(`
+      UPDATE mdm_profiles
+      SET name = ?,
+          platform = ?,
+          profile_type = ?,
+          payload_xml = ?,
+          settings_json = ?,
+          enabled = ?
+      WHERE id = ?
+    `).run(
+      nextName,
+      body.platform || existing.platform,
+      body.profile_type || existing.profile_type,
+      body.payload_xml !== undefined ? body.payload_xml : existing.payload_xml,
+      body.settings !== undefined ? JSON.stringify(body.settings) : existing.settings_json,
+      body.enabled !== undefined ? (body.enabled ? 1 : 0) : existing.enabled,
+      id
+    );
+
+    const updated = db.prepare('SELECT * FROM mdm_profiles WHERE id = ?').get(id) as any;
+    return {
+      success: true,
+      profile: {
+        ...updated,
+        enabled: Boolean(updated.enabled),
+        settings: safeJsonParse<Record<string, any>>(updated.settings_json, {})
+      }
     };
   });
 
@@ -2154,11 +2702,7 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     const existing = db.prepare('SELECT * FROM mdm_profiles WHERE id = ?').get(id) as any;
     if (!existing) return reply.status(404).send({ error: 'MDM profile not found.' });
     const user = request.auth?.user;
-    const hasRestrictedTenants = Boolean(getScopedTenantFilter(user) || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0));
-    if (
-      (existing.tenant_id && !canUserAccessTenant(user, existing.tenant_id)) ||
-      (!existing.tenant_id && hasRestrictedTenants)
-    ) {
+    if (existing.tenant_id ? !canUserAccessTenant(user, existing.tenant_id) : getAllowedTenantIds(user) !== null) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
     db.prepare('DELETE FROM mdm_profiles WHERE id = ?').run(id);
@@ -2229,9 +2773,9 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     const { id } = request.params as { id: string };
     const existing = db.prepare('SELECT * FROM custom_roles WHERE id = ?').get(id) as any;
     if (!existing) return reply.status(404).send({ error: 'Role not found.' });
-    if (existing.id === 'role-super-admin' || existing.id === 'role-msp-super-admin') {
-      return reply.status(400).send({ error: 'System Super Admin role permissions cannot be restricted.' });
-    }
+    const isProtectedSuperAdminRole =
+      existing.id === 'role-super-admin' || existing.id === 'role-msp-super-admin';
+
     const body = (request.body || {}) as {
       name?: string;
       description?: string;
@@ -2239,6 +2783,28 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       permissions?: string[];
       allowed_tenant_ids?: string[];
     };
+
+    const nextName = body.name !== undefined ? String(body.name).trim() : null;
+    if (nextName !== null && !nextName) {
+      return reply.status(400).send({ error: 'Role name cannot be empty.' });
+    }
+
+    if (isProtectedSuperAdminRole) {
+      db.prepare(`
+        UPDATE custom_roles SET
+          name = COALESCE(?, name),
+          description = COALESCE(?, description)
+        WHERE id = ?
+      `).run(nextName, body.description ?? null, id);
+
+      return {
+        success: true,
+        permissionsLocked: true,
+        note: 'Super Admin role label/description updated. Full administrative permissions are preserved to prevent lockout.',
+        role: formatRoleRow(db.prepare('SELECT * FROM custom_roles WHERE id = ?').get(id))
+      };
+    }
+
     const validPerms = body.permissions
       ? normalizePermissionScopes(body.permissions).filter(
           (p) => p === '*' || (ALL_GRANULAR_PERMISSIONS as readonly string[]).includes(p)
@@ -2261,7 +2827,7 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
         allowed_tenant_ids_json = COALESCE(?, allowed_tenant_ids_json)
       WHERE id = ?
     `).run(
-      body.name ?? null,
+      nextName,
       body.description ?? null,
       validTier,
       validPerms ? JSON.stringify(validPerms) : null,
@@ -2364,8 +2930,13 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
     };
 
     const user = request.auth?.user;
-    const scopedTenant = getScopedTenantFilter(user);
-    const hasRestrictedTenants = Boolean(scopedTenant || (user?.allowed_tenant_ids && user.allowed_tenant_ids.length > 0));
+    const allowedTenants = getAllowedTenantIds(user);
+    if (allowedTenants !== null && allowedTenants.length === 0) {
+      return query.format === 'csv'
+        ? reply.header('Content-Type', 'text/csv; charset=utf-8').send('id,timestamp,username,device_id,action,details')
+        : { count: 0, logs: [] };
+    }
+    const isGlobalUser = allowedTenants === null;
     const clauses: string[] = [];
     const params: any[] = [];
 
@@ -2394,9 +2965,9 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       clauses.push('datetime(a.timestamp) <= datetime(?)');
       params.push(query.to.trim());
     }
-    if (scopedTenant) {
-      clauses.push('d.tenant_id = ?');
-      params.push(scopedTenant);
+    if (allowedTenants !== null) {
+      clauses.push(`d.tenant_id IN (${allowedTenants.map(() => '?').join(',')})`);
+      params.push(...allowedTenants);
     }
 
     const limit = Math.min(5000, Math.max(1, parseInt(query.limit || '1000', 10) || 1000));
@@ -2413,7 +2984,7 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       .all(...params, limit) as any[];
 
     const rows = rawRows
-      .filter((r) => (!hasRestrictedTenants ? true : Boolean(r.device_tenant_id && canUserAccessTenant(user, r.device_tenant_id))))
+      .filter((r) => (isGlobalUser ? true : Boolean(r.device_tenant_id && canUserAccessTenant(user, r.device_tenant_id))))
       .map(({ device_tenant_id: _unused, ...rest }) => rest);
 
     if (query.format === 'csv') {
@@ -2436,8 +3007,12 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
 
   // Expose local SVG QR helper for QuickSupport / Guest Portal URLs without external leaks!
   server.get('/api/utils/qr.svg', async (request, reply) => {
-    if (!checkRateLimit(`qr-svg:${request.ip}`, 60, 60_000)) {
-      return reply.status(429).send({ error: 'Too many QR generation requests.' });
+    const qrRate = checkRateLimit(`qr-svg:${request.ip}`, 60, 60_000);
+    if (!qrRate.allowed) {
+      return reply.status(429).send({
+        error: 'Too many QR generation requests.',
+        retryAfterSec: qrRate.retryAfterSec
+      });
     }
     const query = (request.query || {}) as { data?: string; text?: string };
     const text = String(query.data || query.text || '').trim();

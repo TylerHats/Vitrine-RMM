@@ -8,7 +8,6 @@ import {
   Video,
   KeyRound,
   RefreshCw,
-  Clock,
   Users,
   Building,
   Plus,
@@ -51,11 +50,15 @@ import {
   ScopedApiKey,
   ActiveAuthSession,
   BackupPolicy,
-  MdmProfile
+  MdmProfile,
+  Policy
 } from '../types/index.js';
 import {
   updateSettings,
   uploadBrandLogo,
+  fetchPolicies,
+  updatePolicy,
+  uploadPolicyTrayIcon,
   testSmtp,
   syncMeshCentral,
   fetchUsers,
@@ -70,6 +73,7 @@ import {
   fetchSystemHealth,
   fetchTenants,
   createTenant,
+  updateTenant,
   createSite,
   offboardTenant,
   reactivateTenant,
@@ -99,34 +103,80 @@ import {
   regenerateMfaRecoveryCodes,
   fetchCustomFields,
   saveCustomField,
+  updateCustomField,
   deleteCustomField,
   fetchMaintenanceWindows,
   createMaintenanceWindow,
+  updateMaintenanceWindow,
   deleteMaintenanceWindow,
   testOidcDiscovery,
+  testCodeSigningPipeline,
   revealBackupRecoveryKey,
   acknowledgeBackupRecoveryKey,
   fetchCustomRoles,
   createCustomRole,
+  updateCustomRole,
   deleteCustomRole,
   fetchScopedApiKeys,
   createScopedApiKey,
   revokeScopedApiKey,
   fetchBackupPolicies,
   createBackupPolicy,
+  updateBackupPolicy,
   deleteBackupPolicy,
   fetchMdmProfiles,
   createMdmProfile,
+  updateMdmProfile,
   deleteMdmProfile
 } from '../services/api.js';
 import { ALL_GRANULAR_PERMISSIONS } from '../utils/permissions.js';
 import { copyToClipboard } from '../utils/clipboard.js';
+import { sanitizeSafeUrl } from '../utils/urlSafety.js';
 import { MfaChallengeModal } from '../components/MfaChallengeModal.js';
+import { IconCropModal } from '../components/IconCropModal.js';
 
 function isErrorMessage(msg?: string | null): boolean {
   if (!msg) return false;
-  return /^(error|failed|unable|cannot|invalid|rejected|offsite|upload rejected|restore (blocked|error)|sync (encountered|failed)|oidc discovery failed|verification failed|update (did not|error)|⚠️)/i.test(
+  return /^(error|failed|unable|cannot|invalid|rejected|offsite|upload rejected|restore (blocked|error)|sync (encountered|failed)|oidc discovery failed|verification failed|update (did not|error)|must\b|enter\b|select\b|new password|missing|⚠️)/i.test(
     msg.trim()
+  );
+}
+
+function formatFieldOptionsForEditor(raw?: string | null): string {
+  if (!raw) return '';
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+  if (trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        return parsed.map((v) => String(v).trim()).filter(Boolean).join(', ');
+      }
+    } catch {
+      // Fallback to raw text
+    }
+  }
+  return trimmed;
+}
+
+function serializeFieldOptionsFromEditor(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return '[]';
+  if (trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        return JSON.stringify(parsed.map((v) => String(v).trim()).filter(Boolean));
+      }
+    } catch {
+      // Treat as comma-separated list
+    }
+  }
+  return JSON.stringify(
+    trimmed
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
   );
 }
 
@@ -177,7 +227,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onOpenWizard,
   tenants: propTenants
 }) => {
-  const [formData, setFormData] = useState<Settings>({ ...settings });
+  const [formData, setRawFormData] = useState<Settings>({ ...settings });
+  const isDirtyRef = useRef(false);
+  const lastSettingsSnapshotRef = useRef<string>(JSON.stringify(settings));
+  const setFormData = useCallback((updater: React.SetStateAction<Settings>) => {
+    isDirtyRef.current = true;
+    setRawFormData(updater);
+  }, []);
   const [localMesh, setLocalMesh] = useState<LocalMeshCentralDetection | null>(null);
   const initialMeshPair = parseMeshTokenPair(settings.meshcentral_api_token);
   const [meshTokenUser, setMeshTokenUser] = useState(initialMeshPair.user);
@@ -207,10 +263,21 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [syncingMesh, setSyncingMesh] = useState(false);
   const [meshSyncResult, setMeshSyncResult] = useState<string | null>(null);
 
-  // Logo & Backup file inputs
+  // Logo & Backup file inputs + QuickSupport Dedicated Branding Profile
   const logoInputRef = useRef<HTMLInputElement | null>(null);
+  const qsIconInputRef = useRef<HTMLInputElement | null>(null);
   const backupFileInputRef = useRef<HTMLInputElement | null>(null);
+  const [cropIconRequest, setCropIconRequest] = useState<{ mode: 'global' | 'quicksupport'; file: File } | null>(null);
   const [uploadingLogo, setUploadingLogo] = useState(false);
+  const [uploadingQsIcon, setUploadingQsIcon] = useState(false);
+  const [savingQsProfile, setSavingQsProfile] = useState(false);
+  const [qsProfileMsg, setQsProfileMsg] = useState<string | null>(null);
+  const [qsProfileError, setQsProfileError] = useState(false);
+  const [qsBrandName, setQsBrandName] = useState('');
+  const [qsIconUrl, setQsIconUrl] = useState('');
+  const [qsThemeMode, setQsThemeMode] = useState<'inherit' | 'system' | 'dark' | 'light'>('inherit');
+  const [qsTooltip, setQsTooltip] = useState('');
+  const [qsEnabled, setQsEnabled] = useState(true);
   const [uploadingBackup, setUploadingBackup] = useState(false);
 
   // RBAC Users & Tenants management state
@@ -239,6 +306,46 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [newRoleDesc, setNewRoleDesc] = useState('');
   const [newRolePerms, setNewRolePerms] = useState<string[]>(['devices:read', 'alerts:triage', 'docs:write']);
   const [roleNotice, setRoleNotice] = useState<string | null>(null);
+  const [editingRoleId, setEditingRoleId] = useState<string | null>(null);
+  const [editRoleName, setEditRoleName] = useState('');
+  const [editRoleDesc, setEditRoleDesc] = useState('');
+  const [editRoleTier, setEditRoleTier] = useState('technician');
+  const [editRolePerms, setEditRolePerms] = useState<string[]>([]);
+
+  const [editingTenantId, setEditingTenantId] = useState<string | null>(null);
+  const [editTenantName, setEditTenantName] = useState('');
+  const [editTenantEmail, setEditTenantEmail] = useState('');
+
+  const [editingFieldId, setEditingFieldId] = useState<string | null>(null);
+  const [editFieldLabel, setEditFieldLabel] = useState('');
+  const [editFieldType, setEditFieldType] = useState<'text' | 'dropdown' | 'checkbox' | 'secret'>('text');
+  const [editFieldOptions, setEditFieldOptions] = useState('');
+
+  const [editingWinId, setEditingWinId] = useState<string | null>(null);
+  const [editWinTitle, setEditWinTitle] = useState('');
+  const [editWinTenantId, setEditWinTenantId] = useState('');
+  const [editWinStartTime, setEditWinStartTime] = useState('');
+  const [editWinEndTime, setEditWinEndTime] = useState('');
+
+  const [editingBpId, setEditingBpId] = useState<string | null>(null);
+  const [editBpName, setEditBpName] = useState('');
+  const [editBpEngine, setEditBpEngine] = useState('restic');
+  const [editBpRepo, setEditBpRepo] = useState('');
+  const [editBpCron, setEditBpCron] = useState('0 2 * * *');
+  const [editBpRetention, setEditBpRetention] = useState<number | ''>(30);
+
+  const [editingMdmId, setEditingMdmId] = useState<string | null>(null);
+  const [editMdmName, setEditMdmName] = useState('');
+  const [editMdmPlatform, setEditMdmPlatform] = useState<'macos' | 'windows' | 'linux'>('macos');
+  const [editMdmType, setEditMdmType] = useState('security_baseline');
+  const [editMdmPayload, setEditMdmPayload] = useState('');
+
+  const [activeSection, setActiveSection] = useState<
+    'all' | 'users' | 'security' | 'branding' | 'agents' | 'policies' | 'notifications' | 'updates'
+  >('users');
+  const [testingSigning, setTestingSigning] = useState(false);
+  const [signingTestMsg, setSigningTestMsg] = useState<string | null>(null);
+  const [signingTestError, setSigningTestError] = useState(false);
 
   const [apiKeys, setApiKeys] = useState<ScopedApiKey[]>([]);
   const [newKeyName, setNewKeyName] = useState('');
@@ -255,7 +362,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [newBpEngine, setNewBpEngine] = useState('restic');
   const [newBpRepo, setNewBpRepo] = useState('');
   const [newBpCron, setNewBpCron] = useState('0 2 * * *');
-  const [newBpRetention, setNewBpRetention] = useState(30);
+  const [newBpRetention, setNewBpRetention] = useState<number | ''>(30);
   const [bpNotice, setBpNotice] = useState<string | null>(null);
 
   const [mdmProfiles, setMdmProfiles] = useState<MdmProfile[]>([]);
@@ -307,7 +414,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   // Custom Field Definitions & Maintenance Windows state
   const [customFieldDefs, setCustomFieldDefs] = useState<CustomFieldDefinition[]>([]);
   const [newFieldLabel, setNewFieldLabel] = useState('');
-  const [newFieldCategory, setNewFieldCategory] = useState('Operations');
+  const [newFieldCategory] = useState('Operations');
   const [newFieldType, setNewFieldType] = useState<'text' | 'dropdown' | 'checkbox' | 'secret'>('text');
   const [newFieldOptions, setNewFieldOptions] = useState('');
 
@@ -366,12 +473,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [channelGuardrailError, setChannelGuardrailError] = useState<string | null>(null);
 
   useEffect(() => {
-    setFormData({ ...settings });
-    const parsed = parseMeshTokenPair(settings.meshcentral_api_token);
-    setMeshTokenUser(parsed.user);
-    setMeshTokenPass(parsed.pass);
-    setMeshTokenHasSaved(parsed.isMasked);
-    setUseCombinedTokenMode(parsed.isCombinedOnly);
+    const nextSnapshot = JSON.stringify(settings);
+    if (!isDirtyRef.current && nextSnapshot !== lastSettingsSnapshotRef.current) {
+      lastSettingsSnapshotRef.current = nextSnapshot;
+      setRawFormData({ ...settings });
+      const parsed = parseMeshTokenPair(settings.meshcentral_api_token);
+      setMeshTokenUser(parsed.user);
+      setMeshTokenPass(parsed.pass);
+      setMeshTokenHasSaved(parsed.isMasked);
+      setUseCombinedTokenMode(parsed.isCombinedOnly);
+    }
   }, [settings]);
 
   const loadAllAdminData = useCallback(() => {
@@ -428,6 +539,18 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       })
       .catch(() => {});
     fetchUpdaterStatus().then(setUpdaterStatus).catch(() => {});
+    fetchPolicies()
+      .then((list: Policy[]) => {
+        const qs = list.find((p) => p.id === 'pol-quicksupport' || p.tier === 'quicksupport');
+        if (qs) {
+          setQsBrandName(qs.tray_brand_name || '');
+          setQsIconUrl(qs.tray_icon_url || '');
+          setQsThemeMode((qs.tray_theme_mode as any) || 'inherit');
+          setQsTooltip(qs.tray_tooltip || '');
+          setQsEnabled(qs.tray_enabled !== 0 && qs.tray_enabled !== false);
+        }
+      })
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -435,8 +558,18 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   }, [loadAllAdminData]);
   const performSave = async () => {
     setSaving(true);
+    const normalizedPayload: Settings = {
+      ...formData,
+      smtp_port: Number(formData.smtp_port) || 587,
+      backup_retention_count: Math.max(1, Number(formData.backup_retention_count) || 14),
+      backup_max_storage_mb: Math.max(128, Number(formData.backup_max_storage_mb) || 5120),
+      session_idle_timeout_min:
+        formData.session_idle_timeout_min !== undefined
+          ? Math.max(5, Number(formData.session_idle_timeout_min) || 30)
+          : undefined
+    };
     try {
-      const res = await updateSettings(formData);
+      const res = await updateSettings(normalizedPayload);
       if (res.mfaRequired) {
         setPendingMfaAction({
           title: 'Step-Up MFA: Save Global RMM Configuration',
@@ -446,6 +579,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         return;
       }
       if (res.success) {
+        isDirtyRef.current = false;
+        lastSettingsSnapshotRef.current = JSON.stringify(res.settings);
+        setRawFormData({ ...res.settings });
         onUpdated(res.settings);
         setSaveBannerIsError(false);
         setSaveBanner('Settings, White-Labeling, Vaulted Secrets & Compliance Policies saved successfully.');
@@ -464,31 +600,97 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (formData.brand_logo_url && !sanitizeSafeUrl(formData.brand_logo_url)) {
+      setSaveBannerIsError(true);
+      setSaveBanner('Error: Brand logo URL must start with https://, http://, or a relative /path.');
+      return;
+    }
+    const qsPath = String(formData.quicksupport_url_path || '').trim();
+    if (qsPath && (!qsPath.startsWith('/') || qsPath.startsWith('//'))) {
+      setSaveBannerIsError(true);
+      setSaveBanner('Error: QuickSupport URL Path must be a valid single-slash route such as /remote.');
+      return;
+    }
+    const smtpPortVal = formData.smtp_port;
+    if (smtpPortVal !== undefined && String(smtpPortVal) !== '') {
+      const p = Number(smtpPortVal);
+      if (!Number.isInteger(p) || p < 1 || p > 65535) {
+        setSaveBannerIsError(true);
+        setSaveBanner('Error: Outbound SMTP Port must be between 1 and 65535.');
+        return;
+      }
+    }
+    const smtpFrom = String(formData.smtp_from || '').trim();
+    if (smtpFrom && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(smtpFrom)) {
+      setSaveBannerIsError(true);
+      setSaveBanner('Error: Outbound SMTP From Address must be a valid email address.');
+      return;
+    }
+    const retCount = formData.backup_retention_count;
+    if (retCount !== undefined && String(retCount) !== '' && Number(retCount) < 1) {
+      setSaveBannerIsError(true);
+      setSaveBanner('Error: Backup Retention Count must be at least 1.');
+      return;
+    }
+    const quotaMb = formData.backup_max_storage_mb;
+    if (quotaMb !== undefined && String(quotaMb) !== '' && Number(quotaMb) < 128) {
+      setSaveBannerIsError(true);
+      setSaveBanner('Error: Local Backup Storage Quota must be at least 128 MB.');
+      return;
+    }
     await performSave();
   };
 
-  const handleLogoFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleLogoFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    if (logoInputRef.current) logoInputRef.current.value = '';
     if (!file) return;
+    setCropIconRequest({ mode: 'global', file });
+  };
+
+  const handleQsIconFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (qsIconInputRef.current) qsIconInputRef.current.value = '';
+    if (!file) return;
+    setCropIconRequest({ mode: 'quicksupport', file });
+  };
+
+  const handleCropModalConfirm = async (cropped: { filename: string; base64Data: string }) => {
+    const targetMode = cropIconRequest?.mode;
+    setCropIconRequest(null);
+    if (!targetMode) return;
+
+    if (targetMode === 'quicksupport') {
+      setUploadingQsIcon(true);
+      setQsProfileMsg(null);
+      setQsProfileError(false);
+      try {
+        const res = await uploadPolicyTrayIcon('pol-quicksupport', cropped.filename, cropped.base64Data);
+        if (res.success && res.tray_icon_url) {
+          setQsIconUrl(res.tray_icon_url);
+          setQsProfileMsg('Square QuickSupport icon uploaded & ready for QuickSupport EXEs and Portal.');
+        } else {
+          setQsProfileError(true);
+          setQsProfileMsg(res.error || 'Failed to upload QuickSupport icon.');
+        }
+      } catch (err: any) {
+        setQsProfileError(true);
+        setQsProfileMsg(err?.message || 'Failed to upload QuickSupport icon.');
+      } finally {
+        setUploadingQsIcon(false);
+      }
+      return;
+    }
+
     setUploadingLogo(true);
     try {
-      const base64Data = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => {
-          const str = String(reader.result || '');
-          const commaIdx = str.indexOf(',');
-          resolve(commaIdx >= 0 ? str.slice(commaIdx + 1) : str);
-        };
-        reader.onerror = () => reject(new Error('Failed to read image file'));
-        reader.readAsDataURL(file);
-      });
-      const res = await uploadBrandLogo(file.name, base64Data);
+      const res = await uploadBrandLogo(cropped.filename, cropped.base64Data);
       if (res.success && res.brand_logo_url) {
         const next = { ...formData, brand_logo_url: res.brand_logo_url };
         setFormData(next);
         onUpdated(next);
         setSaveBannerIsError(false);
-        setSaveBanner(`Brand logo "${file.name}" uploaded and applied across Web UI & Portals.`);
+        setSaveBanner(`Square brand icon "${cropped.filename}" saved for Web UI, installers & tray defaults.`);
         setTimeout(() => setSaveBanner(null), 4000);
       } else {
         setSaveBannerIsError(true);
@@ -499,7 +701,41 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setSaveBanner(`Logo upload rejected: ${err?.message || 'Unsupported image format'}`);
     } finally {
       setUploadingLogo(false);
-      if (logoInputRef.current) logoInputRef.current.value = '';
+    }
+  };
+
+  const handleSaveQsProfile = async () => {
+    setSavingQsProfile(true);
+    setQsProfileMsg(null);
+    setQsProfileError(false);
+    try {
+      const res = await updatePolicy('pol-quicksupport', {
+        name: 'QuickSupport On-Demand Profile',
+        tray_brand_name: qsBrandName,
+        tray_icon_url: qsIconUrl,
+        tray_theme_mode: (qsThemeMode === 'inherit' ? '' : qsThemeMode) as any,
+        tray_tooltip: qsTooltip,
+        tray_enabled: qsEnabled ? 1 : 0
+      });
+      if (res.mfaRequired) {
+        setPendingMfaAction({
+          title: 'Step-Up MFA: Save QuickSupport Branding Profile',
+          secretType: 'policy_governance',
+          onVerified: () => handleSaveQsProfile()
+        });
+        return;
+      }
+      if (res.success) {
+        setQsProfileMsg('QuickSupport branding & icon profile saved.');
+      } else {
+        setQsProfileError(true);
+        setQsProfileMsg(res.error || 'Failed to save QuickSupport profile.');
+      }
+    } catch (err: any) {
+      setQsProfileError(true);
+      setQsProfileMsg(err?.message || 'Failed to save QuickSupport profile.');
+    } finally {
+      setSavingQsProfile(false);
     }
   };
 
@@ -591,28 +827,40 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   };
 
   const handleRevealBackupKey = async () => {
-    const res = await revealBackupRecoveryKey();
-    if (res.mfaRequired) {
-      setShowBackupKeyMfa(true);
-      return;
-    }
-    if (res.success && res.passphrase) {
-      setRevealedBackupKey(res.passphrase);
-      const next = { ...formData, backup_key_acknowledged: 1 };
-      setFormData(next);
-      onUpdated(next);
-    } else if (res.error) {
-      setBackupNotice(`Unable to reveal recovery key: ${res.error}`);
+    setBackupNotice(null);
+    try {
+      const res = await revealBackupRecoveryKey();
+      if (res.mfaRequired) {
+        setShowBackupKeyMfa(true);
+        return;
+      }
+      if (res.success && res.passphrase) {
+        setRevealedBackupKey(res.passphrase);
+        const next = { ...formData, backup_key_acknowledged: 1 };
+        setFormData(next);
+        onUpdated(next);
+      } else {
+        setBackupNotice(`Unable to reveal recovery key: ${res.error || 'Unknown error'}`);
+      }
+    } catch (err: any) {
+      setBackupNotice(`Unable to reveal recovery key: ${err?.message || 'Connection error'}`);
     }
   };
 
   const handleAcknowledgeBackupKey = async () => {
-    const res = await acknowledgeBackupRecoveryKey();
-    if (res.success) {
-      const next = { ...formData, backup_key_acknowledged: 1 };
-      setFormData(next);
-      onUpdated(next);
-      setBackupNotice('✓ Backup Encryption Passphrase marked as escrowed offline.');
+    setBackupNotice(null);
+    try {
+      const res = await acknowledgeBackupRecoveryKey();
+      if (res.success) {
+        const next = { ...formData, backup_key_acknowledged: 1 };
+        setFormData(next);
+        onUpdated(next);
+        setBackupNotice('✓ Backup Encryption Passphrase marked as escrowed offline.');
+      } else if (res.error) {
+        setBackupNotice(`Unable to mark recovery key escrowed: ${res.error}`);
+      }
+    } catch (err: any) {
+      setBackupNotice(`Unable to mark recovery key escrowed: ${err?.message || 'Connection error'}`);
     }
   };
 
@@ -651,6 +899,27 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       );
     } finally {
       setTestingOidc(false);
+    }
+  };
+
+  const handleTestSigningSettings = async () => {
+    setTestingSigning(true);
+    setSigningTestMsg(null);
+    setSigningTestError(false);
+    try {
+      const res = await testCodeSigningPipeline(formData.code_signing_url);
+      if (res.success) {
+        setSigningTestError(false);
+        setSigningTestMsg(`✓ Verified Signing Endpoint (${res.hsmStatus || 'Ready'}) • ${res.ms2AutoUpdateProtection || 'Connected'}`);
+      } else {
+        setSigningTestError(true);
+        setSigningTestMsg(`Signing check failed: ${res.error || res.hsmStatus || 'Unreachable'}`);
+      }
+    } catch (err: any) {
+      setSigningTestError(true);
+      setSigningTestMsg(`Signing check failed: ${err?.message || 'Unreachable'}`);
+    } finally {
+      setTestingSigning(false);
     }
   };
 
@@ -759,12 +1028,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   };
 
   const handleDeleteUser = async (id: string) => {
-    const res = await deleteUser(id);
-    if (!res.success && res.error) {
-      setUserNotice(`Cannot delete user: ${res.error}`);
-      return;
+    if (!confirm('Permanently delete this user account?')) return;
+    setUserNotice(null);
+    try {
+      const res = await deleteUser(id);
+      if (!res.success && res.error) {
+        setUserNotice(`Cannot delete user: ${res.error}`);
+        return;
+      }
+      setUserNotice('✓ User account removed.');
+      loadAllAdminData();
+    } catch (err: any) {
+      setUserNotice(`Cannot delete user: ${err?.message || 'Unknown error'}`);
     }
-    loadAllAdminData();
   };
 
   const handleCreateCustomRole = async () => {
@@ -796,6 +1072,142 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       }
     } catch (err: any) {
       setRoleNotice(`Failed to create role: ${err?.message || 'Unknown error'}`);
+    }
+  };
+
+  const handleSaveEditRole = async (role: CustomRole) => {
+    setRoleNotice(null);
+    if (!editRoleName.trim()) {
+      setRoleNotice('Error: Role name is required.');
+      return;
+    }
+    const isProtectedSuper = role.id === 'role-super-admin' || role.id === 'role-msp-super-admin';
+    try {
+      const res = await updateCustomRole(role.id, {
+        name: editRoleName.trim(),
+        description: editRoleDesc.trim(),
+        ...(isProtectedSuper ? {} : { base_tier: editRoleTier, permissions: editRolePerms })
+      });
+      if (res.mfaRequired) {
+        setPendingMfaAction({
+          title: `Step-Up MFA: Update Role "${role.name}"`,
+          secretType: 'rbac_role_update',
+          onVerified: () => handleSaveEditRole(role)
+        });
+        return;
+      }
+      if (res.success) {
+        setEditingRoleId(null);
+        setRoleNotice(res.note ? `✓ ${res.note}` : `✓ Updated role "${res.role?.name || editRoleName.trim()}".`);
+        loadAllAdminData();
+      } else {
+        setRoleNotice(`Failed to update role: ${res.error || 'Unknown error'}`);
+      }
+    } catch (err: any) {
+      setRoleNotice(`Failed to update role: ${err?.message || 'Unknown error'}`);
+    }
+  };
+
+  const handleSaveEditTenant = async (tenantId: string) => {
+    setClientActionNotice(null);
+    if (!editTenantName.trim()) {
+      setClientActionNotice('Error: Client organization name is required.');
+      return;
+    }
+    const res = await updateTenant(tenantId, {
+      name: editTenantName.trim(),
+      contact_email: editTenantEmail.trim()
+    });
+    if (res.success) {
+      setEditingTenantId(null);
+      setClientActionNotice(`✓ Updated client "${editTenantName.trim()}".`);
+      loadAllAdminData();
+    } else {
+      setClientActionNotice(`Failed to update client: ${res.error || 'Unknown error'}`);
+    }
+  };
+
+  const handleSaveEditField = async (fieldId: string) => {
+    setSchemaFieldNotice(null);
+    if (!editFieldLabel.trim()) {
+      setSchemaFieldNotice('Error: Attribute label is required.');
+      return;
+    }
+    const res = await updateCustomField(fieldId, {
+      label: editFieldLabel.trim(),
+      field_type: editFieldType,
+      options: editFieldType === 'dropdown' ? serializeFieldOptionsFromEditor(editFieldOptions) : null
+    });
+    if (res.success) {
+      setEditingFieldId(null);
+      setSchemaFieldNotice(`✓ Updated custom attribute "${editFieldLabel.trim()}".`);
+      fetchCustomFields().then(setCustomFieldDefs).catch(() => {});
+    } else {
+      setSchemaFieldNotice(`Failed to update attribute: ${res.error || 'Unknown error'}`);
+    }
+  };
+
+  const handleSaveEditWindow = async (winId: string) => {
+    setSchemaFieldNotice(null);
+    if (!editWinTitle.trim()) {
+      setSchemaFieldNotice('Error: Maintenance window title is required.');
+      return;
+    }
+    const res = await updateMaintenanceWindow(winId, {
+      title: editWinTitle.trim(),
+      tenant_id: editWinTenantId || null,
+      ...(editWinStartTime ? { start_time: new Date(editWinStartTime).toISOString() } : {}),
+      ...(editWinEndTime ? { end_time: new Date(editWinEndTime).toISOString() } : {})
+    });
+    if (res.success) {
+      setEditingWinId(null);
+      setSchemaFieldNotice(`✓ Updated maintenance window "${editWinTitle.trim()}".`);
+      fetchMaintenanceWindows().then(setMaintenanceWindows).catch(() => {});
+    } else {
+      setSchemaFieldNotice(`Failed to update maintenance window: ${res.error || 'Unknown error'}`);
+    }
+  };
+
+  const handleSaveEditBackupPolicy = async (bpId: string) => {
+    setBpNotice(null);
+    if (!editBpName.trim() || !editBpRepo.trim()) {
+      setBpNotice('Error: Policy name and repository target are required.');
+      return;
+    }
+    const res = await updateBackupPolicy(bpId, {
+      name: editBpName.trim(),
+      engine: editBpEngine,
+      repository_url: editBpRepo.trim(),
+      schedule_cron: editBpCron.trim() || '0 2 * * *',
+      retention_days: Math.max(1, Number(editBpRetention) || 30)
+    });
+    if (res.success) {
+      setEditingBpId(null);
+      setBpNotice(`✓ Updated backup policy "${editBpName.trim()}".`);
+      loadAllAdminData();
+    } else {
+      setBpNotice(`Failed to update backup policy: ${res.error || 'Unknown error'}`);
+    }
+  };
+
+  const handleSaveEditMdmProfile = async (mpId: string) => {
+    setMdmNotice(null);
+    if (!editMdmName.trim()) {
+      setMdmNotice('Error: Profile name is required.');
+      return;
+    }
+    const res = await updateMdmProfile(mpId, {
+      name: editMdmName.trim(),
+      platform: editMdmPlatform,
+      profile_type: editMdmType,
+      payload_xml: editMdmPayload
+    });
+    if (res.success) {
+      setEditingMdmId(null);
+      setMdmNotice(`✓ Updated MDM profile "${editMdmName.trim()}".`);
+      loadAllAdminData();
+    } else {
+      setMdmNotice(`Failed to update MDM profile: ${res.error || 'Unknown error'}`);
     }
   };
 
@@ -849,7 +1261,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         engine: newBpEngine,
         repository_url: newBpRepo.trim(),
         schedule_cron: newBpCron.trim() || '0 2 * * *',
-        retention_days: newBpRetention
+        retention_days: Math.max(1, Number(newBpRetention) || 30)
       });
       if (res.success) {
         setNewBpName('');
@@ -952,8 +1364,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     try {
       const res = await createTenant({
         name: newTenantName.trim(),
-        contact_email:
-          newTenantContact.trim() || `it@${newTenantName.trim().toLowerCase().replace(/[^a-z0-9]/g, '')}.com`
+        contact_email: newTenantContact.trim()
       });
       if (res && (res as any).success === false) {
         setClientActionNotice(`Failed to create client: ${(res as any).error || 'Unknown error'}`);
@@ -978,7 +1389,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       const res = await createSite({
         tenant_id: newSiteTenantId,
         name: newSiteName.trim(),
-        subnet: newSiteSubnet.trim() || '10.50.0.0/24'
+        subnet: newSiteSubnet.trim()
       });
       if (res && (res as any).success === false) {
         setClientActionNotice(`Failed to create site: ${(res as any).error || 'Unknown error'}`);
@@ -1430,20 +1841,101 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setSchemaFieldNotice(`Failed to create maintenance window: ${err?.message || 'Unknown error'}`);
     }
   };
+  const showSection = (key: typeof activeSection) => activeSection === 'all' || activeSection === key;
+
+  const renderSectionHeader = (
+    sectionKey: Exclude<typeof activeSection, 'all'>,
+    title: string,
+    subtitle: string,
+    accentColor = 'var(--primary)'
+  ) =>
+    showSection(sectionKey) ? (
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: '1rem',
+          paddingTop: '1.15rem',
+          paddingBottom: '0.35rem',
+          borderTop: '1px solid rgba(148, 163, 184, 0.2)',
+          marginTop: '0.4rem'
+        }}
+      >
+        <div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.55rem' }}>
+            <span
+              style={{
+                width: '4px',
+                height: '18px',
+                borderRadius: '4px',
+                background: accentColor,
+                display: 'inline-block'
+              }}
+            />
+            <h3 style={{ margin: 0, fontSize: '1.08rem', fontWeight: 700, letterSpacing: '0.01em' }}>
+              {title}
+            </h3>
+          </div>
+          <p style={{ margin: '0.2rem 0 0 0.95rem', fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+            {subtitle}
+          </p>
+        </div>
+      </div>
+    ) : null;
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '1.75rem' }} id="settings-view">
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '1.35rem' }} id="settings-view">
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem' }}>
         <div>
-          <h2 style={{ fontFamily: 'var(--font-heading)', fontSize: '1.5rem', fontWeight: 700 }}>
-            System Settings, RBAC &amp; White-Labeling
+          <h2 style={{ fontFamily: 'var(--font-heading)', fontSize: '1.5rem', fontWeight: 700, margin: 0 }}>
+            System Settings &amp; Administration
           </h2>
           <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-            Configure global branding, RBAC technicians, MFA security, Client tenants, Code Signing HSM API, Backups, and MeshCentral 2 link
+            Organize users, built-in &amp; custom roles, white-labeling, remote engine links, code signing, SSO, and backups
           </span>
         </div>
         <button className="btn-glass btn-primary" onClick={onOpenWizard}>
-          Launch Onboarding Wizard
+          Launch Setup Wizard
         </button>
+      </div>
+
+      {/* Section Navigation Pills */}
+      <div
+        className="glass-card"
+        style={{
+          padding: '0.65rem 0.85rem',
+          display: 'flex',
+          flexWrap: 'wrap',
+          gap: '0.45rem',
+          alignItems: 'center',
+          position: 'sticky',
+          top: 'calc(var(--topbar-height) + 0.5rem)',
+          zIndex: 15
+        }}
+      >
+        {(
+          [
+            { id: 'users', label: 'Users, Clients & Roles' },
+            { id: 'branding', label: 'Branding & Portal' },
+            { id: 'agents', label: 'Code Signing & Remote Engine' },
+            { id: 'security', label: 'MFA & API Keys' },
+            { id: 'policies', label: 'Fields, Backup Policies & MDM' },
+            { id: 'notifications', label: 'SSO, PSA & SMTP' },
+            { id: 'updates', label: 'Updates & System Backups' },
+            { id: 'all', label: 'All Sections' }
+          ] as const
+        ).map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            className={`btn-glass ${activeSection === tab.id ? 'btn-primary' : ''}`}
+            style={{ padding: '0.35rem 0.78rem', fontSize: '0.76rem', fontWeight: activeSection === tab.id ? 700 : 500 }}
+            onClick={() => setActiveSection(tab.id)}
+          >
+            {tab.label}
+          </button>
+        ))}
       </div>
 
       {saveBanner && (
@@ -1516,8 +2008,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         </div>
       )}
 
+      {renderSectionHeader(
+        'users',
+        '1. Users, Client Organizations & Role Permissions',
+        'Create and edit administrator/technician accounts, customize built-in or custom role permissions, and manage client organizations.',
+        'var(--primary)'
+      )}
+
       {/* RBAC Technician Management & Client Tenants */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem' }}>
+      {showSection('users') && (
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(460px, 1fr))', gap: '1.5rem' }}>
         {/* RBAC Technicians */}
         <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.65rem', flexWrap: 'wrap' }}>
@@ -1538,11 +2038,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </button>
           </div>
 
-          <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(175px, 1fr))', gap: '0.5rem', alignItems: 'center' }}>
             <input
               type="text"
               className="glass-input"
-              style={{ flex: 1, minWidth: '115px', fontSize: '0.78rem' }}
+              style={{ fontSize: '0.78rem' }}
               placeholder="Full Name"
               value={newUserName}
               onChange={(e) => setNewUserName(e.target.value)}
@@ -1550,7 +2050,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <input
               type="email"
               className="glass-input"
-              style={{ flex: 1, minWidth: '135px', fontSize: '0.78rem' }}
+              style={{ fontSize: '0.78rem' }}
               placeholder="Email Address"
               value={newUserEmail}
               onChange={(e) => setNewUserEmail(e.target.value)}
@@ -1558,14 +2058,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <input
               type="password"
               className="glass-input"
-              style={{ flex: 1, minWidth: '130px', fontSize: '0.78rem' }}
-              placeholder="Initial Password (10+ chars)"
+              style={{ fontSize: '0.78rem' }}
+              placeholder="Password (10+ chars)"
               value={newUserPassword}
               onChange={(e) => setNewUserPassword(e.target.value)}
             />
             <select
               className="glass-select"
-              style={{ width: 'auto', fontSize: '0.78rem' }}
+              style={{ fontSize: '0.78rem' }}
               value={newUserRole}
               onChange={(e) => setNewUserRole(e.target.value as 'super_admin' | 'technician' | 'client_admin' | 'auditor')}
             >
@@ -1577,7 +2077,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             {customRoles.length > 0 && (
               <select
                 className="glass-select"
-                style={{ width: 'auto', fontSize: '0.78rem' }}
+                style={{ fontSize: '0.78rem' }}
                 value={newUserCustomRoleId}
                 onChange={(e) => setNewUserCustomRoleId(e.target.value)}
               >
@@ -1592,7 +2092,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             {newUserRole === 'client_admin' && (
               <select
                 className="glass-select"
-                style={{ width: 'auto', fontSize: '0.78rem' }}
+                style={{ fontSize: '0.78rem' }}
                 value={newUserTenantId}
                 onChange={(e) => setNewUserTenantId(e.target.value)}
               >
@@ -1604,7 +2104,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 ))}
               </select>
             )}
-            <button type="button" className="btn-glass btn-primary" style={{ fontSize: '0.78rem' }} onClick={handleAddUser}>
+            <button type="button" className="btn-glass btn-primary" style={{ fontSize: '0.78rem', justifyContent: 'center' }} onClick={handleAddUser}>
               <Plus size={14} /> Add
             </button>
           </div>
@@ -1642,8 +2142,18 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     className="btn-glass"
                     style={{ padding: '0.15rem 0.45rem', fontSize: '0.68rem', color: '#ef4444' }}
                     onClick={async () => {
-                      await revokeActiveSession(sess.sessionPrefix);
-                      loadAllAdminData();
+                      if (!confirm(`Revoke active session ${sess.sessionPrefix}?`)) return;
+                      try {
+                        const res = await revokeActiveSession(sess.sessionPrefix);
+                        if (res && res.success === false) {
+                          setUserNotice(`Failed to revoke session: ${(res as any).error || 'Request rejected'}`);
+                          return;
+                        }
+                        setUserNotice('✓ Active session revoked.');
+                        loadAllAdminData();
+                      } catch (err: any) {
+                        setUserNotice(`Failed to revoke session: ${err?.message || 'Unknown error'}`);
+                      }
                     }}
                   >
                     Revoke
@@ -1807,32 +2317,32 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           </div>
 
-          <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(175px, 1fr))', gap: '0.5rem', alignItems: 'center' }}>
             <input
               type="text"
               className="glass-input"
-              style={{ flex: 1, fontSize: '0.78rem' }}
-              placeholder="New Client Organization Name"
+              style={{ fontSize: '0.78rem' }}
+              placeholder="Organization Name"
               value={newTenantName}
               onChange={(e) => setNewTenantName(e.target.value)}
             />
             <input
               type="email"
               className="glass-input"
-              style={{ flex: 1, fontSize: '0.78rem' }}
+              style={{ fontSize: '0.78rem' }}
               placeholder="Primary Contact Email"
               value={newTenantContact}
               onChange={(e) => setNewTenantContact(e.target.value)}
             />
-            <button type="button" className="btn-glass btn-primary" style={{ fontSize: '0.78rem' }} onClick={handleAddTenant}>
+            <button type="button" className="btn-glass btn-primary" style={{ fontSize: '0.78rem', justifyContent: 'center' }} onClick={handleAddTenant}>
               <Plus size={14} /> Client
             </button>
           </div>
 
-          <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: '0.5rem', alignItems: 'center' }}>
             <select
               className="glass-select"
-              style={{ flex: 1, fontSize: '0.78rem' }}
+              style={{ fontSize: '0.78rem' }}
               value={newSiteTenantId}
               onChange={(e) => setNewSiteTenantId(e.target.value)}
             >
@@ -1846,20 +2356,20 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <input
               type="text"
               className="glass-input"
-              style={{ flex: 1, fontSize: '0.78rem' }}
-              placeholder="New Site Name"
+              style={{ fontSize: '0.78rem' }}
+              placeholder="Site Name"
               value={newSiteName}
               onChange={(e) => setNewSiteName(e.target.value)}
             />
             <input
               type="text"
               className="glass-input"
-              style={{ width: '130px', fontSize: '0.78rem' }}
+              style={{ fontSize: '0.78rem' }}
               placeholder="Subnet CIDR"
               value={newSiteSubnet}
               onChange={(e) => setNewSiteSubnet(e.target.value)}
             />
-            <button type="button" className="btn-glass" style={{ fontSize: '0.78rem' }} onClick={handleAddSite}>
+            <button type="button" className="btn-glass" style={{ fontSize: '0.78rem', justifyContent: 'center' }} onClick={handleAddSite}>
               <Plus size={14} /> Site
             </button>
           </div>
@@ -1928,6 +2438,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       <button
                         type="button"
                         className="btn-glass btn-icon"
+                        title="Edit Client Organization"
+                        onClick={() => {
+                          if (editingTenantId === t.id) {
+                            setEditingTenantId(null);
+                          } else {
+                            setEditingTenantId(t.id);
+                            setEditTenantName(t.name || '');
+                            setEditTenantEmail(t.contact_email || '');
+                          }
+                        }}
+                      >
+                        <Edit3 size={12} />
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-glass btn-icon"
                         title="Permanently delete client & record Quiet-Offboard tombstone so any sleeping agent that wakes up later quietly uninstalls itself"
                         onClick={() => handleOffboardClient(t, 'permanent_delete')}
                       >
@@ -1936,16 +2462,271 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     </div>
                   </div>
                   <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)', marginTop: '0.2rem' }}>
-                    Sites: {(t.sites || []).map((s) => `${s.name} (${s.subnet})`).join(' • ') || 'None'}
+                    {t.contact_email ? `${t.contact_email} • ` : ''}Sites: {(t.sites || []).map((s) => `${s.name} (${s.subnet})`).join(' • ') || 'None'}
                   </div>
+                  {editingTenantId === t.id && (
+                    <div style={{ marginTop: '0.55rem', display: 'flex', gap: '0.45rem', flexWrap: 'wrap', paddingTop: '0.5rem', borderTop: '1px solid var(--glass-border)' }}>
+                      <input
+                        type="text"
+                        className="glass-input"
+                        style={{ flex: 1, fontSize: '0.74rem' }}
+                        value={editTenantName}
+                        onChange={(e) => setEditTenantName(e.target.value)}
+                        placeholder="Client Name"
+                      />
+                      <input
+                        type="email"
+                        className="glass-input"
+                        style={{ flex: 1, fontSize: '0.74rem' }}
+                        value={editTenantEmail}
+                        onChange={(e) => setEditTenantEmail(e.target.value)}
+                        placeholder="Contact Email"
+                      />
+                      <button type="button" className="btn-glass btn-primary" style={{ fontSize: '0.72rem', padding: '0.28rem 0.6rem' }} onClick={() => handleSaveEditTenant(t.id)}>
+                        Save
+                      </button>
+                      <button type="button" className="btn-glass" style={{ fontSize: '0.72rem', padding: '0.28rem 0.55rem' }} onClick={() => setEditingTenantId(null)}>
+                        Cancel
+                      </button>
+                    </div>
+                  )}
                 </div>
               );
             })}
           </div>
         </div>
       </div>
+      )}
 
-      {/* Step-Up MFA Authenticator & Custom Field / Maintenance Window Schemas */}
+      {showSection('users') && (
+        <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+            <Shield size={20} color="#a78bfa" />
+            <div>
+              <h3 style={{ fontSize: '1.05rem', fontWeight: 600, margin: 0 }}>Built-In &amp; Custom RBAC Role Matrix</h3>
+              <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                Edit permissions on built-in system roles or create custom granular permission profiles ({customRoles.length} total roles)
+              </span>
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+            <input
+              type="text"
+              className="glass-input"
+              style={{ flex: 1, fontSize: '0.76rem' }}
+              placeholder="Role Name (e.g. Tier-1 NOC Analyst)"
+              value={newRoleName}
+              onChange={(e) => setNewRoleName(e.target.value)}
+            />
+            <input
+              type="text"
+              className="glass-input"
+              style={{ flex: 1.2, fontSize: '0.76rem' }}
+              placeholder="Description"
+              value={newRoleDesc}
+              onChange={(e) => setNewRoleDesc(e.target.value)}
+            />
+            <button type="button" className="btn-glass btn-primary" style={{ fontSize: '0.76rem' }} onClick={handleCreateCustomRole}>
+              <Plus size={13} /> Create Role
+            </button>
+          </div>
+
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.35rem', maxHeight: '95px', overflowY: 'auto', padding: '0.45rem', borderRadius: '6px', background: 'rgba(148, 163, 184, 0.05)', border: '1px solid var(--glass-border)' }}>
+            {(availablePermissions.filter((p) => p.includes(':')).length > 0
+              ? availablePermissions.filter((p) => p.includes(':'))
+              : [...ALL_GRANULAR_PERMISSIONS]
+            ).map((perm) => {
+              const checked = newRolePerms.includes(perm);
+              return (
+                <label key={perm} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.7rem', padding: '0.15rem 0.45rem', borderRadius: '4px', background: checked ? 'rgba(167, 139, 250, 0.18)' : 'transparent', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={(e) =>
+                      setNewRolePerms((prev) =>
+                        e.target.checked ? [...prev, perm] : prev.filter((p) => p !== perm)
+                      )
+                    }
+                  />
+                  <code>{perm}</code>
+                </label>
+              );
+            })}
+          </div>
+
+          {roleNotice && (
+            <div
+              style={{
+                fontSize: '0.74rem',
+                color: isErrorMessage(roleNotice) ? '#f87171' : '#34d399',
+                padding: '0.45rem 0.7rem',
+                borderRadius: '6px',
+                background: isErrorMessage(roleNotice) ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+                border: `1px solid ${isErrorMessage(roleNotice) ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`
+              }}
+            >
+              {roleNotice}
+            </div>
+          )}
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem', maxHeight: '340px', overflowY: 'auto' }}>
+            {customRoles.map((cr) => {
+              const isEditingThis = editingRoleId === cr.id;
+              const isProtectedSuper = cr.id === 'role-super-admin' || cr.id === 'role-msp-super-admin';
+              const permCatalog =
+                availablePermissions.filter((p) => p.includes(':')).length > 0
+                  ? availablePermissions.filter((p) => p.includes(':'))
+                  : [...ALL_GRANULAR_PERMISSIONS];
+              return (
+                <div key={cr.id} style={{ padding: '0.55rem 0.75rem', borderRadius: '8px', background: 'rgba(148, 163, 184, 0.06)', border: '1px solid var(--glass-border)', fontSize: '0.76rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                    <div>
+                      <strong>{cr.name}</strong>{' '}
+                      {cr.is_system && (
+                        <span className="status-pill" style={{ fontSize: '0.62rem', background: 'rgba(56, 189, 248, 0.14)', color: '#38bdf8', marginRight: '0.35rem' }}>
+                          Built-in
+                        </span>
+                      )}
+                      <span style={{ color: 'var(--text-dim)' }}>
+                        ({cr.base_tier || 'technician'} • {cr.permissions.length} perms)
+                      </span>
+                      {cr.description && (
+                        <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '0.15rem' }}>
+                          {cr.description}
+                        </div>
+                      )}
+                    </div>
+                    <div style={{ display: 'flex', gap: '0.35rem', alignItems: 'center' }}>
+                      <button
+                        type="button"
+                        className="btn-glass"
+                        style={{ padding: '0.22rem 0.55rem', fontSize: '0.72rem' }}
+                        onClick={() => {
+                          if (isEditingThis) {
+                            setEditingRoleId(null);
+                          } else {
+                            setEditingRoleId(cr.id);
+                            setEditRoleName(cr.name);
+                            setEditRoleDesc(cr.description || '');
+                            setEditRoleTier(cr.base_tier || 'technician');
+                            setEditRolePerms(isProtectedSuper ? [...ALL_GRANULAR_PERMISSIONS] : [...(cr.permissions || [])]);
+                          }
+                        }}
+                      >
+                        <Edit3 size={12} /> {isEditingThis ? 'Close' : 'Edit'}
+                      </button>
+                      {!cr.is_system && (
+                        <button
+                          type="button"
+                          className="btn-glass btn-icon"
+                          onClick={async () => {
+                            if (!confirm(`Delete custom role "${cr.name}"?`)) return;
+                            try {
+                              const res = await deleteCustomRole(cr.id);
+                              if (res && res.success === false) {
+                                setRoleNotice(`Failed to delete role: ${(res as any).error || 'Request rejected'}`);
+                                return;
+                              }
+                              setRoleNotice(`✓ Deleted custom role "${cr.name}".`);
+                              loadAllAdminData();
+                            } catch (err: any) {
+                              setRoleNotice(`Failed to delete role: ${err?.message || 'Unknown error'}`);
+                            }
+                          }}
+                          title="Delete Custom Role"
+                        >
+                          <Trash2 size={12} color="#ef4444" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {isEditingThis && (
+                    <div style={{ marginTop: '0.7rem', paddingTop: '0.65rem', borderTop: '1px solid var(--glass-border)', display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+                      <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                        <input
+                          type="text"
+                          className="glass-input"
+                          style={{ flex: 1, fontSize: '0.75rem' }}
+                          value={editRoleName}
+                          onChange={(e) => setEditRoleName(e.target.value)}
+                          placeholder="Role Name"
+                        />
+                        <input
+                          type="text"
+                          className="glass-input"
+                          style={{ flex: 1.5, fontSize: '0.75rem' }}
+                          value={editRoleDesc}
+                          onChange={(e) => setEditRoleDesc(e.target.value)}
+                          placeholder="Description"
+                        />
+                        {!isProtectedSuper && (
+                          <select
+                            className="glass-select"
+                            style={{ width: 'auto', fontSize: '0.75rem' }}
+                            value={editRoleTier}
+                            onChange={(e) => setEditRoleTier(e.target.value)}
+                          >
+                            <option value="technician">Technician Tier</option>
+                            <option value="auditor">Auditor Tier</option>
+                            <option value="client_admin">Client Admin Tier</option>
+                          </select>
+                        )}
+                      </div>
+
+                      {isProtectedSuper ? (
+                        <div style={{ fontSize: '0.72rem', color: '#fbbf24' }}>
+                          Full administrative permissions are locked on the primary Super Admin role to prevent lockout; Name and Description are editable.
+                        </div>
+                      ) : (
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.35rem', padding: '0.45rem', borderRadius: '6px', background: 'rgba(0,0,0,0.2)', border: '1px solid var(--glass-border)' }}>
+                          {permCatalog.map((perm) => {
+                            const checked = editRolePerms.includes(perm);
+                            return (
+                              <label key={perm} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.69rem', padding: '0.15rem 0.45rem', borderRadius: '4px', background: checked ? 'rgba(167, 139, 250, 0.22)' : 'transparent', cursor: 'pointer' }}>
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={(e) =>
+                                    setEditRolePerms((prev) =>
+                                      e.target.checked ? [...prev, perm] : prev.filter((p) => p !== perm)
+                                    )
+                                  }
+                                />
+                                <code>{perm}</code>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      )}
+
+                      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.45rem' }}>
+                        <button type="button" className="btn-glass" style={{ fontSize: '0.73rem' }} onClick={() => setEditingRoleId(null)}>
+                          Cancel
+                        </button>
+                        <button type="button" className="btn-glass btn-primary" style={{ fontSize: '0.73rem' }} onClick={() => handleSaveEditRole(cr)}>
+                          Save Role Changes (MFA)
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {renderSectionHeader(
+        'security',
+        '2. Step-Up MFA Vault & Public API Keys',
+        'Enroll or manage TOTP 2FA, one-time recovery codes, and scoped bearer tokens for external automation.',
+        '#34d399'
+      )}
+
+      {/* Step-Up MFA Authenticator & Scoped REST API Keys */}
+      {showSection('security') && (
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem' }}>
         {/* TOTP MFA & Single-Use Recovery Codes */}
         <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
@@ -2068,7 +2849,166 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           )}
         </div>
 
-        {/* Custom Field Definitions & Maintenance Windows */}
+        {/* Scoped Public REST API Keys */}
+        <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+            <KeyRound size={20} color="#38bdf8" />
+            <div>
+              <h3 style={{ fontSize: '1.05rem', fontWeight: 600, margin: 0 }}>Scoped Public REST API Keys (<code>vrmm_live_...</code>)</h3>
+              <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                SHA-256 hashed bearer keys for CI/CD, SIEM &amp; external automation ({apiKeys.filter((k) => !k.revoked).length} active)
+              </span>
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', gap: '0.45rem', flexWrap: 'wrap' }}>
+            <input
+              type="text"
+              className="glass-input"
+              style={{ flex: 1.2, fontSize: '0.76rem' }}
+              placeholder="Key Label (e.g. HaloPSA Sync Bot)"
+              value={newKeyName}
+              onChange={(e) => setNewKeyName(e.target.value)}
+            />
+            <select
+              className="glass-select"
+              style={{ width: 'auto', fontSize: '0.75rem' }}
+              value={newKeyRole}
+              onChange={(e) => setNewKeyRole(e.target.value as any)}
+            >
+              <option value="technician">Role: Technician</option>
+              <option value="auditor">Role: Auditor</option>
+              <option value="super_admin">Role: Super Admin</option>
+            </select>
+            <select
+              className="glass-select"
+              style={{ width: 'auto', fontSize: '0.75rem' }}
+              value={newKeyTenantId}
+              onChange={(e) => setNewKeyTenantId(e.target.value)}
+            >
+              <option value="">All Tenants</option>
+              {tenants.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name}
+                </option>
+              ))}
+            </select>
+            <select
+              className="glass-select"
+              style={{ width: 'auto', fontSize: '0.75rem' }}
+              value={newKeyExpiresDays}
+              onChange={(e) => setNewKeyExpiresDays(Number(e.target.value))}
+            >
+              <option value={30}>30 Days</option>
+              <option value={90}>90 Days</option>
+              <option value={365}>1 Year</option>
+              <option value={0}>No Expiry</option>
+            </select>
+            <button type="button" className="btn-glass btn-primary" style={{ fontSize: '0.76rem' }} onClick={handleMintScopedApiKey}>
+              <Plus size={13} /> Mint Key
+            </button>
+          </div>
+
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.35rem', maxHeight: '72px', overflowY: 'auto' }}>
+            {(ALL_GRANULAR_PERMISSIONS as readonly string[]).map((scope) => {
+              const checked = newKeyScopes.includes(scope);
+              return (
+                <label key={scope} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.25rem', fontSize: '0.68rem', padding: '0.12rem 0.4rem', borderRadius: '4px', background: checked ? 'rgba(56, 189, 248, 0.18)' : 'rgba(148,163,184,0.06)', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={(e) =>
+                      setNewKeyScopes((prev) =>
+                        e.target.checked ? [...prev, scope] : prev.filter((s) => s !== scope)
+                      )
+                    }
+                  />
+                  <code>{scope}</code>
+                </label>
+              );
+            })}
+          </div>
+
+          {mintedRawApiKey && (
+            <div style={{ padding: '0.65rem 0.85rem', borderRadius: '8px', background: 'rgba(16, 185, 129, 0.14)', border: '1px solid rgba(16, 185, 129, 0.35)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+              <code style={{ fontSize: '0.74rem', color: '#34d399', wordBreak: 'break-all' }}>{mintedRawApiKey}</code>
+              <button
+                type="button"
+                className="btn-glass"
+                style={{ fontSize: '0.72rem', padding: '0.25rem 0.6rem' }}
+                onClick={async () => {
+                  await copyToClipboard(mintedRawApiKey);
+                  setCopiedApiKey(true);
+                  setTimeout(() => setCopiedApiKey(false), 2000);
+                }}
+              >
+                {copiedApiKey ? <Check size={12} color="#10b981" /> : <Copy size={12} />}
+                <span>{copiedApiKey ? 'Copied!' : 'Copy'}</span>
+              </button>
+            </div>
+          )}
+
+          {apiKeyNotice && (
+            <div
+              style={{
+                fontSize: '0.74rem',
+                color: isErrorMessage(apiKeyNotice) ? '#f87171' : '#34d399',
+                padding: '0.45rem 0.7rem',
+                borderRadius: '6px',
+                background: isErrorMessage(apiKeyNotice) ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+                border: `1px solid ${isErrorMessage(apiKeyNotice) ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`
+              }}
+            >
+              {apiKeyNotice}
+            </div>
+          )}
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', maxHeight: '105px', overflowY: 'auto' }}>
+            {apiKeys.map((k) => (
+              <div key={k.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.4rem 0.65rem', borderRadius: '6px', background: 'rgba(148, 163, 184, 0.06)', border: '1px solid var(--glass-border)', fontSize: '0.73rem', opacity: k.revoked ? 0.55 : 1 }}>
+                <div>
+                  <strong>{k.name}</strong> • <code>{k.key_prefix}...</code> ({k.scopes.length} scopes)
+                </div>
+                {!k.revoked && (
+                  <button
+                    type="button"
+                    className="btn-glass btn-icon"
+                    onClick={async () => {
+                      if (!confirm(`Revoke scoped API key "${k.name}"? Any integrations using it will immediately stop working.`)) return;
+                      try {
+                        const res = await revokeScopedApiKey(k.id);
+                        if (res && res.success === false) {
+                          setApiKeyNotice(`Failed to revoke API key: ${(res as any).error || 'Request rejected'}`);
+                          return;
+                        }
+                        setApiKeyNotice(`✓ Revoked API key "${k.name}".`);
+                        loadAllAdminData();
+                      } catch (err: any) {
+                        setApiKeyNotice(`Failed to revoke API key: ${err?.message || 'Unknown error'}`);
+                      }
+                    }}
+                    title="Revoke API Key"
+                  >
+                    <Trash2 size={12} color="#ef4444" />
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+      )}
+
+      {renderSectionHeader(
+        'policies',
+        '3. Custom Attributes, Maintenance Windows, Endpoint Backups & MDM Profiles',
+        'Define custom metadata fields, fleet-wide alert suppression windows, endpoint backup repositories, and OS compliance baselines.',
+        '#f59e0b'
+      )}
+
+      {/* Custom Field Definitions & Maintenance Windows */}
+      {showSection('policies') && (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
         <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
             <ListChecks size={20} color="var(--primary)" />
@@ -2115,16 +3055,43 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </button>
           </div>
 
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.35rem', maxHeight: '72px', overflowY: 'auto' }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.35rem', maxHeight: '110px', overflowY: 'auto' }}>
             {customFieldDefs.map((cf) => (
-              <span key={cf.id} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', padding: '0.2rem 0.55rem', borderRadius: '6px', background: 'rgba(148, 163, 184, 0.08)', border: '1px solid var(--glass-border)', fontSize: '0.72rem' }}>
+              <span key={cf.id} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', padding: '0.25rem 0.55rem', borderRadius: '6px', background: 'rgba(148, 163, 184, 0.08)', border: '1px solid var(--glass-border)', fontSize: '0.72rem' }}>
                 <strong>{cf.label}</strong> ({cf.field_type})
+                <button
+                  type="button"
+                  style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--primary)', padding: 0, display: 'inline-flex' }}
+                  title="Edit Custom Attribute"
+                  onClick={() => {
+                    if (editingFieldId === cf.id) {
+                      setEditingFieldId(null);
+                    } else {
+                      setEditingFieldId(cf.id);
+                      setEditFieldLabel(cf.label);
+                      setEditFieldType((cf.field_type as any) || 'text');
+                      setEditFieldOptions(formatFieldOptionsForEditor(cf.options));
+                    }
+                  }}
+                >
+                  <Edit3 size={11} />
+                </button>
                 <button
                   type="button"
                   style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#ef4444', padding: 0, display: 'inline-flex' }}
                   onClick={async () => {
-                    await deleteCustomField(cf.id);
-                    fetchCustomFields().then(setCustomFieldDefs).catch(() => {});
+                    if (!confirm(`Delete custom field "${cf.label}"? Stored device values for this attribute will no longer be displayed.`)) return;
+                    try {
+                      const res = await deleteCustomField(cf.id);
+                      if (res && res.success === false) {
+                        setSchemaFieldNotice(`Failed to delete custom field: ${(res as any).error || 'Request rejected'}`);
+                        return;
+                      }
+                      setSchemaFieldNotice(`✓ Deleted custom field "${cf.label}".`);
+                      fetchCustomFields().then(setCustomFieldDefs).catch(() => {});
+                    } catch (err: any) {
+                      setSchemaFieldNotice(`Failed to delete custom field: ${err?.message || 'Unknown error'}`);
+                    }
                   }}
                 >
                   ×
@@ -2132,6 +3099,46 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </span>
             ))}
           </div>
+
+          {editingFieldId && (
+            <div style={{ display: 'flex', gap: '0.45rem', flexWrap: 'wrap', padding: '0.55rem 0.7rem', borderRadius: '6px', background: 'rgba(56, 189, 248, 0.08)', border: '1px solid rgba(56, 189, 248, 0.25)' }}>
+              <input
+                type="text"
+                className="glass-input"
+                style={{ flex: 1, fontSize: '0.74rem' }}
+                value={editFieldLabel}
+                onChange={(e) => setEditFieldLabel(e.target.value)}
+                placeholder="Attribute Label"
+              />
+              <select
+                className="glass-select"
+                style={{ width: 'auto', fontSize: '0.74rem' }}
+                value={editFieldType}
+                onChange={(e) => setEditFieldType(e.target.value as any)}
+              >
+                <option value="text">Text</option>
+                <option value="secret">Encrypted Secret (Vaulted + MFA)</option>
+                <option value="dropdown">Dropdown</option>
+                <option value="checkbox">Checkbox</option>
+              </select>
+              {editFieldType === 'dropdown' && (
+                <input
+                  type="text"
+                  className="glass-input"
+                  style={{ flex: 1, fontSize: '0.74rem' }}
+                  value={editFieldOptions}
+                  onChange={(e) => setEditFieldOptions(e.target.value)}
+                  placeholder="Options (comma-separated)"
+                />
+              )}
+              <button type="button" className="btn-glass btn-primary" style={{ fontSize: '0.72rem', padding: '0.28rem 0.6rem' }} onClick={() => handleSaveEditField(editingFieldId)}>
+                Save
+              </button>
+              <button type="button" className="btn-glass" style={{ fontSize: '0.72rem', padding: '0.28rem 0.55rem' }} onClick={() => setEditingFieldId(null)}>
+                Cancel
+              </button>
+            </div>
+          )}
 
           <div style={{ borderTop: '1px solid var(--glass-border)', paddingTop: '0.65rem', display: 'flex', gap: '0.45rem', flexWrap: 'wrap' }}>
             <CalendarClock size={16} color="#f59e0b" style={{ alignSelf: 'center' }} />
@@ -2196,269 +3203,110 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           )}
 
           {maintenanceWindows.length > 0 && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', maxHeight: '72px', overflowY: 'auto' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', maxHeight: '165px', overflowY: 'auto' }}>
               {maintenanceWindows.map((mw) => (
-                <div key={mw.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.72rem', padding: '0.25rem 0.5rem', borderRadius: '5px', background: 'rgba(245, 158, 11, 0.08)' }}>
-                  <span>
-                    <strong>{mw.title}</strong> ({mw.tenant_id ? 'Tenant' : 'Global'}) — {new Date(mw.start_time).toLocaleString()} &rarr; {new Date(mw.end_time).toLocaleString()}
-                  </span>
-                  <button
-                    type="button"
-                    className="btn-glass btn-icon"
-                    onClick={async () => {
-                      await deleteMaintenanceWindow(mw.id);
-                      fetchMaintenanceWindows().then(setMaintenanceWindows).catch(() => {});
-                    }}
-                  >
-                    <Trash2 size={11} color="#ef4444" />
-                  </button>
+                <div key={mw.id} style={{ padding: '0.35rem 0.55rem', borderRadius: '6px', background: 'rgba(245, 158, 11, 0.08)', border: '1px solid rgba(245, 158, 11, 0.18)', fontSize: '0.72rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.5rem' }}>
+                    <span>
+                      <strong>{mw.title}</strong> ({mw.tenant_id ? tenants.find((t) => t.id === mw.tenant_id)?.name || 'Tenant' : 'Global'}) — {new Date(mw.start_time).toLocaleString()} &rarr; {new Date(mw.end_time).toLocaleString()}
+                    </span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                      <button
+                        type="button"
+                        className="btn-glass btn-icon"
+                        title="Edit Maintenance Window"
+                        onClick={() => {
+                          if (editingWinId === mw.id) {
+                            setEditingWinId(null);
+                          } else {
+                            const toLocalInput = (iso: string) => {
+                              const d = new Date(iso);
+                              if (Number.isNaN(d.getTime())) return '';
+                              const pad = (n: number) => String(n).padStart(2, '0');
+                              return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+                            };
+                            setEditingWinId(mw.id);
+                            setEditWinTitle(mw.title);
+                            setEditWinTenantId(mw.tenant_id || '');
+                            setEditWinStartTime(toLocalInput(mw.start_time));
+                            setEditWinEndTime(toLocalInput(mw.end_time));
+                          }
+                        }}
+                      >
+                        <Edit3 size={11} />
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-glass btn-icon"
+                        onClick={async () => {
+                          if (!confirm(`Delete maintenance window "${mw.title}"?`)) return;
+                          try {
+                            const res = await deleteMaintenanceWindow(mw.id);
+                            if (res && res.success === false) {
+                              setSchemaFieldNotice(`Failed to delete maintenance window: ${(res as any).error || 'Request rejected'}`);
+                              return;
+                            }
+                            setSchemaFieldNotice(`✓ Deleted maintenance window "${mw.title}".`);
+                            fetchMaintenanceWindows().then(setMaintenanceWindows).catch(() => {});
+                          } catch (err: any) {
+                            setSchemaFieldNotice(`Failed to delete maintenance window: ${err?.message || 'Unknown error'}`);
+                          }
+                        }}
+                      >
+                        <Trash2 size={11} color="#ef4444" />
+                      </button>
+                    </div>
+                  </div>
+                  {editingWinId === mw.id && (
+                    <div style={{ marginTop: '0.45rem', paddingTop: '0.45rem', borderTop: '1px solid var(--glass-border)', display: 'flex', gap: '0.4rem', flexWrap: 'wrap', alignItems: 'center' }}>
+                      <input
+                        type="text"
+                        className="glass-input"
+                        style={{ flex: 1.2, minWidth: '130px', fontSize: '0.72rem' }}
+                        value={editWinTitle}
+                        onChange={(e) => setEditWinTitle(e.target.value)}
+                        placeholder="Window Title"
+                      />
+                      <select
+                        className="glass-select"
+                        style={{ width: 'auto', fontSize: '0.72rem' }}
+                        value={editWinTenantId}
+                        onChange={(e) => setEditWinTenantId(e.target.value)}
+                      >
+                        <option value="">Global Fleet</option>
+                        {tenants.map((t) => (
+                          <option key={t.id} value={t.id}>
+                            {t.name}
+                          </option>
+                        ))}
+                      </select>
+                      <input
+                        type="datetime-local"
+                        className="glass-input"
+                        style={{ width: 'auto', fontSize: '0.7rem' }}
+                        value={editWinStartTime}
+                        onChange={(e) => setEditWinStartTime(e.target.value)}
+                      />
+                      <input
+                        type="datetime-local"
+                        className="glass-input"
+                        style={{ width: 'auto', fontSize: '0.7rem' }}
+                        value={editWinEndTime}
+                        onChange={(e) => setEditWinEndTime(e.target.value)}
+                      />
+                      <button type="button" className="btn-glass btn-primary" style={{ fontSize: '0.7rem', padding: '0.24rem 0.55rem' }} onClick={() => handleSaveEditWindow(mw.id)}>
+                        Save
+                      </button>
+                      <button type="button" className="btn-glass" style={{ fontSize: '0.7rem', padding: '0.24rem 0.5rem' }} onClick={() => setEditingWinId(null)}>
+                        Cancel
+                      </button>
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
           )}
         </div>
-      </div>
-
-      {/* Custom Granular RBAC Roles & Scoped Public REST API Keys */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem' }}>
-        <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
-            <Shield size={20} color="#a78bfa" />
-            <div>
-              <h3 style={{ fontSize: '1.05rem', fontWeight: 600, margin: 0 }}>Custom Granular RBAC Role Matrix</h3>
-              <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-                Define fine-grained permission profiles ({customRoles.length} custom roles)
-              </span>
-            </div>
-          </div>
-
-          <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-            <input
-              type="text"
-              className="glass-input"
-              style={{ flex: 1, fontSize: '0.76rem' }}
-              placeholder="Role Name (e.g. Tier-1 NOC Analyst)"
-              value={newRoleName}
-              onChange={(e) => setNewRoleName(e.target.value)}
-            />
-            <input
-              type="text"
-              className="glass-input"
-              style={{ flex: 1.2, fontSize: '0.76rem' }}
-              placeholder="Description"
-              value={newRoleDesc}
-              onChange={(e) => setNewRoleDesc(e.target.value)}
-            />
-            <button type="button" className="btn-glass btn-primary" style={{ fontSize: '0.76rem' }} onClick={handleCreateCustomRole}>
-              <Plus size={13} /> Create Role
-            </button>
-          </div>
-
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.35rem', maxHeight: '95px', overflowY: 'auto', padding: '0.45rem', borderRadius: '6px', background: 'rgba(148, 163, 184, 0.05)', border: '1px solid var(--glass-border)' }}>
-            {(availablePermissions.filter((p) => p.includes(':')).length > 0
-              ? availablePermissions.filter((p) => p.includes(':'))
-              : [...ALL_GRANULAR_PERMISSIONS]
-            ).map((perm) => {
-              const checked = newRolePerms.includes(perm);
-              return (
-                <label key={perm} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.7rem', padding: '0.15rem 0.45rem', borderRadius: '4px', background: checked ? 'rgba(167, 139, 250, 0.18)' : 'transparent', cursor: 'pointer' }}>
-                  <input
-                    type="checkbox"
-                    checked={checked}
-                    onChange={(e) =>
-                      setNewRolePerms((prev) =>
-                        e.target.checked ? [...prev, perm] : prev.filter((p) => p !== perm)
-                      )
-                    }
-                  />
-                  <code>{perm}</code>
-                </label>
-              );
-            })}
-          </div>
-
-          {roleNotice && (
-            <div
-              style={{
-                fontSize: '0.74rem',
-                color: isErrorMessage(roleNotice) ? '#f87171' : '#34d399',
-                padding: '0.45rem 0.7rem',
-                borderRadius: '6px',
-                background: isErrorMessage(roleNotice) ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
-                border: `1px solid ${isErrorMessage(roleNotice) ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`
-              }}
-            >
-              {roleNotice}
-            </div>
-          )}
-
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', maxHeight: '115px', overflowY: 'auto' }}>
-            {customRoles.map((cr) => (
-              <div key={cr.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.4rem 0.65rem', borderRadius: '6px', background: 'rgba(148, 163, 184, 0.06)', border: '1px solid var(--glass-border)', fontSize: '0.74rem' }}>
-                <div>
-                  <strong>{cr.name}</strong>{' '}
-                  <span style={{ color: 'var(--text-dim)' }}>({cr.permissions.length} perms)</span>
-                </div>
-                {!cr.is_system && (
-                  <button
-                    type="button"
-                    className="btn-glass btn-icon"
-                    onClick={async () => {
-                      await deleteCustomRole(cr.id);
-                      loadAllAdminData();
-                    }}
-                  >
-                    <Trash2 size={12} color="#ef4444" />
-                  </button>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {/* Scoped Public REST API Keys */}
-        <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
-            <KeyRound size={20} color="#38bdf8" />
-            <div>
-              <h3 style={{ fontSize: '1.05rem', fontWeight: 600, margin: 0 }}>Scoped Public REST API Keys (<code>vrmm_live_...</code>)</h3>
-              <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-                SHA-256 hashed bearer keys for CI/CD, SIEM &amp; external automation ({apiKeys.filter((k) => !k.revoked).length} active)
-              </span>
-            </div>
-          </div>
-
-          <div style={{ display: 'flex', gap: '0.45rem', flexWrap: 'wrap' }}>
-            <input
-              type="text"
-              className="glass-input"
-              style={{ flex: 1.2, minWidth: '130px', fontSize: '0.76rem' }}
-              placeholder="Key Label (e.g. HaloPSA Sync Bot)"
-              value={newKeyName}
-              onChange={(e) => setNewKeyName(e.target.value)}
-            />
-            <select
-              className="glass-select"
-              style={{ width: 'auto', fontSize: '0.76rem' }}
-              value={newKeyRole}
-              onChange={(e) => setNewKeyRole(e.target.value as 'technician' | 'auditor' | 'super_admin')}
-            >
-              <option value="technician">Technician Ceiling</option>
-              <option value="auditor">Read-Only Ceiling</option>
-              <option value="super_admin">Super Admin Ceiling</option>
-            </select>
-            <select
-              className="glass-select"
-              style={{ width: 'auto', fontSize: '0.76rem' }}
-              value={newKeyTenantId}
-              onChange={(e) => setNewKeyTenantId(e.target.value)}
-            >
-              <option value="">All Tenants</option>
-              {tenants.map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.name}
-                </option>
-              ))}
-            </select>
-            <select
-              className="glass-select"
-              style={{ width: 'auto', fontSize: '0.76rem' }}
-              value={newKeyExpiresDays}
-              onChange={(e) => setNewKeyExpiresDays(Number(e.target.value))}
-            >
-              <option value={30}>30d</option>
-              <option value={90}>90d</option>
-              <option value={365}>365d</option>
-            </select>
-            <button type="button" className="btn-glass btn-primary" style={{ fontSize: '0.76rem' }} onClick={handleMintScopedApiKey}>
-              <Plus size={13} /> Mint Key
-            </button>
-          </div>
-
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.35rem', padding: '0.4rem', borderRadius: '6px', background: 'rgba(148, 163, 184, 0.05)', border: '1px solid var(--glass-border)' }}>
-            {ALL_GRANULAR_PERMISSIONS.map((sc) => {
-              const checked = newKeyScopes.includes(sc);
-              return (
-                <label key={sc} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.7rem', cursor: 'pointer' }}>
-                  <input
-                    type="checkbox"
-                    checked={checked}
-                    onChange={(e) =>
-                      setNewKeyScopes((prev) =>
-                        e.target.checked ? [...prev, sc] : prev.filter((s) => s !== sc)
-                      )
-                    }
-                  />
-                  <code>{sc}</code>
-                </label>
-              );
-            })}
-          </div>
-
-          {mintedRawApiKey && (
-            <div style={{ padding: '0.6rem 0.8rem', borderRadius: '6px', background: 'rgba(16, 185, 129, 0.14)', border: '1px solid rgba(16, 185, 129, 0.4)', display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
-              <code style={{ flex: 1, fontSize: '0.74rem', color: '#34d399', wordBreak: 'break-all' }}>{mintedRawApiKey}</code>
-              <button
-                type="button"
-                className="btn-glass"
-                style={{ fontSize: '0.72rem', padding: '0.2rem 0.55rem' }}
-                onClick={async () => {
-                  const ok = await copyToClipboard(mintedRawApiKey);
-                  if (ok) {
-                    setCopiedApiKey(true);
-                    setTimeout(() => setCopiedApiKey(false), 2000);
-                  }
-                }}
-              >
-                {copiedApiKey ? 'Copied!' : 'Copy'}
-              </button>
-              <button type="button" className="btn-glass" style={{ fontSize: '0.72rem', padding: '0.2rem 0.5rem' }} onClick={() => setMintedRawApiKey(null)}>
-                Dismiss
-              </button>
-            </div>
-          )}
-
-          {apiKeyNotice && (
-            <div
-              style={{
-                fontSize: '0.74rem',
-                padding: '0.45rem 0.7rem',
-                borderRadius: '6px',
-                background: isErrorMessage(apiKeyNotice) ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
-                border: `1px solid ${isErrorMessage(apiKeyNotice) ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`,
-                color: isErrorMessage(apiKeyNotice) ? '#f87171' : '#34d399'
-              }}
-            >
-              {apiKeyNotice}
-            </div>
-          )}
-
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', maxHeight: '115px', overflowY: 'auto' }}>
-            {apiKeys.map((ak) => (
-              <div key={ak.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.4rem 0.65rem', borderRadius: '6px', background: 'rgba(148, 163, 184, 0.06)', border: '1px solid var(--glass-border)', fontSize: '0.73rem', opacity: ak.revoked ? 0.55 : 1 }}>
-                <div>
-                  <strong>{ak.name}</strong> • <code>{ak.key_prefix}...</code> ({ak.role})
-                </div>
-                {!ak.revoked ? (
-                  <button
-                    type="button"
-                    className="btn-glass"
-                    style={{ padding: '0.15rem 0.5rem', fontSize: '0.68rem', color: '#ef4444' }}
-                    onClick={async () => {
-                      await revokeScopedApiKey(ak.id);
-                      loadAllAdminData();
-                    }}
-                  >
-                    Revoke
-                  </button>
-                ) : (
-                  <span style={{ fontSize: '0.68rem', color: '#ef4444' }}>Revoked</span>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
 
       {/* Endpoint Backup Policies & Cross-Platform MDM Configuration Profiles */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem' }}>
@@ -2511,11 +3359,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             />
             <input
               type="number"
+              min={1}
               className="glass-input"
               style={{ width: '75px', fontSize: '0.76rem' }}
               title="Retention Days"
+              placeholder="30"
               value={newBpRetention}
-              onChange={(e) => setNewBpRetention(Number(e.target.value) || 30)}
+              onChange={(e) => setNewBpRetention(e.target.value === '' ? '' : parseInt(e.target.value, 10) || '')}
             />
             <button type="button" className="btn-glass btn-primary" style={{ fontSize: '0.76rem' }} onClick={handleCreateBackupPolicy}>
               <Plus size={13} /> Add
@@ -2537,22 +3387,79 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           )}
 
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', maxHeight: '115px', overflowY: 'auto' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', maxHeight: '185px', overflowY: 'auto' }}>
             {backupPolicies.map((bp) => (
-              <div key={bp.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.4rem 0.65rem', borderRadius: '6px', background: 'rgba(148, 163, 184, 0.06)', border: '1px solid var(--glass-border)', fontSize: '0.73rem' }}>
-                <div>
-                  <strong>{bp.name}</strong> ({bp.engine}) • <code>{bp.schedule_cron}</code> • {bp.retention_days}d
+              <div key={bp.id} style={{ padding: '0.45rem 0.65rem', borderRadius: '6px', background: 'rgba(148, 163, 184, 0.06)', border: '1px solid var(--glass-border)', fontSize: '0.73rem' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.5rem' }}>
+                  <div>
+                    <strong>{bp.name}</strong> ({bp.engine}) • <code>{bp.schedule_cron}</code> • {bp.retention_days}d
+                  </div>
+                  <div style={{ display: 'flex', gap: '0.3rem' }}>
+                    <button
+                      type="button"
+                      className="btn-glass btn-icon"
+                      title="Edit Backup Policy"
+                      onClick={() => {
+                        if (editingBpId === bp.id) {
+                          setEditingBpId(null);
+                        } else {
+                          setEditingBpId(bp.id);
+                          setEditBpName(bp.name || '');
+                          setEditBpEngine(bp.engine || 'restic');
+                          setEditBpRepo(bp.repository_url || bp.target_repo || '');
+                          setEditBpCron(bp.schedule_cron || '0 2 * * *');
+                          setEditBpRetention(bp.retention_days || 30);
+                        }
+                      }}
+                    >
+                      <Edit3 size={12} />
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-glass btn-icon"
+                      onClick={async () => {
+                        if (!confirm(`Delete endpoint backup policy "${bp.name}"?`)) return;
+                        try {
+                          const res = await deleteBackupPolicy(bp.id);
+                          if (res && res.success === false) {
+                            setBpNotice(`Failed to delete backup policy: ${(res as any).error || 'Request rejected'}`);
+                            return;
+                          }
+                          setBpNotice(`✓ Deleted backup policy "${bp.name}".`);
+                          loadAllAdminData();
+                        } catch (err: any) {
+                          setBpNotice(`Failed to delete backup policy: ${err?.message || 'Unknown error'}`);
+                        }
+                      }}
+                    >
+                      <Trash2 size={12} color="#ef4444" />
+                    </button>
+                  </div>
                 </div>
-                <button
-                  type="button"
-                  className="btn-glass btn-icon"
-                  onClick={async () => {
-                    await deleteBackupPolicy(bp.id);
-                    loadAllAdminData();
-                  }}
-                >
-                  <Trash2 size={12} color="#ef4444" />
-                </button>
+                {editingBpId === bp.id && (
+                  <div style={{ marginTop: '0.5rem', display: 'flex', gap: '0.4rem', flexWrap: 'wrap', alignItems: 'center', paddingTop: '0.45rem', borderTop: '1px solid var(--glass-border)' }}>
+                    <input type="text" className="glass-input" style={{ flex: 1, fontSize: '0.72rem' }} value={editBpName} onChange={(e) => setEditBpName(e.target.value)} placeholder="Name" />
+                    <select className="glass-select" style={{ width: 'auto', fontSize: '0.72rem' }} value={editBpEngine} onChange={(e) => setEditBpEngine(e.target.value)}>
+                      <option value="restic">Restic</option>
+                      <option value="vss_wbadmin">VSS</option>
+                      <option value="borg">Borg</option>
+                      <option value="timemachine">Time Machine</option>
+                    </select>
+                    <input type="text" className="glass-input" style={{ flex: 1.3, fontSize: '0.72rem' }} value={editBpRepo} onChange={(e) => setEditBpRepo(e.target.value)} placeholder="Repo URL" />
+                    <input type="text" className="glass-input" style={{ width: '88px', fontSize: '0.72rem' }} value={editBpCron} onChange={(e) => setEditBpCron(e.target.value)} />
+                    <input
+                      type="number"
+                      min={1}
+                      className="glass-input"
+                      style={{ width: '65px', fontSize: '0.72rem' }}
+                      placeholder="30"
+                      value={editBpRetention}
+                      onChange={(e) => setEditBpRetention(e.target.value === '' ? '' : parseInt(e.target.value, 10) || '')}
+                    />
+                    <button type="button" className="btn-glass btn-primary" style={{ fontSize: '0.7rem', padding: '0.24rem 0.55rem' }} onClick={() => handleSaveEditBackupPolicy(bp.id)}>Save</button>
+                    <button type="button" className="btn-glass" style={{ fontSize: '0.7rem', padding: '0.24rem 0.5rem' }} onClick={() => setEditingBpId(null)}>Cancel</button>
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -2629,39 +3536,104 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           )}
 
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', maxHeight: '115px', overflowY: 'auto' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', maxHeight: '185px', overflowY: 'auto' }}>
             {mdmProfiles.map((mp) => (
-              <div key={mp.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.4rem 0.65rem', borderRadius: '6px', background: 'rgba(148, 163, 184, 0.06)', border: '1px solid var(--glass-border)', fontSize: '0.73rem' }}>
-                <div>
-                  <strong>{mp.name}</strong> ({mp.platform.toUpperCase()} • {mp.profile_type})
+              <div key={mp.id} style={{ padding: '0.45rem 0.65rem', borderRadius: '6px', background: 'rgba(148, 163, 184, 0.06)', border: '1px solid var(--glass-border)', fontSize: '0.73rem' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.5rem' }}>
+                  <div>
+                    <strong>{mp.name}</strong> ({mp.platform.toUpperCase()} • {mp.profile_type})
+                  </div>
+                  <div style={{ display: 'flex', gap: '0.3rem' }}>
+                    <button
+                      type="button"
+                      className="btn-glass btn-icon"
+                      title="Edit MDM Profile"
+                      onClick={() => {
+                        if (editingMdmId === mp.id) {
+                          setEditingMdmId(null);
+                        } else {
+                          setEditingMdmId(mp.id);
+                          setEditMdmName(mp.name || '');
+                          setEditMdmPlatform(mp.platform || 'macos');
+                          setEditMdmType(mp.profile_type || 'security_baseline');
+                          setEditMdmPayload(mp.payload_xml || '');
+                        }
+                      }}
+                    >
+                      <Edit3 size={12} />
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-glass btn-icon"
+                      onClick={async () => {
+                        if (!confirm(`Delete MDM profile "${mp.name}"?`)) return;
+                        try {
+                          const res = await deleteMdmProfile(mp.id);
+                          if (res && res.success === false) {
+                            setMdmNotice(`Failed to delete MDM profile: ${(res as any).error || 'Request rejected'}`);
+                            return;
+                          }
+                          setMdmNotice(`✓ Deleted MDM profile "${mp.name}".`);
+                          loadAllAdminData();
+                        } catch (err: any) {
+                          setMdmNotice(`Failed to delete MDM profile: ${err?.message || 'Unknown error'}`);
+                        }
+                      }}
+                    >
+                      <Trash2 size={12} color="#ef4444" />
+                    </button>
+                  </div>
                 </div>
-                <button
-                  type="button"
-                  className="btn-glass btn-icon"
-                  onClick={async () => {
-                    await deleteMdmProfile(mp.id);
-                    loadAllAdminData();
-                  }}
-                >
-                  <Trash2 size={12} color="#ef4444" />
-                </button>
+                {editingMdmId === mp.id && (
+                  <div style={{ marginTop: '0.5rem', display: 'flex', flexDirection: 'column', gap: '0.4rem', paddingTop: '0.45rem', borderTop: '1px solid var(--glass-border)' }}>
+                    <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
+                      <input type="text" className="glass-input" style={{ flex: 1, fontSize: '0.72rem' }} value={editMdmName} onChange={(e) => setEditMdmName(e.target.value)} />
+                      <select className="glass-select" style={{ width: 'auto', fontSize: '0.72rem' }} value={editMdmPlatform} onChange={(e) => setEditMdmPlatform(e.target.value as any)}>
+                        <option value="macos">macOS</option>
+                        <option value="windows">Windows</option>
+                        <option value="linux">Linux</option>
+                      </select>
+                      <select className="glass-select" style={{ width: 'auto', fontSize: '0.72rem' }} value={editMdmType} onChange={(e) => setEditMdmType(e.target.value)}>
+                        <option value="security_baseline">Security Baseline</option>
+                        <option value="wifi_vpn">Wi-Fi / VPN Payload</option>
+                        <option value="disk_encryption">Disk Encryption</option>
+                        <option value="pppc_kiosk">PPPC / Kiosk Restrictions</option>
+                      </select>
+                    </div>
+                    <input type="text" className="glass-input" style={{ fontSize: '0.72rem' }} value={editMdmPayload} onChange={(e) => setEditMdmPayload(e.target.value)} placeholder="XML / JSON payload" />
+                    <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.4rem' }}>
+                      <button type="button" className="btn-glass" style={{ fontSize: '0.7rem', padding: '0.24rem 0.5rem' }} onClick={() => setEditingMdmId(null)}>Cancel</button>
+                      <button type="button" className="btn-glass btn-primary" style={{ fontSize: '0.7rem', padding: '0.24rem 0.55rem' }} onClick={() => handleSaveEditMdmProfile(mp.id)}>Save</button>
+                    </div>
+                  </div>
+                )}
               </div>
             ))}
           </div>
         </div>
+        </div>
       </div>
-      <form onSubmit={handleSave} style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+      )}
+
+      <form noValidate onSubmit={handleSave} style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+        {renderSectionHeader(
+          'branding',
+          '4. Branding, Theme & Public Portal',
+          'Customize the application name, logo, colors, theme defaults, agent service name, and QuickSupport portal path.',
+          '#a78bfa'
+        )}
+
         {/* White-Labeling Card */}
-        <div className="glass-card">
+        <div className="glass-card" style={{ display: showSection('branding') ? undefined : 'none' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.25rem', flexWrap: 'wrap', gap: '0.75rem' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
               <Palette size={20} color="var(--primary)" />
               <h3 style={{ fontSize: '1.1rem', fontWeight: 600, margin: 0 }}>Global White-Labeling &amp; Branding</h3>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
-              {formData.brand_logo_url && (
+              {sanitizeSafeUrl(formData.brand_logo_url) && (
                 <img
-                  src={formData.brand_logo_url}
+                  src={sanitizeSafeUrl(formData.brand_logo_url)!}
                   alt="Brand Logo"
                   style={{ height: '28px', width: 'auto', borderRadius: '4px', objectFit: 'contain' }}
                 />
@@ -2755,6 +3727,43 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
 
             <div className="form-group">
+              <label className="form-label">Endpoint Companion Tray Default Theme</label>
+              <select
+                className="glass-select"
+                value={formData.tray_theme_mode ?? 'system'}
+                onChange={(e) => setFormData({ ...formData, tray_theme_mode: e.target.value as 'system' | 'dark' | 'light' })}
+              >
+                <option value="system">OS Registry Auto (AppsUseLightTheme / macOS / GNOME)</option>
+                <option value="dark">Always Obsidian Dark Tray &amp; HUD</option>
+                <option value="light">Always Crisp Daylight Tray &amp; HUD</option>
+              </select>
+            </div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '1.25rem', marginTop: '1rem' }}>
+            <div className="form-group">
+              <label className="form-label">Custom Endpoint Service Name</label>
+              <input
+                type="text"
+                className="glass-input"
+                placeholder="VitrineAgent"
+                value={formData.installer_service_name ?? 'VitrineAgent'}
+                onChange={(e) => setFormData({ ...formData, installer_service_name: e.target.value })}
+              />
+            </div>
+
+            <div className="form-group">
+              <label className="form-label">Installer &amp; Tray Welcome Banner Text</label>
+              <input
+                type="text"
+                className="glass-input"
+                placeholder="Managed by Enterprise IT Support"
+                value={formData.installer_welcome_text ?? ''}
+                onChange={(e) => setFormData({ ...formData, installer_welcome_text: e.target.value })}
+              />
+            </div>
+
+            <div className="form-group">
               <label className="form-label">Public Client QuickSupport Domain / Endpoint</label>
               <div style={{ display: 'flex', gap: '0.5rem' }}>
                 <input
@@ -2766,7 +3775,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 />
                 {(() => {
                   const rawQsPath = (formData.quicksupport_url_path || '/remote').trim();
-                  const safeQsHref = /^(\/(?!\/)|https?:\/\/)/i.test(rawQsPath) ? rawQsPath : '/remote';
+                  const safeQsHref = sanitizeSafeUrl(rawQsPath) || '/remote';
                   return (
                     <a
                       href={safeQsHref}
@@ -2780,20 +3789,215 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   );
                 })()}
               </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginTop: '0.65rem', flexWrap: 'wrap' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', cursor: 'pointer', fontSize: '0.78rem', color: 'var(--text-main)' }}>
+                  <input
+                    type="checkbox"
+                    checked={(formData.quicksupport_enabled ?? 1) !== 0}
+                    onChange={(e) => setFormData({ ...formData, quicksupport_enabled: e.target.checked ? 1 : 0 })}
+                  />
+                  <span>Enable Public QuickSupport Portal</span>
+                </label>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', flex: 1, minWidth: '170px' }}>
+                  <span style={{ fontSize: '0.74rem', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>URL Path:</span>
+                  <input
+                    type="text"
+                    className="glass-input"
+                    style={{ fontSize: '0.78rem', padding: '0.35rem 0.6rem' }}
+                    placeholder="/remote"
+                    value={formData.quicksupport_url_path ?? '/remote'}
+                    onChange={(e) => setFormData({ ...formData, quicksupport_url_path: e.target.value })}
+                  />
+                </div>
+              </div>
             </div>
+          </div>
+
+          {/* Dedicated QuickSupport Branding Profile */}
+          <div
+            style={{
+              marginTop: '1.35rem',
+              paddingTop: '1.25rem',
+              borderTop: '1px solid var(--glass-border)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '0.95rem'
+            }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.75rem' }}>
+              <div>
+                <h4 style={{ margin: 0, fontSize: '0.96rem', fontWeight: 600, color: 'var(--primary)' }}>
+                  QuickSupport Portal &amp; On-Demand Agent Profile
+                </h4>
+                <p style={{ margin: '0.2rem 0 0 0', fontSize: '0.76rem', color: 'var(--text-muted)' }}>
+                  Customize the dedicated icon, label, and tray theme embedded into QuickSupport launchers and the public <code>/remote</code> portal (inherits Global unless overridden).
+                </p>
+              </div>
+              <button
+                type="button"
+                className="btn-glass btn-primary"
+                style={{ fontSize: '0.78rem' }}
+                disabled={savingQsProfile}
+                onClick={handleSaveQsProfile}
+              >
+                {savingQsProfile ? 'Saving QuickSupport Profile...' : 'Save QuickSupport Profile'}
+              </button>
+            </div>
+
+            {qsProfileMsg && (
+              <div
+                style={{
+                  padding: '0.55rem 0.8rem',
+                  borderRadius: '6px',
+                  fontSize: '0.78rem',
+                  background: qsProfileError ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+                  border: `1px solid ${qsProfileError ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`,
+                  color: qsProfileError ? '#f87171' : '#34d399'
+                }}
+              >
+                {qsProfileMsg}
+              </div>
+            )}
+
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: '0.85rem',
+                padding: '0.7rem 0.9rem',
+                borderRadius: '8px',
+                background: 'rgba(255, 255, 255, 0.03)',
+                border: '1px solid var(--glass-border)',
+                flexWrap: 'wrap'
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.7rem' }}>
+                {sanitizeSafeUrl(qsIconUrl || formData.brand_logo_url) && (
+                  <img
+                    src={sanitizeSafeUrl(qsIconUrl || formData.brand_logo_url)!}
+                    alt="QuickSupport Icon"
+                    style={{ width: '34px', height: '34px', borderRadius: '6px', objectFit: 'contain', background: 'rgba(0,0,0,0.35)', padding: '2px' }}
+                  />
+                )}
+                <div>
+                  <div style={{ fontSize: '0.8rem', fontWeight: 600 }}>QuickSupport EXE, Portal &amp; Tray Icon</div>
+                  <div style={{ fontSize: '0.72rem', color: 'var(--text-dim)' }}>
+                    {qsIconUrl ? `Override: ${qsIconUrl}` : 'Currently inheriting Global Brand Logo'}
+                  </div>
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                <input
+                  ref={qsIconInputRef}
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp,image/x-icon,.ico"
+                  style={{ display: 'none' }}
+                  onChange={handleQsIconFileSelect}
+                />
+                <button
+                  type="button"
+                  className="btn-glass"
+                  style={{ fontSize: '0.76rem' }}
+                  disabled={uploadingQsIcon}
+                  onClick={() => qsIconInputRef.current?.click()}
+                >
+                  <Upload size={13} /> {uploadingQsIcon ? 'Uploading...' : 'Crop & Upload QuickSupport Icon'}
+                </button>
+                {qsIconUrl && (
+                  <button
+                    type="button"
+                    className="btn-glass btn-danger"
+                    style={{ fontSize: '0.74rem' }}
+                    onClick={() => {
+                      setQsIconUrl('');
+                      setQsProfileMsg('Icon override cleared — click Save QuickSupport Profile to inherit Global logo.');
+                      setQsProfileError(false);
+                    }}
+                  >
+                    Clear Override
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '1rem' }}>
+              <div className="form-group" style={{ marginBottom: 0 }}>
+                <label className="form-label">QuickSupport Brand / Portal Label</label>
+                <input
+                  type="text"
+                  className="glass-input"
+                  placeholder={`Inherit (${formData.brand_name || 'Vitrine RMM'})`}
+                  value={qsBrandName}
+                  onChange={(e) => setQsBrandName(e.target.value)}
+                />
+              </div>
+
+              <div className="form-group" style={{ marginBottom: 0 }}>
+                <label className="form-label">QuickSupport Portal &amp; Tray Theme</label>
+                <select
+                  className="glass-select"
+                  value={qsThemeMode}
+                  onChange={(e) => setQsThemeMode(e.target.value as any)}
+                >
+                  <option value="inherit">Inherit Global Theme</option>
+                  <option value="system">OS Auto-Detect</option>
+                  <option value="dark">Obsidian Dark</option>
+                  <option value="light">Crisp Daylight</option>
+                </select>
+              </div>
+
+              <div className="form-group" style={{ marginBottom: 0 }}>
+                <label className="form-label">QuickSupport Tray Tooltip</label>
+                <input
+                  type="text"
+                  className="glass-input"
+                  placeholder="On-Demand IT Support Active"
+                  value={qsTooltip}
+                  onChange={(e) => setQsTooltip(e.target.value)}
+                />
+              </div>
+            </div>
+
+            <label style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', cursor: 'pointer', fontSize: '0.8rem', color: 'var(--text-main)' }}>
+              <input
+                type="checkbox"
+                checked={qsEnabled}
+                onChange={(e) => setQsEnabled(e.target.checked)}
+              />
+              <span>Show System Tray Icon During Active QuickSupport Sessions</span>
+            </label>
           </div>
         </div>
 
+        {renderSectionHeader(
+          'agents',
+          '5. Code Signing, Session Recording & Remote Engine Integration',
+          'Configure automated code signing, session recording retention, installer policies, and connected remote engine instances.',
+          '#38bdf8'
+        )}
+
         {/* Code Signing API Card */}
-        <div className="glass-card">
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem', marginBottom: '1.25rem' }}>
-            <KeyRound size={20} color="var(--primary)" />
-            <div>
-              <h3 style={{ fontSize: '1.1rem', fontWeight: 600 }}>Windows Authenticode &amp; Code Signing API</h3>
-              <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-                Automates EV/OV code signing of generated agent EXEs, PowerShell companion runbooks, and .NET assemblies via Cloud HSM or SignPath.
-              </p>
+        <div className="glass-card" style={{ display: showSection('agents') ? undefined : 'none' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.25rem', flexWrap: 'wrap', gap: '0.75rem' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+              <KeyRound size={20} color="var(--primary)" />
+              <div>
+                <h3 style={{ fontSize: '1.1rem', fontWeight: 600, margin: 0 }}>Code Signing API &amp; Package Integrity</h3>
+                <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', margin: '0.15rem 0 0 0' }}>
+                  Automates EV/OV code signing of generated agent installers, companion scripts, and tray utilities.
+                </p>
+              </div>
             </div>
+            <button
+              type="button"
+              className="btn-glass"
+              style={{ fontSize: '0.78rem' }}
+              onClick={handleTestSigningSettings}
+              disabled={testingSigning}
+            >
+              <Shield size={14} /> {testingSigning ? 'Testing Endpoint...' : 'Test Signing API'}
+            </button>
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
@@ -2808,7 +4012,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </label>
             </div>
 
-            <div style={{ display: 'grid', gridTemplateColumns: '1.6fr 1fr', gap: '1rem' }}>
+            {signingTestMsg && (
+              <div
+                style={{
+                  padding: '0.65rem 0.9rem',
+                  borderRadius: '8px',
+                  fontSize: '0.78rem',
+                  background: signingTestError ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+                  border: `1px solid ${signingTestError ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`,
+                  color: signingTestError ? '#f87171' : '#34d399'
+                }}
+              >
+                {signingTestMsg}
+              </div>
+            )}
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1.3fr 1fr 1fr', gap: '1rem' }}>
               <div className="form-group">
                 <label className="form-label">Code Signing Webhook / API URL</label>
                 <input
@@ -2817,6 +4036,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   placeholder="https://signer.internal/api/v1/sign"
                   value={formData.code_signing_url ?? ''}
                   onChange={(e) => setFormData({ ...formData, code_signing_url: e.target.value })}
+                />
+              </div>
+              <div className="form-group">
+                <label className="form-label">Code Signing API Key (Vaulted)</label>
+                <input
+                  type="password"
+                  className="glass-input"
+                  placeholder="••••••••••••••••"
+                  value={formData.code_signing_api_key ?? ''}
+                  onChange={(e) => setFormData({ ...formData, code_signing_api_key: e.target.value })}
                 />
               </div>
               <div className="form-group">
@@ -2856,10 +4085,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', fontSize: '0.82rem' }}>
                   <input
                     type="checkbox"
-                    checked={(formData.code_signing_sign_assemblies ?? 1) !== 0}
-                    onChange={(e) => setFormData({ ...formData, code_signing_sign_assemblies: e.target.checked ? 1 : 0 })}
+                    checked={(formData.code_signing_sign_ms2_binary ?? 1) !== 0}
+                    onChange={(e) => setFormData({ ...formData, code_signing_sign_ms2_binary: e.target.checked ? 1 : 0 })}
                   />
-                  <span>.NET GUI Tray Assemblies</span>
+                  <span>Companion Tray &amp; MeshCentral Agent Payloads</span>
                 </label>
               </div>
             </div>
@@ -2867,7 +4096,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         </div>
 
         {/* Session Recording & Agent Installer Enforcement */}
-        <div className="glass-card">
+        <div className="glass-card" style={{ display: showSection('agents') ? undefined : 'none' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem', marginBottom: '1.25rem' }}>
             <Video size={20} color="var(--primary)" />
             <div>
@@ -2919,7 +4148,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '1rem' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '1rem' }}>
             <div className="form-group">
               <label className="form-label">Minimum Role to Download Installers</label>
               <select
@@ -2932,6 +4161,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 onChange={(e) => setFormData({ ...formData, installer_download_role: e.target.value })}
               >
                 <option value="technician">Technician+ (All Staff)</option>
+                <option value="senior_tech">Senior Technician+</option>
+                <option value="msp_admin">MSP Admin / Operations</option>
                 <option value="super_admin">MSP Super Admin Only</option>
               </select>
             </div>
@@ -2961,11 +4192,28 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <option value={72}>72 Hours Online</option>
               </select>
             </div>
+
+            <div className="form-group">
+              <label className="form-label">Console Session Idle Timeout (Min)</label>
+              <input
+                type="number"
+                min={5}
+                className="glass-input"
+                placeholder="30"
+                value={formData.session_idle_timeout_min ?? 30}
+                onChange={(e) =>
+                  setFormData({
+                    ...formData,
+                    session_idle_timeout_min: e.target.value === '' ? ('' as any) : parseInt(e.target.value, 10) || '' as any
+                  })
+                }
+              />
+            </div>
           </div>
         </div>
 
         {/* MeshCentral Bi-Directional Sync Card */}
-        <div className="glass-card">
+        <div className="glass-card" style={{ display: showSection('agents') ? undefined : 'none' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.25rem', flexWrap: 'wrap', gap: '1rem' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
               <Shield size={20} color="var(--primary)" />
@@ -3091,7 +4339,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </button>
               2FA accounts: use <strong>My Account → Login Tokens</strong> in MS2 or click <strong>Auto-Generate Login Token</strong>.
             </span>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', cursor: 'pointer', color: 'var(--text-primary)' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', cursor: 'pointer', color: 'var(--text-main)' }}>
               <input
                 type="checkbox"
                 checked={Boolean(formData.meshcentral_allow_self_signed)}
@@ -3102,8 +4350,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
 
           {showAutoTokenGen && (
-            <div style={{ background: 'rgba(15, 23, 42, 0.45)', border: '1px solid var(--glass-border)', borderRadius: '8px', padding: '0.9rem 1rem', marginBottom: '1rem', display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
-              <div style={{ fontSize: '0.76rem', color: '#cbd5e1' }}>
+            <div style={{ background: 'var(--surface-panel)', border: '1px solid var(--glass-border)', borderRadius: '8px', padding: '0.9rem 1rem', marginBottom: '1rem', display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
+              <div style={{ fontSize: '0.76rem', color: 'var(--text-muted)' }}>
                 Mint a permanent 2FA-safe <code>Vitrine RMM</code> Login Token directly from your MeshCentral server (credentials are used once over WebSocket and immediately discarded):
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 0.8fr auto', gap: '0.6rem', alignItems: 'end' }}>
@@ -3264,7 +4512,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 type="text"
                 className="glass-input"
                 style={{ flex: 1, fontSize: '0.78rem' }}
-                placeholder="Instance Label (e.g. Regional MS2 Cluster #2)"
+                placeholder="Label (e.g. Regional MS2 #2)"
                 value={newMeshName}
                 onChange={(e) => setNewMeshName(e.target.value)}
               />
@@ -3347,8 +4595,18 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                           type="button"
                           className="btn-glass btn-icon"
                           onClick={async () => {
-                            await deleteMeshServer(srv.id);
-                            loadAllAdminData();
+                            if (!confirm(`Remove federated MeshCentral instance "${srv.name}"?`)) return;
+                            try {
+                              const res = await deleteMeshServer(srv.id);
+                              if (res && res.success === false) {
+                                setMeshSyncResult(`Failed to remove MeshCentral instance: ${(res as any).error || 'Request rejected'}`);
+                                return;
+                              }
+                              setMeshSyncResult(`✓ Removed federated MeshCentral instance "${srv.name}".`);
+                              loadAllAdminData();
+                            } catch (err: any) {
+                              setMeshSyncResult(`Failed to remove MeshCentral instance: ${err?.message || 'Unknown error'}`);
+                            }
                           }}
                         >
                           <Trash2 size={13} color="#ef4444" />
@@ -3461,8 +4719,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
         </div>
 
+        {renderSectionHeader(
+          'updates',
+          '6. System Updates & Disaster Recovery Backups',
+          'Choose update release channels, configure automated encrypted backups, and restore or export recovery snapshots.',
+          '#10b981'
+        )}
+
         {/* Self-Update Engine (Stable Releases vs. Alpha Commits + Pre-Update Backup & Watchdog Rollback) */}
-        <div className="glass-card" id="self-updater-card">
+        <div className="glass-card" id="self-updater-card" style={{ display: showSection('updates') ? undefined : 'none' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', flexWrap: 'wrap', gap: '0.75rem' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
               <GitBranch size={20} color="var(--primary)" />
@@ -3471,10 +4736,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   Self-Update Engine (Stable Releases vs. Alpha Commits) &amp; Watchdog Auto-Rollback
                 </h3>
                 <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', margin: '0.2rem 0 0 0' }}>
-                  Installed Version: <strong>v{updaterStatus?.installedVersion || formData.installed_version || '2.6.1'}</strong> • Installed Commit:{' '}
+                  Installed Version: <strong>v{updaterStatus?.installedVersion || formData.installed_version || '2.7.0'}</strong> • Installed Commit:{' '}
                   <code>{updaterStatus?.installedCommit || formData.installed_commit || 'HEAD'}</code> • DB Schema:{' '}
                   <code>v{backupStorage.currentAppSchemaVersion}</code> • Mode:{' '}
-                  <strong>{updaterStatus?.deploymentMode === 'docker' ? 'Docker Container' : 'Bare-Metal Systemd'}</strong>
+                  <strong>
+                    {updaterStatus
+                      ? updaterStatus.deploymentMode === 'docker'
+                        ? 'Docker Container'
+                        : 'Bare-Metal Systemd'
+                      : 'Loading...'}
+                  </strong>
                 </p>
               </div>
             </div>
@@ -3517,26 +4788,26 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <div style={{ padding: '0.9rem 1.1rem', borderRadius: '8px', background: 'var(--glass-bg)', border: '1px solid var(--glass-border)' }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.45rem', flexWrap: 'wrap', gap: '0.5rem' }}>
                     <strong style={{ fontSize: '0.88rem', color: '#38bdf8' }}>
-                      Latest Stable Release: {updaterStatus.latestStable.title} (Commit <code>{updaterStatus.latestStable.commitSha}</code>)
+                      Latest Stable Release: {updaterStatus.latestStable?.title || 'Unknown'} (Commit <code>{updaterStatus.latestStable?.commitSha || '—'}</code>)
                     </strong>
                     <span className="status-pill status-online" style={{ fontSize: '0.7rem' }}>
                       {updaterStatus.updateAvailable ? 'Update Available' : 'Up to Date'}
                     </span>
                   </div>
                   <pre style={{ margin: 0, whiteSpace: 'pre-wrap', fontSize: '0.76rem', color: 'var(--text-muted)', fontFamily: 'inherit' }}>
-                    {updaterStatus.latestStable.releaseNotes}
+                    {updaterStatus.latestStable?.releaseNotes || 'No release notes available.'}
                   </pre>
                 </div>
               ) : (
                 <div style={{ padding: '0.9rem 1.1rem', borderRadius: '8px', background: 'var(--glass-bg)', border: '1px solid var(--glass-border)' }}>
                   <strong style={{ fontSize: '0.86rem', color: '#c084fc', display: 'block', marginBottom: '0.5rem' }}>
-                    Alpha Commits Since Installed Commit (<code>{updaterStatus.installedCommit}</code>):
+                    Alpha Commits Since Installed Commit (<code>{updaterStatus.installedCommit || 'HEAD'}</code>):
                   </strong>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
-                    {updaterStatus.pendingAlphaCommits.length === 0 ? (
+                    {(updaterStatus.pendingAlphaCommits || []).length === 0 ? (
                       <div style={{ fontSize: '0.76rem', color: 'var(--text-dim)' }}>No newer commits pending on branch.</div>
                     ) : (
-                      updaterStatus.pendingAlphaCommits.map((c) => (
+                      (updaterStatus.pendingAlphaCommits || []).map((c) => (
                         <div key={c.sha} style={{ fontSize: '0.76rem', display: 'flex', justifyContent: 'space-between', gap: '0.75rem', padding: '0.35rem 0.5rem', background: 'rgba(148, 163, 184, 0.06)', borderRadius: '6px' }}>
                           <span>
                             <code style={{ color: '#38bdf8', marginRight: '0.5rem' }}>{c.sha}</code>
@@ -3606,7 +4877,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       ? 'Running Pre-Update Backup & Installing...'
                       : updaterStatus.deploymentMode === 'docker'
                       ? 'Managed via Docker Image Pull'
-                      : `Install Target Update (${updaterStatus.channel === 'stable' ? updaterStatus.latestStable.version : updaterStatus.latestAlpha.sha})`}
+                      : `Install Target Update (${
+                          updaterStatus.channel === 'stable'
+                            ? updaterStatus.latestStable?.version || 'latest'
+                            : updaterStatus.latestAlpha?.sha || 'HEAD'
+                        })`}
                   </span>
                 </button>
                 <button
@@ -3644,7 +4919,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         </div>
 
         {/* Unified Self-Backup, Local Storage Quota & Schema-Aware Restoration Card */}
-        <div className="glass-card" id="unified-backups-card">
+        <div className="glass-card" id="unified-backups-card" style={{ display: showSection('updates') ? undefined : 'none' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', flexWrap: 'wrap', gap: '0.75rem' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
               <Database size={20} color="#10b981" />
@@ -3688,9 +4963,20 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '1rem', marginBottom: '1rem' }}>
+          <div style={{ display: 'flex', gap: '1.25rem', alignItems: 'center', marginBottom: '0.85rem', flexWrap: 'wrap' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.84rem', fontWeight: 600, cursor: 'pointer', color: 'var(--text-main)' }}>
+              <input
+                type="checkbox"
+                checked={(formData.backup_schedule_enabled ?? 1) !== 0}
+                onChange={(e) => setFormData({ ...formData, backup_schedule_enabled: e.target.checked ? 1 : 0 })}
+              />
+              <span>Enable Automated Disaster Recovery Schedule</span>
+            </label>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '1rem', marginBottom: '1rem' }}>
             <div className="form-group">
-              <label className="form-label">Automated Backup Schedule</label>
+              <label className="form-label">Automated Backup Frequency</label>
               <select
                 className="glass-select"
                 value={formData.backup_schedule_frequency ?? 'daily'}
@@ -3702,13 +4988,28 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </select>
             </div>
             <div className="form-group">
+              <label className="form-label">Scheduled Run Time (UTC)</label>
+              <input
+                type="time"
+                className="glass-input"
+                value={formData.backup_schedule_time ?? '02:30'}
+                onChange={(e) => setFormData({ ...formData, backup_schedule_time: e.target.value })}
+              />
+            </div>
+            <div className="form-group">
               <label className="form-label">Retention Count (Auto-Prune)</label>
               <input
                 type="number"
                 min={1}
                 className="glass-input"
+                placeholder="14"
                 value={formData.backup_retention_count ?? 14}
-                onChange={(e) => setFormData({ ...formData, backup_retention_count: parseInt(e.target.value, 10) || 1 })}
+                onChange={(e) =>
+                  setFormData({
+                    ...formData,
+                    backup_retention_count: e.target.value === '' ? ('' as any) : parseInt(e.target.value, 10) || ('' as any)
+                  })
+                }
               />
             </div>
             <div className="form-group">
@@ -3717,8 +5018,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 type="number"
                 min={128}
                 className="glass-input"
+                placeholder="5120"
                 value={formData.backup_max_storage_mb ?? 5120}
-                onChange={(e) => setFormData({ ...formData, backup_max_storage_mb: parseInt(e.target.value, 10) || 512 })}
+                onChange={(e) =>
+                  setFormData({
+                    ...formData,
+                    backup_max_storage_mb: e.target.value === '' ? ('' as any) : parseInt(e.target.value, 10) || ('' as any)
+                  })
+                }
               />
             </div>
           </div>
@@ -3869,7 +5176,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </div>
             )}
 
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1.2fr 1fr', gap: '0.75rem' }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))', gap: '0.75rem' }}>
               <div>
                 <label className="form-label" style={{ fontSize: '0.72rem' }}>Archive Passphrase (Vaulted)</label>
                 <input
@@ -3904,6 +5211,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   placeholder="https://s3.us-east-005.backblazeb2.com"
                   value={formData.backup_offsite_endpoint ?? ''}
                   onChange={(e) => setFormData({ ...formData, backup_offsite_endpoint: e.target.value })}
+                />
+              </div>
+              <div>
+                <label className="form-label" style={{ fontSize: '0.72rem' }}>S3 Signing Region</label>
+                <input
+                  type="text"
+                  className="glass-input"
+                  style={{ fontSize: '0.78rem' }}
+                  placeholder="us-east-1"
+                  value={formData.backup_offsite_region ?? ''}
+                  onChange={(e) => setFormData({ ...formData, backup_offsite_region: e.target.value })}
                 />
               </div>
               <div>
@@ -4050,9 +5368,20 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                               type="button"
                               className="btn-glass btn-icon"
                               onClick={async () => {
-                                await deleteSystemBackup(b.id);
-                                loadAllAdminData();
+                                if (!confirm(`Delete recovery backup archive "${b.filename || b.id}"? This cannot be undone.`)) return;
+                                try {
+                                  const res = await deleteSystemBackup(b.id);
+                                  if (res && res.success === false) {
+                                    setBackupNotice(`Failed to delete backup: ${(res as any).error || 'Request rejected'}`);
+                                    return;
+                                  }
+                                  setBackupNotice('✓ Deleted disaster recovery backup archive.');
+                                  loadAllAdminData();
+                                } catch (err: any) {
+                                  setBackupNotice(`Failed to delete backup: ${err?.message || 'Unknown error'}`);
+                                }
                               }}
+                              title="Delete Backup"
                             >
                               <Trash2 size={12} color="#ef4444" />
                             </button>
@@ -4067,8 +5396,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
         </div>
 
+        {renderSectionHeader(
+          'notifications',
+          '7. Single Sign-On (OIDC), PSA Integrations & Outbound SMTP',
+          'Configure Enterprise OpenID Connect SSO, external PSA ticket bridges, and outbound email notification credentials.',
+          '#fbbf24'
+        )}
+
         {/* PSA Webhook & OIDC Identity Provider Integration Card */}
-        <div className="glass-card">
+        <div className="glass-card" style={{ display: showSection('notifications') ? undefined : 'none' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem', marginBottom: '1.15rem' }}>
             <Webhook size={20} color="var(--primary)" />
             <div>
@@ -4182,7 +5518,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         </div>
 
         {/* Outbound SMTP Notifications Card */}
-        <div className="glass-card">
+        <div className="glass-card" style={{ display: showSection('notifications') ? undefined : 'none' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.25rem' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
               <Mail size={20} color="var(--primary)" />
@@ -4208,9 +5544,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <label className="form-label">Port</label>
               <input
                 type="number"
+                min={1}
+                max={65535}
                 className="glass-input"
+                placeholder="587"
                 value={formData.smtp_port ?? 587}
-                onChange={(e) => setFormData({ ...formData, smtp_port: parseInt(e.target.value, 10) || 587 })}
+                onChange={(e) =>
+                  setFormData({
+                    ...formData,
+                    smtp_port: e.target.value === '' ? ('' as any) : parseInt(e.target.value, 10) || ('' as any)
+                  })
+                }
               />
             </div>
             <div className="form-group">
@@ -4225,7 +5569,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.25rem' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.25rem', marginTop: '0.85rem' }}>
             <div className="form-group">
               <label className="form-label">Username</label>
               <input
@@ -4245,6 +5589,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 onChange={(e) => setFormData({ ...formData, smtp_pass: e.target.value })}
               />
             </div>
+          </div>
+
+          <div style={{ marginTop: '0.75rem' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.82rem', cursor: 'pointer', color: 'var(--text-main)' }}>
+              <input
+                type="checkbox"
+                checked={Boolean(formData.smtp_tls)}
+                onChange={(e) => setFormData({ ...formData, smtp_tls: e.target.checked ? 1 : 0 })}
+              />
+              <span>Require TLS / Implicit SSL Encryption for Outbound SMTP Relay</span>
+            </label>
           </div>
 
           {smtpTestResult && (
@@ -4270,10 +5625,28 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           )}
         </div>
 
-        {/* Save Button */}
-        <div>
-          <button type="submit" className="btn-glass btn-primary" style={{ padding: '0.75rem 1.75rem' }} disabled={saving}>
-            <CheckCircle2 size={16} /> {saving ? 'Saving Configuration...' : 'Save All Changes'}
+        {/* Sticky Save Bar */}
+        <div
+          className="glass-card"
+          style={{
+            position: 'sticky',
+            bottom: '0.75rem',
+            zIndex: 20,
+            padding: '0.85rem 1.25rem',
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            gap: '1rem',
+            flexWrap: 'wrap',
+            background: 'var(--surface-elevated)',
+            backdropFilter: 'blur(16px)'
+          }}
+        >
+          <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+            Changes to branding, code signing, SSO, SMTP, PSA &amp; updates apply upon saving.
+          </span>
+          <button type="submit" className="btn-glass btn-primary" style={{ padding: '0.68rem 1.65rem' }} disabled={saving}>
+            <CheckCircle2 size={16} /> {saving ? 'Saving Configuration...' : 'Save All Settings'}
           </button>
         </div>
       </form>
@@ -4305,7 +5678,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <div style={{ padding: '0.75rem', borderRadius: '8px', background: 'var(--glass-bg)', border: '1px solid var(--glass-border)' }}>
                   <div style={{ fontSize: '0.73rem', color: 'var(--text-muted)' }}>Installed Software Target</div>
                   <div style={{ fontSize: '1.05rem', fontWeight: 700, color: '#38bdf8' }}>
-                    Schema v{schemaMismatchModal.appSchemaVersion} (App v{updaterStatus?.installedVersion || '2.6.1'})
+                    Schema v{schemaMismatchModal.appSchemaVersion} (App v{updaterStatus?.installedVersion || '2.7.0'})
                   </div>
                 </div>
               </div>
@@ -4382,6 +5755,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         title={pendingMfaAction?.title || 'Step-Up MFA Verification'}
         description="Verify your 6-digit TOTP authenticator or single-use recovery code to authorize this administrative security operation."
         secretType={pendingMfaAction?.secretType || 'admin_security_action'}
+      />
+
+      <IconCropModal
+        isOpen={Boolean(cropIconRequest)}
+        file={cropIconRequest?.file || null}
+        title={cropIconRequest?.mode === 'quicksupport' ? 'Crop QuickSupport EXE & Portal Icon' : 'Crop Global Brand & EXE Icon'}
+        onCancel={() => setCropIconRequest(null)}
+        onConfirm={handleCropModalConfirm}
       />
     </div>
   );

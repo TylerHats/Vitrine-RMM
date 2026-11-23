@@ -15,7 +15,7 @@ import {
   deleteTicketTimeEntry
 } from '../services/api.js';
 import { Tenant, Device, PsaIntegration, PsaTimeEntry, AuthUser } from '../types/index.js';
-import { canMutateFleet } from '../utils/permissions.js';
+import { canMutateFleet, isSuperAdmin as checkIsSuperAdmin } from '../utils/permissions.js';
 
 interface PsaTicket {
   id: string;
@@ -35,6 +35,7 @@ interface PsaSyncViewProps {
 
 export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, devices: propDevices, currentUser }) => {
   const canMutate = canMutateFleet(currentUser);
+  const isSuperAdmin = Boolean(currentUser && checkIsSuperAdmin(currentUser));
   const [activeTab, setActiveTab] = useState<'tickets' | 'connectors'>('tickets');
   const [tickets, setTickets] = useState<PsaTicket[]>([]);
   const [tenants, setTenants] = useState<Tenant[]>(propTenants || []);
@@ -76,7 +77,7 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
 
   useEffect(() => {
     loadTickets();
-    loadIntegrations();
+    if (isSuperAdmin) loadIntegrations();
     if (!propTenants) {
       fetchTenants()
         .then((t) => {
@@ -95,7 +96,7 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
     } else {
       setDevices(propDevices);
     }
-  }, [loadTickets, loadIntegrations, propTenants, propDevices]);
+  }, [loadTickets, loadIntegrations, isSuperAdmin, propTenants, propDevices]);
 
   const resolveDeviceLabel = (deviceId?: string) => {
     if (!deviceId) return 'System Fleet';
@@ -147,8 +148,17 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
 
   const handleDeleteTimeEntry = async (entryId: string) => {
     if (!selectedTicketForTime) return;
-    await deleteTicketTimeEntry(entryId);
-    setTimeEntries((prev) => prev.filter((item) => item.id !== entryId));
+    if (!confirm('Delete this logged time entry?')) return;
+    try {
+      const res: any = await deleteTicketTimeEntry(entryId);
+      if (res?.success === false) {
+        setConnectorNotice(`⚠ Failed to delete time entry: ${res.error || 'Request rejected'}`);
+        return;
+      }
+      setTimeEntries((prev) => prev.filter((item) => item.id !== entryId));
+    } catch (err: any) {
+      setConnectorNotice(`⚠ Failed to delete time entry: ${err?.message || 'Network error'}`);
+    }
   };
 
   const handleCreateConnector = async (e: React.FormEvent) => {
@@ -185,8 +195,18 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
   };
 
   const handleDeleteConnector = async (id: string) => {
-    await deletePsaIntegration(id);
-    loadIntegrations();
+    if (!confirm('Delete this PSA connector integration?')) return;
+    try {
+      const res: any = await deletePsaIntegration(id);
+      if (res?.success === false) {
+        setConnectorNotice(`⚠ Failed to delete PSA connector: ${res.error || 'Request rejected'}`);
+        return;
+      }
+      setConnectorNotice('PSA connector deleted.');
+      loadIntegrations();
+    } catch (err: any) {
+      setConnectorNotice(`⚠ Failed to delete PSA connector: ${err?.message || 'Network error'}`);
+    }
   };
 
   return (
@@ -194,10 +214,12 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem' }}>
         <div>
           <h2 style={{ fontFamily: 'var(--font-heading)', fontSize: '1.5rem', fontWeight: 700 }}>
-            Multi-PSA Service Desk &amp; Time Entry Sync
+            Service Desk Tickets &amp; Time Tracking
           </h2>
           <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-            Bidirectional ticket lifecycle, technician billable time entries, and native connectors for HaloPSA, ConnectWise, Autotask, Syncro, Zammad &amp; ITFlow
+            {isSuperAdmin && activeTab === 'connectors'
+              ? 'Manage outbound PSA webhooks and API bridges (HaloPSA, ConnectWise, Autotask, Syncro, Zammad, ITFlow)'
+              : 'Create and manage support tickets, incident escalations, and technician billable time entries'}
           </span>
         </div>
         <div style={{ display: 'flex', gap: '0.6rem', flexWrap: 'wrap' }}>
@@ -207,16 +229,18 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
           >
             Service Tickets ({tickets.length})
           </button>
-          <button
-            className={`btn-glass ${activeTab === 'connectors' ? 'btn-primary' : ''}`}
-            onClick={() => setActiveTab('connectors')}
-          >
-            <Plug size={14} /> PSA Connectors ({integrations.length})
-          </button>
+          {isSuperAdmin && (
+            <button
+              className={`btn-glass ${activeTab === 'connectors' ? 'btn-primary' : ''}`}
+              onClick={() => setActiveTab('connectors')}
+            >
+              <Plug size={14} /> PSA Connectors ({integrations.length})
+            </button>
+          )}
           {canMutate &&
-            (activeTab === 'tickets' ? (
+            (activeTab === 'tickets' || !isSuperAdmin ? (
               <button className="btn-glass btn-primary" onClick={() => setShowCreateModal(true)}>
-                <Plus size={15} /> Create PSA Ticket
+                <Plus size={15} /> Create Support Ticket
               </button>
             ) : (
               <button className="btn-glass btn-primary" onClick={() => setShowAddConnector(true)}>
@@ -228,13 +252,13 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
 
       <div className="metrics-grid">
         <div className="glass-card">
-          <div className="metric-title">SYNCHRONIZED TICKETS</div>
+          <div className="metric-title">SERVICE TICKETS</div>
           <div className="metric-value" style={{ color: 'var(--primary)' }}>{tickets.length}</div>
           <div className="metric-subtext">Active &amp; historical service desk queue</div>
         </div>
 
         <div className="glass-card">
-          <div className="metric-title">RESOLVED INCIDENTS</div>
+          <div className="metric-title">RESOLVED TICKETS</div>
           <div className="metric-value" style={{ color: '#34d399' }}>
             {tickets.filter((t) => t.status === 'Resolved').length}
           </div>
@@ -242,11 +266,11 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
         </div>
 
         <div className="glass-card">
-          <div className="metric-title">CONFIGURED PSA BRIDGES</div>
+          <div className="metric-title">OPEN TICKETS</div>
           <div className="metric-value" style={{ color: '#38bdf8' }}>
-            {integrations.filter((i) => i.enabled).length || 'Webhook Ready'}
+            {tickets.filter((t) => t.status !== 'Resolved').length}
           </div>
-          <div className="metric-subtext">Listening on /api/psa/webhook (HMAC Verified)</div>
+          <div className="metric-subtext">Awaiting technician triage or completion</div>
         </div>
       </div>
 
@@ -336,7 +360,7 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
                 {tickets.length === 0 && (
                   <tr>
                     <td colSpan={7} style={{ textAlign: 'center', padding: '2.5rem', color: 'var(--text-muted)' }}>
-                      No PSA tickets recorded yet. Condition alerts and manual tickets will appear here.
+                      No service tickets recorded yet. Automated alert tickets and manual tickets will appear here.
                     </td>
                   </tr>
                 )}
@@ -346,7 +370,7 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
         </div>
       )}
 
-      {activeTab === 'connectors' && (
+      {isSuperAdmin && activeTab === 'connectors' && (
         <div className="glass-card" style={{ padding: 0 }}>
           <div className="table-wrapper" style={{ border: 'none', borderRadius: 0 }}>
             <table className="glass-table">
@@ -420,7 +444,7 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
         <div className="modal-overlay" onClick={() => setShowCreateModal(false)}>
           <div className="glass-modal" style={{ maxWidth: '460px', padding: '1.5rem' }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-              <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 700 }}>Create PSA Service Ticket</h3>
+              <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 700 }}>Create Support Ticket</h3>
               <button className="btn-glass btn-icon" onClick={() => setShowCreateModal(false)}>
                 <X size={16} />
               </button>
@@ -638,7 +662,7 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
                   </div>
                   <label style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', cursor: 'pointer', fontSize: '0.82rem', paddingBottom: '0.45rem' }}>
                     <input type="checkbox" checked={billable} onChange={(e) => setBillable(e.target.checked)} />
-                    <span>Billable Service Time (Sync to PSA Invoice)</span>
+                    <span>Billable Service Time</span>
                   </label>
                 </div>
                 <div style={{ display: 'flex', gap: '0.5rem' }}>

@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Search,
   Download,
@@ -19,6 +20,7 @@ import {
 import { Tenant, AppNotification, Device, AuthUser } from '../types/index.js';
 import { fetchNotifications, markNotificationRead, executeNotificationAction } from '../services/api.js';
 import { canMutateFleet } from '../utils/permissions.js';
+import { matchesDeviceSearch } from '../utils/deviceHelpers.js';
 import { MfaChallengeModal } from './MfaChallengeModal.js';
 
 interface TopNavbarProps {
@@ -79,7 +81,7 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
   const [searchFocused, setSearchFocused] = useState(false);
   const notifRef = useRef<HTMLDivElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
-  const searchWrapperRef = useRef<HTMLInputElement>(null);
+  const searchWrapperRef = useRef<HTMLDivElement>(null);
 
   const isClientAdmin = currentUser?.role === 'client_admin';
   const canMutate = canMutateFleet(currentUser);
@@ -157,17 +159,16 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
     }
   };
 
+  const tenantNameById = new Map(tenants.map((t) => [t.id, t.name]));
   const quickMatchingDevices = searchQuery.trim()
     ? devices
-        .filter((d) => {
-          const q = searchQuery.toLowerCase();
-          return (
-            (d.hostname || '').toLowerCase().includes(q) ||
-            (d.ip_address || '').toLowerCase().includes(q) ||
-            (d.serial_number || '').toLowerCase().includes(q) ||
-            (d.device_role || '').toLowerCase().includes(q)
-          );
-        })
+        .filter((d) => selectedTenantId === 'all' || d.tenant_id === selectedTenantId)
+        .filter((d) =>
+          matchesDeviceSearch(d, searchQuery, {
+            tenantName: tenantNameById.get(d.tenant_id) || null,
+            siteName: d.site_name || null
+          })
+        )
         .slice(0, 5)
     : [];
 
@@ -189,7 +190,8 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
           <input
             ref={searchInputRef}
             type="text"
-            placeholder="Quick search endpoints, IP, serial, role... (Ctrl+K)"
+            placeholder="Search fleet... (Ctrl+K)"
+            aria-label="Quick search endpoints by name, IP, serial, or role"
             value={searchQuery}
             onFocus={() => setSearchFocused(true)}
             onChange={(e) => {
@@ -201,14 +203,9 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
           {searchQuery && (
             <button
               type="button"
+              className="topbar-search-clear"
               onClick={() => onSearchChange('')}
-              style={{
-                background: 'none',
-                border: 'none',
-                color: 'var(--text-dim)',
-                cursor: 'pointer',
-                padding: '0 4px'
-              }}
+              aria-label="Clear search"
               title="Clear search"
             >
               <X size={14} />
@@ -317,7 +314,7 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
         {!isClientAdmin && (
           <select
             className="glass-select"
-            style={{ width: '215px', padding: '0.45rem 0.85rem' }}
+            style={{ flex: '0 1 200px', minWidth: '145px', maxWidth: '200px', padding: '0.45rem 0.75rem' }}
             value={selectedTenantId}
             onChange={(e) => onTenantChange(e.target.value)}
             id="tenant-filter-select"
@@ -427,7 +424,7 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
                 position: 'absolute',
                 top: 'calc(100% + 10px)',
                 right: 0,
-                width: '410px',
+                width: 'min(410px, calc(100vw - 1.5rem))',
                 maxHeight: '500px',
                 background: 'var(--surface-base)',
                 border: '1px solid var(--glass-border-highlight)',
@@ -648,20 +645,24 @@ export const TopNavbar: React.FC<TopNavbarProps> = ({
         </div>
       </div>
 
-      <MfaChallengeModal
-        isOpen={Boolean(pendingMfaAction)}
-        onClose={() => setPendingMfaAction(null)}
-        onSuccess={() => {
-          const actionToRun = pendingMfaAction;
-          setPendingMfaAction(null);
-          if (actionToRun) {
-            handleNotificationAction(actionToRun.notifId, actionToRun.actionKey, actionToRun.tenantId);
-          }
-        }}
-        title="Step-Up MFA: Notification Action"
-        description="Enter your 6-digit TOTP authenticator code or recovery code to authorize this administrative notification action."
-        secretType="notification_action"
-      />
+      {typeof document !== 'undefined' &&
+        createPortal(
+          <MfaChallengeModal
+            isOpen={Boolean(pendingMfaAction)}
+            onClose={() => setPendingMfaAction(null)}
+            onSuccess={() => {
+              const actionToRun = pendingMfaAction;
+              setPendingMfaAction(null);
+              if (actionToRun) {
+                handleNotificationAction(actionToRun.notifId, actionToRun.actionKey, actionToRun.tenantId);
+              }
+            }}
+            title="Step-Up MFA: Notification Action"
+            description="Enter your 6-digit TOTP authenticator code or recovery code to authorize this administrative notification action."
+            secretType="notification_action"
+          />,
+          document.body
+        )}
     </header>
   );
 };

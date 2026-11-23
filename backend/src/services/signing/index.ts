@@ -1,6 +1,5 @@
 import fs from 'fs';
 import net from 'net';
-import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { db, DATA_DIR_PATH } from '../../db/index.js';
@@ -53,9 +52,11 @@ export function validateSigningEndpointUrl(rawUrl: string): { valid: boolean; no
 
 function isAllowedSigningFilePath(candidatePath: string): boolean {
   try {
+    if (fs.lstatSync(candidatePath).isSymbolicLink()) {
+      return false;
+    }
     const resolvedFile = fs.realpathSync(candidatePath);
     const allowedRoots = [
-      os.tmpdir(),
       path.join(DATA_DIR_PATH, 'signing-staging'),
       path.join(DATA_DIR_PATH, 'signed-agents')
     ].map((root) => {
@@ -101,52 +102,91 @@ export class CodeSigningService {
 
   public async testConnection(urlOverride?: string): Promise<{
     reachable: boolean;
+    authenticated: boolean;
     endpoint: string;
     httpStatus?: number;
     latencyMs: number;
     error?: string;
   }> {
-    const rawTarget = urlOverride ?? this.getEndpoint();
+    const storedEndpoint = this.getEndpoint();
+    const rawTarget = urlOverride ?? storedEndpoint;
     const start = Date.now();
     const check = validateSigningEndpointUrl(rawTarget);
     if (!check.valid || !check.normalizedUrl) {
       return {
         reachable: false,
+        authenticated: false,
         endpoint: rawTarget || '(unconfigured)',
         latencyMs: Date.now() - start,
         error: check.error || 'Code signing endpoint URL is not configured.'
       };
     }
 
-    const apiKey = this.getApiKey();
+    // Never leak stored API key to an arbitrary urlOverride with a different origin (H-3)
+    let shouldSendStoredKey = !urlOverride;
+    if (urlOverride && storedEndpoint) {
+      try {
+        const targetOrigin = new URL(check.normalizedUrl).origin;
+        const storedOrigin = new URL(storedEndpoint.trim()).origin;
+        shouldSendStoredKey = targetOrigin === storedOrigin;
+      } catch {
+        shouldSendStoredKey = false;
+      }
+    }
+    const apiKey = shouldSendStoredKey ? this.getApiKey() : '';
     const authHeaders: Record<string, string> = apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
 
     try {
       const healthBase = check.normalizedUrl.replace(/\/sign$/i, '');
-      const res = await safeOutboundFetch(`${healthBase}/health`, {
+      let res = await safeOutboundFetch(`${healthBase}/health`, {
         method: 'GET',
         headers: authHeaders,
         timeoutMs: 5000,
         safety: { allowLoopback: true, allowPrivateLan: true }
-      }).catch(async () => {
-        return safeOutboundFetch(check.normalizedUrl!, {
-          method: 'HEAD',
+      });
+
+      if (res.status === 404 || res.status === 405) {
+        res = await safeOutboundFetch(`${healthBase}/`, {
+          method: 'GET',
           headers: authHeaders,
           timeoutMs: 5000,
           safety: { allowLoopback: true, allowPrivateLan: true }
         });
-      });
+      }
+
+      if (res.status >= 200 && res.status < 300) {
+        return {
+          reachable: true,
+          authenticated: true,
+          endpoint: check.normalizedUrl,
+          httpStatus: res.status,
+          latencyMs: Date.now() - start
+        };
+      }
+
+      if (res.status === 401 || res.status === 403) {
+        return {
+          reachable: true,
+          authenticated: false,
+          endpoint: check.normalizedUrl,
+          httpStatus: res.status,
+          latencyMs: Date.now() - start,
+          error: `Signing server rejected API key (HTTP ${res.status})`
+        };
+      }
 
       return {
-        reachable: res.status < 500,
+        reachable: false,
+        authenticated: false,
         endpoint: check.normalizedUrl,
         httpStatus: res.status,
         latencyMs: Date.now() - start,
-        error: res.status >= 500 ? `Endpoint returned HTTP ${res.status}` : undefined
+        error: `Endpoint returned HTTP ${res.status}`
       };
     } catch (err: any) {
       return {
         reachable: false,
+        authenticated: false,
         endpoint: check.normalizedUrl,
         latencyMs: Date.now() - start,
         error: err?.message || 'Unable to reach code signing server'
@@ -216,30 +256,91 @@ export class CodeSigningService {
         };
       }
 
-      const signedBuffer = res.body;
-      const textPreview = signedBuffer.subarray(0, 100).toString('utf8');
-      if (textPreview.startsWith('{"status":"Failed"')) {
+      let signedBuffer = res.body;
+      if (!signedBuffer || signedBuffer.length === 0) {
+        return {
+          success: false,
+          error: 'Signing server returned an empty response.',
+          filename: safeFilename,
+          durationMs: Date.now() - start
+        };
+      }
+
+      // Handle JSON status / batch_id / inline base64 responses from custom signing servers cleanly
+      const jsonPreview = signedBuffer.subarray(0, 512).toString('utf8').trimStart();
+      if (jsonPreview.startsWith('{')) {
+        let parsedJson: any = null;
         try {
-          const parsed = JSON.parse(signedBuffer.toString('utf8'));
-          return {
-            success: false,
-            error: parsed.error || 'Signing server reported failure.',
-            filename: safeFilename,
-            durationMs: Date.now() - start
-          };
+          parsedJson = JSON.parse(signedBuffer.toString('utf8'));
         } catch {
-          return {
-            success: false,
-            error: 'Signing server returned failure payload.',
-            filename: safeFilename,
-            durationMs: Date.now() - start
-          };
+          parsedJson = null;
+        }
+        if (parsedJson && typeof parsedJson === 'object' && ('status' in parsedJson || 'batch_id' in parsedJson || 'error' in parsedJson)) {
+          if (parsedJson.status === 'Failed' || parsedJson.success === false || (parsedJson.error && parsedJson.status !== 'Success')) {
+            return {
+              success: false,
+              error: String(parsedJson.error || parsedJson.message || 'Signing server reported failure.'),
+              filename: safeFilename,
+              durationMs: Date.now() - start
+            };
+          }
+          const inlineB64 =
+            parsedJson.signed_base64 || parsedJson.file_base64 || parsedJson.content_base64 || parsedJson.data;
+          if (typeof inlineB64 === 'string' && inlineB64.trim().length > 0) {
+            signedBuffer = Buffer.from(inlineB64.trim(), 'base64');
+          } else {
+            const baseRoot = urlCheck.normalizedUrl.replace(/\/sign$/i, '');
+            let downloadUrl = '';
+            const rawDl = parsedJson.download_url || parsedJson.signed_url;
+            if (typeof rawDl === 'string' && rawDl.trim()) {
+              try {
+                const resolved = new URL(rawDl.trim(), baseRoot);
+                if (resolved.origin === new URL(urlCheck.normalizedUrl).origin) {
+                  downloadUrl = resolved.toString();
+                }
+              } catch {}
+            } else if (parsedJson.batch_id) {
+              downloadUrl = `${baseRoot}/download/${encodeURIComponent(String(parsedJson.batch_id))}`;
+            }
+
+            if (!downloadUrl) {
+              return {
+                success: false,
+                error: 'Signing server returned JSON Success payload without signed bytes or valid download URL.',
+                filename: safeFilename,
+                durationMs: Date.now() - start
+              };
+            }
+
+            const dlHeaders: Record<string, string> = {};
+            if (apiKey) dlHeaders.Authorization = `Bearer ${apiKey}`;
+            const dlRes = await safeOutboundFetch(downloadUrl, {
+              method: 'GET',
+              headers: dlHeaders,
+              timeoutMs: 10000,
+              maxBytes: 64 * 1024 * 1024,
+              safety: { allowLoopback: true, allowPrivateLan: true }
+            });
+            if (dlRes.status < 200 || dlRes.status >= 300 || !dlRes.body || dlRes.body.length === 0) {
+              return {
+                success: false,
+                error: `Custom signing server batch download failed (HTTP ${dlRes.status}).`,
+                filename: safeFilename,
+                durationMs: Date.now() - start
+              };
+            }
+            signedBuffer = dlRes.body;
+          }
         }
       }
 
       const parsedPath = path.parse(filePath);
       if (parsedPath.ext.toLowerCase() === '.ps1') {
-        const signedText = signedBuffer.toString('utf8');
+        const decodePsBuffer = (buf: Buffer): string =>
+          buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe
+            ? buf.subarray(2).toString('utf16le')
+            : buf.toString('utf8');
+        const signedText = decodePsBuffer(signedBuffer);
         const sigBeginMarker = '# SIG # Begin signature block';
         const sigEndMarker = '# SIG # End signature block';
         const sigIdx = signedText.indexOf(sigBeginMarker);
@@ -253,7 +354,7 @@ export class CodeSigningService {
           };
         }
         const trailingAfterSig = signedText.slice(sigEndIdx + sigEndMarker.length).trim();
-        const originalNormalized = normalizePs1ScriptContent(fileData.toString('utf8'));
+        const originalNormalized = normalizePs1ScriptContent(decodePsBuffer(fileData));
         const signedBodyNormalized = normalizePs1ScriptContent(signedText.slice(0, sigIdx));
         if (trailingAfterSig.length > 0 || signedBodyNormalized !== originalNormalized) {
           return {
@@ -282,6 +383,82 @@ export class CodeSigningService {
       };
     }
   }
+
+  public async wrapPowerShellExecutionIfSigningEnabled(
+    psCode: string,
+    strictVerify?: boolean
+  ): Promise<{ command: string; signed: boolean; error?: string }> {
+    let settings: any = {};
+    try {
+      settings =
+        (db
+          .prepare(
+            'SELECT code_signing_enabled, code_signing_sign_scripts, code_signing_url, code_signing_strict_verify FROM settings WHERE id = 1'
+          )
+          .get() as any) || {};
+    } catch {
+      return { command: psCode, signed: false };
+    }
+
+    if (!settings.code_signing_enabled || !settings.code_signing_sign_scripts || !settings.code_signing_url) {
+      return { command: psCode, signed: false };
+    }
+
+    const effectiveStrict = strictVerify ?? Boolean(settings.code_signing_strict_verify);
+    const stagingDir = path.join(DATA_DIR_PATH, 'signing-staging');
+    if (!fs.existsSync(stagingDir)) {
+      fs.mkdirSync(stagingDir, { recursive: true, mode: 0o700 });
+    }
+
+    const tmpFile = path.join(stagingDir, `vitrine-ps-${crypto.randomUUID()}.ps1`);
+    let signedPathToClean: string | undefined;
+
+    try {
+      fs.writeFileSync(tmpFile, psCode, { encoding: 'utf8', mode: 0o600 });
+      const signRes = await this.signFile(tmpFile);
+      signedPathToClean = signRes.signedFilePath;
+
+      if (!signRes.success || !signRes.signedFilePath || !fs.existsSync(signRes.signedFilePath)) {
+        return {
+          command: effectiveStrict ? '' : psCode,
+          signed: false,
+          error: signRes.error || 'Code signing failed for PowerShell script.'
+        };
+      }
+
+      const signedBytes = fs.readFileSync(signRes.signedFilePath);
+      const b64 = signedBytes.toString('base64');
+      const verifyCheck = effectiveStrict
+        ? `$__vSig = Get-AuthenticodeSignature -FilePath $tmp -ErrorAction SilentlyContinue; if ($null -eq $__vSig -or $__vSig.Status -ne 'Valid') { throw "Authenticode signature verification failed (Status: $($__vSig.Status))" }; `
+        : '';
+
+      const wrapperCommand = [
+        `$tmp = Join-Path $env:TEMP ('vitrine-signed-' + [guid]::NewGuid().ToString('N') + '.ps1')`,
+        `$__vExit = 0`,
+        `try { [IO.File]::WriteAllBytes($tmp, [Convert]::FromBase64String('${b64}')); ${verifyCheck}& powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File $tmp; $__vExit = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 } } finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } }`,
+        `$global:LASTEXITCODE = $__vExit`
+      ].join('; ');
+
+      return { command: wrapperCommand, signed: true };
+    } catch (err: any) {
+      return {
+        command: effectiveStrict ? '' : psCode,
+        signed: false,
+        error: err?.message || 'Failed to stage or sign PowerShell script.'
+      };
+    } finally {
+      try {
+        if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
+      } catch {}
+      try {
+        if (signedPathToClean && fs.existsSync(signedPathToClean)) fs.unlinkSync(signedPathToClean);
+      } catch {}
+    }
+  }
 }
 
 export const codeSigningService = new CodeSigningService();
+
+export async function wrapPowerShellExecutionIfSigningEnabled(psCode: string, strictVerify?: boolean) {
+  return codeSigningService.wrapPowerShellExecutionIfSigningEnabled(psCode, strictVerify);
+}

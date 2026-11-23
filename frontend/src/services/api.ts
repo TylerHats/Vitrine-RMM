@@ -54,7 +54,9 @@ import {
   CustomRole,
   ScopedApiKey,
   ActiveAuthSession,
-  AuditLogRecord
+  AuditLogRecord,
+  TelemetryHistoryResponse,
+  DeviceHardwareDetails
 } from '../types/index.js';
 
 const API_BASE = '/api';
@@ -79,7 +81,8 @@ export function getStoredSessionToken(): string | null {
   return null;
 }
 
-export function setStoredSessionToken(_token: string | null): void {
+export function setStoredSessionToken(token: string | null = null): void {
+  void token;
   try {
     sessionStorage.removeItem('vitrine_session_token');
   } catch {
@@ -122,9 +125,20 @@ async function requestJson<T>(
     returnErrorPayload?: boolean;
     guestGrantId?: string;
     suppressAuthEvent?: boolean;
+    suppressMfaEvent?: boolean;
+    timeoutMs?: number;
   } = {}
 ): Promise<T> {
-  const { returnErrorPayload, guestGrantId, suppressAuthEvent, headers: customHeaders, ...fetchOpts } = options;
+  const {
+    returnErrorPayload,
+    guestGrantId,
+    suppressAuthEvent,
+    suppressMfaEvent,
+    timeoutMs,
+    headers: customHeaders,
+    signal: callerSignal,
+    ...fetchOpts
+  } = options;
   const method = String(fetchOpts.method || 'GET').toUpperCase();
   const headers: Record<string, string> = {
     ...(customHeaders as Record<string, string>)
@@ -145,11 +159,52 @@ async function requestJson<T>(
     }
   }
 
-  const res = await fetch(`${API_BASE}${path}`, {
-    ...fetchOpts,
-    credentials: 'include',
-    headers
-  });
+  let abortController: AbortController | null = null;
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  let timedOut = false;
+  let signal = callerSignal;
+
+  if (timeoutMs && timeoutMs > 0) {
+    abortController = new AbortController();
+    const onCallerAbort = () => abortController?.abort();
+    if (callerSignal) {
+      if (callerSignal.aborted) {
+        abortController.abort();
+      } else {
+        callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+      }
+    }
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      abortController?.abort();
+    }, timeoutMs);
+    signal = abortController.signal;
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${path}`, {
+      ...fetchOpts,
+      signal,
+      credentials: 'include',
+      headers
+    });
+  } catch (err: any) {
+    if (timedOut) {
+      const timeoutMsg = 'Request timed out waiting for the Vitrine server. Please try again.';
+      if (returnErrorPayload) {
+        return {
+          success: false,
+          error: timeoutMsg,
+          code: 'REQUEST_TIMEOUT'
+        } as T;
+      }
+      throw new ApiError(timeoutMsg, 408, 'REQUEST_TIMEOUT');
+    }
+    throw err;
+  } finally {
+    if (timeoutId !== null) clearTimeout(timeoutId);
+  }
 
   const text = await res.text();
   let parsed: any = null;
@@ -170,21 +225,65 @@ async function requestJson<T>(
       window.dispatchEvent(new CustomEvent('vitrine:auth-expired'));
     }
 
-    if (res.status === 403 && errCode === 'MFA_REQUIRED') {
+    if (res.status === 403 && errCode === 'MFA_REQUIRED' && !suppressMfaEvent) {
       window.dispatchEvent(new CustomEvent('vitrine:mfa-required', { detail: parsed }));
     }
 
-    if (returnErrorPayload && parsed && typeof parsed === 'object') {
+    if (returnErrorPayload) {
       return {
         success: false,
         error: errMsg,
         code: errCode,
         mfaRequired: errCode === 'MFA_REQUIRED',
-        ...parsed
+        ...(parsed && typeof parsed === 'object' ? parsed : {})
       } as T;
     }
 
     throw new ApiError(errMsg, res.status, errCode, parsed);
+  }
+
+  return parsed as T;
+}
+
+async function requestBackgroundToolJson<T>(path: string, fallbackError: string): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    credentials: 'include'
+  });
+
+  const text = await res.text();
+  let parsed: any = null;
+  if (text) {
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = { error: text };
+    }
+  }
+
+  if (!res.ok) {
+    const errCode = parsed?.code;
+    const errMsg = parsed?.error || parsed?.message || `HTTP ${res.status} ${res.statusText}`;
+    if (res.status === 401 && errCode === 'AUTH_REQUIRED') {
+      setStoredSessionToken(null);
+      window.dispatchEvent(new CustomEvent('vitrine:auth-expired'));
+    }
+    throw new ApiError(errMsg, res.status, errCode, parsed);
+  }
+
+  const toolStatus = (res.headers.get('X-Vitrine-Tool-Status') || '').toLowerCase();
+  const toolError = res.headers.get('X-Vitrine-Tool-Error');
+  const isEmptyResult =
+    (Array.isArray(parsed) && parsed.length === 0) ||
+    (parsed &&
+      !Array.isArray(parsed) &&
+      typeof parsed === 'object' &&
+      Array.isArray(parsed.subkeys) &&
+      parsed.subkeys.length === 0 &&
+      Array.isArray(parsed.values) &&
+      parsed.values.length === 0);
+
+  if ((toolStatus === 'error' || toolStatus === 'offline' || toolStatus === 'disconnected') && isEmptyResult) {
+    throw new Error(toolError || fallbackError);
   }
 
   return parsed as T;
@@ -227,6 +326,10 @@ export async function loginWithPassword(data: {
   password: string;
 }): Promise<{
   success: boolean;
+  mfaRequired?: boolean;
+  mfaChallengeToken?: string;
+  username?: string;
+  message?: string;
   user?: AuthUser;
   token?: string;
   expiresAt?: string;
@@ -236,6 +339,28 @@ export async function loginWithPassword(data: {
   const res = await requestJson<any>('/auth/login', {
     method: 'POST',
     body: JSON.stringify(data),
+    returnErrorPayload: true,
+    suppressAuthEvent: true
+  });
+  setStoredSessionToken(null);
+  return res;
+}
+
+export async function verifyLoginMfa(
+  mfaChallengeToken: string,
+  code: string
+): Promise<{
+  success: boolean;
+  user?: AuthUser;
+  token?: string;
+  expiresAt?: string;
+  usedRecoveryCode?: boolean;
+  error?: string;
+  retryAfterSec?: number;
+}> {
+  const res = await requestJson<any>('/auth/login/verify-mfa', {
+    method: 'POST',
+    body: JSON.stringify({ mfaChallengeToken, code }),
     returnErrorPayload: true,
     suppressAuthEvent: true
   });
@@ -302,11 +427,23 @@ export async function regenerateMfaRecoveryCodes(code: string): Promise<{
 export async function verifyMfa(
   code: string,
   secretType?: string,
-  deviceId?: string
-): Promise<{ success: boolean; method?: string; verifiedUntil?: string; error?: string }> {
+  deviceId?: string,
+  options?: { totpOnly?: boolean }
+): Promise<{
+  success: boolean;
+  method?: string;
+  verifiedUntil?: string;
+  totpConfirmed?: boolean;
+  error?: string;
+}> {
   return requestJson('/auth/verify-mfa', {
     method: 'POST',
-    body: JSON.stringify({ code, secretType, deviceId }),
+    body: JSON.stringify({
+      code,
+      secretType,
+      deviceId,
+      ...(options?.totpOnly ? { totpOnly: true } : {})
+    }),
     returnErrorPayload: true
   });
 }
@@ -389,6 +526,17 @@ export async function createTenant(data: {
 }): Promise<{ success: boolean; id: string; siteId: string; error?: string }> {
   return requestJson('/tenants', {
     method: 'POST',
+    body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
+export async function updateTenant(
+  id: string,
+  data: { name?: string; contact_email?: string; offline_auto_archive_days?: number }
+): Promise<{ success: boolean; tenant?: Tenant; error?: string }> {
+  return requestJson(`/tenants/${encodeURIComponent(id)}`, {
+    method: 'PUT',
     body: JSON.stringify(data),
     returnErrorPayload: true
   });
@@ -478,7 +626,10 @@ export async function fetchDeviceConsentStatus(id: string): Promise<{
 }
 
 export async function fetchProcesses(deviceId: string): Promise<ProcessItem[]> {
-  return requestJson<ProcessItem[]>(`/devices/${encodeURIComponent(deviceId)}/processes`);
+  return requestBackgroundToolJson<ProcessItem[]>(
+    `/devices/${encodeURIComponent(deviceId)}/processes`,
+    'Failed to query live process list from endpoint.'
+  );
 }
 
 export async function killProcess(deviceId: string, pid: number): Promise<{ success: boolean; error?: string }> {
@@ -489,7 +640,10 @@ export async function killProcess(deviceId: string, pid: number): Promise<{ succ
 }
 
 export async function fetchServices(deviceId: string): Promise<ServiceItem[]> {
-  return requestJson<ServiceItem[]>(`/devices/${encodeURIComponent(deviceId)}/services`);
+  return requestBackgroundToolJson<ServiceItem[]>(
+    `/devices/${encodeURIComponent(deviceId)}/services`,
+    'Failed to query live services from endpoint.'
+  );
 }
 
 export async function manageService(
@@ -507,8 +661,9 @@ export async function fetchRegistry(
   deviceId: string,
   regPath?: string
 ): Promise<{ subkeys: string[]; values: Array<{ path: string; name: string; type: string; value: string }> }> {
-  return requestJson(
-    `/devices/${encodeURIComponent(deviceId)}/registry?path=${encodeURIComponent(regPath || '')}`
+  return requestBackgroundToolJson(
+    `/devices/${encodeURIComponent(deviceId)}/registry?path=${encodeURIComponent(regPath || '')}`,
+    'Failed to browse live endpoint registry/configuration path.'
   );
 }
 
@@ -552,7 +707,10 @@ export async function fetchScheduledTasks(deviceId: string): Promise<
     lastResult: string;
   }>
 > {
-  return requestJson(`/devices/${encodeURIComponent(deviceId)}/tasks`);
+  return requestBackgroundToolJson(
+    `/devices/${encodeURIComponent(deviceId)}/tasks`,
+    'Failed to query scheduled tasks from endpoint.'
+  );
 }
 
 export async function manageScheduledTask(
@@ -590,8 +748,9 @@ export async function fetchFiles(
     permissions: string;
   }>
 > {
-  return requestJson(
-    `/devices/${encodeURIComponent(deviceId)}/files?path=${encodeURIComponent(dirPath || '')}`
+  return requestBackgroundToolJson(
+    `/devices/${encodeURIComponent(deviceId)}/files?path=${encodeURIComponent(dirPath || '')}`,
+    'Failed to list remote directory.'
   );
 }
 
@@ -633,8 +792,9 @@ export async function fetchEventLogs(
   level = 'all',
   limit = 50
 ): Promise<EventLogItem[]> {
-  return requestJson(
-    `/devices/${encodeURIComponent(deviceId)}/eventlogs?channel=${encodeURIComponent(channel)}&level=${encodeURIComponent(level)}&limit=${limit}`
+  return requestBackgroundToolJson(
+    `/devices/${encodeURIComponent(deviceId)}/eventlogs?channel=${encodeURIComponent(channel)}&level=${encodeURIComponent(level)}&limit=${limit}`,
+    'Failed to query live event logs from endpoint.'
   );
 }
 
@@ -700,7 +860,9 @@ export async function fetchPatches(): Promise<Patch[]> {
   return requestJson<Patch[]>('/patches');
 }
 
-export async function scanPatches(deviceIds?: string[]): Promise<{ success: boolean; patches: Patch[] }> {
+export async function scanPatches(
+  deviceIds?: string[]
+): Promise<{ success: boolean; patches: Patch[]; error?: string }> {
   return requestJson('/patches/scan', {
     method: 'POST',
     body: JSON.stringify(deviceIds ? { deviceIds } : {}),
@@ -708,7 +870,9 @@ export async function scanPatches(deviceIds?: string[]): Promise<{ success: bool
   });
 }
 
-export async function approvePatch(patchId: string): Promise<{ success: boolean }> {
+export async function approvePatch(
+  patchId: string
+): Promise<{ success: boolean; error?: string }> {
   return requestJson(`/patches/${encodeURIComponent(patchId)}/approve`, {
     method: 'POST',
     returnErrorPayload: true
@@ -717,7 +881,7 @@ export async function approvePatch(patchId: string): Promise<{ success: boolean 
 
 export async function approvePatchesBulk(
   patchIds: string[]
-): Promise<{ success: boolean; approvedCount: number }> {
+): Promise<{ success: boolean; approvedCount: number; error?: string }> {
   return requestJson('/patches/approve-bulk', {
     method: 'POST',
     body: JSON.stringify({ patchIds }),
@@ -727,7 +891,7 @@ export async function approvePatchesBulk(
 
 export async function rollbackPatch(
   patchId: string
-): Promise<{ success: boolean; message: string }> {
+): Promise<{ success: boolean; message: string; error?: string }> {
   return requestJson(`/patches/${encodeURIComponent(patchId)}/rollback`, {
     method: 'POST',
     returnErrorPayload: true
@@ -897,7 +1061,15 @@ export async function testSmtp(data: {
   pass?: string;
   from: string;
   to?: string;
-}): Promise<{ success: boolean; message: string }> {
+  verifyOnly?: boolean;
+}): Promise<{
+  success: boolean;
+  mode?: 'verify' | 'send';
+  recipient?: string;
+  latencyMs?: number;
+  message: string;
+  error?: string;
+}> {
   return requestJson('/smtp/test', {
     method: 'POST',
     body: JSON.stringify(data),
@@ -936,6 +1108,17 @@ export async function saveCustomField(
   return requestJson('/custom-fields', {
     method: 'POST',
     body: JSON.stringify(def),
+    returnErrorPayload: true
+  });
+}
+
+export async function updateCustomField(
+  id: string,
+  data: { label?: string; category?: string; field_type?: string; scope?: string; options?: string | null; description?: string }
+): Promise<{ success: boolean; field?: CustomFieldDefinition; error?: string }> {
+  return requestJson(`/custom-fields/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
     returnErrorPayload: true
   });
 }
@@ -1030,6 +1213,17 @@ export async function createMaintenanceWindow(
   });
 }
 
+export async function updateMaintenanceWindow(
+  id: string,
+  win: Partial<MaintenanceWindow> & { durationMinutes?: number }
+): Promise<{ success: boolean; window?: MaintenanceWindow; error?: string }> {
+  return requestJson(`/maintenance-windows/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    body: JSON.stringify(win),
+    returnErrorPayload: true
+  });
+}
+
 export async function deleteMaintenanceWindow(id: string): Promise<{ success: boolean }> {
   return requestJson(`/maintenance-windows/${encodeURIComponent(id)}`, {
     method: 'DELETE',
@@ -1095,8 +1289,19 @@ export async function saveRecording(
   };
 }
 
-export function getRecordingDownloadUrl(recordingId: string): string {
-  return `${API_BASE}/recordings/${encodeURIComponent(recordingId)}/download`;
+export function getRecordingDownloadUrl(
+  recordingId: string,
+  mode?: 'inline' | 'attachment'
+): string {
+  const base = `${API_BASE}/recordings/${encodeURIComponent(recordingId)}/download`;
+  return mode ? `${base}?format=${encodeURIComponent(mode)}` : base;
+}
+
+export async function deleteRecording(recordingId: string): Promise<{ success: boolean; error?: string }> {
+  return requestJson(`/recordings/${encodeURIComponent(recordingId)}`, {
+    method: 'DELETE',
+    returnErrorPayload: true
+  });
 }
 
 export async function fetchWarranty(deviceId: string): Promise<OemWarranty | null> {
@@ -1317,7 +1522,7 @@ export async function fetchVirtualization(): Promise<
     ramTotalGb: number;
     storageFreeTb: number;
     storageTotalTb: number;
-    vms: Array<{ vmid: number; name: string; status: string; os: string; cpu: number; ramGb: number; lastSnapshot?: string }>;
+    vms: Array<{ vmid: number | string; name: string; status: string; os: string; cpu: number; ramGb: number; lastSnapshot?: string }>;
   }>
 > {
   return requestJson('/virtualization/hosts');
@@ -1355,7 +1560,9 @@ export async function syncVirtualizationHost(id: string): Promise<{
   });
 }
 
-export async function deleteVirtualizationHost(id: string): Promise<{ success: boolean }> {
+export async function deleteVirtualizationHost(
+  id: string
+): Promise<{ success: boolean; error?: string }> {
   return requestJson(`/virtualization/hosts/${encodeURIComponent(id)}`, {
     method: 'DELETE',
     returnErrorPayload: true
@@ -1364,14 +1571,17 @@ export async function deleteVirtualizationHost(id: string): Promise<{ success: b
 
 export async function manageVmPower(
   hostId: string,
-  vmid: number,
+  vmid: number | string,
   action: 'start' | 'stop' | 'reboot' | 'snapshot'
-): Promise<{ success: boolean }> {
-  return requestJson(`/virtualization/hosts/${encodeURIComponent(hostId)}/vms/${vmid}/action`, {
-    method: 'POST',
-    body: JSON.stringify({ action }),
-    returnErrorPayload: true
-  });
+): Promise<{ success: boolean; error?: string }> {
+  return requestJson(
+    `/virtualization/hosts/${encodeURIComponent(hostId)}/vms/${encodeURIComponent(String(vmid))}/action`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ action }),
+      returnErrorPayload: true
+    }
+  );
 }
 
 export async function wakeDeviceOnLan(
@@ -1388,6 +1598,7 @@ export async function wakeDeviceOnLan(
     success: Boolean(res.success),
     targetDeviceId: res.deviceId || deviceId,
     targetHostname: res.hostname || '',
+    targetIp: res.targetIp || res.ipAddress || res.ip_address || '',
     targetMac: res.macAddress || '',
     newStatus: res.newStatus,
     verifiedOnline: Boolean(res.verifiedOnline || res.newStatus === 'online'),
@@ -1463,7 +1674,7 @@ export async function negotiateRemoteSession(
   mode: 'kvm' | 'ghost' | 'amt_kvm',
   monitor = 1
 ): Promise<RemoteSessionDescriptor> {
-  const mappedMode = mode === 'ghost' ? 'ghost' : 'interactive';
+  const mappedMode = mode === 'amt_kvm' ? 'amt_kvm' : mode === 'ghost' ? 'ghost' : 'interactive';
   const res = await requestJson<any>(`/devices/${encodeURIComponent(deviceId)}/remote-session`, {
     method: 'POST',
     body: JSON.stringify({ mode: mappedMode, monitor }),
@@ -1479,7 +1690,7 @@ export async function negotiateRemoteSession(
     monitor,
     displayDriver:
       mode === 'ghost'
-        ? res.ghostArchitecture || 'Isolated Virtual Framebuffer'
+        ? res.ghostArchitecture || 'Background Terminal / Session Relay'
         : mode === 'amt_kvm'
           ? 'Intel AMT Hardware Redirection'
           : 'MeshCentral Desktop Multiplexer',
@@ -1487,8 +1698,34 @@ export async function negotiateRemoteSession(
     audioPipeline: 'Opus Low-Latency PCM',
     resolution: '1920x1080',
     meshRelayUrl: res.meshRelayUrl || null,
+    meshBridgeConnected: Boolean(res.meshBridgeConnected),
+    shareLinkSource: res.shareLinkSource,
+    meshRelayError: res.meshRelayError || res.error || null,
+    serverUrl: res.serverUrl || null,
+    recordingEnabled: Boolean(res.recordingEnabled),
+    visualIndicator: Boolean(res.visualIndicator),
     userInterference: mode === 'ghost' ? 'None (Background Session)' : 'Interactive'
   };
+}
+
+export async function lockDeviceScreen(
+  deviceId: string
+): Promise<{ success: boolean; error?: string }> {
+  return requestJson(`/devices/${encodeURIComponent(deviceId)}/lock-screen`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+    returnErrorPayload: true
+  });
+}
+
+export async function bypassRemoteConsent(
+  deviceId: string
+): Promise<{ success: boolean; bypassed?: boolean; error?: string }> {
+  return requestJson(`/devices/${encodeURIComponent(deviceId)}/remote-session/consent-bypass`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+    returnErrorPayload: true
+  });
 }
 
 // ============================================================================
@@ -1501,7 +1738,7 @@ export async function fetchDeviceNotes(deviceId: string): Promise<DeviceNote[]> 
 export async function createDeviceNote(
   deviceId: string,
   data: { author?: string; content: string; is_pinned?: boolean }
-): Promise<{ success: boolean; note: DeviceNote }> {
+): Promise<{ success: boolean; note: DeviceNote; error?: string }> {
   return requestJson(`/devices/${encodeURIComponent(deviceId)}/notes`, {
     method: 'POST',
     body: JSON.stringify(data),
@@ -1512,7 +1749,7 @@ export async function createDeviceNote(
 export async function deleteDeviceNote(
   deviceId: string,
   noteId: string
-): Promise<{ success: boolean }> {
+): Promise<{ success: boolean; error?: string }> {
   return requestJson(
     `/devices/${encodeURIComponent(deviceId)}/notes/${encodeURIComponent(noteId)}`,
     { method: 'DELETE', returnErrorPayload: true }
@@ -1700,7 +1937,7 @@ export async function startGuestPortalRemoteSession(
 }
 
 export async function generateInstaller(data: {
-  tenant_id: string;
+  tenant_id?: string;
   site_id?: string;
   device_role?: string;
   ticket_number?: string;
@@ -1736,8 +1973,11 @@ export async function generateInstaller(data: {
   const deployUrl = res.deployUrl || `${window.location.origin}${res.downloadUrl}`;
   const isWin = (data.platform || 'windows') === 'windows';
   const isQuickSupport = resolvedMode === 'quicksupport';
+  const winExeName = isQuickSupport ? 'QuickSupport-VitrineAgent.exe' : 'Install-VitrineAgent.exe';
   const oneLiner = isWin
-    ? `powershell -NoProfile -ExecutionPolicy Bypass -Command "irm '${deployUrl}' | iex"`
+    ? isQuickSupport
+      ? `powershell -NoProfile -Command "$p=Join-Path $env:TEMP '${winExeName}'; Invoke-WebRequest -UseBasicParsing -Uri '${deployUrl}' -OutFile $p; Start-Process -FilePath $p"`
+      : `powershell -NoProfile -Command "$p=Join-Path $env:TEMP '${winExeName}'; Invoke-WebRequest -UseBasicParsing -Uri '${deployUrl}' -OutFile $p; Start-Process -FilePath $p -ArgumentList '/S' -Wait; Remove-Item $p -Force -ErrorAction SilentlyContinue"`
     : isQuickSupport
       ? `curl -fsSL '${deployUrl}' | bash`
       : `curl -fsSL '${deployUrl}' | sudo bash`;
@@ -1971,7 +2211,10 @@ export async function importFromMeshServer(data: {
   importedDevices: number;
   companionsDispatchedOnline: number;
   companionsQueuedOffline: number;
+  companionDeployTiming?: 'after_oobe' | 'immediate' | 'disabled';
+  meshBridgeConnected?: boolean;
   message: string;
+  error?: string;
 }> {
   const res = await requestJson<any>('/mesh-servers/import', {
     method: 'POST',
@@ -1980,19 +2223,37 @@ export async function importFromMeshServer(data: {
       url: data.url,
       api_token: data.api_token,
       allowSelfSigned: data.allowSelfSigned,
+      import_new_groups: data.import_new_groups !== false,
+      auto_deploy_companion: data.auto_deploy_companion !== false,
+      deploy_vitrine_addons: data.auto_deploy_companion !== false,
+      enforce_laps_on_import: data.enforce_laps_on_import !== false,
+      lock_signed_binary_updates: data.lock_signed_binary_updates !== false,
       selected_group_ids: data.selected_group_ids,
-      import_agents: true,
-      deploy_vitrine_addons: data.auto_deploy_companion !== false
+      import_agents: true
     }),
     returnErrorPayload: true
   });
+  const clientsCount = Number(res.importedClients || 0);
+  const agentsCount = Number(res.importedAgents || 0);
+  const dispatched = Number(res.companionsDispatchedOnline || 0);
+  const queued = Number(res.companionsQueuedPending || 0);
+  const timing = res.companionDeployTiming as 'after_oobe' | 'immediate' | 'disabled' | undefined;
+  let msg = `Imported ${clientsCount} client group(s) and synced ${agentsCount} endpoint(s).`;
+  if (timing === 'after_oobe' && queued > 0) {
+    msg += ` ${queued} companion rollouts queued — will auto-deploy once setup completes.`;
+  } else if (dispatched > 0 || queued > 0) {
+    msg += ` Companion pushed to ${dispatched} online endpoint(s); ${queued} queued for next check-in.`;
+  }
   return {
     success: Boolean(res.success),
-    importedClients: res.importedClients || 0,
-    importedDevices: res.importedAgents || 0,
-    companionsDispatchedOnline: res.importedAgents || 0,
-    companionsQueuedOffline: 0,
-    message: `Imported ${res.importedClients || 0} client group(s) and ${res.importedAgents || 0} endpoint(s).`
+    importedClients: clientsCount,
+    importedDevices: agentsCount,
+    companionsDispatchedOnline: dispatched,
+    companionsQueuedOffline: queued,
+    companionDeployTiming: timing,
+    meshBridgeConnected: Boolean(res.meshBridgeConnected),
+    error: res.error,
+    message: res.error || msg
   };
 }
 
@@ -2214,7 +2475,9 @@ export async function revealBackupRecoveryKey(): Promise<{
   return requestJson('/backups/recovery-key', {
     method: 'POST',
     body: JSON.stringify({}),
-    returnErrorPayload: true
+    returnErrorPayload: true,
+    suppressMfaEvent: true,
+    timeoutMs: 15000
   });
 }
 
@@ -2226,7 +2489,8 @@ export async function acknowledgeBackupRecoveryKey(): Promise<{
   return requestJson('/backups/acknowledge-key', {
     method: 'POST',
     body: JSON.stringify({}),
-    returnErrorPayload: true
+    returnErrorPayload: true,
+    timeoutMs: 15000
   });
 }
 
@@ -2738,6 +3002,25 @@ export async function createBackupPolicy(data: {
   });
 }
 
+export async function updateBackupPolicy(
+  id: string,
+  data: {
+    name?: string;
+    engine?: string;
+    repository_url?: string;
+    repository_password?: string;
+    schedule_cron?: string;
+    retention_days?: number;
+    enabled?: boolean;
+  }
+): Promise<{ success: boolean; policy?: BackupPolicy; error?: string }> {
+  return requestJson(`/backup-policies/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
 export async function deleteBackupPolicy(id: string): Promise<{ success: boolean }> {
   return requestJson(`/backup-policies/${encodeURIComponent(id)}`, {
     method: 'DELETE',
@@ -2780,6 +3063,24 @@ export async function createMdmProfile(data: {
   });
 }
 
+export async function updateMdmProfile(
+  id: string,
+  data: {
+    name?: string;
+    platform?: 'macos' | 'windows' | 'linux';
+    profile_type?: string;
+    payload_xml?: string;
+    settings?: Record<string, any>;
+    enabled?: boolean;
+  }
+): Promise<{ success: boolean; profile?: MdmProfile; error?: string }> {
+  return requestJson(`/mdm-profiles/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
 export async function deleteMdmProfile(id: string): Promise<{ success: boolean }> {
   return requestJson(`/mdm-profiles/${encodeURIComponent(id)}`, {
     method: 'DELETE',
@@ -2809,8 +3110,15 @@ export async function createCustomRole(data: {
 
 export async function updateCustomRole(
   id: string,
-  data: { name?: string; description?: string; permissions?: string[] }
-): Promise<{ success: boolean; role?: CustomRole; error?: string }> {
+  data: { name?: string; description?: string; base_tier?: string; permissions?: string[] }
+): Promise<{
+  success: boolean;
+  role?: CustomRole;
+  mfaRequired?: boolean;
+  permissionsLocked?: boolean;
+  note?: string;
+  error?: string;
+}> {
   return requestJson(`/roles/${encodeURIComponent(id)}`, {
     method: 'PUT',
     body: JSON.stringify(data),
@@ -2907,4 +3215,87 @@ export function getAuditExportUrl(
 
 export function getLocalQrSvgUrl(data: string): string {
   return `${API_BASE}/utils/qr.svg?data=${encodeURIComponent(data)}`;
+}
+
+export async function uploadPolicyTrayIcon(
+  policyId: string,
+  filename: string,
+  base64Data: string
+): Promise<{ success: boolean; tray_icon_url?: string; error?: string }> {
+  return requestJson(`/policies/${encodeURIComponent(policyId)}/tray-icon`, {
+    method: 'POST',
+    body: JSON.stringify({ filename, base64Data }),
+    returnErrorPayload: true
+  });
+}
+
+export async function deployDeviceCompanion(deviceId: string): Promise<{
+  success: boolean;
+  dispatched?: boolean;
+  live?: boolean;
+  output?: string;
+  error?: string;
+}> {
+  return requestJson(`/devices/${encodeURIComponent(deviceId)}/deploy-companion`, {
+    method: 'POST',
+    returnErrorPayload: true
+  });
+}
+
+export async function syncDeviceHardwareFromMesh(deviceId: string): Promise<{
+  success: boolean;
+  updated?: boolean;
+  fields?: Record<string, unknown>;
+  device?: Device;
+  error?: string;
+}> {
+  return requestJson(`/devices/${encodeURIComponent(deviceId)}/sync-hardware`, {
+    method: 'POST',
+    returnErrorPayload: true
+  });
+}
+
+export async function fetchDeviceTelemetryHistory(
+  deviceId: string,
+  range: '1h' | '6h' | '24h' | '7d' | '30d' = '24h'
+): Promise<TelemetryHistoryResponse> {
+  return requestJson<TelemetryHistoryResponse>(
+    `/devices/${encodeURIComponent(deviceId)}/telemetry-history?range=${encodeURIComponent(range)}`
+  );
+}
+
+export async function sampleDeviceTelemetryNow(
+  deviceId: string,
+  includeDetailedHardware = false
+): Promise<{
+  success: boolean;
+  sampled: boolean;
+  reason?: string | null;
+  device?: Device;
+  error?: string;
+}> {
+  return requestJson(`/devices/${encodeURIComponent(deviceId)}/telemetry-sample`, {
+    method: 'POST',
+    body: JSON.stringify({ includeDetailedHardware, forceHistoryInsert: true }),
+    returnErrorPayload: true
+  });
+}
+
+export async function fetchDeviceHardwareDetails(deviceId: string): Promise<DeviceHardwareDetails> {
+  return requestJson<DeviceHardwareDetails>(`/devices/${encodeURIComponent(deviceId)}/hardware`);
+}
+
+export async function updateDeviceRole(
+  deviceId: string,
+  payload: { device_role?: string; auto_detect?: boolean }
+): Promise<{
+  success: boolean;
+  device_role: string;
+  device_role_manual: number;
+  device?: Device;
+}> {
+  return requestJson(`/devices/${encodeURIComponent(deviceId)}/role`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload)
+  });
 }

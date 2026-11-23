@@ -1,14 +1,17 @@
 {
   "name": "vitrine-rmm",
-  "version": "2.6.1",
+  "version": "2.7.0",
   "description": "Modern, glassmorphic self-hosted RMM powered by MeshCentral 2.",
   "private": true,
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
     "build": "npm run build --prefix frontend && npm run build --prefix backend",
     "start": "npm run start --prefix backend",
     "dev:backend": "npm run dev --prefix backend",
     "dev:frontend": "npm run dev --prefix frontend",
-    "install:all": "npm install && npm install --prefix backend && npm install --prefix frontend"
+    "install:all": "npm ci --prefix backend && npm ci --prefix frontend"
   },
   "keywords": [
     "rmm",

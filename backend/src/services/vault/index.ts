@@ -388,6 +388,31 @@ export async function safeOutboundFetch(
   };
 
   return new Promise<SafeOutboundResponse>((resolve, reject) => {
+    let settled = false;
+    let activeRes: http.IncomingMessage | null = null;
+    const finishResolve = (val: SafeOutboundResponse) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hardTimer);
+      resolve(val);
+    };
+    const finishReject = (err: unknown) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hardTimer);
+      try {
+        activeRes?.destroy();
+      } catch {}
+      try {
+        req.destroy();
+      } catch {}
+      reject(err instanceof Error ? err : new Error(String(err)));
+    };
+
+    const hardTimer = setTimeout(() => {
+      finishReject(new Error(`Outbound HTTP request timed out after ${timeoutMs}ms`));
+    }, timeoutMs + 2000);
+
     const req = transport.request(
       {
         protocol: parsed.protocol,
@@ -408,6 +433,7 @@ export async function safeOutboundFetch(
           : {})
       },
       (res) => {
+        activeRes = res;
         if (isHttps && options?.expectedCertSha256) {
           const tlsSock = res.socket as any;
           const cert = tlsSock?.getPeerCertificate?.();
@@ -417,7 +443,7 @@ export async function safeOutboundFetch(
           const expectedFp = options.expectedCertSha256.replace(/:/g, '').toLowerCase();
           if (!actualFp || actualFp !== expectedFp) {
             res.destroy();
-            reject(new Error('TLS certificate SHA-256 fingerprint mismatch'));
+            finishReject(new Error('TLS certificate SHA-256 fingerprint mismatch'));
             return;
           }
         }
@@ -425,7 +451,7 @@ export async function safeOutboundFetch(
         const status = res.statusCode || 0;
         if (status >= 300 && status < 400) {
           res.resume();
-          reject(new Error(`Outbound HTTP redirect (${status}) blocked by SSRF policy`));
+          finishReject(new Error(`Outbound HTTP redirect (${status}) blocked by SSRF policy`));
           return;
         }
 
@@ -434,14 +460,20 @@ export async function safeOutboundFetch(
         res.on('data', (chunk: Buffer) => {
           received += chunk.length;
           if (received > maxBytes) {
-            req.destroy(new Error(`Outbound response exceeded ${maxBytes} bytes limit`));
+            finishReject(new Error(`Outbound response exceeded ${maxBytes} bytes limit`));
             return;
           }
           chunks.push(Buffer.from(chunk));
         });
+        res.on('error', finishReject);
+        res.on('close', () => {
+          if (!settled && !res.complete) {
+            finishReject(new Error('Outbound HTTP response closed prematurely'));
+          }
+        });
         res.on('end', () => {
           const bodyBuffer = Buffer.concat(chunks);
-          resolve({
+          finishResolve({
             ok: status >= 200 && status < 300,
             status,
             headers: res.headers,
@@ -455,9 +487,9 @@ export async function safeOutboundFetch(
     );
 
     req.on('timeout', () => {
-      req.destroy(new Error(`Outbound HTTP request timed out after ${timeoutMs}ms`));
+      finishReject(new Error(`Outbound HTTP request timed out after ${timeoutMs}ms`));
     });
-    req.on('error', reject);
+    req.on('error', finishReject);
 
     if (options?.body !== undefined) {
       req.write(options.body);

@@ -83,7 +83,10 @@ function formatProxmoxTokenHeader(apiUsername?: string | null, rawToken?: string
   return `PVEAPIToken=${userPart}!vitrine=${token}`;
 }
 
-export async function syncVirtualizationHost(hostId: string): Promise<{
+export async function syncVirtualizationHost(
+  hostId: string,
+  tenantId?: string | null
+): Promise<{
   synced: boolean;
   liveApiConnected: boolean;
   discoveredVms: number;
@@ -91,7 +94,7 @@ export async function syncVirtualizationHost(hostId: string): Promise<{
   message: string;
 }> {
   const host = db.prepare('SELECT * FROM virtualization_hosts WHERE id = ?').get(hostId) as any;
-  if (!host) {
+  if (!host || (tenantId && tenantId !== 'all' && host.tenant_id && host.tenant_id !== tenantId)) {
     return { synced: false, liveApiConnected: false, discoveredVms: 0, status: 'Unknown', message: 'Host not found.' };
   }
 
@@ -124,7 +127,10 @@ export async function syncVirtualizationHost(hostId: string): Promise<{
           for (const vm of arr) {
             if (!vm?.Name) continue;
             idx++;
-            const vmRowId = `vm-${host.id}-${idx}`;
+            const vmGuid = String(vm.Id || '').trim();
+            const safeVmSlug = (vmGuid || String(idx)).replace(/[^a-zA-Z0-9_-]/g, '');
+            const vmRowId = `vm-${host.id}-${safeVmSlug}`;
+            const storedVmid = vmGuid || String(idx);
             const statusStr = String(vm.StateStr || '').toLowerCase() === 'running' ? 'Running' : 'Stopped';
             db.prepare(`
               INSERT INTO virtualization_vms (id, host_id, vmid, name, status, os, cpu, ram_gb, last_snapshot, moref_id)
@@ -133,7 +139,7 @@ export async function syncVirtualizationHost(hostId: string): Promise<{
             `).run(
               vmRowId,
               host.id,
-              idx,
+              storedVmid,
               String(vm.Name),
               statusStr,
               Number(vm.ProcessorCount || 2),
@@ -309,8 +315,10 @@ export async function syncVirtualizationHost(hostId: string): Promise<{
         for (const vm of vmRes.body) {
           idx++;
           const moref = String(vm.vm || `vm-${idx}`);
-          const vmid = parseInt(moref.replace(/\D/g, ''), 10) || idx;
-          const vmRowId = `vm-${host.id}-${vmid}`;
+          const parsedDigits = parseInt(moref.replace(/\D/g, ''), 10);
+          const vmid: string | number = Number.isFinite(parsedDigits) && parsedDigits > 0 ? parsedDigits : moref;
+          const safeSlug = moref.replace(/[^a-zA-Z0-9_-]/g, '') || String(idx);
+          const vmRowId = `vm-${host.id}-${safeSlug}`;
           const statusStr = String(vm.power_state || '').toUpperCase() === 'POWERED_ON' ? 'Running' : 'Stopped';
           const ramGb = Math.max(1, Math.round(Number(vm.memory_size_MiB || 4096) / 1024));
           const cpus = Math.max(1, Number(vm.cpu_count || 2));
@@ -353,18 +361,30 @@ export async function syncVirtualizationHost(hostId: string): Promise<{
 
 export async function dispatchLiveHypervisorVmAction(
   hostId: string,
-  vmid: number,
-  action: 'start' | 'stop' | 'reboot' | 'snapshot'
+  vmid: number | string,
+  action: 'start' | 'stop' | 'reboot' | 'snapshot',
+  tenantId?: string | null
 ): Promise<{ dispatchedLive: boolean; detail: string }> {
   const host = db.prepare('SELECT * FROM virtualization_hosts WHERE id = ?').get(hostId) as any;
-  if (!host) {
+  if (!host || (tenantId && tenantId !== 'all' && host.tenant_id && host.tenant_id !== tenantId)) {
     return { dispatchedLive: false, detail: 'Hypervisor host not found.' };
   }
 
+  const vmidStr = String(vmid ?? '').trim();
+  if (!vmidStr || vmidStr === 'NaN') {
+    throw new Error('Invalid VM identifier.');
+  }
+  const vmidNum = /^\d+$/.test(vmidStr) ? Number(vmidStr) : null;
+
   const hostTypeLower = String(host.host_type || '').toLowerCase();
   const vmRow = db
-    .prepare('SELECT * FROM virtualization_vms WHERE host_id = ? AND vmid = ?')
-    .get(hostId, vmid) as any;
+    .prepare(
+      `SELECT * FROM virtualization_vms
+       WHERE host_id = ?
+         AND (CAST(vmid AS TEXT) = ? OR id = ? OR moref_id = ? OR (? IS NOT NULL AND vmid = ?))
+       LIMIT 1`
+    )
+    .get(hostId, vmidStr, vmidStr, vmidStr, vmidNum, vmidNum) as any;
 
   // 1. Hyper-V Live PowerShell Action via Linked Windows Agent
   if ((hostTypeLower.includes('hyper-v') || hostTypeLower.includes('hyperv')) && host.linked_device_id && vmRow?.name) {
@@ -429,12 +449,16 @@ export async function dispatchLiveHypervisorVmAction(
     }
 
     const kind = vmRow?.os?.toLowerCase().includes('lxc') ? 'lxc' : 'qemu';
+    const pveVmid = String(vmRow?.vmid ?? vmidStr).trim();
+    if (!/^\d+$/.test(pveVmid)) {
+      throw new Error(`Invalid numeric Proxmox VMID '${pveVmid}'.`);
+    }
 
     if (action === 'snapshot') {
       const snapName = `vitrine_${new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 12)}`;
       const form = new URLSearchParams({ snapname: snapName, description: 'Created by Vitrine RMM' }).toString();
       const snapRes = await requestHypervisorJson(
-        `${baseUrl}/nodes/${encodeURIComponent(targetNode)}/${kind}/${vmid}/snapshot`,
+        `${baseUrl}/nodes/${encodeURIComponent(targetNode)}/${kind}/${pveVmid}/snapshot`,
         {
           method: 'POST',
           headers: { Authorization: authHeader, 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -449,7 +473,7 @@ export async function dispatchLiveHypervisorVmAction(
       return { dispatchedLive: true, detail: `Proxmox VE snapshot '${snapName}' created on node '${targetNode}'.` };
     }
 
-    const pveEndpoint = `${baseUrl}/nodes/${encodeURIComponent(targetNode)}/${kind}/${vmid}/status/${action}`;
+    const pveEndpoint = `${baseUrl}/nodes/${encodeURIComponent(targetNode)}/${kind}/${pveVmid}/status/${action}`;
     const actRes = await requestHypervisorJson(pveEndpoint, {
       method: 'POST',
       headers: { Authorization: authHeader },
@@ -459,7 +483,7 @@ export async function dispatchLiveHypervisorVmAction(
     if (actRes.status < 200 || actRes.status >= 300) {
       throw new Error(`Proxmox ${action} API returned HTTP ${actRes.status}`);
     }
-    return { dispatchedLive: true, detail: `Dispatched Proxmox VE '${action}' task to ${kind}/${vmid} on '${targetNode}'.` };
+    return { dispatchedLive: true, detail: `Dispatched Proxmox VE '${action}' task to ${kind}/${pveVmid} on '${targetNode}'.` };
   }
 
   // 3. VMware vSphere Live Power Actions (/api/vcenter/vm/{moref}/power)
@@ -479,7 +503,7 @@ export async function dispatchLiveHypervisorVmAction(
       }
     }
 
-    const moref = vmRow?.moref_id || `vm-${vmid}`;
+    const moref = vmRow?.moref_id || (vmidStr.startsWith('vm-') ? vmidStr : `vm-${vmidStr}`);
     if (action === 'snapshot') {
       return { dispatchedLive: false, detail: 'Recorded snapshot marker (vSphere REST vCenter VM snapshot requires SOAP/PowerCLI).' };
     }

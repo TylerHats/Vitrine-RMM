@@ -99,7 +99,7 @@ function buildBaselineCommits(): CommitInfo[] {
       sha: APP_INSTALLED_COMMIT,
       date: new Date().toISOString(),
       author: 'Tyler Hatfield',
-      message: 'release(v2.5.0): zero-trust RBAC/MFA auth, encrypted vault & atomic SQLite backups, live condition alerting, and full security hardening',
+      message: 'release(v2.7.0): native 6-section UCRT Windows executables, 4-tier icon cropper, QuickSupport branding, and full Windows companion inventory & tray chat parity',
       schemaVersion: APP_SCHEMA_VERSION
     }
   ];
@@ -120,17 +120,28 @@ const BASELINE_STABLE_RELEASES: ReleaseInfo[] = [
 - **5-Tier Peer-Relayed WoL & AMT**: Reachability chain across local and historical roaming subnets.`
   },
   {
+    version: '2.6.1',
+    tag: 'v2.6.1',
+    commitSha: 'v2.6.1',
+    publishedAt: '2026-11-18T12:00:00Z',
+    schemaVersion: 18,
+    title: 'Vitrine RMM v2.6.1 — Enterprise Security Hardening, Multi-MS2 Federation & Atomic Backups',
+    releaseNotes: `### Highlights in v2.6.1
+- **Zero-Trust Session Auth, RBAC & Step-Up MFA**: Scrypt password hashing, RFC 6238 TOTP with replay guard, one-time recovery codes, and tenant-scoped RBAC.
+- **Per-Instance AES-256-GCM Secret Vault**: Encrypts LAPS, BitLocker recovery keys, MeshCentral tokens, SMTP, S3, and specialty vendor tokens at rest.
+- **Atomic Self-Backup & Live SQLite Restore**: \`VACUUM INTO\` consistent database snapshots, optional AES-256-GCM archive encryption, AWS SigV4 S3/B2/R2 offsite sync, and schema compatibility checks.`
+  },
+  {
     version: APP_VERSION,
     tag: `v${APP_VERSION}`,
     commitSha: APP_INSTALLED_COMMIT,
     publishedAt: new Date().toISOString(),
     schemaVersion: APP_SCHEMA_VERSION,
-    title: `Vitrine RMM v${APP_VERSION} — Enterprise Security Hardening, Multi-MS2 Federation & Atomic Backups`,
+    title: `Vitrine RMM v${APP_VERSION} — Native 6-Section UCRT Windows PE Agents, Custom Icon Cropper & Full Telemetry Parity`,
     releaseNotes: `### Highlights in v${APP_VERSION} (Stable Release)
-- **Zero-Trust Session Auth, RBAC & Step-Up MFA**: Scrypt password hashing, RFC 6238 TOTP with replay guard, one-time recovery codes, and tenant-scoped RBAC.
-- **Per-Instance AES-256-GCM Secret Vault**: Encrypts LAPS, BitLocker recovery keys, MeshCentral tokens, SMTP, S3, and specialty vendor tokens at rest.
-- **Atomic Self-Backup & Live SQLite Restore**: \`VACUUM INTO\` consistent database snapshots, optional AES-256-GCM archive encryption, AWS SigV4 S3/B2/R2 offsite sync, and schema compatibility checks.
-- **4-Tier Policy Engine & 13 Condition Alert Rules**: Explicit per-field override tracking, maintenance-window suppression, live SMTP alerts, and ITFlow PSA ticket creation.`
+- **Native 6-Section Clang+LLD+UCRT Windows PE Agents**: Rebuilt the Windows Installer, Companion Service, Companion Setup, System Tray, and QuickSupport launcher as standalone native C++ executables with clean 6-section MSVC-style PEs and EV Authenticode signing.
+- **4-Tier Custom Icon Cropper & QuickSupport Branding**: Interactive square icon sanitization and per-Client/Site/Role/QuickSupport branding embedded natively into generated \`.exe\` resources and live tray icons.
+- **Full Windows Companion Telemetry & Tray Chat Parity**: Native SMBIOS, CPU, DIMM, volume, adapter, installed software, BitLocker status, and two-way technician-to-tray chat delivery.`
   }
 ];
 
@@ -190,7 +201,7 @@ export class SystemUpdaterService {
               .slice()
               .reverse()
               .map((r: any) => {
-                const tag = String(r.tag_name || 'v2.5.0').trim();
+                const tag = String(r.tag_name || 'v2.7.0').trim();
                 const ver = tag.replace(/^v/i, '');
                 const rawTargetCommitish = String(r.target_commitish || '').trim();
                 const isHexCommitSha = /^[0-9a-f]{7,40}$/i.test(rawTargetCommitish);
@@ -456,10 +467,20 @@ export class SystemUpdaterService {
     const rollbackBackupId = options?.backupId || lastCompleted?.backup_id || null;
 
     if (rollbackRef) {
-      if (!/^[a-zA-Z0-9._/-]+$/.test(rollbackRef)) {
+      if (!/^[a-zA-Z0-9][a-zA-Z0-9._/-]*$/.test(rollbackRef) || rollbackRef.includes('..')) {
         throw new Error(`Invalid rollback git reference '${rollbackRef}'.`);
       }
-      execFileSync('git', ['reset', '--hard', rollbackRef], {
+      const resolvedCommit = execFileSync(
+        'git',
+        ['rev-parse', '--verify', '--', `${rollbackRef}^{commit}`],
+        {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: 10000
+        }
+      ).trim();
+      execFileSync('git', ['reset', '--hard', resolvedCommit], {
         cwd: repoRoot,
         stdio: ['ignore', 'pipe', 'pipe'],
         timeout: 30000
@@ -579,7 +600,7 @@ export class SystemUpdaterService {
 
       const rawTag = String(status.latestStable.tag || `v${status.latestStable.version}`).trim();
       const rawRef = status.channel === 'stable' ? `refs/tags/${rawTag}` : 'origin/main';
-      if (!/^[a-zA-Z0-9._/-]+$/.test(rawRef)) {
+      if (!/^[a-zA-Z0-9][a-zA-Z0-9._/-]*$/.test(rawRef) || rawRef.includes('..')) {
         throw new Error(`Invalid target git reference '${rawRef}'.`);
       }
 
@@ -590,7 +611,13 @@ export class SystemUpdaterService {
       });
 
       if (status.channel === 'stable') {
-        execFileSync('git', ['checkout', rawRef], {
+        const resolvedTagCommit = execFileSync('git', ['rev-parse', '--verify', '--', `${rawRef}^{commit}`], {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: 10000
+        }).trim();
+        execFileSync('git', ['checkout', resolvedTagCommit], {
           cwd: repoRoot,
           stdio: ['ignore', 'pipe', 'pipe'],
           timeout: 30000
@@ -619,11 +646,25 @@ export class SystemUpdaterService {
         this.installAndBuildPackages(repoRoot);
       }
 
-      // Re-verify code signing pipeline for updated agent packages
-      await installerGenerator.runSigningPipeline({
+      // Re-verify code signing pipeline and re-sign MS2 binaries only when signing is enabled
+      const signingPipe = await installerGenerator.runSigningPipeline({
         os: 'windows',
         mode: 'permanent'
       });
+      let ms2AgentsResigned = false;
+      if (settings.code_signing_enabled && (settings.code_signing_sign_ms2_binary ?? 1) && settings.code_signing_url) {
+        try {
+          const binRes = await installerGenerator.getOrBuildSignedMeshBinary(
+            'x64',
+            Boolean(settings.meshcentral_allow_self_signed)
+          );
+          ms2AgentsResigned = Boolean(binRes?.signed);
+        } catch {
+          ms2AgentsResigned = Boolean(
+            signingPipe.stages?.some((s) => s.stepNumber === 1 && s.status === 'signed')
+          );
+        }
+      }
 
       // Apply forward database migrations and record updated target
       runDatabaseMigrations();
@@ -678,7 +719,7 @@ export class SystemUpdaterService {
         fromCommit,
         toCommit: recordedCommit,
         preUpdateBackupId,
-        ms2AgentsResigned: true,
+        ms2AgentsResigned,
         status: this.getStatus()
       };
     } catch (err: any) {

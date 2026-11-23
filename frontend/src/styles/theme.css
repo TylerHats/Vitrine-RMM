@@ -32,12 +32,15 @@
   --bg-mesh-1: rgba(0, 242, 254, 0.08);
   --bg-mesh-2: rgba(127, 0, 255, 0.08);
   --surface-base: #090d16;
+  --surface-elevated: rgba(15, 23, 42, 0.92);
+  --surface-panel: rgba(15, 23, 42, 0.56);
   --input-bg: rgba(0, 0, 0, 0.28);
 
   --glass-bg: rgba(15, 23, 42, 0.65);
   --glass-bg-hover: rgba(26, 38, 66, 0.75);
   --glass-bg-active: rgba(30, 41, 59, 0.85);
   --glass-border: rgba(255, 255, 255, 0.10);
+  --border-glass: rgba(255, 255, 255, 0.10);
   --border-color: rgba(255, 255, 255, 0.10);
   --glass-border-highlight: rgba(255, 255, 255, 0.22);
   --glass-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.45);
@@ -69,12 +72,15 @@
   --bg-mesh-1: rgba(2, 132, 199, 0.10);
   --bg-mesh-2: rgba(124, 58, 237, 0.08);
   --surface-base: #f8fafc;
+  --surface-elevated: rgba(255, 255, 255, 0.96);
+  --surface-panel: rgba(241, 245, 249, 0.82);
   --input-bg: rgba(241, 245, 249, 0.92);
 
   --glass-bg: rgba(255, 255, 255, 0.82);
   --glass-bg-hover: rgba(255, 255, 255, 0.95);
   --glass-bg-active: rgba(241, 245, 249, 0.98);
   --glass-border: rgba(15, 23, 42, 0.10);
+  --border-glass: rgba(15, 23, 42, 0.10);
   --border-color: rgba(15, 23, 42, 0.12);
   --glass-border-highlight: rgba(15, 23, 42, 0.20);
   --glass-shadow: 0 10px 30px 0 rgba(15, 23, 42, 0.08);

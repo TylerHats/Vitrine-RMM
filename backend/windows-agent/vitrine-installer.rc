@@ -1,0 +1,33 @@
+#include <winver.h>
+1 24 "requireAdministrator.manifest"
+1 ICON "vitrine-default.ico"
+101 RCDATA "default-config.json"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 2,7,0,0
+ PRODUCTVERSION 2,7,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "Vitrine RMM"
+            VALUE "FileDescription", "Vitrine RMM Endpoint Installer"
+            VALUE "FileVersion", "2.7.0.0"
+            VALUE "InternalName", "Install-VitrineAgent.exe"
+            VALUE "LegalCopyright", "Copyright (C) 2026 Vitrine RMM"
+            VALUE "OriginalFilename", "Install-VitrineAgent.exe"
+            VALUE "ProductName", "Vitrine RMM"
+            VALUE "ProductVersion", "2.7.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

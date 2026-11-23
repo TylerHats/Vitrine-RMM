@@ -231,10 +231,69 @@ function mergeAlertRules(baseRules: ConditionAlertRule[], overrideJson?: string 
   }
 }
 
+export interface TrayMenuItem {
+  id: string;
+  label: string;
+  type: 'message_support' | 'open_url' | 'endpoint_status' | 'copy_hostname_ip' | 'custom_info' | 'separator';
+  target?: string;
+  enabled: boolean;
+}
+
+const VALID_TRAY_ITEM_TYPES = new Set<TrayMenuItem['type']>([
+  'message_support',
+  'open_url',
+  'endpoint_status',
+  'copy_hostname_ip',
+  'custom_info',
+  'separator'
+]);
+
+export function getDefaultTrayMenuItems(): TrayMenuItem[] {
+  return [
+    { id: 'msg-support', label: 'Message IT Support', type: 'message_support', enabled: true },
+    { id: 'copy-info', label: 'Copy Device Name & IP', type: 'copy_hostname_ip', enabled: true },
+    { id: 'sep-1', label: '---', type: 'separator', enabled: true },
+    { id: 'status', label: 'Endpoint Status', type: 'endpoint_status', enabled: true }
+  ];
+}
+
+export function parsePolicyTrayMenuItems(rawJson?: string | null): TrayMenuItem[] {
+  const defaults = getDefaultTrayMenuItems();
+  if (!rawJson) return defaults;
+  try {
+    const parsed = typeof rawJson === 'string' ? JSON.parse(rawJson) : rawJson;
+    if (!Array.isArray(parsed)) return defaults;
+    const cleaned: TrayMenuItem[] = [];
+    for (let i = 0; i < parsed.length; i++) {
+      const item = parsed[i];
+      if (!item || typeof item !== 'object') continue;
+      const itemType = VALID_TRAY_ITEM_TYPES.has(item.type) ? (item.type as TrayMenuItem['type']) : 'custom_info';
+      const label =
+        itemType === 'separator'
+          ? '---'
+          : String(item.label || '').trim().slice(0, 80);
+      if (!label) continue;
+      const cleanItem: TrayMenuItem = {
+        id: String(item.id || `tray-item-${i + 1}`).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48) || `tray-item-${i + 1}`,
+        label,
+        type: itemType,
+        enabled: item.enabled !== false
+      };
+      if (item.target != null && String(item.target).trim()) {
+        cleanItem.target = String(item.target).trim().slice(0, 500);
+      }
+      cleaned.push(cleanItem);
+    }
+    return cleaned.length > 0 ? cleaned : defaults;
+  } catch {
+    return defaults;
+  }
+}
+
 export interface PolicyRule {
   id: string;
   name: string;
-  tier: 'global' | 'client' | 'site' | 'role';
+  tier: 'global' | 'quicksupport' | 'client' | 'site' | 'role';
   targetId: string | null;
   telemetryIntervalSec: number;
   requireRemoteConsent: boolean;
@@ -292,6 +351,16 @@ export interface PolicyRule {
   defenderPolicyJson?: string;
   backupPolicyId?: string | null;
   mdmProfileId?: string | null;
+  trayBrandName: string;
+  trayIconUrl: string;
+  trayThemeMode: 'system' | 'dark' | 'light';
+  trayEnabled: boolean;
+  trayTooltip: string;
+  traySupportUrl: string;
+  traySupportPhone: string;
+  traySupportEmail: string;
+  trayMenuItems: TrayMenuItem[];
+  companionAutoDeploy: boolean;
   alertRules: ConditionAlertRule[];
 }
 
@@ -306,19 +375,26 @@ export function sanitizeEffectivePolicyForResponse(eff: EffectiveDevicePolicy): 
   return copy;
 }
 
-export function resolveEffectiveDevicePolicy(deviceId: string): EffectiveDevicePolicy {
-  const device = db.prepare('SELECT * FROM devices WHERE id = ?').get(deviceId) as any;
-  if (!device) {
-    throw new Error(`Device ${deviceId} not found`);
-  }
-
-  // 1. Base Global Policy
+function buildBaseEffectivePolicy(label: string, targetId: string | null): {
+  effective: EffectiveDevicePolicy;
+  globalRow: any;
+} {
   const globalRow = db.prepare("SELECT * FROM policies WHERE tier = 'global' LIMIT 1").get() as any;
+  const settingsRow = (db
+    .prepare('SELECT brand_name, brand_logo_url, tray_theme_mode FROM settings WHERE id = 1')
+    .get() || {}) as { brand_name?: string; brand_logo_url?: string; tray_theme_mode?: string };
+  const baseTrayTheme =
+    globalRow?.tray_theme_mode === 'light' || globalRow?.tray_theme_mode === 'dark' || globalRow?.tray_theme_mode === 'system'
+      ? globalRow.tray_theme_mode
+      : settingsRow.tray_theme_mode === 'light' || settingsRow.tray_theme_mode === 'dark'
+        ? settingsRow.tray_theme_mode
+        : 'system';
+
   const effective: EffectiveDevicePolicy = {
-    id: 'effective-' + deviceId,
-    name: 'Effective Policy for ' + device.hostname,
+    id: 'effective-' + (targetId || 'scope'),
+    name: label,
     tier: 'global',
-    targetId: deviceId,
+    targetId,
     telemetryIntervalSec: globalRow?.telemetry_interval_sec ?? 30,
     requireRemoteConsent: Boolean(globalRow?.require_remote_consent ?? 1),
     consentTimeoutSec: globalRow?.consent_timeout_sec ?? 30,
@@ -365,9 +441,69 @@ export function resolveEffectiveDevicePolicy(deviceId: string): EffectiveDeviceP
     defenderPolicyJson: globalRow?.defender_policy_json || '{}',
     backupPolicyId: globalRow?.backup_policy_id || null,
     mdmProfileId: globalRow?.mdm_profile_id || null,
+    trayBrandName: String(globalRow?.tray_brand_name || settingsRow.brand_name || 'Vitrine RMM').trim(),
+    trayIconUrl: String(globalRow?.tray_icon_url || settingsRow.brand_logo_url || '').trim(),
+    trayThemeMode: baseTrayTheme as 'system' | 'dark' | 'light',
+    trayEnabled: Boolean(globalRow?.tray_enabled ?? 1),
+    trayTooltip: String(globalRow?.tray_tooltip || '').trim(),
+    traySupportUrl: String(globalRow?.tray_support_url || '').trim(),
+    traySupportPhone: String(globalRow?.tray_support_phone || '').trim(),
+    traySupportEmail: String(globalRow?.tray_support_email || '').trim(),
+    trayMenuItems: parsePolicyTrayMenuItems(globalRow?.tray_menu_items_json),
+    companionAutoDeploy: Boolean(globalRow?.companion_auto_deploy ?? 0),
     alertRules: parsePolicyAlertRules(globalRow?.alert_rules_json, 'global', null),
     inheritanceChain: [{ tier: 'global', name: globalRow?.name || 'Global MSP Baseline' }]
   };
+
+  return { effective, globalRow };
+}
+
+function resolveLapsTemplateAccount(
+  effective: EffectiveDevicePolicy,
+  tenantId?: string | null,
+  siteId?: string | null,
+  deviceRole?: string | null
+): void {
+  const tenantRow = tenantId
+    ? (db.prepare('SELECT name, slug FROM tenants WHERE id = ?').get(tenantId) as
+        | { name?: string; slug?: string }
+        | undefined)
+    : undefined;
+  const siteRow = siteId
+    ? (db.prepare('SELECT name FROM sites WHERE id = ?').get(siteId) as { name?: string } | undefined)
+    : undefined;
+  const clientSlugClean = (tenantRow?.slug || tenantRow?.name || 'Client').replace(/[^a-zA-Z0-9]/g, '').slice(0, 10);
+  const siteSlugClean = (siteRow?.name || 'Site').replace(/[^a-zA-Z0-9]/g, '').slice(0, 8);
+  const roleClean = (deviceRole || 'Endpoint').replace(/[^a-zA-Z0-9]/g, '').slice(0, 8);
+
+  effective.lapsAccountName =
+    (effective.lapsAccountName || 'LocalAdmin')
+      .replace(/\{ClientSlug\}/gi, clientSlugClean)
+      .replace(/\{ClientName\}/gi, clientSlugClean)
+      .replace(/\{SiteSlug\}/gi, siteSlugClean)
+      .replace(/\{Role\}/gi, roleClean)
+      .replace(/[^a-zA-Z0-9._-]/g, '')
+      .slice(0, 20) || 'LocalAdmin';
+}
+
+export function resolveEffectiveDevicePolicy(deviceId: string): EffectiveDevicePolicy {
+  const device = db.prepare('SELECT * FROM devices WHERE id = ?').get(deviceId) as any;
+  if (!device) {
+    throw new Error(`Device ${deviceId} not found`);
+  }
+
+  const { effective, globalRow } = buildBaseEffectivePolicy('Effective Policy for ' + device.hostname, deviceId);
+
+  // 1b. QuickSupport Session Baseline Override (when running as temporary QuickSupport session)
+  if (String(device.device_role || '').toLowerCase() === 'quicksupport') {
+    const qsPolicy = db
+      .prepare("SELECT * FROM policies WHERE tier = 'quicksupport' OR id = 'pol-quicksupport' LIMIT 1")
+      .get() as any;
+    if (qsPolicy) {
+      applyOverrides(effective, qsPolicy, globalRow);
+      effective.inheritanceChain.push({ tier: 'quicksupport', name: qsPolicy.name });
+    }
+  }
 
   // 2. Client Tier Override
   if (device.tenant_id) {
@@ -404,28 +540,79 @@ export function resolveEffectiveDevicePolicy(deviceId: string): EffectiveDeviceP
     }
   }
 
-  // 5. Resolve dynamic template tokens in lapsAccountName and enforce SAM <= 20-char cap!
-  const tenantRow = device.tenant_id
-    ? (db.prepare('SELECT name, slug FROM tenants WHERE id = ?').get(device.tenant_id) as
-        | { name?: string; slug?: string }
-        | undefined)
-    : undefined;
-  const siteRow = device.site_id
-    ? (db.prepare('SELECT name FROM sites WHERE id = ?').get(device.site_id) as { name?: string } | undefined)
-    : undefined;
-  const clientSlugClean = (tenantRow?.slug || tenantRow?.name || 'Client').replace(/[^a-zA-Z0-9]/g, '').slice(0, 10);
-  const siteSlugClean = (siteRow?.name || 'Site').replace(/[^a-zA-Z0-9]/g, '').slice(0, 8);
-  const roleClean = (device.device_role || 'Endpoint').replace(/[^a-zA-Z0-9]/g, '').slice(0, 8);
+  resolveLapsTemplateAccount(effective, device.tenant_id, device.site_id, device.device_role);
+  return effective;
+}
 
-  effective.lapsAccountName =
-    (effective.lapsAccountName || 'LocalAdmin')
-      .replace(/\{ClientSlug\}/gi, clientSlugClean)
-      .replace(/\{ClientName\}/gi, clientSlugClean)
-      .replace(/\{SiteSlug\}/gi, siteSlugClean)
-      .replace(/\{Role\}/gi, roleClean)
-      .replace(/[^a-zA-Z0-9._-]/g, '')
-      .slice(0, 20) || 'LocalAdmin';
+export function resolvePolicyForInstallerScope(scope: {
+  mode?: 'permanent' | 'quicksupport' | 'companion_only';
+  tenantId?: string | null;
+  siteId?: string | null;
+  deviceRole?: string | null;
+  deviceId?: string | null;
+}): EffectiveDevicePolicy {
+  if (scope.deviceId) {
+    const existing = db.prepare('SELECT id FROM devices WHERE id = ?').get(scope.deviceId) as { id?: string } | undefined;
+    if (existing?.id) {
+      return resolveEffectiveDevicePolicy(existing.id);
+    }
+  }
 
+  const { effective, globalRow } = buildBaseEffectivePolicy(
+    scope.mode === 'quicksupport' ? 'Effective Policy for QuickSupport' : 'Effective Installer Scope Policy',
+    scope.tenantId || null
+  );
+
+  if (scope.mode === 'quicksupport') {
+    const qsPolicy = db
+      .prepare("SELECT * FROM policies WHERE tier = 'quicksupport' OR id = 'pol-quicksupport' LIMIT 1")
+      .get() as any;
+    if (qsPolicy) {
+      applyOverrides(effective, qsPolicy, globalRow);
+      effective.inheritanceChain.push({ tier: 'quicksupport', name: qsPolicy.name });
+    }
+    if (scope.tenantId && scope.tenantId !== 'default' && scope.tenantId !== 'quicksupport') {
+      const clientPolicy = db
+        .prepare("SELECT * FROM policies WHERE tier = 'client' AND target_id = ?")
+        .get(scope.tenantId) as any;
+      if (clientPolicy) {
+        applyOverrides(effective, clientPolicy, globalRow);
+        effective.inheritanceChain.push({ tier: 'client', name: clientPolicy.name });
+      }
+    }
+  } else {
+    if (scope.tenantId && scope.tenantId !== 'quicksupport') {
+      const clientPolicy = db
+        .prepare("SELECT * FROM policies WHERE tier = 'client' AND target_id = ?")
+        .get(scope.tenantId) as any;
+      if (clientPolicy) {
+        applyOverrides(effective, clientPolicy, globalRow);
+        effective.inheritanceChain.push({ tier: 'client', name: clientPolicy.name });
+      }
+    }
+    if (scope.siteId) {
+      const sitePolicy = db
+        .prepare("SELECT * FROM policies WHERE tier = 'site' AND target_id = ?")
+        .get(scope.siteId) as any;
+      if (sitePolicy) {
+        applyOverrides(effective, sitePolicy, globalRow);
+        effective.inheritanceChain.push({ tier: 'site', name: sitePolicy.name });
+      }
+    }
+    if (scope.deviceRole) {
+      const rolePolicy = db
+        .prepare(
+          "SELECT * FROM policies WHERE tier = 'role' AND (LOWER(?) = LOWER(target_id) OR LOWER(?) LIKE '%' || LOWER(target_id) || '%') LIMIT 1"
+        )
+        .get(scope.deviceRole, scope.deviceRole) as any;
+      if (rolePolicy) {
+        applyOverrides(effective, rolePolicy, globalRow);
+        effective.inheritanceChain.push({ tier: 'role', name: rolePolicy.name });
+      }
+    }
+  }
+
+  resolveLapsTemplateAccount(effective, scope.tenantId, scope.siteId, scope.deviceRole);
   return effective;
 }
 
@@ -472,7 +659,17 @@ const SQLITE_POLICY_DEFAULTS: Record<string, unknown> = {
   required_software_json: '[]',
   defender_policy_json: '{}',
   backup_policy_id: null,
-  mdm_profile_id: null
+  mdm_profile_id: null,
+  tray_brand_name: '',
+  tray_icon_url: '',
+  tray_theme_mode: '',
+  tray_enabled: 1,
+  tray_tooltip: '',
+  tray_support_url: '',
+  tray_support_phone: '',
+  tray_support_email: '',
+  tray_menu_items_json: null,
+  companion_auto_deploy: 0
 };
 
 function applyOverrides(target: EffectiveDevicePolicy, source: any, _globalRow?: any) {
@@ -557,6 +754,44 @@ function applyOverrides(target: EffectiveDevicePolicy, source: any, _globalRow?:
   if (shouldApply('defender_policy_json')) target.defenderPolicyJson = source.defender_policy_json;
   if (shouldApply('backup_policy_id')) target.backupPolicyId = source.backup_policy_id;
   if (shouldApply('mdm_profile_id')) target.mdmProfileId = source.mdm_profile_id;
+
+  const applyNonEmptyStringOverride = (col: string, setter: (v: string) => void) => {
+    if (!shouldApply(col)) return;
+    const val = String(source[col] ?? '').trim();
+    if (val || (explicitKeys && explicitKeys.has(col) && source[col] !== '')) {
+      setter(val);
+    }
+  };
+  applyNonEmptyStringOverride('tray_brand_name', (v) => {
+    if (v) target.trayBrandName = v;
+  });
+  applyNonEmptyStringOverride('tray_icon_url', (v) => {
+    target.trayIconUrl = v;
+  });
+  if (shouldApply('tray_theme_mode')) {
+    const t = String(source.tray_theme_mode || '').trim();
+    if (t === 'system' || t === 'dark' || t === 'light') {
+      target.trayThemeMode = t;
+    }
+  }
+  if (shouldApply('tray_enabled')) target.trayEnabled = Boolean(source.tray_enabled);
+  applyNonEmptyStringOverride('tray_tooltip', (v) => {
+    target.trayTooltip = v;
+  });
+  applyNonEmptyStringOverride('tray_support_url', (v) => {
+    target.traySupportUrl = v;
+  });
+  applyNonEmptyStringOverride('tray_support_phone', (v) => {
+    target.traySupportPhone = v;
+  });
+  applyNonEmptyStringOverride('tray_support_email', (v) => {
+    target.traySupportEmail = v;
+  });
+  if (source.tray_menu_items_json && (shouldApply('tray_menu_items_json') || source.tray_menu_items_json !== null)) {
+    target.trayMenuItems = parsePolicyTrayMenuItems(source.tray_menu_items_json);
+  }
+  if (shouldApply('companion_auto_deploy')) target.companionAutoDeploy = Boolean(source.companion_auto_deploy);
+
   if (source.alert_rules_json) {
     target.alertRules = mergeAlertRules(target.alertRules, source.alert_rules_json);
   }
@@ -625,8 +860,28 @@ export async function dispatchAlertToNotificationChannels(alert: {
   const sevRank = { info: 1, warning: 2, critical: 3 };
 
   for (const ch of rows) {
-    const minRank = sevRank[(ch.min_severity as 'info' | 'warning' | 'critical') || 'warning'] || 2;
-    if (alert.eventAction !== 'resolve' && sevRank[alert.severity] < minRank) continue;
+    const minSevKey = String(ch.min_severity || 'warning').trim().toLowerCase() as 'info' | 'warning' | 'critical';
+    const minRank = sevRank[minSevKey] || 2;
+    const alertSevKey = String(alert.severity || 'warning').trim().toLowerCase() as 'info' | 'warning' | 'critical';
+    const alertRank = sevRank[alertSevKey] || 2;
+    if (alert.eventAction !== 'resolve' && alertRank < minRank) continue;
+
+    if (ch.events_json) {
+      try {
+        const parsedEvents = JSON.parse(ch.events_json);
+        if (Array.isArray(parsedEvents) && parsedEvents.length > 0) {
+          const eventName = alert.eventAction === 'resolve' ? 'alert.resolved' : 'alert.triggered';
+          const allowed = parsedEvents.map((ev: unknown) => String(ev).trim().toLowerCase());
+          const matchesEvent =
+            allowed.includes('*') ||
+            allowed.includes('all') ||
+            allowed.includes(eventName) ||
+            allowed.includes(String(alert.conditionId || '').toLowerCase()) ||
+            allowed.includes(alertSevKey);
+          if (!matchesEvent) continue;
+        }
+      } catch {}
+    }
 
     const type = String(ch.channel_type || 'webhook').toLowerCase();
     const targetUrl = decryptVaultSecret(ch.webhook_url_encrypted) || '';
@@ -748,7 +1003,7 @@ export async function dispatchAlertToNotificationChannels(alert: {
         headers,
         body: rawBody,
         timeoutMs: 6000,
-        safety: { allowLoopback: true, allowPrivateLan: true }
+        safety: { allowLoopback: false, allowPrivateLan: false }
       });
       const nowIso = new Date().toISOString();
       if (res.status >= 200 && res.status < 300) {
@@ -1093,18 +1348,15 @@ export async function evaluateFleetAlertConditions(): Promise<{
       return;
     }
 
-    // Deduplicate recent notifications within flapGraceMinutes using SQLite `datetime()` normalization!
-    const graceCutoffIso = new Date(Date.now() - Math.max(1, flapGraceMinutes) * 60 * 1000).toISOString();
+    // Deduplicate alerts via `alert_incidents` (not UI `notifications`!) within flapGraceMinutes
+    const graceMs = Math.max(1, flapGraceMinutes) * 60 * 1000;
+    const prevSeenMs = existingInc ? parseSqlTimestampMs(existingInc.last_seen_at) : NaN;
+    const isDeduplicated = Boolean(existingInc && !Number.isNaN(prevSeenMs) && Date.now() - prevSeenMs < graceMs);
     const expectedTitlePrefix = `[${rule.severity.toUpperCase()}] ${rule.label}: ${entityName}`;
-    const recentNotif = db
-      .prepare(
-        'SELECT id FROM notifications WHERE type = ? AND title = ? AND COALESCE(tenant_id, \'\') = COALESCE(?, \'\') AND datetime(created_at) >= datetime(?) LIMIT 1'
-      )
-      .get(rule.conditionId, expectedTitlePrefix, resolvedTenantId || '', graceCutoffIso) as { id?: string } | undefined;
 
     const channels: string[] = [];
 
-    if (rule.notifyWebUi && !recentNotif) {
+    if (rule.notifyWebUi && !isDeduplicated) {
       channels.push('Web UI Notification');
       webUiNotificationsCreated++;
       db.prepare(`
@@ -1120,7 +1372,7 @@ export async function evaluateFleetAlertConditions(): Promise<{
       );
     }
 
-    if (rule.notifyEmail && !recentNotif) {
+    if (rule.notifyEmail && !isDeduplicated) {
       const emailRes = await sendAlertEmailUsingStoredSettings({
         subject: `${expectedTitlePrefix}`,
         headline: `${rule.label} — ${entityName}`,
@@ -1134,7 +1386,7 @@ export async function evaluateFleetAlertConditions(): Promise<{
       }
     }
 
-    if (!recentNotif) {
+    if (!isDeduplicated) {
       const webhookSent = await dispatchAlertToNotificationChannels({
         incidentId,
         tenantId: resolvedTenantId,

@@ -7,7 +7,7 @@ import fs from 'fs';
 import os from 'os';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
-import { initDatabase, closeDatabase, db, BRANDING_DIR_PATH } from './db/index.js';
+import { initDatabase, closeDatabase, db, BRANDING_DIR_PATH, APP_VERSION } from './db/index.js';
 import { registerApiRoutes } from './routes/api.js';
 import {
   extractAuthContext,
@@ -75,7 +75,12 @@ function sendVerifiedStaticFile(
     const contentType = MIME_MAP[ext] || 'application/octet-stream';
     const baseName = path.basename(realTarget);
 
-    if (baseName === 'index.html' || baseName === 'sw.js' || baseName === 'manifest.json') {
+    if (
+      baseName === 'index.html' ||
+      baseName === 'sw.js' ||
+      baseName === 'manifest.json' ||
+      baseName === 'manifest.webmanifest'
+    ) {
       reply.header('Cache-Control', 'no-cache, no-store, must-revalidate');
     } else if (cleanedRel.startsWith('assets/')) {
       reply.header('Cache-Control', 'public, max-age=31536000, immutable');
@@ -199,16 +204,21 @@ async function startServer() {
   });
 
   // Defensive HTTP security headers & strict Content-Security-Policy on every response
-  server.addHook('onSend', async (req, reply) => {
-    reply.header('X-Content-Type-Options', 'nosniff');
-    reply.header('X-Frame-Options', 'SAMEORIGIN');
-    reply.header('Referrer-Policy', 'strict-origin-when-cross-origin');
-    reply.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
-    if ((req.raw.url || '').startsWith('/branding/')) {
-      reply.header('Content-Security-Policy', "default-src 'none'; sandbox");
-    } else {
-      reply.header('Content-Security-Policy', buildContentSecurityPolicy());
+  server.addHook('onSend', (req, reply, payload, done) => {
+    try {
+      reply.header('X-Content-Type-Options', 'nosniff');
+      reply.header('X-Frame-Options', 'SAMEORIGIN');
+      reply.header('Referrer-Policy', 'strict-origin-when-cross-origin');
+      reply.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+      if ((req.raw.url || '').startsWith('/branding/')) {
+        reply.header('Content-Security-Policy', "default-src 'none'; sandbox");
+      } else {
+        reply.header('Content-Security-Policy', buildContentSecurityPolicy());
+      }
+    } catch {
+      // Never block response delivery if header serialization throws
     }
+    done(null, payload);
   });
 
   await server.register(cors, {
@@ -287,6 +297,21 @@ async function startServer() {
     let currentDeviceId = query.deviceId || '';
     let currentRunAs: 'system' | 'user' = query.runAs === 'user' ? 'user' : 'system';
     let currentShell = query.shell || '';
+    let currentCols = Math.max(40, Math.min(300, parseInt(query.cols || '120', 10) || 120));
+    let currentRows = Math.max(10, Math.min(120, parseInt(query.rows || '34', 10) || 34));
+    let activeRelay: { write: (data: string) => void; resize: (cols: number, rows: number) => void; close: () => void } | null = null;
+    let terminalMode: 'pty' | 'line_fallback' | 'unconnected' = 'unconnected';
+    let fallbackLineBuffer = '';
+    let openGeneration = 0;
+
+    const closeActiveRelay = () => {
+      if (activeRelay) {
+        try {
+          activeRelay.close();
+        } catch {}
+        activeRelay = null;
+      }
+    };
 
     const getDeviceRow = (devId: string) => {
       if (!devId) return null;
@@ -350,18 +375,255 @@ async function startServer() {
       ].join('\r\n');
     };
 
-    socket.send(JSON.stringify({ type: 'output', data: buildBanner() }));
+    const openTerminalSession = async () => {
+      const gen = ++openGeneration;
+      closeActiveRelay();
+      fallbackLineBuffer = '';
+
+      if (!currentDeviceId) {
+        terminalMode = 'unconnected';
+        socket.send(JSON.stringify({ type: 'status', mode: 'unconnected' }));
+        socket.send(JSON.stringify({ type: 'output', data: buildBanner() }));
+        return;
+      }
+
+      const dev = getDeviceRow(currentDeviceId);
+      if (!dev || !canUserAccessTenant(auth.user, dev.tenant_id)) {
+        terminalMode = 'unconnected';
+        socket.send(JSON.stringify({ type: 'status', mode: 'unconnected', error: 'Endpoint unavailable or access denied' }));
+        socket.send(
+          JSON.stringify({
+            type: 'output',
+            data: `\r\n\x1b[31m[Access Denied] Endpoint unavailable or not authorized for your account.\x1b[0m\r\n> `
+          })
+        );
+        return;
+      }
+
+      const osType = dev.os_type || 'windows';
+      currentShell = resolveShell(osType, currentShell);
+      socket.send(
+        JSON.stringify({
+          type: 'status',
+          mode: 'connecting',
+          deviceId: dev.id,
+          shell: currentShell,
+          runAs: currentRunAs
+        })
+      );
+
+      let relay: { write: (data: string) => void; resize: (cols: number, rows: number) => void; close: () => void } | null = null;
+      if (dev.status === 'online' || dev.status === 'isolated') {
+        relay = await meshBridge.openInteractiveTerminalRelay(dev.id, {
+          runAs: currentRunAs,
+          shell: currentShell,
+          cols: currentCols,
+          rows: currentRows,
+          onData: (chunk) => {
+            if (gen !== openGeneration || socket.readyState !== 1) return;
+            try {
+              socket.send(JSON.stringify({ type: 'output', data: chunk }));
+            } catch {}
+          },
+          onReady: ({ protocol, recorded }) => {
+            if (gen !== openGeneration || socket.readyState !== 1) return;
+            try {
+              socket.send(
+                JSON.stringify({
+                  type: 'status',
+                  mode: 'pty',
+                  deviceId: dev.id,
+                  shell: currentShell,
+                  runAs: currentRunAs,
+                  protocol,
+                  recorded
+                })
+              );
+            } catch {}
+          },
+          onClose: (reason) => {
+            if (gen !== openGeneration) return;
+            activeRelay = null;
+            if (terminalMode === 'pty') {
+              terminalMode = 'line_fallback';
+            }
+            if (socket.readyState === 1) {
+              try {
+                socket.send(
+                  JSON.stringify({
+                    type: 'output',
+                    data: `\r\n\x1b[33m[PTY Closed] ${reason || 'Remote tunnel disconnected.'}\x1b[0m\r\n`
+                  })
+                );
+                socket.send(
+                  JSON.stringify({
+                    type: 'status',
+                    mode: 'line_fallback',
+                    deviceId: dev.id,
+                    shell: currentShell,
+                    runAs: currentRunAs
+                  })
+                );
+              } catch {}
+            }
+          },
+          onError: (err) => {
+            if (gen !== openGeneration || socket.readyState !== 1) return;
+            try {
+              socket.send(
+                JSON.stringify({
+                  type: 'output',
+                  data: `\r\n\x1b[31m[PTY Error] ${err}\x1b[0m\r\n`
+                })
+              );
+            } catch {}
+          }
+        });
+      }
+
+      if (gen !== openGeneration || socket.readyState !== 1) {
+        relay?.close();
+        return;
+      }
+
+      if (relay) {
+        activeRelay = relay;
+        terminalMode = 'pty';
+        db.prepare(`
+          INSERT INTO audit_logs (id, username, device_id, action, details)
+          VALUES (?, ?, ?, 'Interactive PTY Shell Opened', ?)
+        `).run(
+          `aud-pty-${crypto.randomUUID()}`,
+          auth.user.username,
+          dev.id,
+          `Opened live MS2 PTY tunnel (${currentRunAs.toUpperCase()}/${currentShell}) on ${dev.hostname}`
+        );
+        socket.send(
+          JSON.stringify({
+            type: 'output',
+            data: `\x1b[36m[Vitrine Live PTY — ${dev.hostname} (${currentShell.toUpperCase()} / ${currentRunAs.toUpperCase()})]\x1b[0m\r\n`
+          })
+        );
+        socket.send(
+          JSON.stringify({
+            type: 'status',
+            mode: 'pty',
+            deviceId: dev.id,
+            shell: currentShell,
+            runAs: currentRunAs
+          })
+        );
+        return;
+      }
+
+      terminalMode = 'line_fallback';
+      const reason =
+        dev.status !== 'online' && dev.status !== 'isolated'
+          ? 'device_offline'
+          : meshBridge.getStatus().connected
+            ? 'meshrelay_unavailable'
+            : 'mesh_bridge_disconnected';
+      socket.send(
+        JSON.stringify({
+          type: 'status',
+          mode: 'line_fallback',
+          deviceId: dev.id,
+          shell: currentShell,
+          runAs: currentRunAs,
+          reason
+        })
+      );
+      socket.send(
+        JSON.stringify({
+          type: 'output',
+          data:
+            `\r\n\x1b[33m[Command Relay Fallback] Interactive PTY tunnel unavailable (${reason}). Commands execute per-line when you press Enter.\x1b[0m` +
+            buildBanner()
+        })
+      );
+    };
+
+    const runLineCommand = async (rawCmd: string) => {
+      const cmd = rawCmd.trim();
+      const dev = getDeviceRow(currentDeviceId);
+      if (!dev) {
+        socket.send(JSON.stringify({ type: 'output', data: '\r\nDevice not found.\r\n> ' }));
+        return;
+      }
+      if (!canUserAccessTenant(auth.user, dev.tenant_id)) {
+        socket.send(JSON.stringify({ type: 'output', data: '\r\nAccess denied for target device.\r\n' }));
+        return;
+      }
+
+      const shell = resolveShell(dev.os_type || 'windows', currentShell);
+      const prompt = getPrompt(dev, currentRunAs, shell);
+
+      if (!cmd) {
+        socket.send(JSON.stringify({ type: 'output', data: `\r\n${prompt}` }));
+        return;
+      }
+
+      if (cmd === 'clear' || cmd === 'cls') {
+        socket.send(JSON.stringify({ type: 'output', data: `\x1b[2J\x1b[H${prompt}` }));
+        return;
+      }
+
+      db.prepare(`
+        INSERT INTO audit_logs (id, username, device_id, action, details)
+        VALUES (?, ?, ?, 'Remote Shell Command', ?)
+      `).run(
+        `aud-pty-${crypto.randomUUID()}`,
+        auth.user.username,
+        dev.id,
+        `[${currentRunAs.toUpperCase()}/${shell}] ${cmd.slice(0, 240)}`
+      );
+
+      const execRes = await meshBridge.executeCommandOnNode(dev.id, cmd, {
+        runAs: currentRunAs,
+        shell
+      });
+
+      socket.send(
+        JSON.stringify({
+          type: 'output',
+          data: `\r\n${execRes.output}\r\n\r\n${prompt}`
+        })
+      );
+    };
+
+    void openTerminalSession();
+
+    socket.on('close', () => {
+      openGeneration++;
+      closeActiveRelay();
+    });
+
+    socket.on('error', () => {
+      openGeneration++;
+      closeActiveRelay();
+    });
 
     socket.on('message', async (message: Buffer) => {
       try {
         const liveUser = isSessionTokenActive(auth.tokenHash);
-        if (!liveUser || !isTechnicianOrAbove(liveUser.role)) {
+        const currentDev = currentDeviceId ? getDeviceRow(currentDeviceId) : null;
+        const tenantRevoked = Boolean(
+          currentDeviceId && (!currentDev || !canUserAccessTenant(liveUser, currentDev.tenant_id))
+        );
+        if (
+          !liveUser ||
+          !isTechnicianOrAbove(liveUser.role) ||
+          !hasUserPermission(liveUser, 'remote:connect') ||
+          tenantRevoked
+        ) {
           socket.send(
             JSON.stringify({
               type: 'output',
               data: '\r\n\x1b[31m[Session Terminated] Your session expired or privileges were revoked.\x1b[0m\r\n'
             })
           );
+          openGeneration++;
+          closeActiveRelay();
           socket.close(1008, 'Session expired or revoked');
           return;
         }
@@ -385,63 +647,61 @@ async function startServer() {
           }
           if (parsed.runAs === 'system' || parsed.runAs === 'user') currentRunAs = parsed.runAs;
           if (parsed.shell) currentShell = String(parsed.shell);
-          socket.send(
-            JSON.stringify({
-              type: 'output',
-              data:
-                `\r\n\x1b[35m[Vitrine PTY] Context -> runAs=${currentRunAs.toUpperCase()}, shell=${currentShell}...\x1b[0m\r\n` +
-                buildBanner()
-            })
-          );
+          if (typeof parsed.cols === 'number') currentCols = Math.max(40, Math.min(300, parsed.cols));
+          if (typeof parsed.rows === 'number') currentRows = Math.max(10, Math.min(120, parsed.rows));
+          await openTerminalSession();
+          return;
+        }
+
+        if (parsed.type === 'resize') {
+          const nextCols = Math.max(40, Math.min(300, Number(parsed.cols) || currentCols));
+          const nextRows = Math.max(10, Math.min(120, Number(parsed.rows) || currentRows));
+          currentCols = nextCols;
+          currentRows = nextRows;
+          if (activeRelay) {
+            activeRelay.resize(nextCols, nextRows);
+          }
+          return;
+        }
+
+        if (parsed.type === 'data') {
+          const data = String(parsed.data ?? '');
+          if (terminalMode === 'pty' && activeRelay) {
+            activeRelay.write(data);
+            return;
+          }
+          if (terminalMode === 'line_fallback') {
+            for (const ch of data) {
+              if (ch === '\r' || ch === '\n') {
+                const toRun = fallbackLineBuffer;
+                fallbackLineBuffer = '';
+                await runLineCommand(toRun);
+              } else if (ch === '\x7f' || ch === '\b') {
+                if (fallbackLineBuffer.length > 0) {
+                  fallbackLineBuffer = fallbackLineBuffer.slice(0, -1);
+                  socket.send(JSON.stringify({ type: 'output', data: '\b \b' }));
+                }
+              } else if (ch === '\x03') {
+                fallbackLineBuffer = '';
+                const dev = getDeviceRow(currentDeviceId);
+                const shell = resolveShell(dev?.os_type || 'windows', currentShell);
+                socket.send(JSON.stringify({ type: 'output', data: `^C\r\n${getPrompt(dev, currentRunAs, shell)}` }));
+              } else if (ch >= ' ') {
+                fallbackLineBuffer += ch;
+                socket.send(JSON.stringify({ type: 'output', data: ch }));
+              }
+            }
+          }
           return;
         }
 
         if (parsed.type === 'input') {
-          const cmd = String(parsed.data || '').trim();
-          const dev = getDeviceRow(currentDeviceId);
-          if (!dev) {
-            socket.send(JSON.stringify({ type: 'output', data: '\r\nDevice not found.\r\n> ' }));
+          const rawInput = String(parsed.data || '');
+          if (terminalMode === 'pty' && activeRelay) {
+            activeRelay.write(rawInput.endsWith('\r') || rawInput.endsWith('\n') ? rawInput : `${rawInput}\r`);
             return;
           }
-          if (!canUserAccessTenant(auth.user, dev.tenant_id)) {
-            socket.send(JSON.stringify({ type: 'output', data: '\r\nAccess denied for target device.\r\n' }));
-            return;
-          }
-
-          const shell = resolveShell(dev.os_type || 'windows', currentShell);
-          const prompt = getPrompt(dev, currentRunAs, shell);
-
-          if (!cmd) {
-            socket.send(JSON.stringify({ type: 'output', data: `\r\n${prompt}` }));
-            return;
-          }
-
-          if (cmd === 'clear' || cmd === 'cls') {
-            socket.send(JSON.stringify({ type: 'output', data: `\x1b[2J\x1b[H${prompt}` }));
-            return;
-          }
-
-          db.prepare(`
-            INSERT INTO audit_logs (id, username, device_id, action, details)
-            VALUES (?, ?, ?, 'Remote Shell Command', ?)
-          `).run(
-            `aud-pty-${crypto.randomUUID()}`,
-            auth.user.username,
-            dev.id,
-            `[${currentRunAs.toUpperCase()}/${shell}] ${cmd.slice(0, 240)}`
-          );
-
-          const execRes = await meshBridge.executeCommandOnNode(dev.id, cmd, {
-            runAs: currentRunAs,
-            shell
-          });
-
-          socket.send(
-            JSON.stringify({
-              type: 'output',
-              data: `\r\n${execRes.output}\r\n\r\n${prompt}`
-            })
-          );
+          await runLineCommand(rawInput);
         }
       } catch {
         // Ignore malformed WS frames
@@ -484,7 +744,7 @@ async function startServer() {
           .get(resolvedGrantId) as any;
         if (
           grant &&
-          grant.status !== 'revoked' &&
+          grant.status === 'active' &&
           grant.can_view_telemetry &&
           grant.expires_at &&
           new Date(grant.expires_at).getTime() > Date.now()
@@ -512,6 +772,67 @@ async function startServer() {
     }
 
     const targetDeviceId = authorizedGuestDeviceId || query.deviceId || '';
+    let lastLiveProbeAt = 0;
+    let lastHostNetSample: { bytes: number; ts: number } | null = null;
+
+    const sampleHostNetMbps = (): number => {
+      try {
+        const raw = fs.readFileSync('/proc/net/dev', 'utf8');
+        let totalBytes = 0;
+        for (const line of raw.split('\n')) {
+          const trimmed = line.trim();
+          const colonIdx = trimmed.indexOf(':');
+          if (colonIdx <= 0) continue;
+          const iface = trimmed.slice(0, colonIdx).trim();
+          if (iface === 'lo') continue;
+          const cols = trimmed.slice(colonIdx + 1).trim().split(/\s+/);
+          if (cols.length >= 9) {
+            const rx = Number(cols[0]) || 0;
+            const tx = Number(cols[8]) || 0;
+            totalBytes += rx + tx;
+          }
+        }
+        const nowTs = Date.now();
+        if (lastHostNetSample && nowTs > lastHostNetSample.ts) {
+          const deltaBytes = Math.max(0, totalBytes - lastHostNetSample.bytes);
+          const deltaSec = (nowTs - lastHostNetSample.ts) / 1000;
+          lastHostNetSample = { bytes: totalBytes, ts: nowTs };
+          return Number(((deltaBytes * 8) / (deltaSec * 1_000_000)).toFixed(2));
+        }
+        lastHostNetSample = { bytes: totalBytes, ts: nowTs };
+      } catch {
+        // /proc/net/dev unavailable on non-Linux hosts
+      }
+      return 0;
+    };
+
+    const triggerLiveTelemetryProbeIfStale = (dev: any) => {
+      if (!dev || !dev.mesh_node_id || dev.status !== 'online' || (dev.lifecycle_state || 'active') !== 'active') return;
+      if (!meshBridge.getStatus().connected) return;
+      const nowMs = Date.now();
+      if (nowMs - lastLiveProbeAt < 15_000) return;
+
+      let stale = Number(dev.ram_used_gb || 0) <= 0;
+      if (!stale) {
+        try {
+          const latest = db
+            .prepare('SELECT recorded_at FROM device_telemetry_history WHERE device_id = ? ORDER BY recorded_at DESC, id DESC LIMIT 1')
+            .get(dev.id) as { recorded_at?: string } | undefined;
+          if (!latest?.recorded_at) {
+            stale = true;
+          } else {
+            const latestMs = new Date(String(latest.recorded_at).replace(' ', 'T')).getTime();
+            stale = Number.isNaN(latestMs) || nowMs - latestMs >= 30_000;
+          }
+        } catch {
+          stale = true;
+        }
+      }
+      if (stale) {
+        lastLiveProbeAt = nowMs;
+        void meshBridge.sampleLiveTelemetry(dev.id).catch(() => {});
+      }
+    };
 
     const emitSample = () => {
       if (socket.readyState !== 1) return; // 1 = WebSocket.OPEN
@@ -529,7 +850,7 @@ async function startServer() {
           .get(authorizedGuestGrantId) as { status?: string; expires_at?: string } | undefined;
         if (
           !grantCheck ||
-          grantCheck.status === 'revoked' ||
+          grantCheck.status !== 'active' ||
           !grantCheck.expires_at ||
           new Date(grantCheck.expires_at).getTime() <= Date.now()
         ) {
@@ -540,12 +861,20 @@ async function startServer() {
 
       if (targetDeviceId) {
         const dev = db
-          .prepare(
-            'SELECT id, tenant_id, status, lifecycle_state, cpu_usage, ram_used_gb, ram_total_gb FROM devices WHERE id = ?'
-          )
+          .prepare(`
+            SELECT id, tenant_id, status, lifecycle_state, mesh_node_id,
+                   cpu_usage, ram_used_gb, ram_total_gb,
+                   disk_free_gb, disk_total_gb,
+                   net_rx_mbps, net_tx_mbps, uptime_seconds, last_seen
+            FROM devices
+            WHERE id = ?
+          `)
           .get(targetDeviceId) as any;
 
-        if (!dev || (auth && !canUserAccessTenant(auth.user, dev.tenant_id))) {
+        if (
+          !dev ||
+          (auth && (!hasUserPermission(auth.user, 'devices:read') || !canUserAccessTenant(auth.user, dev.tenant_id)))
+        ) {
           socket.close(1008, 'Unauthorized device');
           return;
         }
@@ -559,14 +888,27 @@ async function startServer() {
               online: false,
               cpuUsage: 0,
               ramUsageGb: 0,
+              ramTotalGb: Number(dev.ram_total_gb || 0),
+              diskFreeGb: Number(dev.disk_free_gb || 0),
+              diskTotalGb: Number(dev.disk_total_gb || 0),
+              netRxMbps: 0,
+              netTxMbps: 0,
               networkMbps: 0
             })
           );
           return;
         }
 
+        triggerLiveTelemetryProbeIfStale(dev);
+
         const cpuVal = Number(Number(dev.cpu_usage || 0).toFixed(1));
-        const ramVal = Number(Number(dev.ram_used_gb || 0).toFixed(1));
+        const ramVal = Number(Number(dev.ram_used_gb || 0).toFixed(2));
+        const ramTotal = Number(Number(dev.ram_total_gb || 0).toFixed(2));
+        const diskFree = Number(Number(dev.disk_free_gb || 0).toFixed(2));
+        const diskTotal = Number(Number(dev.disk_total_gb || 0).toFixed(2));
+        const netRx = Number(Number(dev.net_rx_mbps || 0).toFixed(3));
+        const netTx = Number(Number(dev.net_tx_mbps || 0).toFixed(3));
+        const netTotal = Number((netRx + netTx).toFixed(2));
         socket.send(
           JSON.stringify({
             type: 'telemetry_tick',
@@ -575,10 +917,16 @@ async function startServer() {
             online: true,
             cpu: cpuVal,
             ramGb: ramVal,
-            netMbps: '0.4',
+            ramTotalGb: ramTotal,
+            diskFreeGb: diskFree,
+            diskTotalGb: diskTotal,
+            netRxMbps: netRx,
+            netTxMbps: netTx,
+            netMbps: netTotal.toFixed(2),
             cpuUsage: cpuVal,
             ramUsageGb: ramVal,
-            networkMbps: 0.4
+            networkMbps: netTotal,
+            uptimeSeconds: Number(dev.uptime_seconds || 0)
           })
         );
         return;
@@ -593,6 +941,7 @@ async function startServer() {
       const cpus = os.cpus().length || 1;
       const loadPct = Number(Math.min(100, Math.max(0.5, (os.loadavg()[0] / cpus) * 100)).toFixed(1));
       const usedRamGb = Number(((os.totalmem() - os.freemem()) / (1024 * 1024 * 1024)).toFixed(1));
+      const hostNetMbps = sampleHostNetMbps();
 
       socket.send(
         JSON.stringify({
@@ -601,10 +950,10 @@ async function startServer() {
           online: true,
           cpu: loadPct,
           ramGb: usedRamGb,
-          netMbps: '0.2',
+          netMbps: hostNetMbps.toFixed(2),
           cpuUsage: loadPct,
           ramUsageGb: usedRamGb,
-          networkMbps: 0.2
+          networkMbps: hostNetMbps
         })
       );
     };
@@ -692,7 +1041,7 @@ async function startServer() {
 
   try {
     await server.listen({ port: PORT, host: HOST });
-    console.log(`\n🔮 Vitrine RMM v2.6.1 control plane listening on http://${HOST}:${PORT}`);
+    console.log(`\n🔮 Vitrine RMM v${APP_VERSION} control plane listening on http://${HOST}:${PORT}`);
   } catch (err) {
     server.log.error(err);
     process.exit(1);

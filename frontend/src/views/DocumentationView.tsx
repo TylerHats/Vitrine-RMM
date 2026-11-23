@@ -28,9 +28,180 @@ import {
   fetchScripts,
   runScript
 } from '../services/api.js';
-import { canMutateFleet } from '../utils/permissions.js';
+import { canMutateFleet, hasPermission, isTechnicianOrAbove } from '../utils/permissions.js';
 import { copyToClipboard } from '../utils/clipboard.js';
+import { sanitizeSafeUrl } from '../utils/urlSafety.js';
 import { MfaChallengeModal } from '../components/MfaChallengeModal.js';
+
+function renderInlineMarkdown(text: string): React.ReactNode[] {
+  const nodes: React.ReactNode[] = [];
+  const tokenRe = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]+\]\([^)]+\))/g;
+  let lastIdx = 0;
+  let match: RegExpExecArray | null;
+  let keyIdx = 0;
+  while ((match = tokenRe.exec(text)) !== null) {
+    if (match.index > lastIdx) {
+      nodes.push(text.slice(lastIdx, match.index));
+    }
+    const tok = match[0];
+    if (tok.startsWith('`') && tok.endsWith('`')) {
+      nodes.push(
+        <code
+          key={`c-${keyIdx++}`}
+          style={{
+            background: 'var(--surface-panel)',
+            border: '1px solid var(--glass-border)',
+            padding: '0.08rem 0.35rem',
+            borderRadius: '4px',
+            fontFamily: 'var(--font-mono)',
+            fontSize: '0.84em'
+          }}
+        >
+          {tok.slice(1, -1)}
+        </code>
+      );
+    } else if (tok.startsWith('**') && tok.endsWith('**')) {
+      nodes.push(<strong key={`b-${keyIdx++}`}>{tok.slice(2, -2)}</strong>);
+    } else if (tok.startsWith('*') && tok.endsWith('*')) {
+      nodes.push(<em key={`i-${keyIdx++}`}>{tok.slice(1, -1)}</em>);
+    } else if (tok.startsWith('[')) {
+      const linkMatch = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(tok);
+      if (linkMatch) {
+        const safeHref = sanitizeSafeUrl(linkMatch[2]);
+        if (safeHref) {
+          nodes.push(
+            <a
+              key={`a-${keyIdx++}`}
+              href={safeHref}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: 'var(--primary)', textDecoration: 'underline' }}
+            >
+              {linkMatch[1]}
+            </a>
+          );
+        } else {
+          nodes.push(linkMatch[1]);
+        }
+      } else {
+        nodes.push(tok);
+      }
+    }
+    lastIdx = tokenRe.lastIndex;
+  }
+  if (lastIdx < text.length) {
+    nodes.push(text.slice(lastIdx));
+  }
+  return nodes;
+}
+
+function renderSafeMarkdown(markdown: string): React.ReactNode {
+  const lines = String(markdown || '').split(/\r?\n/);
+  const blocks: React.ReactNode[] = [];
+  let i = 0;
+  let blockKey = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^```/.test(line.trim())) {
+      const codeLines: string[] = [];
+      i++;
+      while (i < lines.length && !/^```/.test(lines[i].trim())) {
+        codeLines.push(lines[i]);
+        i++;
+      }
+      if (i < lines.length) i++;
+      blocks.push(
+        <pre
+          key={`pre-${blockKey++}`}
+          style={{
+            background: 'var(--surface-panel)',
+            border: '1px solid var(--glass-border)',
+            borderRadius: '8px',
+            padding: '0.75rem 0.95rem',
+            fontFamily: 'var(--font-mono)',
+            fontSize: '0.8rem',
+            overflowX: 'auto',
+            margin: '0.5rem 0'
+          }}
+        >
+          <code>{codeLines.join('\n')}</code>
+        </pre>
+      );
+      continue;
+    }
+
+    const headingMatch = /^(#{1,4})\s+(.+)$/.exec(line.trim());
+    if (headingMatch) {
+      const level = headingMatch[1].length;
+      const size = level === 1 ? '1.22rem' : level === 2 ? '1.05rem' : '0.94rem';
+      blocks.push(
+        <div key={`h-${blockKey++}`} style={{ fontSize: size, fontWeight: 700, margin: '0.65rem 0 0.25rem', color: 'var(--text-main)' }}>
+          {renderInlineMarkdown(headingMatch[2])}
+        </div>
+      );
+      i++;
+      continue;
+    }
+
+    if (/^\s*[-*]\s+/.test(line)) {
+      const items: string[] = [];
+      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*[-*]\s+/, ''));
+        i++;
+      }
+      blocks.push(
+        <ul key={`ul-${blockKey++}`} style={{ margin: '0.35rem 0', paddingLeft: '1.35rem', display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+          {items.map((item, idx) => (
+            <li key={idx}>{renderInlineMarkdown(item)}</li>
+          ))}
+        </ul>
+      );
+      continue;
+    }
+
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items: string[] = [];
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*\d+\.\s+/, ''));
+        i++;
+      }
+      blocks.push(
+        <ol key={`ol-${blockKey++}`} style={{ margin: '0.35rem 0', paddingLeft: '1.35rem', display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+          {items.map((item, idx) => (
+            <li key={idx}>{renderInlineMarkdown(item)}</li>
+          ))}
+        </ol>
+      );
+      continue;
+    }
+
+    if (!line.trim()) {
+      i++;
+      continue;
+    }
+
+    const paraLines: string[] = [];
+    while (
+      i < lines.length &&
+      lines[i].trim() !== '' &&
+      !/^```/.test(lines[i].trim()) &&
+      !/^#{1,4}\s+/.test(lines[i].trim()) &&
+      !/^\s*[-*]\s+/.test(lines[i]) &&
+      !/^\s*\d+\.\s+/.test(lines[i])
+    ) {
+      paraLines.push(lines[i]);
+      i++;
+    }
+    blocks.push(
+      <p key={`p-${blockKey++}`} style={{ margin: '0.35rem 0', lineHeight: 1.65 }}>
+        {renderInlineMarkdown(paraLines.join(' '))}
+      </p>
+    );
+  }
+
+  return <div style={{ fontSize: '0.88rem', color: 'var(--text-main)' }}>{blocks}</div>;
+}
 
 interface DocumentationViewProps {
   tenants: Tenant[];
@@ -75,7 +246,9 @@ export const DocumentationView: React.FC<DocumentationViewProps> = ({
   const [notice, setNotice] = useState<string | null>(null);
   const [noticeIsError, setNoticeIsError] = useState(false);
 
-  const allowEdit = canMutateFleet(currentUser);
+  const allowEdit = hasPermission(currentUser, 'docs:write') || canMutateFleet(currentUser);
+  const canRunScripts = hasPermission(currentUser, 'scripts:run');
+  const canRevealVault = isTechnicianOrAbove(currentUser);
 
   const loadDocs = useCallback(async () => {
     const [docs, scList] = await Promise.all([
@@ -88,9 +261,9 @@ export const DocumentationView: React.FC<DocumentationViewProps> = ({
     ]);
     setArticles(docs);
     setScripts(scList);
-    if (docs.length > 0) {
-      setSelectedArticleId((prev) => prev || (docs[0]?.id ?? null));
-    }
+    setSelectedArticleId((prev) =>
+      prev && docs.some((d) => d.id === prev) ? prev : (docs[0]?.id ?? null)
+    );
   }, [selectedTenantId, categoryFilter, searchText, currentUser?.role]);
 
   useEffect(() => {
@@ -108,7 +281,7 @@ export const DocumentationView: React.FC<DocumentationViewProps> = ({
     setTitle('');
     setCategory('SOP Runbook');
     setDocTenantId(selectedTenantId !== 'all' ? selectedTenantId : '');
-    setTagsInput('network, recovery');
+    setTagsInput('');
     setIsPinned(false);
     setLinkedScriptId('');
     setSecretsDraft([]);
@@ -271,7 +444,7 @@ export const DocumentationView: React.FC<DocumentationViewProps> = ({
             MSP Documentation, SOPs &amp; Runbooks
           </h2>
           <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-            Tenant-scoped knowledge base, architecture notes &amp; executable runbook links (NinjaOne Docs / IT Glue parity)
+            Tenant-scoped knowledge base, architecture notes &amp; executable runbook links
           </span>
         </div>
 
@@ -508,7 +681,7 @@ export const DocumentationView: React.FC<DocumentationViewProps> = ({
                       gap: '0.75rem',
                       padding: '0.65rem 0.85rem',
                       borderRadius: '6px',
-                      background: 'rgba(15, 23, 42, 0.55)',
+                      background: 'var(--surface-panel)',
                       border: '1px solid rgba(251, 191, 36, 0.35)'
                     }}
                   >
@@ -630,9 +803,21 @@ export const DocumentationView: React.FC<DocumentationViewProps> = ({
                       className="btn-glass btn-icon"
                       onClick={async () => {
                         if (!confirm(`Delete documentation article "${activeArticle.title}"?`)) return;
-                        await deleteDocumentationArticle(activeArticle.id);
-                        setSelectedArticleId(null);
-                        loadDocs();
+                        try {
+                          const res: any = await deleteDocumentationArticle(activeArticle.id);
+                          if (res?.success === false) {
+                            setNoticeIsError(true);
+                            setNotice(res.error || 'Failed to delete documentation article.');
+                            return;
+                          }
+                          setNoticeIsError(false);
+                          setNotice(`Deleted runbook "${activeArticle.title}".`);
+                          setSelectedArticleId(null);
+                          loadDocs();
+                        } catch (err: any) {
+                          setNoticeIsError(true);
+                          setNotice(err?.message || 'Failed to delete documentation article.');
+                        }
                       }}
                     >
                       <Trash2 size={14} color="#ef4444" />
@@ -641,7 +826,7 @@ export const DocumentationView: React.FC<DocumentationViewProps> = ({
                 )}
               </div>
 
-              {activeArticle.linked_script_id && allowEdit && (
+              {activeArticle.linked_script_id && canRunScripts && (
                 <div
                   style={{
                     padding: '0.75rem 1rem',
@@ -670,11 +855,17 @@ export const DocumentationView: React.FC<DocumentationViewProps> = ({
                       onChange={(e) => setTargetDeviceId(e.target.value)}
                     >
                       <option value="">-- Select Target Endpoint --</option>
-                      {devices.map((d) => (
-                        <option key={d.id} value={d.id}>
-                          {d.hostname} ({d.ip_address})
-                        </option>
-                      ))}
+                      {devices
+                        .filter(
+                          (d) =>
+                            (d.lifecycle_state || 'active') !== 'archived' &&
+                            (selectedTenantId === 'all' || d.tenant_id === selectedTenantId)
+                        )
+                        .map((d) => (
+                          <option key={d.id} value={d.id}>
+                            {d.hostname} ({d.ip_address})
+                          </option>
+                        ))}
                     </select>
                     <button
                       type="button"
@@ -705,30 +896,36 @@ export const DocumentationView: React.FC<DocumentationViewProps> = ({
                     <span style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', fontSize: '0.82rem', fontWeight: 600 }}>
                       <Lock size={15} color="#fbbf24" /> Encrypted Runbook Credentials Attached (AES-256-GCM)
                     </span>
-                    {revealedSecrets[activeArticle.id] ? (
-                      <button
-                        type="button"
-                        className="btn-glass"
-                        style={{ fontSize: '0.75rem' }}
-                        onClick={() =>
-                          setRevealedSecrets((prev) => {
-                            const copy = { ...prev };
-                            delete copy[activeArticle.id];
-                            return copy;
-                          })
-                        }
-                      >
-                        <EyeOff size={13} /> Hide Vault Secrets
-                      </button>
+                    {canRevealVault ? (
+                      revealedSecrets[activeArticle.id] ? (
+                        <button
+                          type="button"
+                          className="btn-glass"
+                          style={{ fontSize: '0.75rem' }}
+                          onClick={() =>
+                            setRevealedSecrets((prev) => {
+                              const copy = { ...prev };
+                              delete copy[activeArticle.id];
+                              return copy;
+                            })
+                          }
+                        >
+                          <EyeOff size={13} /> Hide Vault Secrets
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className="btn-glass"
+                          style={{ fontSize: '0.75rem' }}
+                          onClick={() => performRevealSecrets(activeArticle.id, false)}
+                        >
+                          <Eye size={13} /> Reveal Vault Secrets
+                        </button>
+                      )
                     ) : (
-                      <button
-                        type="button"
-                        className="btn-glass"
-                        style={{ fontSize: '0.75rem' }}
-                        onClick={() => performRevealSecrets(activeArticle.id, false)}
-                      >
-                        <Eye size={13} /> Reveal Vault Secrets
-                      </button>
+                      <span style={{ fontSize: '0.74rem', color: 'var(--text-dim)' }}>
+                        Technician role or higher required to decrypt
+                      </span>
                     )}
                   </div>
                   {revealedSecrets[activeArticle.id] && (
@@ -743,14 +940,15 @@ export const DocumentationView: React.FC<DocumentationViewProps> = ({
                             gap: '0.5rem',
                             padding: '0.45rem 0.7rem',
                             borderRadius: '6px',
-                            background: 'rgba(15, 23, 42, 0.5)',
+                            background: 'var(--surface-panel)',
+                            border: '1px solid var(--glass-border)',
                             fontFamily: 'var(--font-mono)',
                             fontSize: '0.78rem'
                           }}
                         >
                           <span style={{ color: 'var(--text-muted)' }}>{sec.label}</span>
                           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                            <strong style={{ color: '#fde68a' }}>{sec.value}</strong>
+                            <strong style={{ color: 'var(--text-main)' }}>{sec.value}</strong>
                             <button
                               type="button"
                               className="btn-glass btn-icon"
@@ -774,18 +972,7 @@ export const DocumentationView: React.FC<DocumentationViewProps> = ({
                 </div>
               )}
 
-              <pre
-                style={{
-                  margin: 0,
-                  whiteSpace: 'pre-wrap',
-                  fontFamily: 'var(--font-sans)',
-                  fontSize: '0.88rem',
-                  lineHeight: 1.65,
-                  color: 'var(--text-main)'
-                }}
-              >
-                {activeArticle.content_markdown}
-              </pre>
+              {renderSafeMarkdown(activeArticle.content_markdown)}
             </div>
           ) : (
             <div style={{ padding: '3rem 1.5rem', textAlign: 'center', color: 'var(--text-dim)' }}>

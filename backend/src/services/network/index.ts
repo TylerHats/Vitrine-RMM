@@ -626,6 +626,23 @@ export function probeTcpPort(host: string, port: number, timeoutMs = 1500): Prom
 }
 
 export class NetworkDiscoveryService {
+  private formatApplianceRow(row: Record<string, any>): Record<string, any> {
+    const clean = { ...row };
+    const hasApiToken = Boolean(clean.vendor_api_token_encrypted || clean.api_token_encrypted);
+    const hasSnmpCommunity = Boolean(clean.snmp_community_encrypted);
+    const hasSnmpV3AuthKey = Boolean(clean.snmp_v3_auth_key_encrypted);
+    delete clean.vendor_api_token_encrypted;
+    delete clean.api_token_encrypted;
+    delete clean.snmp_community_encrypted;
+    delete clean.snmp_v3_auth_key_encrypted;
+    return {
+      ...clean,
+      hasApiToken,
+      hasSnmpCommunity,
+      hasSnmpV3AuthKey
+    };
+  }
+
   public async pollAppliance(applianceId: string) {
     const row = db.prepare('SELECT * FROM network_appliances WHERE id = ?').get(applianceId) as any;
     if (!row) {
@@ -685,7 +702,7 @@ export class NetworkDiscoveryService {
           version: snmpVersion,
           community,
           v3Username: row.snmp_v3_username || undefined,
-          v3AuthProtocol: row.snmp_v3_auth_protocol || 'SHA',
+          v3AuthProtocol: row.snmp_v3_auth_proto || row.snmp_v3_auth_protocol || 'SHA',
           v3AuthKey: v3AuthKey || undefined,
           timeoutMs: 2200
         },
@@ -725,7 +742,8 @@ export class NetworkDiscoveryService {
 
     // 2. Vendor-specific HTTPS REST API Pollers (Redfish iDRAC/iLO, FortiOS, Synology DSM, UniFi)
     const vendorLower = `${row.manufacturer || row.vendor || ''} ${row.vendor_model || ''} ${row.appliance_type || ''} ${row.model || ''}`.toLowerCase();
-    const apiSecret = decryptVaultSecret(row.api_token_encrypted) || '';
+    const apiSecret = decryptVaultSecret(row.vendor_api_token_encrypted || row.api_token_encrypted) || '';
+    const allowInsecureTls = Boolean(row.allow_self_signed ?? 0);
 
     if (vendorLower.includes('idrac') || vendorLower.includes('ilo') || vendorLower.includes('redfish') || vendorLower.includes('bmc')) {
       try {
@@ -738,7 +756,7 @@ export class NetworkDiscoveryService {
         const rf = await safeOutboundFetch(`https://${host}/redfish/v1/Systems`, {
           headers,
           timeoutMs: 4000,
-          allowInsecureTls: true,
+          allowInsecureTls,
           safety: { allowLoopback: false, allowPrivateLan: true }
         });
         if (rf.status >= 200 && rf.status < 400) {
@@ -749,7 +767,7 @@ export class NetworkDiscoveryService {
             const sysDetail = await safeOutboundFetch(`https://${host}${firstMember}`, {
               headers,
               timeoutMs: 4000,
-              allowInsecureTls: true,
+              allowInsecureTls,
               safety: { allowLoopback: false, allowPrivateLan: true }
             });
             if (sysDetail.status >= 200 && sysDetail.status < 300) {
@@ -769,7 +787,7 @@ export class NetworkDiscoveryService {
         const fg = await safeOutboundFetch(`https://${host}/api/v2/monitor/system/status`, {
           headers,
           timeoutMs: 4000,
-          allowInsecureTls: true,
+          allowInsecureTls,
           safety: { allowLoopback: false, allowPrivateLan: true }
         });
         if (fg.status >= 200 && fg.status < 300) {
@@ -785,7 +803,7 @@ export class NetworkDiscoveryService {
           `https://${host}:5001/webapi/query.cgi?api=SYNO.API.Info&version=1&method=query&query=SYNO.API.Auth,SYNO.Core.System`,
           {
             timeoutMs: 3500,
-            allowInsecureTls: true,
+            allowInsecureTls,
             safety: { allowLoopback: false, allowPrivateLan: true }
           }
         );
@@ -798,7 +816,7 @@ export class NetworkDiscoveryService {
       try {
         const uf = await safeOutboundFetch(`https://${host}:8443/status`, {
           timeoutMs: 3500,
-          allowInsecureTls: true,
+          allowInsecureTls,
           safety: { allowLoopback: false, allowPrivateLan: true }
         });
         if (uf.status >= 200 && uf.status < 400) {
@@ -858,7 +876,7 @@ export class NetworkDiscoveryService {
 
     const updated = (db.prepare('SELECT * FROM network_appliances WHERE id = ?').get(applianceId) || {}) as Record<string, any>;
     return {
-      ...updated,
+      ...this.formatApplianceRow(updated),
       status: newStatus,
       latencyMs: latencyMs ?? 0
     };
@@ -876,6 +894,9 @@ export class NetworkDiscoveryService {
       apiToken?: string;
     }
   ) {
+    const tableCols = new Set(
+      (db.prepare('PRAGMA table_info(network_appliances)').all() as Array<{ name: string }>).map((c) => c.name)
+    );
     const sets: string[] = [];
     const vals: any[] = [];
     if (creds.snmpVersion) {
@@ -895,7 +916,8 @@ export class NetworkDiscoveryService {
       vals.push(creds.snmpV3Username || null);
     }
     if (creds.snmpV3AuthProtocol !== undefined) {
-      sets.push('snmp_v3_auth_protocol = ?');
+      const authProtoCol = tableCols.has('snmp_v3_auth_proto') ? 'snmp_v3_auth_proto' : 'snmp_v3_auth_protocol';
+      sets.push(`${authProtoCol} = ?`);
       vals.push(creds.snmpV3AuthProtocol);
     }
     if (creds.snmpV3AuthKey !== undefined && creds.snmpV3AuthKey !== '••••••••') {
@@ -903,7 +925,8 @@ export class NetworkDiscoveryService {
       vals.push(creds.snmpV3AuthKey ? encryptVaultSecret(creds.snmpV3AuthKey) : null);
     }
     if (creds.apiToken !== undefined && creds.apiToken !== '••••••••') {
-      sets.push('api_token_encrypted = ?');
+      const tokenCol = tableCols.has('vendor_api_token_encrypted') ? 'vendor_api_token_encrypted' : 'api_token_encrypted';
+      sets.push(`${tokenCol} = ?`);
       vals.push(creds.apiToken ? encryptVaultSecret(creds.apiToken) : null);
     }
     if (sets.length > 0) {
@@ -1026,6 +1049,10 @@ export class NetworkDiscoveryService {
 
     if (params.autoRegister) {
       const serverHostname = os.hostname() || 'vitrine-control-plane';
+      const validCols = new Set(
+        (db.prepare('PRAGMA table_info(network_appliances)').all() as Array<{ name: string }>).map((c) => c.name)
+      );
+      const nowIso = new Date().toISOString();
       for (const d of discovered) {
         const existing = db
           .prepare('SELECT id FROM network_appliances WHERE tenant_id = ? AND ip_address = ?')
@@ -1034,27 +1061,34 @@ export class NetworkDiscoveryService {
           const mfg = d.sysDescr ? d.sysDescr.split(' ')[0].slice(0, 32) : 'Generic';
           const modelStr = d.inferredType.toUpperCase();
           const vendorModel = `${mfg} ${modelStr}`.trim();
-          db.prepare(`
-            INSERT INTO network_appliances (
-              id, tenant_id, name, appliance_type, manufacturer, model, vendor_model,
-              ip_address, mac_address, snmp_version, probe_device_id, probe_hostname,
-              status, firmware_version, snmp_community_encrypted, metrics_json, last_polled
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '00:00:00:00:00:00', '2c', 'control-plane', ?, 'Healthy', ?, ?, ?, ?)
-          `).run(
-            `net-${crypto.randomUUID().slice(0, 8)}`,
-            params.tenantId,
-            d.sysName || `Discovered-${d.ipAddress}`,
-            d.inferredType,
-            mfg,
-            modelStr,
-            vendorModel,
-            d.ipAddress,
-            serverHostname,
-            d.sysDescr ? d.sysDescr.slice(0, 64) : 'SNMP/TCP Discovered',
-            encryptVaultSecret(community),
-            JSON.stringify({ openTcpPorts: d.openPorts, latencyMs: d.latencyMs, sysDescr: d.sysDescr }),
-            new Date().toISOString()
-          );
+          const candidateRow: Record<string, unknown> = {
+            id: `net-${crypto.randomUUID().slice(0, 8)}`,
+            tenant_id: params.tenantId,
+            name: d.sysName || `Discovered-${d.ipAddress}`,
+            appliance_type: d.inferredType,
+            vendor: mfg,
+            manufacturer: mfg,
+            model: modelStr,
+            vendor_model: vendorModel,
+            ip_address: d.ipAddress,
+            mac_address: '00:00:00:00:00:00',
+            snmp_version: '2c',
+            probe_device_id: null,
+            probe_hostname: serverHostname,
+            status: 'Healthy',
+            latency_ms: d.latencyMs,
+            firmware_version: d.sysDescr ? d.sysDescr.slice(0, 64) : 'SNMP/TCP Discovered',
+            snmp_community_encrypted: encryptVaultSecret(community),
+            metrics_json: JSON.stringify({ openTcpPorts: d.openPorts, latencyMs: d.latencyMs, sysDescr: d.sysDescr }),
+            last_polled: nowIso
+          };
+          const cols = Object.keys(candidateRow).filter((c) => validCols.has(c));
+          if (cols.length > 0) {
+            const placeholders = cols.map(() => '?').join(', ');
+            db.prepare(`INSERT INTO network_appliances (${cols.join(', ')}) VALUES (${placeholders})`).run(
+              ...cols.map((c) => candidateRow[c])
+            );
+          }
         }
       }
     }

@@ -13,6 +13,9 @@ import {
 import { executeScheduledAutomationNow, matchesCronExpression } from '../automation/index.js';
 import { quoteBashLiteral, quotePowerShellLiteral } from '../agent/installerGenerator.js';
 import { meshBridge } from '../meshcentral/index.js';
+import { pruneTelemetryHistory } from '../telemetry/index.js';
+import { decryptVaultSecret } from '../vault/index.js';
+import { codeSigningService } from '../signing/index.js';
 
 let fastTimer: ReturnType<typeof setInterval> | null = null;
 let conditionTimer: ReturnType<typeof setInterval> | null = null;
@@ -33,23 +36,30 @@ registerDatabaseSwapHooks(
 const hourlyWatchdogRuns = new Map<string, { hourBucket: number; count: number }>();
 const monitorCooldownMap = new Map<string, number>();
 
-function parseIncludePathsArray(rawJson?: string | null, isWindows = false): string[] {
+function parseSafePathsArray(
+  rawJson: string | null | undefined,
+  isWindows: boolean,
+  fallbackDefaults: string[]
+): string[] {
   try {
     const parsed = typeof rawJson === 'string' ? JSON.parse(rawJson) : rawJson;
     if (Array.isArray(parsed)) {
       const valid = parsed
-        .filter((p): p is string => typeof p === 'string' && p.trim().length > 0 && !p.includes('\0'))
+        .filter(
+          (p): p is string =>
+            typeof p === 'string' &&
+            p.trim().length > 0 &&
+            !/[\0\r\n]/.test(p) &&
+            !p.trim().startsWith('-')
+        )
         .map((p) => p.trim());
-      if (valid.length > 0) {
-        const filtered = isWindows
-          ? valid.filter((p) => /^[a-zA-Z]:\\|^\\\\/.test(p))
-          : valid.filter((p) => p.startsWith('/'));
-        if (filtered.length > 0) return filtered;
-        return valid;
-      }
+      const filtered = isWindows
+        ? valid.filter((p) => /^[a-zA-Z]:\\|^\\\\/.test(p))
+        : valid.filter((p) => p.startsWith('/'));
+      if (filtered.length > 0) return filtered;
     }
   } catch {}
-  return isWindows ? ['C:\\Users'] : ['/etc', '/home'];
+  return fallbackDefaults;
 }
 
 function buildBackupJobCommand(
@@ -57,26 +67,35 @@ function buildBackupJobCommand(
   engineRaw: string | undefined,
   targetRepoRaw: string | undefined,
   includePathsJson: string | undefined,
-  jobId: string
-): { code: string; shell: 'powershell' | 'bash'; includePaths: string[] } {
+  jobId: string,
+  excludePathsJson?: string | null,
+  hasResticPassword = false
+): { code: string; shell: 'powershell' | 'bash'; includePaths: string[]; excludePaths: string[] } {
   const isWindows = String(osType || '').toLowerCase() === 'windows';
   const engine = String(engineRaw || 'restic').toLowerCase();
   const targetRepo = String(targetRepoRaw || '').trim();
-  const includePaths = parseIncludePathsArray(includePathsJson, isWindows);
+  const includePaths = parseSafePathsArray(includePathsJson, isWindows, isWindows ? ['C:\\Users'] : ['/etc', '/home']);
+  const excludePaths = parseSafePathsArray(excludePathsJson, isWindows, []);
   const safeJobSlug = jobId.replace(/[^a-zA-Z0-9_-]/g, '');
 
   if (isWindows) {
+    const psResticEnv = hasResticPassword
+      ? 'if ($env:VITRINE_PARAM_RESTIC_PASSWORD) { $env:RESTIC_PASSWORD = $env:VITRINE_PARAM_RESTIC_PASSWORD }; '
+      : '';
     if (engine === 'restic' && targetRepo) {
       const quotedRepo = quotePowerShellLiteral(targetRepo);
       const quotedPaths = includePaths.map((p) => quotePowerShellLiteral(p)).join(', ');
-      const code = `$repo = ${quotedRepo}; $paths = @(${quotedPaths}); if (Get-Command restic -ErrorAction SilentlyContinue) { & restic -r $repo backup @paths } else { vssadmin list shadows }`;
-      return { code, shell: 'powershell', includePaths };
+      const exArgs = excludePaths.map((p) => `'--exclude', ${quotePowerShellLiteral(p)}`).join(', ');
+      const exDecl = exArgs ? `$exArgs = @(${exArgs}); ` : '$exArgs = @(); ';
+      const code = `${psResticEnv}$repo = ${quotedRepo}; $paths = @(${quotedPaths}); ${exDecl}if (Get-Command restic -ErrorAction SilentlyContinue) { & restic -r $repo backup @paths @exArgs } else { vssadmin list shadows }`;
+      return { code, shell: 'powershell', includePaths, excludePaths };
     }
     if (engine === 'vss' || !targetRepo) {
       return {
         code: `vssadmin list shadows`,
         shell: 'powershell',
-        includePaths
+        includePaths,
+        excludePaths
       };
     }
     const quotedArchive = quotePowerShellLiteral(`C:\\ProgramData\\VitrineBackup-${safeJobSlug}.zip`);
@@ -84,31 +103,42 @@ function buildBackupJobCommand(
     return {
       code: `Compress-Archive -Path @(${quotedPaths}) -DestinationPath ${quotedArchive} -Force -ErrorAction Stop; Write-Output "Snapshot saved: ${safeJobSlug}"`,
       shell: 'powershell',
-      includePaths
+      includePaths,
+      excludePaths
     };
   }
 
   // POSIX (Linux / macOS)
+  const quotedPaths = includePaths.map((p) => quoteBashLiteral(p)).join(' ');
+  const tarExcludeArgs = excludePaths.map((p) => `--exclude=${quoteBashLiteral(p)}`).join(' ');
+  const resticExcludeArgs = excludePaths.map((p) => `--exclude=${quoteBashLiteral(p)}`).join(' ');
+  const bashResticEnv = hasResticPassword
+    ? 'if [ -n "${VITRINE_PARAM_RESTIC_PASSWORD:-}" ]; then export RESTIC_PASSWORD="$VITRINE_PARAM_RESTIC_PASSWORD"; fi; '
+    : '';
+
   if (engine === 'restic' && targetRepo) {
     const quotedRepo = quoteBashLiteral(targetRepo);
-    const quotedPaths = includePaths.map((p) => quoteBashLiteral(p)).join(' ');
     const fallbackTar = quoteBashLiteral(`/tmp/vitrine-snap-${safeJobSlug}.tar.gz`);
+    const tarExPart = tarExcludeArgs ? `${tarExcludeArgs} ` : '';
+    const resticExPart = resticExcludeArgs ? ` ${resticExcludeArgs}` : '';
     return {
-      code: `if command -v restic >/dev/null 2>&1; then restic -r ${quotedRepo} backup ${quotedPaths}; else tar -czf ${fallbackTar} ${quotedPaths} 2>/dev/null && ls -lh ${fallbackTar} && rm -f ${fallbackTar}; fi`,
+      code: `${bashResticEnv}if command -v restic >/dev/null 2>&1; then restic -r ${quotedRepo} backup${resticExPart} -- ${quotedPaths}; else tar -czf ${fallbackTar} ${tarExPart}-- ${quotedPaths} 2>/dev/null && ls -lh ${fallbackTar} && rm -f ${fallbackTar}; fi`,
       shell: 'bash',
-      includePaths
+      includePaths,
+      excludePaths
     };
   }
 
   const archiveDest = targetRepo
     ? quoteBashLiteral(`${targetRepo.replace(/\/+$/, '')}/vitrine-snap-${safeJobSlug}.tar.gz`)
     : quoteBashLiteral(`/tmp/vitrine-snap-${safeJobSlug}.tar.gz`);
-  const quotedPaths = includePaths.map((p) => quoteBashLiteral(p)).join(' ');
+  const tarExPart = tarExcludeArgs ? `${tarExcludeArgs} ` : '';
   const cleanupTail = targetRepo ? '' : ` && rm -f ${archiveDest}`;
   return {
-    code: `tar -czf ${archiveDest} ${quotedPaths} 2>/dev/null && ls -lh ${archiveDest}${cleanupTail}`,
+    code: `tar -czf ${archiveDest} ${tarExPart}-- ${quotedPaths} 2>/dev/null && ls -lh ${archiveDest}${cleanupTail}`,
     shell: 'bash',
-    includePaths
+    includePaths,
+    excludePaths
   };
 }
 
@@ -157,7 +187,7 @@ export async function runMaintenanceAndLifecycleTick(): Promise<{
     autoArchivedOffboards = sweep.autoArchivedCount;
   } catch {}
 
-  // 3. Scheduled LAPS password expiry check (verified live delivery before vault commit; offline-safe deferral)
+  // 3. Scheduled LAPS password expiry check & deferred online retry (verified live delivery before vault commit)
   try {
     const dueRows = db
       .prepare(`
@@ -165,9 +195,14 @@ export async function runMaintenanceAndLifecycleTick(): Promise<{
         FROM laps_vault v
         JOIN devices d ON d.id = v.device_id
         WHERE COALESCE(d.lifecycle_state, 'active') = 'active'
-          AND COALESCE(v.rotation_pending_online, 0) = 0
-          AND v.expires_at IS NOT NULL
-          AND datetime(v.expires_at) <= datetime(?)
+          AND (
+            (COALESCE(v.rotation_pending_online, 0) = 1 AND d.status = 'online')
+            OR (
+              COALESCE(v.rotation_pending_online, 0) = 0
+              AND v.expires_at IS NOT NULL
+              AND datetime(v.expires_at) <= datetime(?)
+            )
+          )
       `)
       .all(nowIso) as Array<{ device_id: string }>;
 
@@ -179,17 +214,55 @@ export async function runMaintenanceAndLifecycleTick(): Promise<{
     }
   } catch {}
 
+  // 3b. Companion auto-deploy sweep for online MS2-managed devices queued after OOBE
+  try {
+    const oobeRow = db.prepare('SELECT oobe_completed, is_onboarded FROM settings WHERE id = 1').get() as
+      | { oobe_completed?: number; is_onboarded?: number }
+      | undefined;
+    if (oobeRow?.oobe_completed === 1 || oobeRow?.is_onboarded === 1) {
+      const pendingCompanions = db
+        .prepare(`
+          SELECT id
+          FROM devices
+          WHERE COALESCE(companion_deploy_pending, 0) = 1
+            AND COALESCE(companion_installed, 0) = 0
+            AND COALESCE(lifecycle_state, 'active') = 'active'
+            AND status = 'online'
+            AND mesh_node_id IS NOT NULL
+          LIMIT 5
+        `)
+        .all() as Array<{ id: string }>;
+      if (pendingCompanions.length > 0) {
+        const { meshBridge } = await import('../meshcentral/index.js');
+        if (meshBridge.getStatus().connected) {
+          for (const dev of pendingCompanions) {
+            try {
+              await meshBridge.deployCompanionOverMesh(dev.id);
+            } catch {}
+          }
+        }
+      }
+    }
+  } catch {}
+
   // 4. Prune expired auth sessions & aged session recordings (cleaning up .webm video files strictly inside RECORDINGS_DIR_PATH!)
   try {
     db.prepare('DELETE FROM auth_sessions WHERE datetime(expires_at) <= datetime(?)').run(nowIso);
 
     let retentionDays = 90;
     try {
-      const globalPol = db
-        .prepare("SELECT session_recording_retention_days FROM policies WHERE tier = 'global' LIMIT 1")
+      const settingsRow = db
+        .prepare('SELECT session_recording_retention_days FROM settings WHERE id = 1')
         .get() as { session_recording_retention_days?: number } | undefined;
-      if (globalPol?.session_recording_retention_days && globalPol.session_recording_retention_days > 0) {
-        retentionDays = globalPol.session_recording_retention_days;
+      if (settingsRow?.session_recording_retention_days && settingsRow.session_recording_retention_days > 0) {
+        retentionDays = settingsRow.session_recording_retention_days;
+      } else {
+        const globalPol = db
+          .prepare("SELECT session_recording_retention_days FROM policies WHERE tier = 'global' LIMIT 1")
+          .get() as { session_recording_retention_days?: number } | undefined;
+        if (globalPol?.session_recording_retention_days && globalPol.session_recording_retention_days > 0) {
+          retentionDays = globalPol.session_recording_retention_days;
+        }
       }
     } catch {}
     const cutoffIso = new Date(Date.now() - retentionDays * 86400 * 1000).toISOString();
@@ -216,6 +289,38 @@ export async function runMaintenanceAndLifecycleTick(): Promise<{
         } catch {}
       }
       db.prepare('DELETE FROM session_recordings WHERE id = ?').run(rec.id);
+    }
+
+    // Also prune aged telemetry history according to policy retention days
+    pruneTelemetryHistory();
+  } catch {}
+
+  // 4b. Lightweight background live telemetry sampling for online managed devices
+  // so RAM/CPU/Disk/Net usage & history charts remain accurate even without companion check-ins
+  try {
+    if (meshBridge.getStatus().connected) {
+      const twoMinAgoIso = new Date(Date.now() - 2 * 60_000).toISOString();
+      const staleOnline = db
+        .prepare(`
+          SELECT d.id
+          FROM devices d
+          WHERE d.status = 'online'
+            AND COALESCE(d.lifecycle_state, 'active') = 'active'
+            AND d.mesh_node_id IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM device_telemetry_history h
+              WHERE h.device_id = d.id AND datetime(h.recorded_at) > datetime(?)
+            )
+          ORDER BY COALESCE(d.ram_used_gb, 0) ASC, d.last_seen DESC
+          LIMIT 8
+        `)
+        .all(twoMinAgoIso) as Array<{ id: string }>;
+
+      for (const dev of staleOnline) {
+        try {
+          await meshBridge.sampleLiveTelemetry(dev.id);
+        } catch {}
+      }
     }
   } catch {}
 
@@ -316,11 +421,23 @@ export async function runMaintenanceAndLifecycleTick(): Promise<{
         os_type?: string;
       }>;
 
+      const rawResticPass =
+        bp.restic_password_encrypted || bp.repo_password_encrypted || bp.password_encrypted || '';
+      const resticPassword = rawResticPass ? decryptVaultSecret(rawResticPass) : '';
+
       for (const dev of onlineDevs) {
         const eff = resolveEffectiveDevicePolicy(dev.id);
         if (eff.backupPolicyId && eff.backupPolicyId !== bp.id) continue;
         const jobId = `bjob-${crypto.randomUUID()}`;
-        const built = buildBackupJobCommand(dev.os_type, bp.engine, bp.target_repo, bp.include_paths_json, jobId);
+        const built = buildBackupJobCommand(
+          dev.os_type,
+          bp.engine,
+          bp.target_repo,
+          bp.include_paths_json,
+          jobId,
+          bp.exclude_paths_json,
+          Boolean(resticPassword)
+        );
 
         db.prepare(`
           INSERT INTO device_backup_jobs (id, device_id, policy_id, engine, status, details, executed_at)
@@ -333,6 +450,8 @@ export async function runMaintenanceAndLifecycleTick(): Promise<{
           engine: bp.engine || 'restic',
           targetRepo: bp.target_repo || '',
           includePaths: built.includePaths,
+          excludePaths: built.excludePaths,
+          env: resticPassword ? { VITRINE_PARAM_RESTIC_PASSWORD: resticPassword } : {},
           shell: built.shell,
           language: built.shell,
           code: built.code
@@ -421,6 +540,35 @@ export async function runSelfHealingWatchdogSweep(): Promise<void> {
         let remStatus: 'Success' | 'Failed' = 'Success';
         let remOutput = '';
 
+        const isWin = String(dev.os_type || '').toLowerCase() === 'windows';
+        const scriptLang = scriptRow?.language === 'powershell' ? 'powershell' : scriptRow?.language === 'python' ? 'python' : 'bash';
+        const isScriptCompatible = Boolean(
+          scriptRow?.code && ((isWin && scriptLang === 'powershell') || (!isWin && scriptLang === 'bash') || scriptLang === 'python')
+        );
+
+        const runCompatibleRemediation = async (): Promise<{ ok: boolean; output: string; queued?: boolean }> => {
+          if (!scriptRow?.code || !isScriptCompatible) {
+            return { ok: false, output: 'No OS-compatible remediation script configured.' };
+          }
+          let codeToRun = scriptRow.code;
+          if (isWin && scriptLang === 'powershell') {
+            const wrapped = await codeSigningService.wrapPowerShellExecutionIfSigningEnabled(codeToRun);
+            if (wrapped.error && !wrapped.command) {
+              return { ok: false, output: wrapped.error };
+            }
+            codeToRun = wrapped.command;
+          }
+          const execRes = await meshBridge.executeCommandOnNode(dev.id, codeToRun, {
+            shell: scriptLang,
+            timeoutMs: 20000
+          });
+          return {
+            ok: execRes.exitCode === 0 || Boolean(execRes.queued),
+            output: execRes.output || `Executed remediation script ${scriptRow.name}.`,
+            queued: execRes.queued
+          };
+        };
+
         if (condType === 'service_stopped' && condValStr) {
           const svcs = await meshBridge.getServices(dev.id);
           const match = svcs.find((s) => s.name.toLowerCase() === condValStr.toLowerCase());
@@ -432,17 +580,10 @@ export async function runSelfHealingWatchdogSweep(): Promise<void> {
               : `Failed to restart stopped service '${match.name}'.`;
             if (!svcOk) remStatus = 'Failed';
 
-            if (scriptRow?.code) {
-              const isWin = String(dev.os_type || '').toLowerCase() === 'windows';
-              const lang = scriptRow.language === 'powershell' ? 'powershell' : 'bash';
-              if ((isWin && lang === 'powershell') || (!isWin && lang === 'bash')) {
-                const execRes = await meshBridge.executeCommandOnNode(dev.id, scriptRow.code, {
-                  shell: lang,
-                  timeoutMs: 15000
-                });
-                if (execRes.output) remOutput = `${remOutput}\n${execRes.output}`.trim();
-                if (execRes.exitCode !== 0 && !execRes.queued) remStatus = 'Failed';
-              }
+            if (isScriptCompatible) {
+              const remRes = await runCompatibleRemediation();
+              if (remRes.output) remOutput = `${remOutput}\n${remRes.output}`.trim();
+              if (!remRes.ok) remStatus = 'Failed';
             }
           }
         } else if (
@@ -451,43 +592,28 @@ export async function runSelfHealingWatchdogSweep(): Promise<void> {
         ) {
           const thresholdPct = Number(condValStr || 10);
           const freePct = (Number(dev.disk_free_gb || 0) / Number(dev.disk_total_gb)) * 100;
-          if (freePct < thresholdPct && scriptRow?.code) {
+          if (freePct < thresholdPct && isScriptCompatible) {
             triggered = true;
-            const isWin = String(dev.os_type || '').toLowerCase() === 'windows';
-            const lang = isWin ? 'powershell' : 'bash';
-            const execRes = await meshBridge.executeCommandOnNode(dev.id, scriptRow.code, {
-              shell: lang,
-              timeoutMs: 20000
-            });
-            remOutput = execRes.output || `Executed remediation script ${scriptRow.name}.`;
-            if (execRes.exitCode !== 0 && !execRes.queued) remStatus = 'Failed';
+            const remRes = await runCompatibleRemediation();
+            remOutput = remRes.output;
+            if (!remRes.ok) remStatus = 'Failed';
           }
         } else if (condType === 'cpu_high' || condType === 'high_cpu') {
           const thresholdPct = Number(condValStr || 90);
-          if (Number(dev.cpu_usage || 0) >= thresholdPct && scriptRow?.code) {
+          if (Number(dev.cpu_usage || 0) >= thresholdPct && isScriptCompatible) {
             triggered = true;
-            const isWin = String(dev.os_type || '').toLowerCase() === 'windows';
-            const lang = isWin ? 'powershell' : 'bash';
-            const execRes = await meshBridge.executeCommandOnNode(dev.id, scriptRow.code, {
-              shell: lang,
-              timeoutMs: 20000
-            });
-            remOutput = execRes.output || `Executed CPU remediation script ${scriptRow.name}.`;
-            if (execRes.exitCode !== 0 && !execRes.queued) remStatus = 'Failed';
+            const remRes = await runCompatibleRemediation();
+            remOutput = remRes.output;
+            if (!remRes.ok) remStatus = 'Failed';
           }
         } else if (condType === 'ram_high' || condType === 'high_ram' || condType === 'memory_high') {
           const thresholdPct = Number(condValStr || 90);
           const ramPct = dev.ram_total_gb > 0 ? (Number(dev.ram_used_gb || 0) / Number(dev.ram_total_gb)) * 100 : 0;
-          if (ramPct >= thresholdPct && scriptRow?.code) {
+          if (ramPct >= thresholdPct && isScriptCompatible) {
             triggered = true;
-            const isWin = String(dev.os_type || '').toLowerCase() === 'windows';
-            const lang = isWin ? 'powershell' : 'bash';
-            const execRes = await meshBridge.executeCommandOnNode(dev.id, scriptRow.code, {
-              shell: lang,
-              timeoutMs: 20000
-            });
-            remOutput = execRes.output || `Executed memory remediation script ${scriptRow.name}.`;
-            if (execRes.exitCode !== 0 && !execRes.queued) remStatus = 'Failed';
+            const remRes = await runCompatibleRemediation();
+            remOutput = remRes.output;
+            if (!remRes.ok) remStatus = 'Failed';
           }
         }
 
@@ -514,6 +640,19 @@ export async function runSelfHealingWatchdogSweep(): Promise<void> {
               new Date().toISOString()
             );
           } catch {}
+          if (remStatus === 'Failed' && Boolean(mon.alert_on_failure)) {
+            try {
+              db.prepare(`
+                INSERT INTO notifications (id, tenant_id, type, title, message, severity)
+                VALUES (?, ?, 'self_healing_failure', ?, ?, 'warning')
+              `).run(
+                `notif-rem-${crypto.randomUUID()}`,
+                dev.tenant_id || null,
+                `Self-Healing Remediation Failed: ${mon.name || condType} on ${dev.hostname || dev.id}`,
+                remOutput.slice(0, 500) || 'Watchdog remediation returned a failure status.'
+              );
+            } catch {}
+          }
         }
       }
     }

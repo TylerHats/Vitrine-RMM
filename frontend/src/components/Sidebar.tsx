@@ -15,10 +15,12 @@ import {
   FileText,
   BellRing,
   BookOpen,
-  ScrollText
+  ScrollText,
+  Video
 } from 'lucide-react';
 import { AuthUser } from '../types/index.js';
 import { isSuperAdmin as checkIsSuperAdmin } from '../utils/permissions.js';
+import { sanitizeSafeUrl } from '../utils/urlSafety.js';
 
 interface SidebarProps {
   currentView: string;
@@ -49,7 +51,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onCloseMobile,
   currentUser,
   meshConnected = false,
-  appVersion = '2.5.0'
+  appVersion = '2.7.0'
 }) => {
   const isClientAdmin = currentUser?.role === 'client_admin';
   const isSuperAdmin = Boolean(currentUser && checkIsSuperAdmin(currentUser));
@@ -57,19 +59,20 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const coreNavItems = [
     { id: 'dashboard', label: 'Fleet Dashboard', icon: LayoutDashboard, allowClient: true },
     { id: 'alerts', label: 'Alerts & Incidents', icon: BellRing, allowClient: true },
-    { id: 'policies', label: 'Policy Hierarchy', icon: ShieldCheck, allowClient: false },
+    { id: 'policies', label: 'Policies', icon: ShieldCheck, allowClient: false },
     { id: 'patching', label: 'Patch & Software', icon: RefreshCw, allowClient: true },
     { id: 'scripts', label: 'Scripts & Schedules', icon: Code2, allowClient: false },
-    { id: 'self-healing', label: 'Self-Healing', icon: HeartPulse, allowClient: false }
+    { id: 'self-healing', label: 'Self-Healing', icon: HeartPulse, allowClient: false },
+    { id: 'recordings', label: 'Session Recordings', icon: Video, allowClient: false }
   ].filter((item) => !isClientAdmin || item.allowClient);
 
   const infraNavItems = [
-    { id: 'documentation', label: 'MSP Documentation', icon: BookOpen, allowClient: true },
+    { id: 'documentation', label: 'Documentation', icon: BookOpen, allowClient: true },
     { id: 'topology', label: 'Network & Topology', icon: Network, allowClient: false },
     { id: 'virtualization', label: 'Hypervisors & VMs', icon: Server, allowClient: false },
-    { id: 'psa', label: 'PSA & Time Tracking', icon: Ticket, allowClient: false },
-    { id: 'audit', label: 'Audit Explorer', icon: ScrollText, allowClient: false },
-    ...(isSuperAdmin ? [{ id: 'settings', label: 'White-Label & Setup', icon: Settings, allowClient: false }] : [])
+    { id: 'psa', label: 'Tickets & Time', icon: Ticket, allowClient: false },
+    { id: 'audit', label: 'Audit Logs', icon: ScrollText, allowClient: false },
+    ...(isSuperAdmin ? [{ id: 'settings', label: 'Settings', icon: Settings, allowClient: false }] : [])
   ].filter((item) => !isClientAdmin || item.allowClient);
 
   const handleNavClick = (id: string) => {
@@ -86,7 +89,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
       />
       <aside className={`sidebar ${isMobileOpen ? 'mobile-open' : ''}`} id="app-sidebar">
         <div className="sidebar-header">
-          <img src={brandLogoUrl || '/branding/logo.png'} alt="Vitrine Logo" className="brand-logo-img" />
+          <img
+            src={sanitizeSafeUrl(brandLogoUrl) || '/branding/logo.png'}
+            alt={`${brandName || 'Vitrine RMM'} Logo`}
+            className="brand-logo-img"
+          />
           <span className="brand-title">{brandName || 'Vitrine RMM'}</span>
           <span className="brand-badge">v{appVersion}</span>
         </div>
@@ -173,12 +180,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
             {theme === 'dark' ? <Sun size={17} /> : <Moon size={17} />}
           </button>
           <div style={{ fontSize: '0.73rem', color: 'var(--text-dim)', textAlign: 'right' }}>
-            MeshCentral 2 Bridge
+            Remote Engine
             <br />
             {meshConnected ? (
-              <span style={{ color: 'var(--accent-success)', fontWeight: 600 }}>● Connected Relay</span>
+              <span style={{ color: 'var(--accent-success)', fontWeight: 600 }}>● Connected</span>
             ) : (
-              <span style={{ color: 'var(--accent-warning)', fontWeight: 600 }}>○ Standalone Mode</span>
+              <span style={{ color: 'var(--accent-warning)', fontWeight: 600 }}>○ Disconnected</span>
             )}
           </div>
         </div>

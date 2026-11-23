@@ -293,13 +293,13 @@ export function generateQrCodeSvg(text: string, marginModules = 2): string {
     upward = !upward;
   }
 
-  // Write format info bits for mask 0
+  // Write format info bits for mask 0 (MSB-first for top-left per ISO/IEC 18004)
   const fBits = computeBchFormatInfo(0);
-  for (let i = 0; i <= 5; i++) modules[8][i] = Boolean((fBits >>> i) & 1);
-  modules[8][7] = Boolean((fBits >>> 6) & 1);
+  for (let i = 0; i <= 5; i++) modules[8][i] = Boolean((fBits >>> (14 - i)) & 1);
+  modules[8][7] = Boolean((fBits >>> 8) & 1);
   modules[8][8] = Boolean((fBits >>> 7) & 1);
-  modules[7][8] = Boolean((fBits >>> 8) & 1);
-  for (let i = 9; i < 15; i++) modules[14 - i][8] = Boolean((fBits >>> i) & 1);
+  modules[7][8] = Boolean((fBits >>> 6) & 1);
+  for (let r = 0; r <= 5; r++) modules[r][8] = Boolean((fBits >>> r) & 1);
 
   for (let i = 0; i < 8; i++) modules[8][size - 1 - i] = Boolean((fBits >>> i) & 1);
   for (let i = 8; i < 15; i++) modules[size - 15 + i][8] = Boolean((fBits >>> i) & 1);

@@ -119,7 +119,11 @@ export const PatchManagementView: React.FC<PatchManagementViewProps> = ({
   };
 
   const handleApprove = async (id: string) => {
-    await approvePatch(id);
+    const res = await approvePatch(id);
+    if (!res.success) {
+      showNotification(`Error approving patch ${id}: ${res.error || 'Request rejected'}`);
+      return;
+    }
     setPatches(patches.map((p) => (p.id === id ? { ...p, status: 'Approved' } : p)));
     showNotification(`Patch ${id} approved for the next scheduled maintenance window.`);
   };
@@ -128,12 +132,20 @@ export const PatchManagementView: React.FC<PatchManagementViewProps> = ({
     const pendingIds = filteredPatches.filter((p) => p.status === 'Pending').map((p) => p.id);
     if (pendingIds.length === 0) return;
     const res = await approvePatchesBulk(pendingIds);
+    if (!res.success) {
+      showNotification(`Error approving patches: ${res.error || 'Request rejected'}`);
+      return;
+    }
     loadAll();
     showNotification(`Approved ${res.approvedCount} pending updates for staged deployment.`);
   };
 
   const handleFleetScan = async () => {
     const res = await scanPatches();
+    if (!res.success) {
+      showNotification(`Error running patch scan: ${res.error || 'Request rejected'}`);
+      return;
+    }
     loadAll();
     showNotification(`Triggered fleet patch scan across all active endpoints (${res.patches?.length || 0} updates indexed).`);
   };
@@ -144,6 +156,8 @@ export const PatchManagementView: React.FC<PatchManagementViewProps> = ({
     if (res.success) {
       setPatches(patches.map((p) => (p.id === id ? { ...p, status: 'Rolled Back' } : p)));
       showNotification(`Rollback initiated for ${kbId}: ${res.message}`);
+    } else {
+      showNotification(`Error rolling back ${kbId}: ${res.error || 'Request rejected'}`);
     }
   };
 
@@ -172,13 +186,15 @@ export const PatchManagementView: React.FC<PatchManagementViewProps> = ({
 
   const handleDeployPackage = async (pkg: SoftwarePackage, action: 'install' | 'upgrade' | 'uninstall') => {
     if (selectedDeployDevices.length === 0) {
-      alert('Select at least one target endpoint above to deploy software.');
+      showNotification('⚠ Select at least one target endpoint above to deploy software.');
       return;
     }
     const res = await deploySoftwarePackage(pkg.id, { deviceIds: selectedDeployDevices, action });
     if (res.success) {
       loadAll();
       showNotification(`Dispatched ${action.toUpperCase()} of "${pkg.name}" across ${res.deployedCount ?? selectedDeployDevices.length} endpoint(s).`);
+    } else {
+      showNotification(`Error dispatching ${action} of "${pkg.name}": ${(res as any).error || 'Request rejected'}`);
     }
   };
 
@@ -220,8 +236,14 @@ export const PatchManagementView: React.FC<PatchManagementViewProps> = ({
     setAutoApproveThirdParty(checked);
     try {
       const res = await updateSettings({ patch_auto_approve_third_party: checked ? 1 : 0 });
-      if (res.success && res.settings) onSettingsUpdated?.(res.settings);
-    } catch {}
+      if (res.success && res.settings) {
+        onSettingsUpdated?.(res.settings);
+      } else if (!res.success) {
+        setActionMessage(`⚠️ Failed to save auto-approve setting: ${res.error || 'Unknown error'}`);
+      }
+    } catch (err: unknown) {
+      setActionMessage(`⚠️ Failed to save auto-approve setting: ${err instanceof Error ? err.message : 'Request failed'}`);
+    }
   };
 
   const handleCanaryChange = async (days: number) => {
@@ -229,8 +251,14 @@ export const PatchManagementView: React.FC<PatchManagementViewProps> = ({
     setCanaryDelayDays(days);
     try {
       const res = await updateSettings({ patch_canary_delay_days: days });
-      if (res.success && res.settings) onSettingsUpdated?.(res.settings);
-    } catch {}
+      if (res.success && res.settings) {
+        onSettingsUpdated?.(res.settings);
+      } else if (!res.success) {
+        setActionMessage(`⚠️ Failed to save canary delay setting: ${res.error || 'Unknown error'}`);
+      }
+    } catch (err: unknown) {
+      setActionMessage(`⚠️ Failed to save canary delay setting: ${err instanceof Error ? err.message : 'Request failed'}`);
+    }
   };
 
   const pendingCount = filteredPatches.filter((p) => p.status === 'Pending').length;
@@ -293,11 +321,23 @@ export const PatchManagementView: React.FC<PatchManagementViewProps> = ({
         </div>
       </div>
 
-      {actionMessage && (
-        <div style={{ background: 'rgba(0, 242, 254, 0.12)', border: '1px solid rgba(0, 242, 254, 0.35)', padding: '0.75rem 1.25rem', borderRadius: '8px', color: '#38bdf8', fontSize: '0.85rem' }}>
-          {actionMessage}
-        </div>
-      )}
+      {actionMessage && (() => {
+        const isPatchErr = actionMessage.startsWith('⚠') || /^error/i.test(actionMessage);
+        return (
+          <div
+            style={{
+              background: isPatchErr ? 'rgba(239, 68, 68, 0.14)' : 'rgba(0, 242, 254, 0.12)',
+              border: `1px solid ${isPatchErr ? 'rgba(239, 68, 68, 0.35)' : 'rgba(0, 242, 254, 0.35)'}`,
+              padding: '0.75rem 1.25rem',
+              borderRadius: '8px',
+              color: isPatchErr ? '#f87171' : 'var(--primary)',
+              fontSize: '0.85rem'
+            }}
+          >
+            {actionMessage}
+          </div>
+        );
+      })()}
 
       {activeTab === 'patches' && (
         <>

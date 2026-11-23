@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { ArrowRight, Sliders, Edit3, X, Clock, KeyRound, ShieldCheck, Database, Zap, Plus, Trash2, Bell, AlertCircle } from 'lucide-react';
-import { Policy, Device, Tenant, ConditionAlertRule, BackupPolicy, MdmProfile, AuthUser } from '../types/index.js';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { ArrowRight, Sliders, Edit3, X, Clock, KeyRound, ShieldCheck, Database, Zap, Plus, Trash2, Bell, AlertCircle, Upload, Monitor } from 'lucide-react';
+import { Policy, Device, Tenant, ConditionAlertRule, BackupPolicy, MdmProfile, AuthUser, TrayMenuItem } from '../types/index.js';
 import {
   fetchPolicies,
   updatePolicy,
@@ -9,10 +9,12 @@ import {
   evaluatePolicyConditions,
   fetchEffectiveDevicePolicy,
   fetchBackupPolicies,
-  fetchMdmProfiles
+  fetchMdmProfiles,
+  uploadPolicyTrayIcon
 } from '../services/api.js';
 import { canMutateFleet } from '../utils/permissions.js';
 import { MfaChallengeModal } from '../components/MfaChallengeModal.js';
+import { IconCropModal } from '../components/IconCropModal.js';
 
 interface PoliciesViewProps {
   devices: Device[];
@@ -53,10 +55,47 @@ interface EffectivePolicy {
   backupPolicyId?: string | null;
   mdmProfileId?: string | null;
   alertRules?: ConditionAlertRule[];
+  trayBrandName?: string;
+  trayIconUrl?: string;
+  trayThemeMode?: 'system' | 'dark' | 'light';
+  trayEnabled?: boolean;
+  trayTooltip?: string;
+  traySupportUrl?: string;
+  traySupportPhone?: string;
+  traySupportEmail?: string;
+  trayMenuItems?: TrayMenuItem[];
+  companionAutoDeploy?: boolean;
+}
+
+const DEFAULT_TRAY_MENU_ITEMS: TrayMenuItem[] = [
+  { id: 'tray-support', label: 'Open Support Portal', action: 'open_url', target: '', enabled: true },
+  { id: 'tray-info', label: 'Show Device Info', action: 'show_device_info', target: '', enabled: true },
+  { id: 'tray-help', label: 'Request Remote Help', action: 'request_remote_help', target: '', enabled: true },
+  { id: 'tray-copy', label: 'Copy Hostname & IP', action: 'copy_hostname', target: '', enabled: true }
+];
+
+function parseTrayMenuItemsFromPolicy(p: Policy | null): TrayMenuItem[] | null {
+  if (!p) return null;
+  if (Array.isArray(p.tray_menu_items)) {
+    return p.tray_menu_items.map((item) => ({ ...item }));
+  }
+  if (typeof p.tray_menu_items_json === 'string' && p.tray_menu_items_json.trim() !== '') {
+    try {
+      const parsed = JSON.parse(p.tray_menu_items_json);
+      if (Array.isArray(parsed)) return parsed;
+    } catch {
+      // Fall back when tray menu JSON is invalid
+    }
+  }
+  return null;
 }
 
 export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [], currentUser }) => {
   const canMutate = canMutateFleet(currentUser);
+  const trayIconInputRef = useRef<HTMLInputElement | null>(null);
+  const [cropPolicyIconFile, setCropPolicyIconFile] = useState<File | null>(null);
+  const [uploadingTrayIcon, setUploadingTrayIcon] = useState(false);
+  const [trayIconStatus, setTrayIconStatus] = useState<string | null>(null);
   const [policies, setPolicies] = useState<Policy[]>([]);
   const [backupPolicies, setBackupPolicies] = useState<BackupPolicy[]>([]);
   const [mdmProfiles, setMdmProfiles] = useState<MdmProfile[]>([]);
@@ -65,6 +104,7 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
   const [editingPolicy, setEditingPolicy] = useState<Policy | null>(null);
   const [savingPolicy, setSavingPolicy] = useState(false);
   const [policyError, setPolicyError] = useState<string | null>(null);
+  const [listNotice, setListNotice] = useState<{ text: string; isError?: boolean } | null>(null);
   const [createPolicyError, setCreatePolicyError] = useState<string | null>(null);
   const [mfaRetryAction, setMfaRetryAction] = useState<'save' | 'create' | null>(null);
   const [evaluatingConditions, setEvaluatingConditions] = useState(false);
@@ -77,7 +117,7 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
       const res = await evaluatePolicyConditions();
       if (res.success) {
         setEvalSummaryMsg(
-          `✓ Evaluated ${res.evaluatedDevices} active endpoints & ${res.evaluatedAppliances} specialty appliances across 4-tier policies: ${res.triggeredConditions.length} condition(s) matched → ${res.webUiNotificationsCreated} Web UI alert(s), ${res.emailsDispatched} Email dispatch(es), and ${res.psaTicketsCreated} Direct PSA Ticket(s) created.`
+          `✓ Evaluated ${res.evaluatedDevices} active endpoints & ${res.evaluatedAppliances} specialty appliances across 4-tier policies: ${res.triggeredConditions.length} condition(s) matched → ${res.webUiNotificationsCreated} Web UI alert(s), ${res.emailsDispatched} Email dispatch(es), and ${res.psaTicketsCreated} Support Ticket(s) created.`
         );
       }
     } finally {
@@ -93,6 +133,67 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
     setEditingPolicy({ ...editingPolicy, alert_rules: currentRules });
   };
 
+  const getEditingTrayItems = (pol: Policy): TrayMenuItem[] => {
+    const parsed = parseTrayMenuItemsFromPolicy(pol);
+    if (parsed !== null) return parsed;
+    return pol.tier === 'global' ? DEFAULT_TRAY_MENU_ITEMS.map((item) => ({ ...item })) : [];
+  };
+
+  const handleUpdateTrayMenuItem = (index: number, patch: Partial<TrayMenuItem>) => {
+    if (!editingPolicy) return;
+    const items = getEditingTrayItems(editingPolicy);
+    if (!items[index]) return;
+    items[index] = { ...items[index], ...patch };
+    setEditingPolicy({ ...editingPolicy, tray_menu_items: items });
+  };
+
+  const handleAddTrayMenuItem = () => {
+    if (!editingPolicy) return;
+    const items = getEditingTrayItems(editingPolicy);
+    items.push({
+      id: `tray-${Date.now()}`,
+      label: 'Custom Support Link',
+      action: 'open_url',
+      target: editingPolicy.tray_support_url || '',
+      enabled: true
+    });
+    setEditingPolicy({ ...editingPolicy, tray_menu_items: items });
+  };
+
+  const handleRemoveTrayMenuItem = (index: number) => {
+    if (!editingPolicy) return;
+    const items = getEditingTrayItems(editingPolicy).filter((_, i) => i !== index);
+    setEditingPolicy({ ...editingPolicy, tray_menu_items: items });
+  };
+
+  const handleTrayIconFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (trayIconInputRef.current) trayIconInputRef.current.value = '';
+    if (!file || !editingPolicy) return;
+    setTrayIconStatus(null);
+    setCropPolicyIconFile(file);
+  };
+
+  const handleTrayIconCropped = async (cropped: { filename: string; base64Data: string }) => {
+    setCropPolicyIconFile(null);
+    if (!editingPolicy) return;
+    setUploadingTrayIcon(true);
+    setTrayIconStatus(null);
+    try {
+      const res = await uploadPolicyTrayIcon(editingPolicy.id, cropped.filename, cropped.base64Data);
+      if (res.success && res.tray_icon_url) {
+        setEditingPolicy((prev) => (prev ? { ...prev, tray_icon_url: res.tray_icon_url } : prev));
+        setTrayIconStatus('Square icon saved for EXE installers & endpoint tray.');
+      } else {
+        setTrayIconStatus(res.error || 'Failed to upload custom icon.');
+      }
+    } catch (err: any) {
+      setTrayIconStatus(err?.message || 'Failed to upload custom icon.');
+    } finally {
+      setUploadingTrayIcon(false);
+    }
+  };
+
   // Create Policy Modal
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [newPolicyName, setNewPolicyName] = useState('');
@@ -100,6 +201,9 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
   const [newPolicyTargetId, setNewPolicyTargetId] = useState(tenants[0]?.id || 'ten-1');
   const [newPolicyTelemetry, setNewPolicyTelemetry] = useState(15);
   const [newPolicyPatchSchedule, setNewPolicyPatchSchedule] = useState('Sat 03:00 AM');
+  const [newPolicyTrayEnabled, setNewPolicyTrayEnabled] = useState(true);
+  const [newPolicyAutoDeployCompanion, setNewPolicyAutoDeployCompanion] = useState(true);
+  const [newPolicyTrayBrandName, setNewPolicyTrayBrandName] = useState('');
 
   const loadPolicies = useCallback(() => {
     fetchPolicies().then(setPolicies).catch(() => {});
@@ -137,7 +241,10 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
         tier: newPolicyTier,
         target_id: newPolicyTargetId,
         telemetry_interval_sec: newPolicyTelemetry,
-        patch_schedule: newPolicyPatchSchedule
+        patch_schedule: newPolicyPatchSchedule,
+        tray_enabled: newPolicyTrayEnabled ? 1 : 0,
+        companion_auto_deploy: newPolicyAutoDeployCompanion ? 1 : 0,
+        tray_brand_name: newPolicyTrayBrandName.trim() || undefined
       });
       if (res.mfaRequired) {
         setMfaRetryAction('create');
@@ -148,6 +255,7 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
         loadEffective();
         setShowCreateModal(false);
         setNewPolicyName('');
+        setNewPolicyTrayBrandName('');
       } else {
         setCreatePolicyError(res.error || 'Failed to create policy.');
       }
@@ -162,15 +270,35 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
   };
 
   const handleDeletePolicy = async (id: string) => {
-    await deletePolicy(id);
-    loadPolicies();
-    loadEffective();
+    if (!confirm('Delete this tier policy? Endpoints inheriting it will revert to parent policy tiers.')) return;
+    setListNotice(null);
+    try {
+      const res = await deletePolicy(id);
+      if (!res.success) {
+        setListNotice({ text: res.error || 'Failed to delete policy.', isError: true });
+        return;
+      }
+      setListNotice({ text: 'Tier policy deleted.' });
+      loadPolicies();
+      loadEffective();
+    } catch (err: any) {
+      setListNotice({ text: err?.message || 'Failed to delete policy.', isError: true });
+    }
   };
 
   const performSavePolicy = async () => {
     if (!editingPolicy) return;
     setSavingPolicy(true);
     setPolicyError(null);
+    const isGlobal = editingPolicy.tier === 'global';
+    const parsedTrayItems = parseTrayMenuItemsFromPolicy(editingPolicy);
+    const trayItemsToSave =
+      Array.isArray(editingPolicy.tray_menu_items)
+        ? editingPolicy.tray_menu_items
+        : isGlobal
+          ? parsedTrayItems ?? DEFAULT_TRAY_MENU_ITEMS.map((item) => ({ ...item }))
+          : parsedTrayItems ?? undefined;
+
     try {
       const res = await updatePolicy(editingPolicy.id, {
         name: editingPolicy.name,
@@ -179,14 +307,20 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
         consent_timeout_sec: editingPolicy.consent_timeout_sec,
         consent_timeout_action: editingPolicy.consent_timeout_action,
         auto_lock_on_disconnect: editingPolicy.auto_lock_on_disconnect,
-        bitlocker_enforced: editingPolicy.bitlocker_enforced ?? editingPolicy.bitlocker_enforcement ?? 1,
-        patch_schedule: editingPolicy.patch_schedule || '',
-        patch_ring: editingPolicy.patch_ring || 'production',
-        patch_delay_days: editingPolicy.patch_delay_days ?? 0,
-        defender_managed: editingPolicy.defender_managed ?? editingPolicy.managed_defender_enabled ?? 1,
-        backup_policy_id: editingPolicy.backup_policy_id || null,
-        mdm_profile_id: editingPolicy.mdm_profile_id || null,
-        patch_reboot_enforcement: editingPolicy.patch_reboot_enforcement || '',
+        bitlocker_enforced: isGlobal
+          ? (editingPolicy.bitlocker_enforced ?? editingPolicy.bitlocker_enforcement ?? 1)
+          : (editingPolicy.bitlocker_enforced ?? editingPolicy.bitlocker_enforcement ?? undefined),
+        patch_schedule: isGlobal ? (editingPolicy.patch_schedule || '') : (editingPolicy.patch_schedule ?? undefined),
+        patch_ring: isGlobal ? (editingPolicy.patch_ring || 'production') : (editingPolicy.patch_ring ?? undefined),
+        patch_delay_days: isGlobal ? (editingPolicy.patch_delay_days ?? 0) : (editingPolicy.patch_delay_days ?? undefined),
+        defender_managed: isGlobal
+          ? (editingPolicy.defender_managed ?? editingPolicy.managed_defender_enabled ?? 1)
+          : (editingPolicy.defender_managed ?? editingPolicy.managed_defender_enabled ?? undefined),
+        backup_policy_id: isGlobal ? (editingPolicy.backup_policy_id || null) : editingPolicy.backup_policy_id,
+        mdm_profile_id: isGlobal ? (editingPolicy.mdm_profile_id || null) : editingPolicy.mdm_profile_id,
+        patch_reboot_enforcement: isGlobal
+          ? (editingPolicy.patch_reboot_enforcement || '')
+          : (editingPolicy.patch_reboot_enforcement ?? undefined),
         max_snooze_hours: editingPolicy.max_snooze_hours,
         force_reboot_after_snooze: editingPolicy.force_reboot_after_snooze,
         final_countdown_sec: editingPolicy.final_countdown_sec,
@@ -214,7 +348,27 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
         network_drift_detection_enabled: editingPolicy.network_drift_detection_enabled,
         self_healing_max_hourly_runs: editingPolicy.self_healing_max_hourly_runs,
         self_healing_alert_psa: editingPolicy.self_healing_alert_psa,
-        alert_rules: editingPolicy.alert_rules
+        alert_rules: editingPolicy.alert_rules,
+        tray_brand_name: editingPolicy.tray_brand_name ?? undefined,
+        tray_icon_url: editingPolicy.tray_icon_url ?? undefined,
+        tray_theme_mode: editingPolicy.tray_theme_mode ?? undefined,
+        tray_enabled:
+          editingPolicy.tray_enabled === undefined || editingPolicy.tray_enabled === null
+            ? undefined
+            : editingPolicy.tray_enabled
+              ? 1
+              : 0,
+        tray_tooltip: editingPolicy.tray_tooltip ?? undefined,
+        tray_support_url: editingPolicy.tray_support_url ?? undefined,
+        tray_support_phone: editingPolicy.tray_support_phone ?? undefined,
+        tray_support_email: editingPolicy.tray_support_email ?? undefined,
+        tray_menu_items: trayItemsToSave,
+        companion_auto_deploy:
+          editingPolicy.companion_auto_deploy === undefined || editingPolicy.companion_auto_deploy === null
+            ? undefined
+            : editingPolicy.companion_auto_deploy
+              ? 1
+              : 0
       });
       if (res.mfaRequired) {
         setMfaRetryAction('save');
@@ -341,14 +495,21 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
                 {policies.map((p) => (
                   <tr key={p.id}>
                     <td>
-                      <span className="status-pill status-online" style={{ fontSize: '0.7rem' }}>
-                        {p.tier.toUpperCase()}
+                      <span
+                        className="status-pill status-online"
+                        style={{
+                          fontSize: '0.7rem',
+                          background: p.tier === 'quicksupport' ? 'rgba(16, 185, 129, 0.16)' : undefined,
+                          color: p.tier === 'quicksupport' ? '#34d399' : undefined
+                        }}
+                      >
+                        {p.tier === 'quicksupport' ? 'QUICKSUPPORT' : p.tier.toUpperCase()}
                       </span>
                     </td>
                     <td><strong>{p.name}</strong></td>
                     <td>{p.telemetry_interval_sec}s</td>
                     <td>
-                      <span style={{ fontWeight: 600, color: 'var(--accent-primary, #00f2fe)' }}>
+                      <span style={{ fontWeight: 600, color: 'var(--primary)' }}>
                         {p.max_snooze_hours ?? 8}h Max
                       </span>
                     </td>
@@ -375,7 +536,7 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
                             <Edit3 size={12} />
                             <span>Edit</span>
                           </button>
-                          {p.tier !== 'global' && (
+                          {p.tier !== 'global' && p.tier !== 'quicksupport' && (
                             <button
                               className="btn-glass btn-icon"
                               title="Delete Tier Policy"
@@ -395,6 +556,21 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
               </tbody>
             </table>
           </div>
+          {listNotice && (
+            <div
+              style={{
+                marginTop: '0.75rem',
+                padding: '0.65rem 0.9rem',
+                borderRadius: '8px',
+                fontSize: '0.8rem',
+                background: listNotice.isError ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+                border: `1px solid ${listNotice.isError ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'}`,
+                color: listNotice.isError ? '#f87171' : '#34d399'
+              }}
+            >
+              {listNotice.text}
+            </div>
+          )}
         </div>
 
         {/* Live Resolved Policy Inspector */}
@@ -409,16 +585,25 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
               style={{ width: '200px' }}
               value={selectedDeviceId}
               onChange={(e) => setSelectedDeviceId(e.target.value)}
+              disabled={devices.length === 0}
             >
-              {devices.map((d) => (
-                <option key={d.id} value={d.id}>
-                  {d.hostname} ({d.device_role})
-                </option>
-              ))}
+              {devices.length === 0 ? (
+                <option value="">No endpoints enrolled</option>
+              ) : (
+                devices.map((d) => (
+                  <option key={d.id} value={d.id}>
+                    {d.hostname} ({d.device_role})
+                  </option>
+                ))
+              )}
             </select>
           </div>
 
-          {effectivePolicy ? (
+          {devices.length === 0 ? (
+            <div style={{ color: 'var(--text-muted)', fontSize: '0.85rem', padding: '1rem 0' }}>
+              No endpoints enrolled yet. Enroll a managed endpoint to inspect its live effective inherited policy cascade.
+            </div>
+          ) : effectivePolicy ? (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
               <div style={{ background: 'rgba(0, 242, 254, 0.08)', padding: '0.85rem 1rem', borderRadius: '8px', border: '1px solid rgba(0, 242, 254, 0.2)' }}>
                 <div style={{ fontSize: '0.82rem', fontWeight: 600, color: 'var(--primary)', marginBottom: '0.35rem' }}>
@@ -453,7 +638,7 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
 
                 <div className="glass-card" style={{ padding: '0.85rem' }}>
                   <div style={{ color: 'var(--text-dim)', fontSize: '0.75rem' }}>Max Tray Snooze Timeout</div>
-                  <div style={{ fontWeight: 600, fontSize: '1.05rem', color: 'var(--accent-primary, #00f2fe)' }}>
+                  <div style={{ fontWeight: 600, fontSize: '1.05rem', color: 'var(--primary)' }}>
                     {effectivePolicy.maxSnoozeHours ?? 8} Hours Limit
                   </div>
                 </div>
@@ -494,6 +679,32 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
                   </div>
                 </div>
 
+                <div className="glass-card" style={{ padding: '0.85rem', gridColumn: 'span 2', borderColor: 'rgba(0, 242, 254, 0.3)' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+                    <div>
+                      <div style={{ color: '#00f2fe', fontSize: '0.75rem', fontWeight: 600 }}>Resolved Endpoint Companion &amp; Tray Branding</div>
+                      <div style={{ fontWeight: 600, fontSize: '0.86rem', marginTop: '0.2rem' }}>
+                        Tray UI: <span style={{ color: effectivePolicy.trayEnabled !== false ? '#10b981' : '#94a3b8' }}>
+                          {effectivePolicy.trayEnabled !== false ? 'Visible' : 'Hidden (Service Only)'}
+                        </span> • Brand Label: <code>{effectivePolicy.trayBrandName || 'Vitrine RMM'}</code> • Auto-Deploy:{' '}
+                        <strong>{effectivePolicy.companionAutoDeploy !== false ? 'Enabled' : 'Manual'}</strong>
+                      </div>
+                      <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>
+                        Theme: <code>{effectivePolicy.trayThemeMode || 'system'}</code> • Menu Items:{' '}
+                        <strong>{Array.isArray(effectivePolicy.trayMenuItems) ? effectivePolicy.trayMenuItems.filter((m) => m.enabled !== false).length : 0}</strong>{' '}
+                        {effectivePolicy.traySupportUrl ? `• Portal: ${effectivePolicy.traySupportUrl}` : ''}
+                      </div>
+                    </div>
+                    {effectivePolicy.trayIconUrl && (
+                      <img
+                        src={effectivePolicy.trayIconUrl}
+                        alt="Effective Tray Icon"
+                        style={{ height: '32px', width: '32px', borderRadius: '6px', objectFit: 'contain', background: 'rgba(0,0,0,0.35)', padding: '2px' }}
+                      />
+                    )}
+                  </div>
+                </div>
+
                 {effectivePolicy.alertRules && effectivePolicy.alertRules.length > 0 && (
                   <div className="glass-card" style={{ padding: '0.85rem', gridColumn: 'span 2', borderColor: 'rgba(56, 189, 248, 0.3)' }}>
                     <div style={{ color: '#38bdf8', fontSize: '0.75rem', fontWeight: 600, marginBottom: '0.45rem' }}>
@@ -527,7 +738,7 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
                               {r.notifyWebUi && <span className="status-pill status-online" style={{ fontSize: '0.62rem' }}>Web UI</span>}
                               {r.notifyEmail && <span className="status-pill status-reboot" style={{ fontSize: '0.62rem' }}>Email</span>}
                               {r.createPsaTicket && (
-                                <span className="status-pill status-isolated" style={{ fontSize: '0.62rem' }}>PSA Ticket</span>
+                                <span className="status-pill status-isolated" style={{ fontSize: '0.62rem' }}>Ticket</span>
                               )}
                             </div>
                           </div>
@@ -655,6 +866,40 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
                 </div>
               </div>
 
+              <div style={{ background: 'rgba(0, 242, 254, 0.04)', border: '1px solid rgba(0, 242, 254, 0.22)', borderRadius: '8px', padding: '0.75rem', display: 'flex', flexDirection: 'column', gap: '0.55rem' }}>
+                <div style={{ fontSize: '0.78rem', fontWeight: 700, color: '#00f2fe' }}>
+                  Companion Agent &amp; System Tray Defaults
+                </div>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', fontSize: '0.78rem', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={newPolicyTrayEnabled}
+                    onChange={(e) => setNewPolicyTrayEnabled(e.target.checked)}
+                  />
+                  <span>Show Endpoint System Tray Icon &amp; Support Menu</span>
+                </label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', fontSize: '0.78rem', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={newPolicyAutoDeployCompanion}
+                    onChange={(e) => setNewPolicyAutoDeployCompanion(e.target.checked)}
+                  />
+                  <span>Auto-deploy Vitrine Companion on online MS2 devices in this scope</span>
+                </label>
+                <div>
+                  <label style={{ fontSize: '0.74rem', color: 'var(--text-dim)', display: 'block', marginBottom: '0.2rem' }}>
+                    Tray Brand Label Override (optional)
+                  </label>
+                  <input
+                    type="text"
+                    className="glass-input"
+                    placeholder="Inherit Global Brand Name"
+                    value={newPolicyTrayBrandName}
+                    onChange={(e) => setNewPolicyTrayBrandName(e.target.value)}
+                  />
+                </div>
+              </div>
+
               {createPolicyError && (
                 <div
                   style={{
@@ -721,7 +966,7 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
           >
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                <Edit3 size={18} color="var(--accent-primary, #00f2fe)" />
+                <Edit3 size={18} color="var(--primary)" />
                 <h3 style={{ fontSize: '1.25rem', fontWeight: 700, margin: 0 }}>
                   Configure Policy: {editingPolicy.name}
                 </h3>
@@ -866,11 +1111,113 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
                 </div>
               </div>
 
-              {/* Update Reminder & Reboot Controls (User Request 1) */}
-              <div style={{ background: 'rgba(255, 255, 255, 0.03)', border: '1px solid rgba(255, 255, 255, 0.08)', borderRadius: '8px', padding: '1rem', display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+              {/* Remote Session Privacy Consent & Auto-Lock Controls */}
+              <div style={{ background: 'var(--surface-panel)', border: '1px solid var(--glass-border)', borderRadius: '8px', padding: '1rem', display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+                <div style={{ fontWeight: 600, fontSize: '0.9rem', color: 'var(--text-main)' }}>
+                  Remote Control Privacy Consent &amp; Session Security
+                </div>
+                <div className="grid-2" style={{ gap: '0.85rem' }}>
+                  <div>
+                    <label style={{ fontSize: '0.76rem', color: 'var(--text-dim)', display: 'block', marginBottom: '0.25rem' }}>
+                      End-User Consent Prompt
+                    </label>
+                    <select
+                      className="glass-select"
+                      value={
+                        editingPolicy.require_remote_consent === undefined || editingPolicy.require_remote_consent === null
+                          ? ''
+                          : editingPolicy.require_remote_consent
+                            ? '1'
+                            : '0'
+                      }
+                      onChange={(e) =>
+                        setEditingPolicy({
+                          ...editingPolicy,
+                          require_remote_consent:
+                            e.target.value === '' ? undefined : Number(e.target.value)
+                        })
+                      }
+                    >
+                      {editingPolicy.tier !== 'global' && <option value="">Inherit from Parent Tier</option>}
+                      <option value="1">Require User Approval Prompt</option>
+                      <option value="0">Instant Connect (No Prompt)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label style={{ fontSize: '0.76rem', color: 'var(--text-dim)', display: 'block', marginBottom: '0.25rem' }}>
+                      Consent Prompt Timeout (Seconds)
+                    </label>
+                    <input
+                      type="number"
+                      min={5}
+                      max={300}
+                      className="glass-input"
+                      placeholder={editingPolicy.tier === 'global' ? '15' : 'Inherit'}
+                      value={editingPolicy.consent_timeout_sec ?? ''}
+                      onChange={(e) =>
+                        setEditingPolicy({
+                          ...editingPolicy,
+                          consent_timeout_sec: e.target.value === '' ? undefined : Number(e.target.value)
+                        })
+                      }
+                    />
+                  </div>
+
+                  <div>
+                    <label style={{ fontSize: '0.76rem', color: 'var(--text-dim)', display: 'block', marginBottom: '0.25rem' }}>
+                      Action If Consent Times Out
+                    </label>
+                    <select
+                      className="glass-select"
+                      value={editingPolicy.consent_timeout_action ?? ''}
+                      onChange={(e) =>
+                        setEditingPolicy({
+                          ...editingPolicy,
+                          consent_timeout_action: (e.target.value || undefined) as 'allow' | 'deny' | undefined
+                        })
+                      }
+                    >
+                      {editingPolicy.tier !== 'global' && <option value="">Inherit from Parent Tier</option>}
+                      <option value="deny">Deny Remote Session</option>
+                      <option value="allow">Auto-Allow After Countdown</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label style={{ fontSize: '0.76rem', color: 'var(--text-dim)', display: 'block', marginBottom: '0.25rem' }}>
+                      Auto-Lock Workstation on Disconnect
+                    </label>
+                    <select
+                      className="glass-select"
+                      value={
+                        editingPolicy.auto_lock_on_disconnect === undefined || editingPolicy.auto_lock_on_disconnect === null
+                          ? ''
+                          : editingPolicy.auto_lock_on_disconnect
+                            ? '1'
+                            : '0'
+                      }
+                      onChange={(e) =>
+                        setEditingPolicy({
+                          ...editingPolicy,
+                          auto_lock_on_disconnect:
+                            e.target.value === '' ? undefined : Number(e.target.value)
+                        })
+                      }
+                    >
+                      {editingPolicy.tier !== 'global' && <option value="">Inherit from Parent Tier</option>}
+                      <option value="1">Auto-Lock Screen on Disconnect</option>
+                      <option value="0">Leave Session Unlocked</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              {/* Update Reminder & Reboot Controls */}
+              <div style={{ background: 'var(--surface-panel)', border: '1px solid var(--glass-border)', borderRadius: '8px', padding: '1rem', display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
-                  <Clock size={16} color="var(--accent-primary, #00f2fe)" />
-                  <span style={{ fontWeight: 600, fontSize: '0.9rem', color: '#fff' }}>
+                  <Clock size={16} color="var(--primary)" />
+                  <span style={{ fontWeight: 600, fontSize: '0.9rem', color: 'var(--text-main)' }}>
                     Tray Update Reminder &amp; Reboot Snooze Policy
                   </span>
                 </div>
@@ -942,10 +1289,10 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
               </div>
 
               {/* LAPS & Local Administrator Governance */}
-              <div style={{ background: 'rgba(255, 255, 255, 0.03)', border: '1px solid rgba(255, 255, 255, 0.08)', borderRadius: '8px', padding: '1rem', display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+              <div style={{ background: 'var(--surface-panel)', border: '1px solid var(--glass-border)', borderRadius: '8px', padding: '1rem', display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
                   <KeyRound size={16} color="#fbbf24" />
-                  <span style={{ fontWeight: 600, fontSize: '0.9rem', color: '#fff' }}>
+                  <span style={{ fontWeight: 600, fontSize: '0.9rem', color: 'var(--text-main)' }}>
                     Automated Local Administrator (LAPS) Vault &amp; Endpoint Account Governance
                   </span>
                 </div>
@@ -959,7 +1306,7 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
                       type="text"
                       className="glass-input"
                       placeholder="e.g. VitrineAdmin or {ClientSlug}Admin"
-                      value={editingPolicy.laps_account_name || 'VitrineAdmin'}
+                      value={editingPolicy.laps_account_name ?? ''}
                       onChange={(e) => setEditingPolicy({ ...editingPolicy, laps_account_name: e.target.value })}
                     />
                     <span style={{ fontSize: '0.68rem', color: 'var(--text-dim)', marginTop: '0.2rem', display: 'block' }}>
@@ -1235,10 +1582,10 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
               </div>
 
               {/* Zero-Trust & MFA Settings */}
-              <div style={{ background: 'rgba(255, 255, 255, 0.03)', border: '1px solid rgba(255, 255, 255, 0.08)', borderRadius: '8px', padding: '1rem', display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+              <div style={{ background: 'var(--surface-panel)', border: '1px solid var(--glass-border)', borderRadius: '8px', padding: '1rem', display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
                   <ShieldCheck size={16} color="#34d399" />
-                  <span style={{ fontWeight: 600, fontSize: '0.9rem', color: '#fff' }}>
+                  <span style={{ fontWeight: 600, fontSize: '0.9rem', color: 'var(--text-main)' }}>
                     Zero-Trust Secret Protection &amp; Step-Up MFA
                   </span>
                 </div>
@@ -1254,10 +1601,10 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
               </div>
 
               {/* Telemetry & Audit Retention */}
-              <div style={{ background: 'rgba(255, 255, 255, 0.03)', border: '1px solid rgba(255, 255, 255, 0.08)', borderRadius: '8px', padding: '1rem', display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+              <div style={{ background: 'var(--surface-panel)', border: '1px solid var(--glass-border)', borderRadius: '8px', padding: '1rem', display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
                   <Database size={16} color="#38bdf8" />
-                  <span style={{ fontWeight: 600, fontSize: '0.9rem', color: '#fff' }}>
+                  <span style={{ fontWeight: 600, fontSize: '0.9rem', color: 'var(--text-main)' }}>
                     Telemetry History Retention &amp; Hardware/Network Watchdogs
                   </span>
                 </div>
@@ -1301,10 +1648,10 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
               </div>
 
               {/* Self-Healing Circuit Breaker */}
-              <div style={{ background: 'rgba(255, 255, 255, 0.03)', border: '1px solid rgba(255, 255, 255, 0.08)', borderRadius: '8px', padding: '1rem', display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+              <div style={{ background: 'var(--surface-panel)', border: '1px solid var(--glass-border)', borderRadius: '8px', padding: '1rem', display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
                   <Zap size={16} color="#a855f7" />
-                  <span style={{ fontWeight: 600, fontSize: '0.9rem', color: '#fff' }}>
+                  <span style={{ fontWeight: 600, fontSize: '0.9rem', color: 'var(--text-main)' }}>
                     Automated Self-Healing Circuit Breakers &amp; Ticketing
                   </span>
                 </div>
@@ -1331,8 +1678,258 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
                     checked={Boolean(editingPolicy.self_healing_alert_psa ?? 1)}
                     onChange={(e) => setEditingPolicy({ ...editingPolicy, self_healing_alert_psa: e.target.checked ? 1 : 0 })}
                   />
-                  <span>Automatically open High-Priority PSA Incident Ticket when self-healing circuit breaker trips</span>
+                  <span>Automatically open High-Priority Support Ticket when self-healing triggers</span>
                 </label>
+              </div>
+
+              {/* Companion Agent Tray Branding, Icon Override & Popup Menu Customizer */}
+              <div style={{ background: 'rgba(0, 242, 254, 0.04)', border: '1px solid rgba(0, 242, 254, 0.25)', borderRadius: '8px', padding: '1rem', display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
+                    <Monitor size={16} color="var(--primary)" />
+                    <span style={{ fontWeight: 700, fontSize: '0.9rem', color: 'var(--text-main)' }}>
+                      Companion Agent Tray Branding &amp; Interactive Menu
+                    </span>
+                  </div>
+                  <span style={{ fontSize: '0.7rem', color: 'var(--text-dim)' }}>
+                    Delivered automatically on companion install &amp; next agent check-in
+                  </span>
+                </div>
+
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem' }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', fontSize: '0.82rem' }}>
+                    <input
+                      type="checkbox"
+                      checked={editingPolicy.tray_enabled !== 0 && editingPolicy.tray_enabled !== false}
+                      onChange={(e) => setEditingPolicy({ ...editingPolicy, tray_enabled: e.target.checked ? 1 : 0 })}
+                    />
+                    <span>Enable Endpoint System Tray Icon &amp; Support Menu (uncheck on headless servers to run service-only)</span>
+                  </label>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', fontSize: '0.82rem' }}>
+                    <input
+                      type="checkbox"
+                      checked={editingPolicy.companion_auto_deploy !== 0 && editingPolicy.companion_auto_deploy !== false}
+                      onChange={(e) => setEditingPolicy({ ...editingPolicy, companion_auto_deploy: e.target.checked ? 1 : 0 })}
+                    />
+                    <span>Auto-deploy Vitrine Companion &amp; Tray onto online MS2-managed devices in this tier</span>
+                  </label>
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.85rem' }}>
+                  <div>
+                    <label style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-dim)', display: 'block', marginBottom: '0.25rem' }}>
+                      Tray Brand / Company Label Override
+                    </label>
+                    <input
+                      type="text"
+                      className="glass-input"
+                      placeholder="Inherit Global Brand Name"
+                      value={editingPolicy.tray_brand_name || ''}
+                      onChange={(e) => setEditingPolicy({ ...editingPolicy, tray_brand_name: e.target.value })}
+                    />
+                  </div>
+                  <div>
+                    <label style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-dim)', display: 'block', marginBottom: '0.25rem' }}>
+                      Tray &amp; HUD Color Theme
+                    </label>
+                    <select
+                      className="glass-select"
+                      value={editingPolicy.tray_theme_mode || 'inherit'}
+                      onChange={(e) => setEditingPolicy({ ...editingPolicy, tray_theme_mode: e.target.value as any })}
+                    >
+                      <option value="inherit">Inherit Parent / Global Theme</option>
+                      <option value="system">OS Registry Auto (AppsUseLightTheme)</option>
+                      <option value="dark">Force Obsidian Dark</option>
+                      <option value="light">Force Crisp Daylight</option>
+                    </select>
+                  </div>
+                </div>
+
+                {/* Custom Tray Icon Upload */}
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.85rem', padding: '0.65rem 0.85rem', background: 'rgba(255,255,255,0.03)', borderRadius: '6px', border: '1px solid var(--glass-border)', flexWrap: 'wrap' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+                    {editingPolicy.tray_icon_url ? (
+                      <img
+                        src={editingPolicy.tray_icon_url}
+                        alt="Tray Icon"
+                        style={{ height: '32px', width: '32px', borderRadius: '6px', objectFit: 'contain', background: 'rgba(0,0,0,0.4)', padding: '2px' }}
+                      />
+                    ) : (
+                      <div style={{ height: '32px', width: '32px', borderRadius: '6px', background: 'rgba(255,255,255,0.06)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.65rem', color: 'var(--text-dim)' }}>
+                        Auto
+                      </div>
+                    )}
+                    <div>
+                      <div style={{ fontSize: '0.78rem', fontWeight: 600 }}>Custom Tier EXE &amp; Tray Icon (PNG / JPEG / WebP / ICO)</div>
+                      <div style={{ fontSize: '0.71rem', color: trayIconStatus ? '#34d399' : 'var(--text-dim)' }}>
+                        {trayIconStatus || (editingPolicy.tray_icon_url ? `Embedded in EXEs & Tray: ${editingPolicy.tray_icon_url}` : 'Inheriting global or parent tier logo')}
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: '0.45rem', alignItems: 'center' }}>
+                    <input
+                      ref={trayIconInputRef}
+                      type="file"
+                      accept="image/png,image/jpeg,image/webp,image/x-icon,.ico"
+                      style={{ display: 'none' }}
+                      onChange={handleTrayIconFileSelect}
+                    />
+                    <button
+                      type="button"
+                      className="btn-glass"
+                      style={{ fontSize: '0.74rem', padding: '0.28rem 0.65rem' }}
+                      disabled={uploadingTrayIcon}
+                      onClick={() => trayIconInputRef.current?.click()}
+                    >
+                      <Upload size={12} /> {uploadingTrayIcon ? 'Uploading...' : 'Crop & Upload Icon'}
+                    </button>
+                    {editingPolicy.tray_icon_url && (
+                      <button
+                        type="button"
+                        className="btn-glass btn-danger"
+                        style={{ fontSize: '0.72rem', padding: '0.28rem 0.55rem' }}
+                        onClick={() => setEditingPolicy({ ...editingPolicy, tray_icon_url: '' })}
+                      >
+                        Clear
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.85rem' }}>
+                  <div>
+                    <label style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-dim)', display: 'block', marginBottom: '0.25rem' }}>
+                      Hover Tooltip Text
+                    </label>
+                    <input
+                      type="text"
+                      className="glass-input"
+                      placeholder="Protected by Enterprise IT Support"
+                      value={editingPolicy.tray_tooltip || ''}
+                      onChange={(e) => setEditingPolicy({ ...editingPolicy, tray_tooltip: e.target.value })}
+                    />
+                  </div>
+                  <div>
+                    <label style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-dim)', display: 'block', marginBottom: '0.25rem' }}>
+                      Support Portal URL
+                    </label>
+                    <input
+                      type="url"
+                      className="glass-input"
+                      placeholder="https://support.yourdomain.com"
+                      value={editingPolicy.tray_support_url || ''}
+                      onChange={(e) => setEditingPolicy({ ...editingPolicy, tray_support_url: e.target.value })}
+                    />
+                  </div>
+                  <div>
+                    <label style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-dim)', display: 'block', marginBottom: '0.25rem' }}>
+                      Helpdesk Phone Number
+                    </label>
+                    <input
+                      type="text"
+                      className="glass-input"
+                      placeholder="+1 (800) 555-0199"
+                      value={editingPolicy.tray_support_phone || ''}
+                      onChange={(e) => setEditingPolicy({ ...editingPolicy, tray_support_phone: e.target.value })}
+                    />
+                  </div>
+                  <div>
+                    <label style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-dim)', display: 'block', marginBottom: '0.25rem' }}>
+                      Helpdesk Support Email
+                    </label>
+                    <input
+                      type="email"
+                      className="glass-input"
+                      placeholder="helpdesk@yourdomain.com"
+                      value={editingPolicy.tray_support_email || ''}
+                      onChange={(e) => setEditingPolicy({ ...editingPolicy, tray_support_email: e.target.value })}
+                    />
+                  </div>
+                </div>
+
+                {/* Interactive Popup Menu Builder */}
+                <div style={{ borderTop: '1px solid rgba(255,255,255,0.08)', paddingTop: '0.75rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span style={{ fontSize: '0.78rem', fontWeight: 700, color: 'var(--text-main)' }}>
+                      Popup Context Menu Actions ({getEditingTrayItems(editingPolicy).length})
+                    </span>
+                    <button
+                      type="button"
+                      className="btn-glass"
+                      style={{ fontSize: '0.72rem', padding: '0.22rem 0.55rem' }}
+                      onClick={handleAddTrayMenuItem}
+                    >
+                      <Plus size={12} /> Add Menu Item
+                    </button>
+                  </div>
+
+                  {getEditingTrayItems(editingPolicy).map((item, idx) => (
+                    <div
+                      key={item.id || idx}
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: 'auto 1.1fr 1fr 1.1fr auto',
+                        gap: '0.45rem',
+                        alignItems: 'center',
+                        padding: '0.45rem',
+                        borderRadius: '6px',
+                        background: 'rgba(255,255,255,0.03)',
+                        border: '1px solid var(--border-color)'
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={item.enabled !== false}
+                        onChange={(e) => handleUpdateTrayMenuItem(idx, { enabled: e.target.checked })}
+                        title="Enable menu item"
+                      />
+                      <input
+                        type="text"
+                        className="glass-input"
+                        style={{ padding: '0.28rem 0.45rem', fontSize: '0.74rem' }}
+                        placeholder="Menu Label"
+                        value={item.label}
+                        onChange={(e) => handleUpdateTrayMenuItem(idx, { label: e.target.value })}
+                      />
+                      <select
+                        className="glass-select"
+                        style={{ padding: '0.28rem 0.45rem', fontSize: '0.73rem' }}
+                        value={item.action}
+                        onChange={(e) => handleUpdateTrayMenuItem(idx, { action: e.target.value as TrayMenuItem['action'] })}
+                      >
+                        <option value="open_url">Open Support URL</option>
+                        <option value="open_support_ticket">Open Ticket Form</option>
+                        <option value="show_device_info">Show Device Info HUD</option>
+                        <option value="request_remote_help">Request Remote Help</option>
+                        <option value="copy_hostname">Copy Hostname &amp; IP</option>
+                        <option value="custom_message">Show Notice Message</option>
+                      </select>
+                      <input
+                        type="text"
+                        className="glass-input"
+                        style={{ padding: '0.28rem 0.45rem', fontSize: '0.73rem' }}
+                        placeholder={
+                          item.action === 'open_url'
+                            ? 'https://... (or Support URL)'
+                            : item.action === 'custom_message'
+                              ? 'Popup notice text...'
+                              : 'Optional target / email'
+                        }
+                        value={item.target || ''}
+                        onChange={(e) => handleUpdateTrayMenuItem(idx, { target: e.target.value })}
+                      />
+                      <button
+                        type="button"
+                        className="btn-glass btn-danger btn-icon"
+                        style={{ padding: '0.25rem' }}
+                        onClick={() => handleRemoveTrayMenuItem(idx)}
+                        title="Remove menu item"
+                      >
+                        <Trash2 size={12} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
               </div>
 
               {/* 4-Tier Condition & State Notification Routing Matrix (Web UI, Email, Direct PSA Ticket) */}
@@ -1341,12 +1938,12 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem' }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
                       <Bell size={16} color="#38bdf8" />
-                      <span style={{ fontWeight: 700, fontSize: '0.9rem', color: '#fff' }}>
+                      <span style={{ fontWeight: 700, fontSize: '0.9rem', color: 'var(--text-main)' }}>
                         Per-Tier Condition &amp; State Notification Matrix ({editingPolicy.tier.toUpperCase()} Level)
                       </span>
                     </div>
                     <span style={{ fontSize: '0.7rem', color: 'var(--text-dim)' }}>
-                      Configure thresholds &amp; independent Web UI, Email, and Direct PSA Ticket routing per state
+                      Configure thresholds &amp; independent Web UI, Email, and Support Ticket routing per state
                     </span>
                   </div>
 
@@ -1403,7 +2000,7 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
                           )}
                         </div>
 
-                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.6rem', fontSize: '0.73rem', color: '#cbd5e1' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.6rem', fontSize: '0.73rem', color: 'var(--text-muted)' }}>
                           <div style={{ display: 'flex', alignItems: 'center', gap: '0.85rem', flexWrap: 'wrap' }}>
                             <label style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', cursor: 'pointer' }}>
                               <input
@@ -1427,7 +2024,7 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
                                 checked={rule.createPsaTicket}
                                 onChange={(e) => handleUpdateAlertRule(idx, { createPsaTicket: e.target.checked })}
                               />
-                              <span style={{ color: rule.createPsaTicket ? '#fbbf24' : undefined }}>Direct PSA Ticket</span>
+                              <span style={{ color: rule.createPsaTicket ? '#fbbf24' : undefined }}>Create Support Ticket</span>
                             </label>
                             <label style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', cursor: 'pointer' }}>
                               <input
@@ -1511,6 +2108,14 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
         title="Step-Up MFA: Policy Governance"
         description="Enter your 6-digit TOTP authenticator code or recovery code to authorize modifying hierarchical fleet security & LAPS policies."
         secretType="policy_governance"
+      />
+
+      <IconCropModal
+        isOpen={Boolean(cropPolicyIconFile)}
+        file={cropPolicyIconFile}
+        title="Crop Custom Tier EXE & Tray Icon"
+        onCancel={() => setCropPolicyIconFile(null)}
+        onConfirm={handleTrayIconCropped}
       />
     </div>
   );

@@ -49,6 +49,7 @@ export interface AuthContext {
   authSource: 'cookie' | 'bearer' | 'api_key' | 'ws_ticket';
   mfaVerified: boolean;
   mfaVerifiedUntil: string | null;
+  isApiKey?: boolean;
 }
 
 declare module 'fastify' {
@@ -68,6 +69,7 @@ interface RateBucket {
 
 const rateBuckets = new Map<string, RateBucket>();
 const usedWsNonces = new Map<string, number>();
+const usedLoginMfaNonces = new Map<string, number>();
 
 export function checkRateLimit(
   bucketKey: string,
@@ -167,7 +169,9 @@ export const ALL_GRANULAR_PERMISSIONS = [
   'laps:reveal',
   'laps:rotate',
   'policies:write',
+  'alerts:read',
   'alerts:triage',
+  'docs:read',
   'docs:write',
   'psa:manage',
   'users:manage',
@@ -203,16 +207,18 @@ const PERMISSION_SCOPE_ALIASES: Record<string, string> = {
   'laps.rotate': 'laps:rotate',
   'policies.write': 'policies:write',
   'policies.manage': 'policies:write',
-  'read:alerts': 'alerts:triage',
+  'read:alerts': 'alerts:read',
+  'alerts.read': 'alerts:read',
+  'alerts.view': 'alerts:read',
   'write:alerts': 'alerts:triage',
-  'alerts.read': 'alerts:triage',
-  'alerts.view': 'alerts:triage',
   'alerts.manage': 'alerts:triage',
   'alerts.triage': 'alerts:triage',
-  'docs.view': 'docs:write',
-  'docs.read': 'docs:write',
+  'docs.view': 'docs:read',
+  'docs.read': 'docs:read',
+  'read:docs': 'docs:read',
   'docs.write': 'docs:write',
   'docs.manage': 'docs:write',
+  'write:docs': 'docs:write',
   'psa.manage': 'psa:manage',
   'psa.write': 'psa:manage',
   'users.manage': 'users:manage',
@@ -231,6 +237,8 @@ export function normalizePermissionScope(scope: string): string {
   return PERMISSION_SCOPE_ALIASES[clean] || clean;
 }
 
+export const normalizePermissionKey = normalizePermissionScope;
+
 export function normalizePermissionScopes(scopes: string[] | null | undefined): string[] {
   if (!Array.isArray(scopes)) return [];
   const dedup = new Set<string>();
@@ -248,7 +256,7 @@ export function resolveEffectivePermissions(
   if (isSuperAdminRole(role)) {
     return [...ALL_GRANULAR_PERMISSIONS];
   }
-  if (customPermissions && customPermissions.length > 0) {
+  if (Array.isArray(customPermissions)) {
     return normalizePermissionScopes(customPermissions);
   }
   return DEFAULT_ROLE_PERMISSIONS[role] || ['devices:read'];
@@ -264,7 +272,12 @@ export function hasUserPermission(
   const perms = normalizePermissionScopes(
     user.permissions || resolveEffectivePermissions(user.role)
   );
-  return perms.includes(normalizedTarget) || perms.includes('*');
+  if (perms.includes(normalizedTarget) || perms.includes('*')) return true;
+  if (normalizedTarget === 'alerts:read' && perms.includes('alerts:triage')) return true;
+  if (normalizedTarget === 'docs:read' && perms.includes('docs:write')) return true;
+  if (normalizedTarget === 'devices:read' && perms.includes('devices:manage')) return true;
+  if (normalizedTarget === 'scripts:run' && perms.includes('scripts:write')) return true;
+  return false;
 }
 
 export function canUserAccessTenant(
@@ -272,17 +285,18 @@ export function canUserAccessTenant(
   tenantId?: string | null
 ): boolean {
   if (!user) return false;
-  if (isSuperAdminRole(user.role) && !user.is_api_key) return true;
 
   // Tenant-pinned accounts or API keys are strictly confined to their assigned tenant
-  if (user.tenant_id) {
+  if (user.tenant_id && (!isSuperAdminRole(user.role) || user.is_api_key)) {
     return Boolean(tenantId && user.tenant_id === tenantId);
   }
 
   // Multi-tenant custom role or explicit tenant allowlist
-  if (user.allowed_tenant_ids && user.allowed_tenant_ids.length > 0) {
+  if (Array.isArray(user.allowed_tenant_ids) && user.allowed_tenant_ids.length > 0) {
     return Boolean(tenantId && user.allowed_tenant_ids.includes(tenantId));
   }
+
+  if (isSuperAdminRole(user.role) && !user.is_api_key) return true;
 
   // Global (unpinned) technicians, super-admin API keys, and MSP-wide compliance auditors
   if (isTechnicianOrAbove(user.role) || user.role === 'auditor') {
@@ -294,26 +308,39 @@ export function canUserAccessTenant(
 }
 
 /**
- * Returns the forced single-tenant filter for SQL queries, or '__DENY_ALL__' if a tenant-only
- * role (e.g. client_admin) has no assigned tenant (preventing null tenant_id fail-open leaks).
- * Note: When a user has multiple `allowed_tenant_ids` (>1), callers should also filter rows via `canUserAccessTenant`.
+ * Returns the explicit list of tenant IDs the user may access, or `null` when the user
+ * has unrestricted global access across all tenants. Returns `[]` for fail-closed deny-all.
  */
-export function getScopedTenantFilter(user: AuthenticatedUser | null | undefined): string | null {
-  if (!user) return '__DENY_ALL__';
-  if (isSuperAdminRole(user.role) && !user.is_api_key) return null;
+export function getAllowedTenantIds(user: AuthenticatedUser | null | undefined): string[] | null {
+  if (!user) return [];
 
-  if (user.tenant_id) {
-    return user.tenant_id;
+  if (user.tenant_id && (!isSuperAdminRole(user.role) || user.is_api_key)) {
+    return [user.tenant_id];
   }
 
-  if (user.allowed_tenant_ids && user.allowed_tenant_ids.length > 0) {
-    return user.allowed_tenant_ids.length === 1 ? user.allowed_tenant_ids[0] : null;
+  if (Array.isArray(user.allowed_tenant_ids) && user.allowed_tenant_ids.length > 0) {
+    return user.allowed_tenant_ids;
+  }
+
+  if (isSuperAdminRole(user.role) && !user.is_api_key) {
+    return null;
   }
 
   if (isTechnicianOrAbove(user.role) || user.role === 'auditor') {
     return null;
   }
 
+  return [];
+}
+
+/**
+ * Returns the forced single-tenant filter for SQL queries, or '__DENY_ALL__' if a tenant-only
+ * role (e.g. client_admin) has no assigned tenant or multi-tenant restriction applies.
+ */
+export function getScopedTenantFilter(user: AuthenticatedUser | null | undefined): string | null {
+  const allowed = getAllowedTenantIds(user);
+  if (allowed === null) return null;
+  if (allowed.length === 1) return allowed[0];
   return '__DENY_ALL__';
 }
 
@@ -461,10 +488,32 @@ function sha256Hex(val: string): string {
   return crypto.createHash('sha256').update(val).digest('hex');
 }
 
+export function getConfiguredSessionTtlMs(): { ttlMs: number; isIdleTimeout: boolean } {
+  try {
+    const row = db.prepare('SELECT * FROM settings WHERE id = 1').get() as Record<string, any> | undefined;
+    const rawIdle = row?.session_idle_timeout_min;
+    const rawAbs = row?.session_timeout_min;
+    const chosen =
+      rawIdle !== undefined && rawIdle !== null && rawIdle !== ''
+        ? { val: Number(rawIdle), isIdle: true }
+        : rawAbs !== undefined && rawAbs !== null && rawAbs !== ''
+          ? { val: Number(rawAbs), isIdle: false }
+          : null;
+    if (chosen && Number.isFinite(chosen.val) && chosen.val > 0) {
+      const clampedMin = Math.max(1, Math.min(43_200, chosen.val));
+      return { ttlMs: clampedMin * 60 * 1000, isIdleTimeout: chosen.isIdle };
+    }
+  } catch {
+    // Ignore missing settings table/columns during initial bootstrap
+  }
+  return { ttlMs: SESSION_TTL_MS, isIdleTimeout: false };
+}
+
 export function createUserSession(
   userId: string,
   ipAddress?: string,
-  userAgent?: string
+  userAgent?: string,
+  options?: { mfaVerified?: boolean }
 ): { rawToken: string; expiresAt: string } {
   try {
     db.prepare('DELETE FROM auth_sessions WHERE expires_at <= ?').run(new Date().toISOString());
@@ -474,12 +523,16 @@ export function createUserSession(
 
   const rawToken = crypto.randomBytes(32).toString('base64url');
   const tokenHash = sha256Hex(rawToken);
-  const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+  const { ttlMs } = getConfiguredSessionTtlMs();
+  const expiresAt = new Date(Date.now() + ttlMs).toISOString();
+  const mfaVerifiedUntil = options?.mfaVerified
+    ? new Date(Date.now() + MFA_STEPUP_TTL_MS).toISOString()
+    : null;
 
   db.prepare(`
     INSERT INTO auth_sessions (token_hash, user_id, expires_at, mfa_verified_until, ip_address, user_agent)
-    VALUES (?, ?, ?, NULL, ?, ?)
-  `).run(tokenHash, userId, expiresAt, ipAddress || null, (userAgent || '').slice(0, 255));
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(tokenHash, userId, expiresAt, mfaVerifiedUntil, ipAddress || null, (userAgent || '').slice(0, 255));
 
   db.prepare('UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = ?').run(userId);
 
@@ -557,12 +610,24 @@ export function revokeSessionByPrefix(
   return res.changes > 0;
 }
 
+function appendSetCookieHeader(reply: FastifyReply, cookieStr: string): void {
+  const existing = reply.getHeader('Set-Cookie');
+  if (!existing) {
+    reply.header('Set-Cookie', cookieStr);
+  } else if (Array.isArray(existing)) {
+    reply.header('Set-Cookie', [...existing.map(String), cookieStr]);
+  } else {
+    reply.header('Set-Cookie', [String(existing), cookieStr]);
+  }
+}
+
 export function setSessionCookie(reply: FastifyReply, req: FastifyRequest, rawToken: string): void {
   const isSecure =
     req.protocol === 'https' ||
     (process.env.VITRINE_TRUST_PROXY === 'true' && req.headers['x-forwarded-proto'] === 'https') ||
     process.env.FORCE_SECURE_COOKIE === 'true';
-  const maxAgeSec = Math.floor(SESSION_TTL_MS / 1000);
+  const { ttlMs } = getConfiguredSessionTtlMs();
+  const maxAgeSec = Math.floor(ttlMs / 1000);
   const parts = [
     `${SESSION_COOKIE_NAME}=${encodeURIComponent(rawToken)}`,
     'Path=/',
@@ -571,14 +636,14 @@ export function setSessionCookie(reply: FastifyReply, req: FastifyRequest, rawTo
     `Max-Age=${maxAgeSec}`
   ];
   if (isSecure) parts.push('Secure');
-  reply.header('Set-Cookie', parts.join('; '));
+  appendSetCookieHeader(reply, parts.join('; '));
 }
 
 export function clearSessionCookie(reply: FastifyReply): void {
-  reply.header('Set-Cookie', `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+  appendSetCookieHeader(reply, `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
 }
 
-function parseCookies(cookieHeader?: string): Record<string, string> {
+export function parseCookies(cookieHeader?: string): Record<string, string> {
   const out: Record<string, string> = {};
   if (!cookieHeader) return out;
   for (const pair of cookieHeader.split(';')) {
@@ -595,10 +660,11 @@ function parseCookies(cookieHeader?: string): Record<string, string> {
   return out;
 }
 
-function hydrateUserRow(row: any): AuthenticatedUser {
+export function hydrateUserRow(row: any): AuthenticatedUser {
   let customPerms: string[] | null = null;
   let allowedTenants: string[] = [];
   let customRoleName: string | null = null;
+  const normalizedRole = String(row.role || '').trim().toLowerCase();
 
   if (row.custom_role_id) {
     try {
@@ -612,6 +678,31 @@ function hydrateUserRow(row: any): AuthenticatedUser {
       }
     } catch {
       // Ignore missing custom_roles table during bootstrap
+    }
+  } else if (!isSuperAdminRole(row.role) && normalizedRole !== 'client_admin') {
+    try {
+      const builtInRole = db
+        .prepare(`
+          SELECT permissions_json
+          FROM custom_roles
+          WHERE is_system = 1 AND base_tier = ?
+          ORDER BY CASE id
+            WHEN 'role-senior-tech' THEN 0
+            WHEN 'role-security-auditor' THEN 0
+            WHEN 'role-client-admin' THEN 0
+            ELSE 1
+          END, rowid ASC
+          LIMIT 1
+        `)
+        .get(normalizedRole) as { permissions_json?: string } | undefined;
+      if (builtInRole?.permissions_json) {
+        const parsed = JSON.parse(builtInRole.permissions_json);
+        if (Array.isArray(parsed)) {
+          customPerms = parsed;
+        }
+      }
+    } catch {
+      // Ignore during bootstrap
     }
   }
 
@@ -644,9 +735,11 @@ export function issueEphemeralWsTicket(params: {
   });
 }
 
-export function consumeEphemeralWsTicket(ticket?: string | null): {
+function verifyWsTicketPayload(ticket?: string | null): {
   userId?: string | null;
   grantId?: string | null;
+  nonce: string;
+  exp?: number;
 } | null {
   const payload = hmacVerifyToken<{
     scope?: string;
@@ -656,6 +749,20 @@ export function consumeEphemeralWsTicket(ticket?: string | null): {
     exp?: number;
   }>(ticket);
   if (!payload || payload.scope !== 'ws_ticket' || !payload.nonce) return null;
+  return {
+    userId: payload.userId,
+    grantId: payload.grantId,
+    nonce: payload.nonce,
+    exp: payload.exp
+  };
+}
+
+export function consumeEphemeralWsTicket(ticket?: string | null): {
+  userId?: string | null;
+  grantId?: string | null;
+} | null {
+  const payload = verifyWsTicketPayload(ticket);
+  if (!payload) return null;
 
   const now = Date.now();
   for (const [n, exp] of usedWsNonces.entries()) {
@@ -665,6 +772,28 @@ export function consumeEphemeralWsTicket(ticket?: string | null): {
   usedWsNonces.set(payload.nonce, payload.exp || now + 45_000);
 
   return { userId: payload.userId, grantId: payload.grantId };
+}
+
+/**
+ * Resolves a user from a WS ticket ONLY when `userId` is present.
+ * Guest tickets (`!payload.userId`) return `null` WITHOUT consuming the nonce
+ * so `consumeEphemeralWsTicket` can validate and consume it once in `server.ts`.
+ */
+export function extractUserFromWsTicket(ticket?: string | null): AuthenticatedUser | null {
+  const payload = verifyWsTicketPayload(ticket);
+  if (!payload || !payload.userId) return null;
+
+  const now = Date.now();
+  for (const [n, exp] of usedWsNonces.entries()) {
+    if (exp <= now) usedWsNonces.delete(n);
+  }
+  if (usedWsNonces.has(payload.nonce)) return null;
+
+  const uRow = db.prepare('SELECT * FROM users WHERE id = ?').get(payload.userId) as any;
+  if (!uRow) return null;
+
+  usedWsNonces.set(payload.nonce, payload.exp || now + 45_000);
+  return hydrateUserRow(uRow);
 }
 
 export function issuePublicApiKey(params: {
@@ -794,7 +923,8 @@ export function extractAuthContext(req: FastifyRequest): AuthContext | null {
         rawToken: candidateApiKey,
         authSource: 'api_key',
         mfaVerified: false,
-        mfaVerifiedUntil: null
+        mfaVerifiedUntil: null,
+        isApiKey: true
       };
     } catch {
       return null;
@@ -826,19 +956,17 @@ export function extractAuthContext(req: FastifyRequest): AuthContext | null {
   if (!rawToken && req.url?.startsWith('/ws/')) {
     const q = (req.query || {}) as Record<string, string>;
     if (q.ticket) {
-      const consumed = consumeEphemeralWsTicket(q.ticket);
-      if (consumed?.userId) {
-        const uRow = db.prepare('SELECT * FROM users WHERE id = ?').get(consumed.userId) as any;
-        if (uRow) {
-          return {
-            user: hydrateUserRow(uRow),
-            tokenHash: `ws-ticket-${consumed.userId}`,
-            rawToken: '',
-            authSource: 'ws_ticket',
-            mfaVerified: false,
-            mfaVerifiedUntil: null
-          };
-        }
+      const wsUser = extractUserFromWsTicket(q.ticket);
+      if (wsUser) {
+        return {
+          user: wsUser,
+          tokenHash: `ws-ticket-${wsUser.id}`,
+          rawToken: '',
+          authSource: 'ws_ticket',
+          mfaVerified: false,
+          mfaVerifiedUntil: null,
+          isApiKey: false
+        };
       }
     }
     if (q.token) {
@@ -861,9 +989,18 @@ export function extractAuthContext(req: FastifyRequest): AuthContext | null {
     .get(tokenHash) as any;
 
   if (!row) return null;
-  if (!row.expires_at || new Date(row.expires_at).getTime() <= Date.now()) {
+  const expiresMs = row.expires_at ? new Date(row.expires_at).getTime() : 0;
+  if (!expiresMs || expiresMs <= Date.now()) {
     db.prepare('DELETE FROM auth_sessions WHERE token_hash = ?').run(tokenHash);
     return null;
+  }
+
+  const { ttlMs, isIdleTimeout } = getConfiguredSessionTtlMs();
+  if (isIdleTimeout && expiresMs - Date.now() < ttlMs - 1000) {
+    try {
+      const nextExpiresAt = new Date(Date.now() + ttlMs).toISOString();
+      db.prepare('UPDATE auth_sessions SET expires_at = ? WHERE token_hash = ?').run(nextExpiresAt, tokenHash);
+    } catch {}
   }
 
   const mfaVerified = Boolean(
@@ -876,7 +1013,8 @@ export function extractAuthContext(req: FastifyRequest): AuthContext | null {
     rawToken,
     authSource,
     mfaVerified,
-    mfaVerifiedUntil: row.mfa_verified_until || null
+    mfaVerifiedUntil: row.mfa_verified_until || null,
+    isApiKey: false
   };
 }
 
@@ -968,11 +1106,12 @@ export function authenticateUserPassword(
 }
 
 // ============================================================================
-// Step-Up MFA Verification & Enrollment Helpers
+// Login & Step-Up MFA Verification & Enrollment Helpers
 // ============================================================================
-export function verifySessionStepUpMfa(
-  auth: AuthContext,
-  codeInput: string
+function verifyUserMfaCodeAtomic(
+  userId: string,
+  codeInput: string,
+  options?: { totpOnly?: boolean }
 ): { success: boolean; verifiedUntil?: string; usedRecoveryCode?: boolean; error?: string } {
   const cleaned = (codeInput || '').trim().toUpperCase();
   if (!cleaned) {
@@ -980,7 +1119,7 @@ export function verifySessionStepUpMfa(
   }
 
   // Per-user rate limit (in addition to IP rate limit) so rotating IPs cannot brute-force 6-digit TOTP
-  const userRate = checkRateLimit(`mfa-user:${auth.user.id}`, 8, 5 * 60_000);
+  const userRate = checkRateLimit(`mfa-user:${userId}`, 8, 5 * 60_000);
   if (!userRate.allowed) {
     return {
       success: false,
@@ -998,7 +1137,7 @@ export function verifySessionStepUpMfa(
       .prepare(
         'SELECT id, username, totp_secret, last_totp_step, totp_confirmed_at, recovery_codes_json FROM users WHERE id = ?'
       )
-      .get(auth.user.id) as any;
+      .get(userId) as any;
 
     if (!userRow) {
       return { success: false, error: 'User account not found.' };
@@ -1008,6 +1147,13 @@ export function verifySessionStepUpMfa(
 
     // 1. Check 6-digit RFC 6238 TOTP with atomic replay guard
     const numericOnly = cleaned.replace(/\s|-/g, '');
+    if (options?.totpOnly && !/^\d{6}$/.test(numericOnly)) {
+      return {
+        success: false,
+        error: 'Enter the current 6-digit code from your authenticator app to confirm enrollment.'
+      };
+    }
+
     if (/^\d{6}$/.test(numericOnly) && userSecret) {
       const check = verifyTotp(userSecret, numericOnly, userRow.last_totp_step, 1);
       if (check.replayDetected) {
@@ -1020,13 +1166,16 @@ export function verifySessionStepUpMfa(
         const verifiedUntil = new Date(Date.now() + MFA_STEPUP_TTL_MS).toISOString();
         db.prepare(
           'UPDATE users SET last_totp_step = ?, totp_enabled = 1, totp_confirmed_at = COALESCE(totp_confirmed_at, CURRENT_TIMESTAMP) WHERE id = ?'
-        ).run(check.matchedStep, auth.user.id);
-        db.prepare('UPDATE auth_sessions SET mfa_verified_until = ? WHERE token_hash = ?').run(
-          verifiedUntil,
-          auth.tokenHash
-        );
+        ).run(check.matchedStep, userId);
         return { success: true, verifiedUntil };
       }
+    }
+
+    if (options?.totpOnly) {
+      return {
+        success: false,
+        error: 'Invalid 6-digit authenticator code. Ensure your device clock is synced and enter the current code.'
+      };
     }
 
     // 2. Check one-time XXXX-XXXX recovery codes (atomic single-use consumption)
@@ -1050,11 +1199,7 @@ export function verifySessionStepUpMfa(
           const verifiedUntil = new Date(Date.now() + MFA_STEPUP_TTL_MS).toISOString();
           db.prepare(
             'UPDATE users SET recovery_codes_json = ?, totp_confirmed_at = COALESCE(totp_confirmed_at, CURRENT_TIMESTAMP) WHERE id = ?'
-          ).run(JSON.stringify(storedHashes), auth.user.id);
-          db.prepare('UPDATE auth_sessions SET mfa_verified_until = ? WHERE token_hash = ?').run(
-            verifiedUntil,
-            auth.tokenHash
-          );
+          ).run(JSON.stringify(storedHashes), userId);
           return { success: true, verifiedUntil, usedRecoveryCode: true };
         }
       } catch {
@@ -1069,6 +1214,100 @@ export function verifySessionStepUpMfa(
   });
 
   return txVerify.immediate();
+}
+
+export function doesUserRequireLoginMfa(userId: string): {
+  requiresMfaChallenge: boolean;
+  requiresInitialEnrollment: boolean;
+} {
+  const row = db
+    .prepare('SELECT totp_enabled, totp_confirmed_at, totp_secret FROM users WHERE id = ?')
+    .get(userId) as { totp_enabled?: number; totp_confirmed_at?: string | null; totp_secret?: string | null } | undefined;
+  if (!row) {
+    return { requiresMfaChallenge: false, requiresInitialEnrollment: false };
+  }
+  const hasSecret = Boolean(row.totp_secret && decryptVaultSecret(row.totp_secret));
+  if (row.totp_enabled && row.totp_confirmed_at && hasSecret) {
+    return { requiresMfaChallenge: true, requiresInitialEnrollment: false };
+  }
+  if (row.totp_enabled && !row.totp_confirmed_at) {
+    return { requiresMfaChallenge: false, requiresInitialEnrollment: true };
+  }
+  return { requiresMfaChallenge: false, requiresInitialEnrollment: false };
+}
+
+export function issuePendingMfaLoginToken(userId: string): string {
+  const nonce = crypto.randomBytes(16).toString('hex');
+  return hmacSignToken({
+    scope: 'mfa_login_challenge',
+    userId,
+    nonce,
+    exp: Date.now() + 5 * 60_000
+  });
+}
+
+export function verifyPendingMfaLoginChallenge(
+  mfaChallengeToken: string,
+  codeInput: string
+): { success: boolean; user?: AuthenticatedUser; usedRecoveryCode?: boolean; error?: string } {
+  const payload = hmacVerifyToken<{
+    scope?: string;
+    userId?: string;
+    nonce?: string;
+    exp?: number;
+  }>(mfaChallengeToken);
+  if (!payload || payload.scope !== 'mfa_login_challenge' || !payload.userId || !payload.nonce) {
+    return {
+      success: false,
+      error: 'Login MFA challenge has expired or is invalid. Please sign in with your password again.'
+    };
+  }
+
+  const now = Date.now();
+  for (const [n, exp] of usedLoginMfaNonces.entries()) {
+    if (exp <= now) usedLoginMfaNonces.delete(n);
+  }
+  if (usedLoginMfaNonces.has(payload.nonce)) {
+    return {
+      success: false,
+      error: 'This MFA login challenge was already used. Please sign in again.'
+    };
+  }
+
+  const verified = verifyUserMfaCodeAtomic(payload.userId, codeInput);
+  if (!verified.success) {
+    return { success: false, error: verified.error || 'Invalid MFA verification code.' };
+  }
+
+  usedLoginMfaNonces.set(payload.nonce, payload.exp || now + 5 * 60_000);
+  const userRow = db
+    .prepare(
+      'SELECT id, username, email, role, tenant_id, totp_enabled, totp_confirmed_at, custom_role_id FROM users WHERE id = ?'
+    )
+    .get(payload.userId) as any;
+  if (!userRow) {
+    return { success: false, error: 'User account not found.' };
+  }
+  return {
+    success: true,
+    user: hydrateUserRow(userRow),
+    usedRecoveryCode: Boolean(verified.usedRecoveryCode)
+  };
+}
+
+export function verifySessionStepUpMfa(
+  auth: AuthContext,
+  codeInput: string,
+  options?: { totpOnly?: boolean }
+): { success: boolean; verifiedUntil?: string; usedRecoveryCode?: boolean; error?: string } {
+  const res = verifyUserMfaCodeAtomic(auth.user.id, codeInput, options);
+  if (res.success && res.verifiedUntil) {
+    db.prepare('UPDATE auth_sessions SET mfa_verified_until = ? WHERE token_hash = ?').run(
+      res.verifiedUntil,
+      auth.tokenHash
+    );
+  }
+  return res;
 }
 
 /**

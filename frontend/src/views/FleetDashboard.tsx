@@ -1,6 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import {
   Monitor,
+  Laptop,
+  Server,
   EyeOff,
   Terminal,
   KeyRound,
@@ -35,6 +37,7 @@ import {
 } from '../services/api.js';
 import { MfaChallengeModal } from '../components/MfaChallengeModal.js';
 import { isSuperAdmin, canMutateFleet } from '../utils/permissions.js';
+import { matchesDeviceSearch } from '../utils/deviceHelpers.js';
 
 function sanitizeCsvCell(val: unknown): string {
   const raw = String(val ?? '');
@@ -54,6 +57,7 @@ interface FleetDashboardProps {
   onOpenInstaller?: () => void;
   onOpenOnboarding?: () => void;
   onRefreshFleet?: () => void;
+  onResetTenantFilter?: () => void;
   currentUser?: AuthUser | null;
 }
 
@@ -69,8 +73,10 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
   onOpenInstaller,
   onOpenOnboarding,
   onRefreshFleet,
+  onResetTenantFilter,
   currentUser
 }) => {
+  const enableLabDemo = import.meta.env.VITE_ENABLE_LAB_DEMO === 'true';
   const [smartGroup, setSmartGroup] = useState('all');
   const [lifecycleView, setLifecycleView] = useState<'active' | 'pending_offboard' | 'archived'>('active');
   const [customGroups, setCustomGroups] = useState<SmartGroup[]>([]);
@@ -86,6 +92,14 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
   const [localDevices, setLocalDevices] = useState<Device[]>(devices);
   const [showBreakGlassMfa, setShowBreakGlassMfa] = useState(false);
   const [breakGlassRows, setBreakGlassRows] = useState<BreakGlassRecoveryEntry[] | null>(null);
+  useEffect(() => {
+    setSelectedIds([]);
+  }, [selectedTenantId, lifecycleView, smartGroup, searchQuery]);
+
+  useEffect(() => {
+    setSelectedIds((prev) => prev.filter((id) => devices.some((d) => d.id === id)));
+  }, [devices]);
+
   const canMutate = canMutateFleet(currentUser);
 
   useEffect(() => {
@@ -145,7 +159,7 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
     const r = raw.toLowerCase();
     if (r.includes('pending_reboot = 1')) return d.pending_reboot === 1;
     if (r.includes('edr_status != active')) return d.edr_status !== 'Active';
-    if (r.includes('bitlocker_status not like')) return !d.bitlocker_status.includes('Encrypted');
+    if (r.includes('bitlocker_status not like')) return !d.bitlocker_status?.includes('Encrypted');
     if (r.includes('os_type in')) return d.os_type === 'linux' || d.os_type === 'macos';
     const cpuMatch = r.match(/cpu_usage\s*>\s*(\d+)/);
     if (cpuMatch) return d.cpu_usage > Number(cpuMatch[1]);
@@ -173,22 +187,14 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
     }
 
     // Search query
-    if (searchQuery.trim()) {
-      const q = searchQuery.toLowerCase();
-      const match =
-        d.hostname.toLowerCase().includes(q) ||
-        d.ip_address.toLowerCase().includes(q) ||
-        d.os_version.toLowerCase().includes(q) ||
-        d.device_role.toLowerCase().includes(q) ||
-        d.serial_number.toLowerCase().includes(q) ||
-        (d.tenant_name && d.tenant_name.toLowerCase().includes(q));
-      if (!match) return false;
+    if (searchQuery.trim() && !matchesDeviceSearch(d, searchQuery, { tenantName: d.tenant_name, siteName: d.site_name })) {
+      return false;
     }
 
     // Dynamic Smart Groups (Feature 27)
     if (smartGroup === 'pending_reboot') return d.pending_reboot === 1;
     if (smartGroup === 'isolated') return d.quarantined === 1;
-    if (smartGroup === 'unencrypted') return !d.bitlocker_status.includes('Encrypted');
+    if (smartGroup === 'unencrypted') return !d.bitlocker_status?.includes('Encrypted');
     if (smartGroup === 'multi_os') return d.os_type === 'linux' || d.os_type === 'macos';
     if (smartGroup === 'servers') {
       return (
@@ -212,7 +218,7 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
   const onlineCount = activeDevices.filter((d) => d.status === 'online').length;
   const rebootCount = activeDevices.filter((d) => d.pending_reboot === 1).length;
   const isolatedCount = activeDevices.filter((d) => d.quarantined === 1).length;
-  const bitlockerCount = tenantScopedDevices.filter((d) => d.bitlocker_status.includes('Encrypted')).length;
+  const bitlockerCount = tenantScopedDevices.filter((d) => d.bitlocker_status?.includes('Encrypted')).length;
 
   const handleForceArchive = async (d: Device) => {
     const res = await forceArchiveDevice(d.id);
@@ -399,6 +405,7 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
     const res = await deleteTenant(selectedTenantId);
     if (res.success) {
       setBulkStatusMsg('Client organization removed.');
+      onResetTenantFilter?.();
       onRefreshFleet?.();
     } else {
       setBulkStatusMsg(res.error || 'Cannot delete client while endpoints remain attached.');
@@ -555,7 +562,7 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
           { id: 'pending_reboot', label: '⚠️ Pending Reboot' },
           { id: 'isolated', label: '🛡️ Cyber Isolated' },
           { id: 'unencrypted', label: '🔓 Missing BitLocker' },
-          { id: 'multi_os', label: '🐧 Linux & macOS Parity' }
+          { id: 'multi_os', label: '🐧 Linux & macOS' }
         ].map((g) => (
           <button
             key={g.id}
@@ -721,7 +728,14 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
                       >
                         {d.hostname}
                       </span>
-                      <span style={{ fontSize: '0.72rem', color: 'var(--text-dim)' }}>
+                      <span style={{ fontSize: '0.72rem', color: 'var(--text-dim)', display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
+                        {(() => {
+                          const r = (d.device_role || '').toLowerCase();
+                          if (r.includes('laptop')) return <Laptop size={12} color="#38bdf8" />;
+                          if (r.includes('server') || r.includes('hypervisor') || r.includes('controller')) return <Server size={12} color="#a78bfa" />;
+                          if (r.includes('virtual')) return <Cpu size={12} color="#34d399" />;
+                          return <Monitor size={12} color="var(--text-dim)" />;
+                        })()}
                         {d.device_role} • {d.ip_address}
                         {d.offboard_reason ? ` • ${d.offboard_reason}` : ''}
                       </span>
@@ -742,11 +756,18 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
                     </div>
                   </td>
 
-                  <td style={{ minWidth: '150px' }}>
+                  <td style={{ minWidth: '185px' }}>
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.72rem' }}>
-                        <span>CPU: {d.cpu_usage.toFixed(1)}%</span>
-                        <span>RAM: {d.ram_used_gb.toFixed(1)}/{d.ram_total_gb}GB</span>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.5rem', fontSize: '0.72rem', whiteSpace: 'nowrap' }}>
+                        <span>CPU: {d.status === 'offline' && d.cpu_usage <= 0 ? '—' : `${d.cpu_usage.toFixed(1)}%`}</span>
+                        <span>
+                          RAM:{' '}
+                          {d.ram_used_gb > 0
+                            ? `${d.ram_used_gb.toFixed(1)}/${d.ram_total_gb.toFixed(0)}GB`
+                            : d.ram_total_gb > 0
+                            ? `— / ${d.ram_total_gb.toFixed(0)}GB`
+                            : '—'}
+                        </span>
                       </div>
                       <div style={{ width: '100%', height: '5px', background: 'rgba(148, 163, 184, 0.22)', borderRadius: '3px', overflow: 'hidden' }}>
                         <div
@@ -773,8 +794,8 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
                       >
                         <ShieldCheck size={12} /> {d.edr_status === 'Active' ? d.edr_name || 'EDR Active' : d.edr_status || 'Unmonitored'}
                       </span>
-                      <span style={{ fontSize: '0.7rem', color: d.has_bitlocker_key || d.bitlocker_status.includes('Encrypted') ? '#38bdf8' : '#f59e0b' }}>
-                        🔒 {d.has_bitlocker_key || d.bitlocker_status.includes('Encrypted') ? 'BitLocker Escrowed' : 'Unencrypted'}
+                      <span style={{ fontSize: '0.7rem', color: d.has_bitlocker_key || d.bitlocker_status?.includes('Encrypted') ? '#38bdf8' : '#f59e0b' }}>
+                        🔒 {d.has_bitlocker_key || d.bitlocker_status?.includes('Encrypted') ? 'BitLocker Escrowed' : 'Unencrypted'}
                       </span>
                     </div>
                   </td>
@@ -793,11 +814,11 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
                           </button>
                         )}
 
-                        {(d.lifecycle_state === 'pending_offboard' || d.lifecycle_state === 'archived') && (
+                        {enableLabDemo && (d.lifecycle_state === 'pending_offboard' || d.lifecycle_state === 'archived') && (
                           <button
                             className="btn-glass"
                             style={{ padding: '0.25rem 0.55rem', fontSize: '0.72rem', borderColor: 'rgba(56, 189, 248, 0.45)', color: '#38bdf8' }}
-                            title="Simulate this endpoint waking up or re-installing: resurrects to Active if Archived & parent client is Active; executes queued/quiet offboard if Pending Offboard or parent client is Archived/Deleted"
+                            title="Lab demo: simulate this endpoint checking back in"
                             onClick={() => handleSimulateWakeCheckIn(d)}
                           >
                             <Zap size={13} /> Simulate Wake / Check-In
@@ -893,10 +914,10 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
                           )}
                           {onOpenOnboarding && isSuperAdmin(currentUser) && (
                             <button className="btn-glass" onClick={onOpenOnboarding}>
-                              Import from MeshCentral 2
+                              Import from MeshCentral
                             </button>
                           )}
-                          {isSuperAdmin(currentUser) && (
+                          {enableLabDemo && isSuperAdmin(currentUser) && (
                             <button className="btn-glass" onClick={handleSeedDemoLab}>
                               Load Lab Demo Dataset
                             </button>
@@ -1124,7 +1145,7 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
             </div>
             <div className="modal-footer" style={{ display: 'flex', justifyContent: 'space-between' }}>
               <button className="btn-glass" onClick={downloadBreakGlassCsv}>
-                <Download size={14} /> Download Encrypted-Ready CSV Sheet
+                <Download size={14} /> Download Plaintext Break-Glass CSV
               </button>
               <button className="btn-glass btn-primary" onClick={() => setBreakGlassRows(null)}>
                 Close

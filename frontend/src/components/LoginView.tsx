@@ -13,25 +13,55 @@ import {
   LifeBuoy,
   Globe
 } from 'lucide-react';
-import { setupInitialSuperAdmin, loginWithPassword, getLocalQrSvgUrl } from '../services/api.js';
+import {
+  setupInitialSuperAdmin,
+  loginWithPassword,
+  verifyLoginMfa,
+  getLocalQrSvgUrl,
+  verifyMfa,
+  fetchMfaEnrollment
+} from '../services/api.js';
 import { AuthStatusResponse, AuthUser } from '../types/index.js';
 import { copyToClipboard } from '../utils/clipboard.js';
 import { isSuperAdmin as checkIsSuperAdmin } from '../utils/permissions.js';
+import { sanitizeSafeUrl } from '../utils/urlSafety.js';
+
+const SSO_ERROR_MESSAGES: Record<string, string> = {
+  access_denied: 'Single Sign-On authorization was cancelled or denied by the identity provider.',
+  invalid_request: 'Invalid Single Sign-On request parameters.',
+  unauthorized_client: 'OIDC client is not authorized for this grant type.',
+  invalid_state: 'Single Sign-On session state mismatch or expired. Please try signing in again.',
+  missing_code: 'Identity provider callback did not include an authorization code.',
+  oidc_disabled: 'OpenID Connect SSO is currently disabled by your administrator.',
+  oidc_not_configured: 'OpenID Connect SSO is not yet configured on this server.',
+  token_exchange_failed: 'Failed to exchange authorization code with the OIDC identity provider.',
+  invalid_id_token: 'Identity provider returned an invalid or untrusted ID token.',
+  email_unverified: 'Your SSO provider did not assert a verified email address.',
+  user_not_provisioned: 'No matching Vitrine user account is provisioned for your SSO identity.',
+  user_disabled: 'Your user account has been disabled. Contact your administrator.',
+  server_error: 'The OIDC identity provider encountered an internal error.',
+  temporarily_unavailable: 'The OIDC identity provider is temporarily unavailable.',
+  sso_failed: 'Single Sign-On authentication failed. Please try again or use local credentials.'
+};
 
 interface LoginViewProps {
   authStatus: AuthStatusResponse;
   onAuthenticated: (user: AuthUser, triggerOobe?: boolean) => void;
   onOpenQuickSupport?: () => void;
+  pendingMfaUser?: AuthUser | null;
+  onSignOutPendingMfa?: () => Promise<void> | void;
 }
 
 export const LoginView: React.FC<LoginViewProps> = ({
   authStatus,
   onAuthenticated,
-  onOpenQuickSupport
+  onOpenQuickSupport,
+  pendingMfaUser,
+  onSignOutPendingMfa
 }) => {
   const isFirstSetup = !authStatus.initialized;
   const brandName = authStatus.branding?.brand_name || 'Vitrine RMM';
-  const brandLogoUrl = authStatus.branding?.brand_logo_url || '/branding/logo.png';
+  const brandLogoUrl = sanitizeSafeUrl(authStatus.branding?.brand_logo_url) || '/branding/logo.png';
 
   const [username, setUsername] = useState(isFirstSetup ? 'admin' : '');
   const [email, setEmail] = useState('');
@@ -44,7 +74,8 @@ export const LoginView: React.FC<LoginViewProps> = ({
     const params = new URLSearchParams(window.location.search);
     const ssoErr = params.get('sso_error');
     if (ssoErr) {
-      setError(ssoErr);
+      const normalized = ssoErr.trim().toLowerCase();
+      setError(SSO_ERROR_MESSAGES[normalized] || SSO_ERROR_MESSAGES.sso_failed);
       params.delete('sso_error');
       const cleanQuery = params.toString();
       const nextUrl = `${window.location.pathname}${cleanQuery ? `?${cleanQuery}` : ''}${window.location.hash}`;
@@ -59,10 +90,82 @@ export const LoginView: React.FC<LoginViewProps> = ({
     otpAuthUri: string;
     qrSvg?: string;
     recoveryCodes: string[];
+    remainingRecoveryCodes?: number;
+    resumed?: boolean;
   } | null>(null);
   const [copiedSecret, setCopiedSecret] = useState(false);
   const [copiedCodes, setCopiedCodes] = useState(false);
-  const [confirmedSaved, setConfirmedSaved] = useState(false);
+  const [totpCode, setTotpCode] = useState('');
+  const [mfaVerifying, setMfaVerifying] = useState(false);
+  const [mfaVerifyError, setMfaVerifyError] = useState<string | null>(null);
+  const [loadingPendingMfa, setLoadingPendingMfa] = useState(false);
+  const [pendingMfaLoadError, setPendingMfaLoadError] = useState<string | null>(null);
+
+  // Returning user sign-in TOTP MFA challenge state
+  const [loginMfaChallenge, setLoginMfaChallenge] = useState<{
+    token: string;
+    username: string;
+  } | null>(null);
+  const [loginMfaCode, setLoginMfaCode] = useState('');
+  const [loginMfaError, setLoginMfaError] = useState<string | null>(null);
+  const [loginMfaSubmitting, setLoginMfaSubmitting] = useState(false);
+
+  const loadPendingMfaEnrollment = async (user: AuthUser) => {
+    setLoadingPendingMfa(true);
+    setPendingMfaLoadError(null);
+    try {
+      const details = await fetchMfaEnrollment();
+      setProvisionedMfa({
+        user,
+        totpSecret: details.secretBase32 || '',
+        otpAuthUri: details.otpAuthUri || '',
+        qrSvg: details.qrSvg || details.qrCodeSvg || undefined,
+        recoveryCodes: [],
+        remainingRecoveryCodes: details.remainingRecoveryCodes,
+        resumed: true
+      });
+    } catch (err: any) {
+      setPendingMfaLoadError(err?.message || 'Unable to load pending MFA enrollment details.');
+    } finally {
+      setLoadingPendingMfa(false);
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!pendingMfaUser) return;
+    if (provisionedMfa && provisionedMfa.user.id === pendingMfaUser.id) return;
+
+    const resumeEnrollment = async () => {
+      setLoadingPendingMfa(true);
+      setPendingMfaLoadError(null);
+      try {
+        const details = await fetchMfaEnrollment();
+        if (cancelled) return;
+        setProvisionedMfa({
+          user: pendingMfaUser,
+          totpSecret: details.secretBase32 || '',
+          otpAuthUri: details.otpAuthUri || '',
+          qrSvg: details.qrSvg || details.qrCodeSvg || undefined,
+          recoveryCodes: [],
+          remainingRecoveryCodes: details.remainingRecoveryCodes,
+          resumed: true
+        });
+      } catch (err: any) {
+        if (cancelled) return;
+        setPendingMfaLoadError(err?.message || 'Unable to load pending MFA enrollment details.');
+      } finally {
+        if (!cancelled) {
+          setLoadingPendingMfa(false);
+        }
+      }
+    };
+
+    resumeEnrollment();
+    return () => {
+      cancelled = true;
+    };
+  }, [pendingMfaUser, provisionedMfa]);
 
   const handleBootstrapSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -92,6 +195,8 @@ export const LoginView: React.FC<LoginViewProps> = ({
         setError(res.error || 'Failed to initialize Super Admin account.');
         return;
       }
+      setTotpCode('');
+      setMfaVerifyError(null);
       setProvisionedMfa({
         user: res.user,
         totpSecret: res.totpSecret || '',
@@ -103,6 +208,36 @@ export const LoginView: React.FC<LoginViewProps> = ({
       setError(err?.message || 'Unable to reach Vitrine authentication service.');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleVerifyInitialTotp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!provisionedMfa) return;
+
+    const cleaned = totpCode.replace(/\D/g, '').trim();
+    if (cleaned.length !== 6) {
+      setMfaVerifyError('Enter the current 6-digit code from your authenticator app.');
+      return;
+    }
+
+    setMfaVerifying(true);
+    setMfaVerifyError(null);
+    try {
+      const res = await verifyMfa(cleaned, 'initial_admin_mfa_enrollment', undefined, {
+        totpOnly: true
+      });
+      if (res.success) {
+        onAuthenticated({ ...provisionedMfa.user, totp_confirmed: true }, !authStatus.isOnboarded);
+      } else {
+        setMfaVerifyError(
+          res.error || 'Invalid 6-digit authenticator code. Please check your authenticator app and try again.'
+        );
+      }
+    } catch (err: any) {
+      setMfaVerifyError(err?.message || 'Failed to verify authenticator code. Please try again.');
+    } finally {
+      setMfaVerifying(false);
     }
   };
 
@@ -120,15 +255,55 @@ export const LoginView: React.FC<LoginViewProps> = ({
         username: username.trim(),
         password
       });
-      if (!res.success || !res.user) {
+      if (!res.success) {
         setError(res.error || 'Invalid username or password.');
         return;
       }
-      onAuthenticated(res.user, !authStatus.isOnboarded && checkIsSuperAdmin(res.user));
+      if (res.mfaRequired && res.mfaChallengeToken) {
+        setLoginMfaCode('');
+        setLoginMfaError(null);
+        setLoginMfaChallenge({
+          token: res.mfaChallengeToken,
+          username: res.username || username.trim()
+        });
+        return;
+      }
+      if (!res.user) {
+        setError(res.error || 'Invalid username or password.');
+        return;
+      }
+      onAuthenticated(res.user, !authStatus.isOnboarded && checkIsSuperAdmin(res.user) && res.user.totp_confirmed !== false);
     } catch (err: any) {
       setError(err?.message || 'Authentication request failed.');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleLoginMfaSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!loginMfaChallenge) return;
+    const cleaned = loginMfaCode.trim();
+    if (!cleaned) {
+      setLoginMfaError('Enter your 6-digit authenticator code or an emergency recovery code.');
+      return;
+    }
+
+    setLoginMfaSubmitting(true);
+    setLoginMfaError(null);
+    try {
+      const res = await verifyLoginMfa(loginMfaChallenge.token, cleaned);
+      if (!res.success || !res.user) {
+        setLoginMfaError(res.error || 'Invalid authenticator or recovery code.');
+        return;
+      }
+      setLoginMfaChallenge(null);
+      setLoginMfaCode('');
+      onAuthenticated(res.user, !authStatus.isOnboarded && checkIsSuperAdmin(res.user) && res.user.totp_confirmed !== false);
+    } catch (err: any) {
+      setLoginMfaError(err?.message || 'Unable to verify MFA code.');
+    } finally {
+      setLoginMfaSubmitting(false);
     }
   };
 
@@ -158,6 +333,58 @@ export const LoginView: React.FC<LoginViewProps> = ({
     a.click();
     URL.revokeObjectURL(url);
   };
+
+  if (pendingMfaUser && !provisionedMfa) {
+    return (
+      <div
+        style={{
+          minHeight: '100vh',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: '1.5rem'
+        }}
+      >
+        <div className="glass-card" style={{ maxWidth: '500px', width: '100%', padding: '2rem', textAlign: 'center' }}>
+          <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '1rem' }}>
+            <ShieldCheck size={32} color="var(--primary)" />
+          </div>
+          <h2 style={{ fontSize: '1.2rem', fontWeight: 700, marginBottom: '0.5rem' }}>
+            Complete Authenticator Enrollment
+          </h2>
+          {loadingPendingMfa ? (
+            <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+              Loading TOTP MFA setup for {pendingMfaUser.username}...
+            </p>
+          ) : (
+            <>
+              <p style={{ fontSize: '0.84rem', color: '#f87171', marginBottom: '1rem' }}>
+                {pendingMfaLoadError || 'Failed to load pending MFA enrollment details.'}
+              </p>
+              <div style={{ display: 'flex', gap: '0.6rem', justifyContent: 'center' }}>
+                <button
+                  type="button"
+                  className="btn-glass btn-primary"
+                  onClick={() => loadPendingMfaEnrollment(pendingMfaUser)}
+                >
+                  Retry Loading Setup
+                </button>
+                {onSignOutPendingMfa && (
+                  <button
+                    type="button"
+                    className="btn-glass"
+                    onClick={() => onSignOutPendingMfa()}
+                  >
+                    Sign Out
+                  </button>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   if (provisionedMfa) {
     return (
@@ -252,87 +479,279 @@ export const LoginView: React.FC<LoginViewProps> = ({
               marginBottom: '1.1rem'
             }}
           >
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
-              <span style={{ fontSize: '0.76rem', fontWeight: 600, color: 'var(--accent-warning)' }}>
-                2. One-Time Emergency Recovery Codes (8 Single-Use Backup Codes)
-              </span>
-              <div style={{ display: 'flex', gap: '0.4rem' }}>
-                <button
-                  type="button"
-                  className="btn-glass"
-                  style={{ padding: '0.3rem 0.65rem', fontSize: '0.75rem' }}
-                  onClick={async () => {
-                    const ok = await copyToClipboard(provisionedMfa.recoveryCodes.join('\n'));
-                    if (ok) {
-                      setCopiedCodes(true);
-                      setTimeout(() => setCopiedCodes(false), 2000);
-                    }
-                  }}
-                >
-                  {copiedCodes ? <CheckCircle size={13} color="#10b981" /> : <Copy size={13} />}
-                  <span>{copiedCodes ? 'Copied' : 'Copy All'}</span>
-                </button>
-                <button
-                  type="button"
-                  className="btn-glass"
-                  style={{ padding: '0.3rem 0.65rem', fontSize: '0.75rem' }}
-                  onClick={handleDownloadRecoveryKit}
-                >
-                  <Download size={13} />
-                  <span>Download .txt</span>
-                </button>
-              </div>
-            </div>
-            <div className="grid-2" style={{ gap: '0.45rem' }}>
-              {provisionedMfa.recoveryCodes.map((code) => (
-                <div
-                  key={code}
-                  style={{
-                    fontFamily: 'var(--font-mono)',
-                    fontSize: '0.84rem',
-                    padding: '0.4rem 0.65rem',
-                    borderRadius: '6px',
-                    background: 'var(--input-bg)',
-                    border: '1px solid var(--glass-border)',
-                    textAlign: 'center',
-                    fontWeight: 600
-                  }}
-                >
-                  {code}
+            {provisionedMfa.recoveryCodes.length > 0 ? (
+              <>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
+                  <span style={{ fontSize: '0.76rem', fontWeight: 600, color: 'var(--accent-warning)' }}>
+                    2. One-Time Emergency Recovery Codes (8 Single-Use Backup Codes)
+                  </span>
+                  <div style={{ display: 'flex', gap: '0.4rem' }}>
+                    <button
+                      type="button"
+                      className="btn-glass"
+                      style={{ padding: '0.3rem 0.65rem', fontSize: '0.75rem' }}
+                      onClick={async () => {
+                        const ok = await copyToClipboard(provisionedMfa.recoveryCodes.join('\n'));
+                        if (ok) {
+                          setCopiedCodes(true);
+                          setTimeout(() => setCopiedCodes(false), 2000);
+                        }
+                      }}
+                    >
+                      {copiedCodes ? <CheckCircle size={13} color="#10b981" /> : <Copy size={13} />}
+                      <span>{copiedCodes ? 'Copied' : 'Copy All'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-glass"
+                      style={{ padding: '0.3rem 0.65rem', fontSize: '0.75rem' }}
+                      onClick={handleDownloadRecoveryKit}
+                    >
+                      <Download size={13} />
+                      <span>Download .txt</span>
+                    </button>
+                  </div>
                 </div>
-              ))}
+                <div className="grid-2" style={{ gap: '0.45rem' }}>
+                  {provisionedMfa.recoveryCodes.map((code) => (
+                    <div
+                      key={code}
+                      style={{
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: '0.84rem',
+                        padding: '0.4rem 0.65rem',
+                        borderRadius: '6px',
+                        background: 'var(--input-bg)',
+                        border: '1px solid var(--glass-border)',
+                        textAlign: 'center',
+                        fontWeight: 600
+                      }}
+                    >
+                      {code}
+                    </div>
+                  ))}
+                </div>
+                <p style={{ fontSize: '0.74rem', color: 'var(--text-muted)', marginTop: '0.55rem', marginBottom: 0 }}>
+                  Save these offline now — they are only displayed once during initial setup.
+                </p>
+              </>
+            ) : (
+              <div>
+                <div style={{ fontSize: '0.76rem', fontWeight: 600, color: 'var(--accent-warning)', marginBottom: '0.3rem' }}>
+                  2. Single-Use Emergency Recovery Codes
+                </div>
+                <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', margin: 0 }}>
+                  {provisionedMfa.remainingRecoveryCodes ?? 8} single-use emergency recovery codes are active for{' '}
+                  <strong>{provisionedMfa.user.username}</strong>. Once setup completes, you can regenerate recovery codes
+                  anytime in <strong>Settings → Security &amp; MFA</strong>.
+                </p>
+              </div>
+            )}
+          </div>
+
+          <form onSubmit={handleVerifyInitialTotp}>
+            <div
+              style={{
+                background: 'rgba(16, 185, 129, 0.08)',
+                border: '1px solid rgba(16, 185, 129, 0.28)',
+                borderRadius: '10px',
+                padding: '1rem',
+                marginBottom: '1rem'
+              }}
+            >
+              <label
+                htmlFor="initial-totp-code-input"
+                style={{
+                  display: 'block',
+                  fontSize: '0.76rem',
+                  fontWeight: 600,
+                  color: 'var(--accent-success)',
+                  marginBottom: '0.45rem'
+                }}
+              >
+                3. Enter Current 6-Digit Authenticator Code to Continue
+              </label>
+              <input
+                id="initial-totp-code-input"
+                type="text"
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                maxLength={6}
+                autoFocus
+                className="glass-input"
+                placeholder="000000"
+                value={totpCode}
+                onChange={(e) => {
+                  setTotpCode(e.target.value.replace(/\D/g, '').slice(0, 6));
+                  if (mfaVerifyError) setMfaVerifyError(null);
+                }}
+                style={{
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: '1.25rem',
+                  fontWeight: 700,
+                  letterSpacing: '0.35em',
+                  textAlign: 'center'
+                }}
+              />
+              <p style={{ fontSize: '0.74rem', color: 'var(--text-muted)', marginTop: '0.45rem', marginBottom: 0 }}>
+                Confirm your authenticator app is synced by entering the current 6-digit TOTP code.
+              </p>
+            </div>
+
+            {mfaVerifyError && (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.55rem',
+                  background: 'rgba(239, 68, 68, 0.14)',
+                  border: '1px solid rgba(239, 68, 68, 0.35)',
+                  color: '#f87171',
+                  padding: '0.7rem 0.9rem',
+                  borderRadius: '8px',
+                  fontSize: '0.8rem',
+                  marginBottom: '0.9rem'
+                }}
+              >
+                <AlertCircle size={16} style={{ flexShrink: 0 }} />
+                <span>{mfaVerifyError}</span>
+              </div>
+            )}
+
+            <button
+              type="submit"
+              className="btn-glass btn-primary"
+              style={{ width: '100%', padding: '0.75rem' }}
+              disabled={mfaVerifying || totpCode.length !== 6}
+              id="complete-admin-bootstrap-btn"
+            >
+              <span>
+                {mfaVerifying
+                  ? 'Verifying Authenticator Code...'
+                  : authStatus.isOnboarded
+                    ? 'Verify Code & Continue'
+                    : 'Verify Code & Continue to Guided Setup'}
+              </span>
+              <ArrowRight size={16} />
+            </button>
+
+            {pendingMfaUser && onSignOutPendingMfa && (
+              <button
+                type="button"
+                className="btn-glass"
+                style={{ width: '100%', padding: '0.55rem', marginTop: '0.6rem', justifyContent: 'center', fontSize: '0.8rem' }}
+                onClick={() => onSignOutPendingMfa()}
+              >
+                Sign Out
+              </button>
+            )}
+          </form>
+        </div>
+      </div>
+    );
+  }
+
+  if (loginMfaChallenge) {
+    return (
+      <div
+        style={{
+          minHeight: '100vh',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: '1.5rem'
+        }}
+      >
+        <div className="glass-card" style={{ maxWidth: '460px', width: '100%', padding: '2rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.85rem', marginBottom: '1.35rem' }}>
+            <img src={brandLogoUrl} alt={brandName} className="brand-logo-img" style={{ width: 42, height: 42 }} />
+            <div>
+              <div className="brand-title" style={{ fontSize: '1.3rem' }}>
+                {brandName}
+              </div>
+              <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                Two-Factor Authentication Required — {loginMfaChallenge.username}
+              </div>
             </div>
           </div>
 
-          <label
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '0.6rem',
-              fontSize: '0.82rem',
-              cursor: 'pointer',
-              marginBottom: '1.25rem'
-            }}
-          >
-            <input
-              type="checkbox"
-              checked={confirmedSaved}
-              onChange={(e) => setConfirmedSaved(e.target.checked)}
-            />
-            <span>I have enrolled my TOTP authenticator or saved my emergency recovery codes offline.</span>
-          </label>
+          <p style={{ fontSize: '0.83rem', color: 'var(--text-muted)', marginTop: 0, marginBottom: '1.15rem', lineHeight: 1.5 }}>
+            Enter the current 6-digit verification code from your authenticator app, or enter one of your saved{' '}
+            <code>XXXX-XXXX</code> emergency recovery codes.
+          </p>
 
-          <button
-            type="button"
-            className="btn-glass btn-primary"
-            style={{ width: '100%', padding: '0.75rem' }}
-            disabled={!confirmedSaved}
-            onClick={() => onAuthenticated(provisionedMfa.user, true)}
-            id="complete-admin-bootstrap-btn"
-          >
-            <span>Continue to Guided OOBE Setup</span>
-            <ArrowRight size={16} />
-          </button>
+          <form onSubmit={handleLoginMfaSubmit}>
+            <div className="form-group">
+              <label htmlFor="login-mfa-code-input" className="form-label">
+                <ShieldCheck size={13} style={{ display: 'inline', marginRight: 5 }} />
+                Authenticator or Recovery Code
+              </label>
+              <input
+                id="login-mfa-code-input"
+                type="text"
+                autoComplete="one-time-code"
+                autoFocus
+                className="glass-input"
+                placeholder="000000 or XXXX-XXXX"
+                value={loginMfaCode}
+                onChange={(e) => {
+                  setLoginMfaCode(e.target.value);
+                  if (loginMfaError) setLoginMfaError(null);
+                }}
+                style={{
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: '1.2rem',
+                  fontWeight: 700,
+                  letterSpacing: '0.2em',
+                  textAlign: 'center'
+                }}
+              />
+            </div>
+
+            {loginMfaError && (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.55rem',
+                  background: 'rgba(239, 68, 68, 0.14)',
+                  border: '1px solid rgba(239, 68, 68, 0.35)',
+                  color: '#f87171',
+                  padding: '0.7rem 0.9rem',
+                  borderRadius: '8px',
+                  fontSize: '0.8rem',
+                  marginBottom: '1rem'
+                }}
+              >
+                <AlertCircle size={16} style={{ flexShrink: 0 }} />
+                <span>{loginMfaError}</span>
+              </div>
+            )}
+
+            <button
+              type="submit"
+              className="btn-glass btn-primary"
+              style={{ width: '100%', padding: '0.75rem' }}
+              disabled={loginMfaSubmitting || !loginMfaCode.trim()}
+              id="login-mfa-submit-btn"
+            >
+              <span>{loginMfaSubmitting ? 'Verifying Code...' : 'Verify & Sign In'}</span>
+              <ArrowRight size={16} />
+            </button>
+
+            <button
+              type="button"
+              className="btn-glass"
+              style={{ width: '100%', padding: '0.55rem', marginTop: '0.65rem', justifyContent: 'center', fontSize: '0.8rem' }}
+              onClick={() => {
+                setLoginMfaChallenge(null);
+                setLoginMfaCode('');
+                setLoginMfaError(null);
+              }}
+            >
+              Use a different account
+            </button>
+          </form>
         </div>
       </div>
     );
@@ -357,8 +776,8 @@ export const LoginView: React.FC<LoginViewProps> = ({
             </div>
             <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
               {isFirstSetup
-                ? 'First-Visit Setup — Create MSP Super Admin Account'
-                : 'Zero-Trust Control Plane Sign In'}
+                ? 'First-Visit Setup — Create Super Admin Account'
+                : 'Sign in to your account'}
             </div>
           </div>
         </div>
@@ -462,34 +881,41 @@ export const LoginView: React.FC<LoginViewProps> = ({
           >
             {loading
               ? isFirstSetup
-                ? 'Provisioning Encrypted Vault & Admin...'
+                ? 'Creating Administrator Account...'
                 : 'Signing In...'
               : isFirstSetup
                 ? 'Initialize Super Admin & Vault'
-                : 'Sign In to Control Plane'}
+                : 'Sign In'}
           </button>
 
           {!isFirstSetup && authStatus.oidcEnabled && (
-            <button
-              type="button"
-              className="btn-glass"
-              style={{
-                width: '100%',
-                padding: '0.7rem',
-                marginTop: '0.65rem',
-                justifyContent: 'center',
-                borderColor: 'rgba(0, 242, 254, 0.38)',
-                color: 'var(--primary)',
-                fontWeight: 600
-              }}
-              onClick={() => {
-                window.location.href = '/api/auth/oidc/login';
-              }}
-              id="oidc-sso-login-btn"
-            >
-              <Globe size={15} />
-              <span>Sign In with Enterprise SSO (OpenID Connect)</span>
-            </button>
+            <>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem', margin: '0.85rem 0 0.65rem', color: 'var(--text-dim)', fontSize: '0.74rem' }}>
+                <span style={{ flex: 1, height: '1px', background: 'var(--glass-border)' }} />
+                <span>OR</span>
+                <span style={{ flex: 1, height: '1px', background: 'var(--glass-border)' }} />
+              </div>
+              <button
+                type="button"
+                className="btn-glass"
+                style={{
+                  width: '100%',
+                  padding: '0.72rem',
+                  justifyContent: 'center',
+                  borderColor: 'rgba(0, 242, 254, 0.45)',
+                  background: 'rgba(0, 242, 254, 0.08)',
+                  color: 'var(--primary)',
+                  fontWeight: 600
+                }}
+                onClick={() => {
+                  window.location.href = '/api/auth/oidc/login';
+                }}
+                id="oidc-sso-login-btn"
+              >
+                <Globe size={15} />
+                <span>Sign in with SSO</span>
+              </button>
+            </>
           )}
         </form>
 

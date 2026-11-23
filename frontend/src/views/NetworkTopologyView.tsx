@@ -81,10 +81,10 @@ export const NetworkTopologyView: React.FC<NetworkTopologyViewProps> = ({ curren
   const [showAddAppliance, setShowAddAppliance] = useState(false);
   const [appName, setAppName] = useState('');
   const [appType, setAppType] = useState<string>('wap');
-  const [appVendor, setAppVendor] = useState('Ubiquiti UniFi Dream Machine Pro Max + U7-Pro APs');
-  const [appIp, setAppIp] = useState('10.200.10.2');
+  const [appVendor, setAppVendor] = useState('');
+  const [appIp, setAppIp] = useState('');
   const [appProtocol, setAppProtocol] = useState<string>('ubiquiti_unifi_api');
-  const [appApiEndpoint, setAppApiEndpoint] = useState('https://10.200.10.2/proxy/network/integration/v1/sites');
+  const [appApiEndpoint, setAppApiEndpoint] = useState('');
   const [appApiToken, setAppApiToken] = useState('');
   const [appSnmp, setAppSnmp] = useState('UniFi OS Local REST API (X-API-KEY) + SNMPv3');
   const [showSetupGuideModal, setShowSetupGuideModal] = useState(false);
@@ -247,8 +247,10 @@ export const NetworkTopologyView: React.FC<NetworkTopologyViewProps> = ({ curren
 
   const handleDeleteAppliance = async (id: string, name: string) => {
     if (!confirm(`Remove network appliance monitor "${name}"?`)) return;
-    await deleteNetworkAppliance(id);
-    setAppliances((prev) => prev.filter((a) => a.id !== id));
+    const res: any = await deleteNetworkAppliance(id);
+    if (res?.success !== false) {
+      setAppliances((prev) => prev.filter((a) => a.id !== id));
+    }
   };
 
   const handleAddPort = async (e: React.FormEvent) => {
@@ -665,28 +667,16 @@ export const NetworkTopologyView: React.FC<NetworkTopologyViewProps> = ({ curren
                       setAppType(val);
                       if (val === 'wap' || val === 'nvr_camera') {
                         setAppProtocol('ubiquiti_unifi_api');
-                        setAppVendor(val === 'wap' ? 'Ubiquiti UniFi UDM-Pro-Max + U7-Pro APs' : 'Ubiquiti UniFi Protect UNVR-Pro + G5 Cameras');
-                        setAppApiEndpoint('https://10.200.10.2/proxy/network/integration/v1/sites');
                       } else if (val === 'oob_bmc') {
                         setAppProtocol('redfish_idrac_ilo_api');
-                        setAppVendor('Dell PowerEdge R760 (iDRAC 9 Enterprise)');
-                        setAppApiEndpoint('https://10.200.10.240/redfish/v1/Systems/System.Embedded.1');
                       } else if (val === 'firewall') {
                         setAppProtocol('fortinet_fortios_api');
-                        setAppVendor('Fortinet FortiGate 200F (FortiOS 7.4)');
-                        setAppApiEndpoint('https://10.200.10.254/api/v2/monitor/system/status');
                       } else if (val === 'nas') {
                         setAppProtocol('synology_qnap_api');
-                        setAppVendor('Synology RackStation RS3621xs+ (DSM 7.2)');
-                        setAppApiEndpoint('https://192.168.40.20:5001/webapi/entry.cgi');
                       } else if (val === 'ups') {
                         setAppProtocol('apc_eaton_ups_probe');
-                        setAppVendor('APC Smart-UPS SRT 3000VA (NMC3)');
-                        setAppApiEndpoint('snmpv3://10.200.10.6:161');
                       } else {
                         setAppProtocol('generic_snmp_v3');
-                        setAppVendor('Enterprise SNMP / LAN Monitored Appliance');
-                        setAppApiEndpoint('snmpv3://10.200.10.250:161');
                       }
                     }}
                   >
@@ -717,7 +707,6 @@ export const NetworkTopologyView: React.FC<NetworkTopologyViewProps> = ({ curren
                       setAppProtocol(proto);
                       const g = VENDOR_SETUP_GUIDES[proto];
                       if (g) {
-                        setAppApiEndpoint(g.defaultEndpoint);
                         setAppSnmp(g.snmpLabel);
                       }
                     }}
@@ -754,6 +743,7 @@ export const NetworkTopologyView: React.FC<NetworkTopologyViewProps> = ({ curren
                     type="text"
                     required
                     className="glass-input"
+                    placeholder="e.g. 192.168.1.10 or switch01.lan"
                     value={appIp}
                     onChange={(e) => setAppIp(e.target.value)}
                   />
@@ -782,6 +772,7 @@ export const NetworkTopologyView: React.FC<NetworkTopologyViewProps> = ({ curren
                   <input
                     type="text"
                     className="glass-input"
+                    placeholder={VENDOR_SETUP_GUIDES[appProtocol]?.defaultEndpoint || 'https://appliance.lan/api'}
                     value={appApiEndpoint}
                     onChange={(e) => setAppApiEndpoint(e.target.value)}
                   />

@@ -3,28 +3,30 @@ import {
   Monitor,
   X,
   Lock,
-  Volume2,
-  VolumeX,
-  Clipboard,
   Shield,
   EyeOff,
-  CheckCircle2,
   CircleDot,
   Cpu,
   ExternalLink,
-  KeyRound
+  KeyRound,
+  RefreshCw,
+  AlertTriangle,
+  Video
 } from 'lucide-react';
 import { Device, RemoteSessionDescriptor } from '../types/index.js';
 import {
-  saveRecording,
-  getRecordingDownloadUrl,
   fetchSettings,
   fetchDeviceConsentStatus,
   negotiateRemoteSession,
   elevateRemoteAgent,
-  startGuestPortalRemoteSession
+  startGuestPortalRemoteSession,
+  saveRecording,
+  lockDeviceScreen,
+  bypassRemoteConsent
 } from '../services/api.js';
 import { MfaChallengeModal } from './MfaChallengeModal.js';
+import { isIntelAmtEligible, isTemporaryOrNonServiceAgent } from '../utils/deviceHelpers.js';
+import { sanitizeSafeUrl } from '../utils/urlSafety.js';
 
 interface RemoteScreenModalProps {
   device: Device;
@@ -45,30 +47,34 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
   onClose
 }) => {
   const isGuestPortal = Boolean(guestGrantId);
+  const amtEligible = isIntelAmtEligible(device);
+  const showElevateButton = isTemporaryOrNonServiceAgent(device);
   const canUseKvm = !isGuestPortal || !guestPermissions || guestPermissions.canRemoteScreen !== false;
   const canUseGhost = !isGuestPortal || !guestPermissions || Boolean(guestPermissions.canGhostSession);
   const [sessionMode, setSessionMode] = useState<'kvm' | 'ghost' | 'amt_kvm'>(
     isGhostSession && canUseGhost ? 'ghost' : canUseKvm ? 'kvm' : 'ghost'
   );
-  const [selectedMonitor, setSelectedMonitor] = useState(1);
   const [sessionDescriptor, setSessionDescriptor] = useState<RemoteSessionDescriptor | null>(null);
-  const [useLiveMeshIframe, setUseLiveMeshIframe] = useState(false);
-  const [audioEnabled, setAudioEnabled] = useState(false);
+  const [sessionLoading, setSessionLoading] = useState(true);
+  const [sessionRetrySeq, setSessionRetrySeq] = useState(0);
   const [consentGranted, setConsentGranted] = useState(false);
   const [consentCountdown, setConsentCountdown] = useState(15);
   const [consentTimeoutAction, setConsentTimeoutAction] = useState<string>('deny');
   const [consentTimedOut, setConsentTimedOut] = useState(false);
   const [consentConfigLoaded, setConsentConfigLoaded] = useState(false);
   const [consentRetrySeq, setConsentRetrySeq] = useState(0);
+  const [bypassingConsent, setBypassingConsent] = useState(false);
+  const [consentError, setConsentError] = useState<string | null>(null);
   const [autoLockOnDisconnect, setAutoLockOnDisconnect] = useState(true);
-  const [clipboardSynced, setClipboardSynced] = useState(false);
   const [isRecording, setIsRecording] = useState(true);
   const [recordSeconds, setRecordSeconds] = useState(0);
   const [stealthForTechs, setStealthForTechs] = useState(false);
-  const [manualRecording, setManualRecording] = useState(false);
-  const [manualSeconds, setManualSeconds] = useState(0);
-  const [latencyMs] = useState(14);
-  const [fps] = useState(60);
+  const [videoCapturing, setVideoCapturing] = useState(false);
+  const [closingAndSaving, setClosingAndSaving] = useState(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  const savedRecordingRef = useRef(false);
 
   // Tech-Side Remote Self-Elevation state
   const [showElevateModal, setShowElevateModal] = useState(false);
@@ -81,79 +87,23 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
   const [elevateIsError, setElevateIsError] = useState(false);
   const [elevateMfaOpen, setElevateMfaOpen] = useState(false);
   const [statusBanner, setStatusBanner] = useState<string | null>(null);
-  const [agentPrivilegeLevel, setAgentPrivilegeLevel] = useState<string>(device.agent_privilege_mode || 'SYSTEM');
-
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const recordedChunksRef = useRef<Blob[]>([]);
-
-  const startCanvasWebmCapture = () => {
-    recordedChunksRef.current = [];
-    const canvas = canvasRef.current;
-    if (!canvas || typeof (canvas as any).captureStream !== 'function' || typeof MediaRecorder === 'undefined') {
-      return;
-    }
-    try {
-      const stream = (canvas as any).captureStream(15) as MediaStream;
-      const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp8')
-        ? 'video/webm;codecs=vp8'
-        : 'video/webm';
-      const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 600_000 });
-      recorder.ondataavailable = (ev) => {
-        if (ev.data && ev.data.size > 0) {
-          recordedChunksRef.current.push(ev.data);
-        }
-      };
-      recorder.start(500);
-      mediaRecorderRef.current = recorder;
-    } catch {
-      mediaRecorderRef.current = null;
-    }
-  };
-
-  const stopCanvasWebmCaptureBase64 = (): Promise<{ base64?: string; sizeMb?: number }> => {
-    return new Promise((resolve) => {
-      const recorder = mediaRecorderRef.current;
-      mediaRecorderRef.current = null;
-      const finalize = () => {
-        if (recordedChunksRef.current.length === 0) {
-          resolve({});
-          return;
-        }
-        const blob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
-        recordedChunksRef.current = [];
-        const reader = new FileReader();
-        reader.onloadend = () => {
-          const dataUrl = String(reader.result || '');
-          const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
-          resolve({
-            base64,
-            sizeMb: Number((blob.size / (1024 * 1024)).toFixed(3))
-          });
-        };
-        reader.onerror = () => resolve({});
-        reader.readAsDataURL(blob);
-      };
-      if (!recorder || recorder.state === 'inactive') {
-        finalize();
-        return;
-      }
-      recorder.onstop = finalize;
-      try {
-        recorder.stop();
-      } catch {
-        finalize();
-      }
-    });
-  };
+  const [agentPrivilegeLevel, setAgentPrivilegeLevel] = useState<string>(device.agent_privilege_mode || 'system_service');
 
   const showTransientBanner = (msg: string) => {
     setStatusBanner(msg);
     setTimeout(() => setStatusBanner(null), 4000);
   };
 
-  // Negotiate OS-specific display pipeline & Ghost Session isolation with backend
   useEffect(() => {
+    if (sessionMode === 'amt_kvm' && !amtEligible) {
+      setSessionMode(canUseKvm ? 'kvm' : 'ghost');
+    }
+  }, [amtEligible, canUseKvm, sessionMode]);
+
+  // Negotiate live MeshCentral relay session URL with backend
+  useEffect(() => {
+    let active = true;
+    setSessionLoading(true);
     if (guestGrantId) {
       startGuestPortalRemoteSession(
         guestGrantId,
@@ -161,6 +111,7 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
         sessionMode === 'ghost' ? 'ghost' : 'interactive'
       )
         .then((res) => {
+          if (!active) return;
           if (res?.success) {
             const relayUrl = (res as any).session?.meshRelayUrl || res.meshRelayUrl || null;
             setSessionDescriptor({
@@ -170,7 +121,7 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
               hostname: device.hostname,
               osType: device.os_type,
               mode: sessionMode,
-              monitor: selectedMonitor,
+              monitor: 1,
               displayDriver: relayUrl ? 'MeshCentral Live Relay' : 'Scoped Vendor KVM Relay',
               sessionIsolation:
                 sessionMode === 'ghost'
@@ -182,25 +133,32 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
               meshBridgeConnected: Boolean(relayUrl),
               userInterference: sessionMode === 'ghost' ? 'None (Background Isolated)' : 'Shared Console'
             });
-            if (relayUrl) setUseLiveMeshIframe(true);
             setConsentGranted(true);
           }
         })
-        .catch(() => {});
-      return;
+        .catch(() => {})
+        .finally(() => {
+          if (active) setSessionLoading(false);
+        });
+      return () => {
+        active = false;
+      };
     }
 
-    negotiateRemoteSession(device.id, sessionMode, selectedMonitor)
+    negotiateRemoteSession(device.id, sessionMode, 1)
       .then((desc) => {
-        if (desc?.success) {
-          setSessionDescriptor(desc);
-          if (desc.meshBridgeConnected && desc.meshRelayUrl) {
-            setUseLiveMeshIframe(true);
-          }
-        }
+        if (!active) return;
+        setSessionDescriptor(desc);
       })
-      .catch(() => {});
-  }, [device.id, device.hostname, device.os_type, guestGrantId, sessionMode, selectedMonitor]);
+      .catch(() => {})
+      .finally(() => {
+        if (active) setSessionLoading(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [device.id, device.hostname, device.os_type, guestGrantId, sessionMode, sessionRetrySeq]);
 
   // Load stealth settings & policy consent configuration
   useEffect(() => {
@@ -240,14 +198,133 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
     return () => clearInterval(interval);
   }, [isRecording]);
 
-  // Timer for manual clip recording
   useEffect(() => {
-    if (!manualRecording) return;
-    const interval = setInterval(() => {
-      setManualSeconds((s) => s + 1);
-    }, 1000);
-    return () => clearInterval(interval);
-  }, [manualRecording]);
+    return () => {
+      try {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+          mediaRecorderRef.current.stop();
+        }
+      } catch {
+        // Ignore recorder cleanup failure
+      }
+      try {
+        mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+      } catch {
+        // Ignore stream track cleanup failure
+      }
+    };
+  }, []);
+
+  const handleToggleVideoCapture = async () => {
+    if (videoCapturing) {
+      try {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+          mediaRecorderRef.current.stop();
+        }
+      } catch {
+        // Ignore recorder stop error
+      }
+      try {
+        mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+      } catch {
+        // Ignore stream track stop error
+      }
+      setVideoCapturing(false);
+      showTransientBanner('Video capture stopped. Recording will save when session closes.');
+      return;
+    }
+    if (!navigator.mediaDevices?.getDisplayMedia || typeof MediaRecorder === 'undefined') {
+      showTransientBanner('Browser screen capture API is unavailable in this environment.');
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+      recordedChunksRef.current = [];
+      const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+        ? 'video/webm;codecs=vp9'
+        : 'video/webm';
+      const recorder = new MediaRecorder(stream, { mimeType });
+      recorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) recordedChunksRef.current.push(ev.data);
+      };
+      stream.getVideoTracks().forEach((track) => {
+        track.onended = () => setVideoCapturing(false);
+      });
+      recorder.start(1000);
+      mediaStreamRef.current = stream;
+      mediaRecorderRef.current = recorder;
+      setVideoCapturing(true);
+      showTransientBanner('Capturing WebM session video — it will save to Session Recordings on close.');
+    } catch {
+      showTransientBanner('Screen capture permission cancelled.');
+    }
+  };
+
+  const handleClose = async () => {
+    if (closingAndSaving) return;
+    setClosingAndSaving(true);
+    try {
+      let videoBase64: string | undefined;
+      let mimeType: string | undefined;
+
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        const rec = mediaRecorderRef.current;
+        await new Promise<void>((resolve) => {
+          const fallbackTimer = setTimeout(resolve, 800);
+          rec.onstop = () => {
+            clearTimeout(fallbackTimer);
+            resolve();
+          };
+          try {
+            rec.stop();
+          } catch {
+            clearTimeout(fallbackTimer);
+            resolve();
+          }
+        });
+      }
+      try {
+        mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+      } catch {
+        // Ignore stream track stop error
+      }
+
+      if (recordedChunksRef.current.length > 0) {
+        const blob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
+        if (blob.size > 0 && blob.size <= 35 * 1024 * 1024) {
+          mimeType = 'video/webm';
+          videoBase64 = await new Promise<string>((resolve) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(String(reader.result || ''));
+            reader.readAsDataURL(blob);
+          });
+        }
+      }
+
+      if (
+        !savedRecordingRef.current &&
+        !isGuestPortal &&
+        consentGranted &&
+        (sessionDescriptor?.recordingEnabled || Boolean(videoBase64)) &&
+        (recordSeconds >= 1 || Boolean(videoBase64))
+      ) {
+        savedRecordingRef.current = true;
+        await saveRecording({
+          device_id: device.id,
+          duration_sec: Math.max(1, recordSeconds),
+          is_ghost_session: sessionMode === 'ghost',
+          ...(videoBase64 ? { video_base64: videoBase64, mime_type: mimeType } : {})
+        }).catch(() => {});
+      }
+
+      if (autoLockOnDisconnect && !isGuestPortal && consentGranted) {
+        await lockDeviceScreen(device.id).catch(() => {});
+      }
+    } finally {
+      setClosingAndSaving(false);
+      onClose();
+    }
+  };
 
   // Ghost Sessions and Out-of-Band AMT KVM never interrupt or prompt the physical user
   const bypassesUserPrompt =
@@ -280,285 +357,39 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
     return () => clearInterval(timer);
   }, [bypassesUserPrompt, consentConfigLoaded, consentGranted, consentTimedOut, consentTimeoutAction, consentRetrySeq]);
 
-  // OS-aware & Mode-aware Canvas rendering of interactive screen viewport
-  useEffect(() => {
-    if (!consentGranted || useLiveMeshIframe) return;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    let frameId: number;
-    let t = 0;
-    const osType = device.os_type || 'windows';
-
-    const render = () => {
-      t += 0.03;
-      const w = canvas.width;
-      const h = canvas.height;
-
-      if (sessionMode === 'amt_kvm') {
-        // Intel AMT / vPro Hardware Out-of-Band BIOS / Pre-Boot KVM View
-        ctx.fillStyle = '#070b14';
-        ctx.fillRect(0, 0, w, h);
-
-        ctx.fillStyle = '#1e3a8a';
-        ctx.fillRect(0, 0, w, 42);
-        ctx.fillStyle = '#ffffff';
-        ctx.font = '700 13px JetBrains Mono, monospace';
-        ctx.fillText(`INTEL(R) AMT / vPRO HARDWARE KVM — OUT-OF-BAND MEI FRAMEBUFFER (${device.hostname})`, 20, 26);
-
-        ctx.strokeStyle = '#3b82f6';
-        ctx.lineWidth = 1.5;
-        ctx.strokeRect(40, 70, w - 80, h - 130);
-
-        ctx.fillStyle = '#93c5fd';
-        ctx.font = '600 13px JetBrains Mono, monospace';
-        ctx.fillText(`UEFI / BIOS Setup & Pre-Boot Hardware Telemetry — Serial: ${device.serial_number}`, 64, 105);
-        ctx.fillStyle = '#e2e8f0';
-        ctx.font = '12px JetBrains Mono, monospace';
-        ctx.fillText(`Processor       : ${device.cpu_model} (${device.cpu_cores} Cores)`, 64, 140);
-        ctx.fillText(`Installed RAM   : ${device.ram_total_gb * 1024} MB ECC/Non-ECC DDR5`, 64, 165);
-        ctx.fillText(`Firmware / BIOS : ${device.bios_version} | TPM: ${device.tpm_version}`, 64, 190);
-        ctx.fillText(`Boot Volume     : ${device.bitlocker_status} (${device.disk_total_gb} GB NVMe)`, 64, 215);
-        ctx.fillText(`MEI Power State : S0 Working (CIRA / WS-Management Port 16993 TLS Active)`, 64, 240);
-
-        ctx.fillStyle = 'rgba(30, 58, 138, 0.45)';
-        ctx.fillRect(64, 275, w - 128, 160);
-        ctx.fillStyle = '#38bdf8';
-        ctx.fillText(`[F2] Enter UEFI Setup    [F12] Network PXE Boot    [F8] Windows Recovery / Safe Mode`, 84, 310);
-        ctx.fillStyle = '#a7f3d0';
-        ctx.fillText(`> Hardware Redfish / WS-Man KVM stream synchronized @ 30fps (Pre-OS keyboard capture active)`, 84, 350);
-        ctx.fillText(`> Physical monitor blanking: Optional (Current state: Mirrored)`, 84, 380);
-      } else {
-        // Draw OS-specific desktop background
-        const grad = ctx.createLinearGradient(0, 0, w, h);
-        if (sessionMode === 'ghost') {
-          grad.addColorStop(0, '#1e1b4b');
-          grad.addColorStop(1, '#090d16');
-        } else if (osType === 'macos') {
-          grad.addColorStop(0, '#0f766e');
-          grad.addColorStop(0.5, '#1d4ed8');
-          grad.addColorStop(1, '#1e1b4b');
-        } else if (osType === 'linux') {
-          grad.addColorStop(0, '#4a154b');
-          grad.addColorStop(1, '#111827');
-        } else {
-          grad.addColorStop(0, '#0284c7');
-          grad.addColorStop(1, '#0f172a');
+  const handleToggleRecording = () => {
+    const next = !isRecording;
+    setIsRecording(next);
+    const rec = mediaRecorderRef.current;
+    if (rec) {
+      try {
+        if (!next && rec.state === 'recording') {
+          rec.pause();
+        } else if (next && rec.state === 'paused') {
+          rec.resume();
         }
-        ctx.fillStyle = grad;
-        ctx.fillRect(0, 0, w, h);
-
-        // macOS / Linux GNOME Top Bar
-        if (osType === 'macos' || osType === 'linux') {
-          ctx.fillStyle = 'rgba(10, 15, 25, 0.85)';
-          ctx.fillRect(0, 0, w, 26);
-          ctx.fillStyle = '#f8fafc';
-          ctx.font = '600 11px Inter, sans-serif';
-          if (osType === 'macos') {
-            ctx.fillText(`  Finder   File   Edit   View   Go   Window   Help`, 16, 17);
-            ctx.fillText(`${device.hostname}  |  ${sessionMode === 'ghost' ? 'Secondary CGSession (Ghost)' : 'Console CGSession'}`, w - 340, 17);
-          } else {
-            ctx.fillText(`Activities   Terminal   System Monitor`, 16, 17);
-            ctx.fillText(`${device.hostname} (${sessionMode === 'ghost' ? 'Xvfb :99 Ghost Desktop' : 'Display :0'})`, w - 310, 17);
-          }
-        }
-
-        // Draw Desktop Icons
-        const topOffset = osType === 'windows' ? 24 : 44;
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
-        ctx.fillRect(20, topOffset, 42, 42);
-        ctx.fillStyle = '#ffffff';
-        ctx.font = '11px Inter, sans-serif';
-        ctx.fillText(osType === 'macos' ? 'Macintosh HD' : osType === 'linux' ? 'Root FS (/)' : 'This PC', 14, topOffset + 56);
-
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
-        ctx.fillRect(20, topOffset + 78, 42, 42);
-        ctx.fillStyle = '#ffffff';
-        ctx.fillText('Vitrine Agent', 14, topOffset + 134);
-
-        // Draw Primary Application Window
-        const winX = 110 + Math.sin(t * 0.5) * 6;
-        const winY = 64 + Math.cos(t * 0.5) * 4;
-        const winW = 680;
-        const winH = 380;
-
-        ctx.shadowColor = 'rgba(0, 0, 0, 0.55)';
-        ctx.shadowBlur = 22;
-        ctx.fillStyle = 'rgba(15, 23, 42, 0.96)';
-        ctx.fillRect(winX, winY, winW, winH);
-        ctx.shadowBlur = 0;
-
-        // Window Titlebar
-        ctx.fillStyle = sessionMode === 'ghost' ? '#4c1d95' : osType === 'linux' ? '#374151' : '#0369a1';
-        ctx.fillRect(winX, winY, winW, 30);
-
-        if (osType === 'macos') {
-          // macOS Traffic Light Buttons
-          ctx.fillStyle = '#ef4444';
-          ctx.beginPath();
-          ctx.arc(winX + 16, winY + 15, 5, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.fillStyle = '#f59e0b';
-          ctx.beginPath();
-          ctx.arc(winX + 32, winY + 15, 5, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.fillStyle = '#10b981';
-          ctx.beginPath();
-          ctx.arc(winX + 48, winY + 15, 5, 0, Math.PI * 2);
-          ctx.fill();
-        }
-
-        ctx.fillStyle = '#ffffff';
-        ctx.font = '600 11px Inter, sans-serif';
-        const titlePrefix =
-          sessionMode === 'ghost'
-            ? `[GHOST BACKEND DESKTOP — USER UNDISTURBED] `
-            : `[INTERACTIVE KVM] `;
-        ctx.fillText(
-          `${titlePrefix}${device.hostname} (${device.os_version}) — Display ${selectedMonitor}`,
-          winX + (osType === 'macos' ? 68 : 14),
-          winY + 19
-        );
-
-        // Window Content
-        ctx.fillStyle = '#38bdf8';
-        ctx.font = '11.5px JetBrains Mono, monospace';
-        ctx.fillText(
-          `Pipeline  : ${sessionDescriptor?.displayDriver || (sessionMode === 'ghost' ? 'Isolated Virtual Framebuffer' : 'Primary Display Capture')}`,
-          winX + 18,
-          winY + 56
-        );
-        ctx.fillText(
-          `Isolation : ${sessionDescriptor?.sessionIsolation || (sessionMode === 'ghost' ? 'Background Graphical Session (Physical User Undisturbed)' : 'Shared Console Session')}`,
-          winX + 18,
-          winY + 78
-        );
-        ctx.fillText(
-          `Telemetry : CPU ${device.cpu_usage}% | RAM ${device.ram_used_gb} / ${device.ram_total_gb} GB | Disk Free ${device.disk_free_gb} GB`,
-          winX + 18,
-          winY + 100
-        );
-        ctx.fillText(
-          `Security  : ${device.bitlocker_status} | EDR: ${device.edr_name} (${device.edr_status})`,
-          winX + 18,
-          winY + 122
-        );
-
-        // Secondary Floating Terminal Window inside the Graphical Desktop
-        const termX = winX + 36;
-        const termY = winY + 148;
-        const termW = winW - 72;
-        const termH = 195;
-        ctx.fillStyle = '#050811';
-        ctx.fillRect(termX, termY, termW, termH);
-        ctx.strokeStyle = 'rgba(56, 189, 248, 0.35)';
-        ctx.strokeRect(termX, termY, termW, termH);
-
-        ctx.fillStyle = '#a7f3d0';
-        ctx.font = '11px JetBrains Mono, monospace';
-        if (osType === 'windows') {
-          ctx.fillText(`PS C:\\Windows\\System32> qwinsta`, termX + 12, termY + 24);
-          ctx.fillStyle = '#cbd5e1';
-          ctx.fillText(` SESSIONNAME       USERNAME                 ID  STATE   TYPE`, termX + 12, termY + 44);
-          ctx.fillText(` console           local-user                1  Active  wdcon (Physical User)`, termX + 12, termY + 62);
-          if (sessionMode === 'ghost') {
-            ctx.fillStyle = '#c084fc';
-            ctx.fillText(`>vitrine-ghost#99  NT AUTHORITY\\SYSTEM       2  Active  idd-virtual (Ghost GUI)`, termX + 12, termY + 80);
-          }
-        } else if (osType === 'macos') {
-          ctx.fillText(`root@${device.hostname.toLowerCase()} ~ # launchctl print system/com.apple.WindowServer`, termX + 12, termY + 24);
-          ctx.fillStyle = '#cbd5e1';
-          ctx.fillText(` active count = 2 | Console CGSession (UID 501) + Vitrine Ghost CGSession (UID 0)`, termX + 12, termY + 46);
-        } else {
-          ctx.fillText(`root@${device.hostname.toLowerCase()}:~# loginctl list-sessions`, termX + 12, termY + 24);
-          ctx.fillStyle = '#cbd5e1';
-          ctx.fillText(` SESSION  UID USER   SEAT  TTY   DISPLAY`, termX + 12, termY + 44);
-          ctx.fillText(`       1 1000 ubuntu seat0 tty2  :0 (Physical Desktop)`, termX + 12, termY + 62);
-          if (sessionMode === 'ghost') {
-            ctx.fillStyle = '#c084fc';
-            ctx.fillText(`      99    0 root   -     pts/4 :99 (Xvfb Headless Ghost GUI)`, termX + 12, termY + 80);
-          }
-        }
-
-        // Live animated waveform inside terminal
-        ctx.beginPath();
-        ctx.strokeStyle = sessionMode === 'ghost' ? '#a855f7' : '#00f2fe';
-        ctx.lineWidth = 2;
-        for (let x = 0; x < termW - 32; x += 4) {
-          const y = termY + 145 + Math.sin((x + t * 40) * 0.05) * 18;
-          if (x === 0) ctx.moveTo(termX + 16 + x, y);
-          else ctx.lineTo(termX + 16 + x, y);
-        }
-        ctx.stroke();
-
-        // Draw OS Taskbar / Dock
-        if (osType === 'macos') {
-          // macOS Translucent Bottom Dock
-          const dockW = 320;
-          ctx.fillStyle = 'rgba(15, 23, 42, 0.78)';
-          ctx.fillRect((w - dockW) / 2, h - 46, dockW, 38);
-          ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
-          ctx.strokeRect((w - dockW) / 2, h - 46, dockW, 38);
-          for (let i = 0; i < 6; i++) {
-            ctx.fillStyle = i % 2 === 0 ? '#38bdf8' : '#818cf8';
-            ctx.fillRect((w - dockW) / 2 + 24 + i * 48, h - 38, 24, 22);
-          }
-        } else {
-          // Windows 11 / Linux Panel
-          ctx.fillStyle = 'rgba(10, 15, 25, 0.92)';
-          ctx.fillRect(0, h - 38, w, 38);
-          ctx.fillStyle = '#00f2fe';
-          ctx.fillRect(w / 2 - 20, h - 30, 8, 8);
-          ctx.fillRect(w / 2 - 10, h - 30, 8, 8);
-          ctx.fillRect(w / 2 - 20, h - 20, 8, 8);
-          ctx.fillRect(w / 2 - 10, h - 20, 8, 8);
-        }
+      } catch {
+        // MediaRecorder pause/resume unsupported in current browser
       }
-
-      // Live Cursor
-      const curX = w / 2 + Math.cos(t) * 120;
-      const curY = h / 2 + Math.sin(t * 1.5) * 80;
-      ctx.fillStyle = '#ffffff';
-      ctx.beginPath();
-      ctx.moveTo(curX, curY);
-      ctx.lineTo(curX + 10, curY + 14);
-      ctx.lineTo(curX + 4, curY + 14);
-      ctx.lineTo(curX, curY);
-      ctx.fill();
-
-      // Mode Watermark Badge
-      if (sessionMode === 'ghost') {
-        ctx.fillStyle = 'rgba(168, 85, 247, 0.92)';
-        ctx.font = '700 12px Inter, sans-serif';
-        ctx.fillText(
-          `🛡️ HEADLESS GHOST DESKTOP (${osType.toUpperCase()}) — ZERO INTERFERENCE WITH LOGGED-IN USER SESSION`,
-          16,
-          osType === 'windows' ? 24 : 44
-        );
-      }
-
-      frameId = requestAnimationFrame(render);
-    };
-
-    render();
-    return () => cancelAnimationFrame(frameId);
-  }, [consentGranted, sessionMode, selectedMonitor, sessionDescriptor, useLiveMeshIframe, device]);
-
-  const handleSendCtrlAltDel = () => {
-    showTransientBanner(`Ctrl+Alt+Del Secure Attention Sequence dispatched to ${device.hostname}.`);
+    }
   };
 
-  const handleSyncClipboard = async () => {
+  const handleBypassConsent = async () => {
+    setBypassingConsent(true);
+    setConsentError(null);
     try {
-      await navigator.clipboard.readText();
-    } catch {
-      // Clipboard permission optional
+      const res = await bypassRemoteConsent(device.id);
+      if (res.success) {
+        setConsentGranted(true);
+        showTransientBanner(`Consent bypass authorized and audited for ${device.hostname}.`);
+      } else {
+        setConsentError(res.error || 'Failed to bypass remote user consent.');
+      }
+    } catch (e: any) {
+      setConsentError(e?.message || 'Failed to bypass remote user consent.');
+    } finally {
+      setBypassingConsent(false);
     }
-    setClipboardSynced(true);
-    showTransientBanner(`Clipboard synchronized with ${device.hostname}.`);
-    setTimeout(() => setClipboardSynced(false), 2000);
   };
 
   const handleTriggerElevation = async () => {
@@ -591,10 +422,9 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
     }
   };
 
-  const liveStreamActive =
-    Boolean(useLiveMeshIframe) &&
-    Boolean(sessionDescriptor?.meshRelayUrl) &&
-    /^https?:\/\//i.test(sessionDescriptor?.meshRelayUrl || '');
+  const safeMeshRelayUrl = sanitizeSafeUrl(sessionDescriptor?.meshRelayUrl, false);
+  const safeServerUrl = sanitizeSafeUrl(sessionDescriptor?.serverUrl, false);
+  const liveStreamActive = Boolean(safeMeshRelayUrl);
 
   return (
     <div className="modal-backdrop" id="remote-screen-modal">
@@ -605,9 +435,9 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
             {sessionMode === 'ghost' ? (
               <>
                 <EyeOff size={18} style={{ color: '#a855f7' }} />
-                <span>Ghost Desktop Session — {device.hostname}</span>
+                <span>Ghost Backstage Session — {device.hostname}</span>
                 <span className="status-pill status-isolated" style={{ background: 'rgba(168, 85, 247, 0.15)', color: '#c084fc', border: '1px solid rgba(168, 85, 247, 0.3)' }}>
-                  Headless Graphical Desktop (User Undisturbed)
+                  Background Terminal / Session Relay (User Undisturbed)
                 </span>
               </>
             ) : sessionMode === 'amt_kvm' ? (
@@ -626,21 +456,7 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
               </>
             )}
 
-            {!liveStreamActive && (
-              <span
-                className="status-pill status-reboot"
-                style={{
-                  background: 'rgba(245, 158, 11, 0.18)',
-                  color: '#fbbf24',
-                  border: '1px solid rgba(245, 158, 11, 0.45)',
-                  fontWeight: 700
-                }}
-              >
-                PREVIEW SIMULATION
-              </span>
-            )}
-
-            {/* 3-Mode Session Type Switcher */}
+            {/* Mode Switcher */}
             <div style={{ display: 'flex', background: 'rgba(0, 0, 0, 0.35)', borderRadius: '6px', padding: '2px', marginLeft: '0.5rem' }}>
               {canUseKvm && (
                 <button
@@ -658,12 +474,12 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
                   className={`btn-glass ${sessionMode === 'ghost' ? 'btn-primary' : ''}`}
                   style={{ padding: '0.2rem 0.55rem', fontSize: '0.72rem' }}
                   onClick={() => setSessionMode('ghost')}
-                  title="Spawn a full headless graphical desktop without interfering with the logged-in user"
+                  title="Open an isolated background MeshCentral session without interfering with the logged-in user console"
                 >
-                  Ghost Session (Headless GUI)
+                  Ghost Session (Backstage)
                 </button>
               )}
-              {!isGuestPortal && (
+              {!isGuestPortal && amtEligible && (
                 <button
                   type="button"
                   className={`btn-glass ${sessionMode === 'amt_kvm' ? 'btn-primary' : ''}`}
@@ -679,12 +495,12 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
 
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
             {/* Server-Side Session Recording Indicator (Shown only if NOT in Admin Stealth Mode or Guest Portal) */}
-            {!stealthForTechs && !isGuestPortal && (
+            {!stealthForTechs && !isGuestPortal && sessionDescriptor?.recordingEnabled && (
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
                 {isRecording ? (
                   <button
                     type="button"
-                    onClick={() => setIsRecording(false)}
+                    onClick={handleToggleRecording}
                     style={{
                       display: 'flex',
                       alignItems: 'center',
@@ -698,114 +514,57 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
                       fontWeight: 700,
                       cursor: 'pointer'
                     }}
-                    title="Automated server-side compliance recording active (Click to pause)"
+                    title="Compliance session recording active (Click to pause timer & capture)"
                   >
                     <CircleDot size={12} className="animate-pulse" color="#ef4444" />
                     <span>
-                      VAULT REC {Math.floor(recordSeconds / 60).toString().padStart(2, '0')}:
+                      REC {Math.floor(recordSeconds / 60).toString().padStart(2, '0')}:
                       {(recordSeconds % 60).toString().padStart(2, '0')}
                     </span>
                   </button>
                 ) : (
                   <button
                     type="button"
-                    onClick={() => setIsRecording(true)}
+                    onClick={handleToggleRecording}
                     className="btn-glass"
                     style={{ fontSize: '0.72rem', color: 'var(--text-dim)', padding: '0.2rem 0.55rem' }}
+                    title="Resume recording timer & capture"
                   >
-                    Resume Vault Rec
+                    Resume REC
                   </button>
                 )}
+                <button
+                  type="button"
+                  onClick={handleToggleVideoCapture}
+                  className="btn-glass"
+                  style={{
+                    fontSize: '0.72rem',
+                    padding: '0.22rem 0.55rem',
+                    borderColor: videoCapturing ? 'rgba(192, 132, 252, 0.55)' : undefined,
+                    color: videoCapturing ? '#d8b4fe' : undefined
+                  }}
+                  title="Capture browser tab as playable WebM video saved to Session Recordings"
+                >
+                  <Video size={12} />
+                  <span>{videoCapturing ? 'Stop Video' : 'Capture Video'}</span>
+                </button>
               </div>
             )}
 
-            {/* Manual Technician Clip Recording (Captures real WebM video clip to Audit Vault) */}
-            {!isGuestPortal && (
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
-                {manualRecording ? (
-                  <button
-                    className="btn-glass btn-danger"
-                    style={{ padding: '0.25rem 0.65rem', fontSize: '0.72rem', display: 'flex', alignItems: 'center', gap: '0.35rem' }}
-                    onClick={async () => {
-                      const dur = Math.max(1, manualSeconds);
-                      setManualRecording(false);
-                      setManualSeconds(0);
-                      try {
-                        const captured = await stopCanvasWebmCaptureBase64();
-                        if (!captured.base64) {
-                          showTransientBanner('Clip capture stopped (no media frames recorded).');
-                          return;
-                        }
-                        const rec = await saveRecording({
-                          device_id: device.id,
-                          is_ghost_session: sessionMode === 'ghost' ? 1 : 0,
-                          duration_sec: dur,
-                          file_size_mb: captured.sizeMb || 0.01,
-                          video_base64: captured.base64,
-                          mime_type: 'video/webm'
-                        });
-                        if (rec.id) {
-                          window.open(getRecordingDownloadUrl(rec.id), '_blank');
-                        }
-                        showTransientBanner(`Session WebM clip (${dur}s) saved to audit vault.`);
-                      } catch {
-                        showTransientBanner('Clip capture stopped.');
-                      }
-                    }}
-                    title="Click to stop manual recording and download WebM audit clip"
-                  >
-                    <CircleDot size={12} color="#fff" />
-                    <span>Stop Clip ({Math.floor(manualSeconds / 60)}:{(manualSeconds % 60).toString().padStart(2, '0')})</span>
-                  </button>
-                ) : (
-                  <button
-                    className="btn-glass"
-                    style={{ padding: '0.25rem 0.55rem', fontSize: '0.72rem' }}
-                    onClick={() => {
-                      startCanvasWebmCapture();
-                      setManualRecording(true);
-                      setManualSeconds(0);
-                    }}
-                    title="Record real WebM video clip to Audit Vault & download"
-                  >
-                    ● Record Clip
-                  </button>
-                )}
-              </div>
-            )}
-
-            {/* Monitor Switcher */}
-            <div style={{ display: 'flex', background: 'rgba(0, 0, 0, 0.3)', borderRadius: '6px', padding: '2px' }}>
-              <button
-                className={`btn-glass ${selectedMonitor === 1 ? 'btn-primary' : ''}`}
-                style={{ padding: '0.25rem 0.65rem', fontSize: '0.75rem' }}
-                onClick={() => setSelectedMonitor(1)}
-              >
-                Display 1 (4K)
-              </button>
-              <button
-                className={`btn-glass ${selectedMonitor === 2 ? 'btn-primary' : ''}`}
-                style={{ padding: '0.25rem 0.65rem', fontSize: '0.75rem' }}
-                onClick={() => setSelectedMonitor(2)}
-              >
-                Display 2 (1080p)
-              </button>
-            </div>
-
-            {sessionDescriptor?.meshRelayUrl && (
+            {liveStreamActive && safeMeshRelayUrl && (
               <button
                 type="button"
-                className={`btn-glass ${useLiveMeshIframe ? 'btn-primary' : ''}`}
-                style={{ padding: '0.3rem 0.6rem', fontSize: '0.72rem', display: 'flex', alignItems: 'center', gap: '0.3rem' }}
-                onClick={() => setUseLiveMeshIframe(!useLiveMeshIframe)}
-                title="Switch between embedded MeshCentral WebRTC stream and Vitrine Canvas compositor"
+                className="btn-glass btn-primary"
+                style={{ padding: '0.3rem 0.65rem', fontSize: '0.74rem', display: 'flex', alignItems: 'center', gap: '0.35rem' }}
+                onClick={() => window.open(safeMeshRelayUrl, '_blank', 'noopener,noreferrer')}
+                title="Open live MeshCentral session stream in a full browser tab"
               >
-                <ExternalLink size={12} />
-                <span>{useLiveMeshIframe ? 'Canvas View' : 'MeshWebRTC Stream'}</span>
+                <ExternalLink size={13} />
+                <span>Open Live Stream in New Tab</span>
               </button>
             )}
 
-            {!isGuestPortal && (
+            {!isGuestPortal && showElevateButton && agentPrivilegeLevel !== 'system_service' && (
               <button
                 className="btn-glass"
                 style={{
@@ -823,105 +582,41 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
               </button>
             )}
 
-            <button
-              className="btn-glass"
-              style={{ padding: '0.35rem 0.65rem', fontSize: '0.75rem', opacity: liveStreamActive ? 1 : 0.45 }}
-              disabled={!liveStreamActive}
-              onClick={handleSendCtrlAltDel}
-              title={liveStreamActive ? 'Inject Ctrl+Alt+Del' : 'Requires live MeshCentral KVM relay'}
-            >
-              <Lock size={13} />
-              <span>Ctrl+Alt+Del</span>
-            </button>
-
-            <button
-              className="btn-glass"
-              style={{ padding: '0.35rem 0.65rem', fontSize: '0.75rem', opacity: liveStreamActive ? 1 : 0.45 }}
-              disabled={!liveStreamActive}
-              onClick={handleSyncClipboard}
-              title={liveStreamActive ? 'Sync Clipboard' : 'Requires live MeshCentral KVM relay'}
-            >
-              {clipboardSynced ? <CheckCircle2 size={13} color="#10b981" /> : <Clipboard size={13} />}
-              <span>{clipboardSynced ? 'Synced!' : 'Clipboard'}</span>
-            </button>
-
-            <button
-              className="btn-glass btn-icon"
-              style={{ padding: '0.35rem', opacity: liveStreamActive ? 1 : 0.45 }}
-              disabled={!liveStreamActive}
-              onClick={() => setAudioEnabled(!audioEnabled)}
-              title={
-                !liveStreamActive
-                  ? 'Remote Audio requires live MeshCentral KVM relay'
-                  : audioEnabled
-                    ? 'Remote Audio Enabled'
-                    : 'Remote Audio Muted'
-              }
-            >
-              {audioEnabled ? <Volume2 size={15} color="#00f2fe" /> : <VolumeX size={15} />}
-            </button>
-
-            <button
-              className="btn-glass btn-icon"
-              style={{ padding: '0.35rem', opacity: liveStreamActive ? 1 : 0.45 }}
-              disabled={!liveStreamActive}
-              onClick={() => setAutoLockOnDisconnect(!autoLockOnDisconnect)}
-              title={
-                !liveStreamActive
-                  ? 'Auto-lock on disconnect requires live MeshCentral KVM relay'
-                  : autoLockOnDisconnect
-                    ? 'Auto-lock target endpoint upon disconnect (Active)'
-                    : 'Auto-lock disabled'
-              }
-            >
-              <Lock size={15} color={autoLockOnDisconnect ? '#10b981' : '#94a3b8'} />
-            </button>
-
-            <button
-              className="btn-glass btn-icon"
-              onClick={async () => {
-                if (!isGuestPortal && recordSeconds > 5 && mediaRecorderRef.current) {
-                  const captured = await stopCanvasWebmCaptureBase64().catch(() => ({ base64: undefined, sizeMb: undefined }));
-                  if (captured.base64) {
-                    saveRecording({
-                      device_id: device.id,
-                      is_ghost_session: sessionMode === 'ghost' ? 1 : 0,
-                      duration_sec: recordSeconds,
-                      file_size_mb: captured.sizeMb || 0.01,
-                      video_base64: captured.base64,
-                      mime_type: 'video/webm'
-                    }).catch(() => {});
-                  }
+            {!isGuestPortal && (
+              <button
+                type="button"
+                className="btn-glass"
+                style={{
+                  padding: '0.3rem 0.6rem',
+                  fontSize: '0.73rem',
+                  borderColor: autoLockOnDisconnect ? 'rgba(16, 185, 129, 0.45)' : undefined,
+                  color: autoLockOnDisconnect ? '#10b981' : 'var(--text-muted)'
+                }}
+                onClick={() => setAutoLockOnDisconnect(!autoLockOnDisconnect)}
+                title={
+                  autoLockOnDisconnect
+                    ? 'Endpoint screen will lock automatically when this session disconnects'
+                    : 'Auto-Lock on Disconnect is disabled'
                 }
-                onClose();
-              }}
+              >
+                <Lock size={13} color={autoLockOnDisconnect ? '#10b981' : '#94a3b8'} />
+                <span>Auto-Lock on Disconnect</span>
+              </button>
+            )}
+
+            <button
+              type="button"
+              className="btn-glass btn-icon"
+              onClick={handleClose}
+              disabled={closingAndSaving}
               id="close-remote-modal-btn"
+              aria-label="Close remote session"
+              title="Close"
             >
               <X size={18} />
             </button>
           </div>
         </div>
-
-        {!liveStreamActive && (
-          <div
-            style={{
-              padding: '0.5rem 1.5rem',
-              background: 'rgba(245, 158, 11, 0.14)',
-              borderBottom: '1px solid rgba(245, 158, 11, 0.4)',
-              color: '#fbbf24',
-              fontSize: '0.78rem',
-              fontWeight: 600,
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              gap: '0.75rem'
-            }}
-          >
-            <span>
-              PREVIEW SIMULATION — Connect MeshCentral 2 Server for Live Endpoint KVM (Canvas compositor preview active; live input, audio &amp; clipboard controls disabled)
-            </span>
-          </div>
-        )}
 
         {statusBanner && (
           <div style={{ padding: '0.5rem 1.5rem', background: 'rgba(16, 185, 119, 0.14)', borderBottom: '1px solid rgba(16, 185, 129, 0.35)', color: '#34d399', fontSize: '0.8rem' }}>
@@ -987,39 +682,126 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
                   type="button"
                   className="btn-glass"
                   style={{ padding: '0.25rem 0.75rem', fontSize: '0.75rem', background: '#f59e0b', color: '#000', fontWeight: 600 }}
-                  onClick={() => setConsentGranted(true)}
+                  disabled={bypassingConsent}
+                  onClick={handleBypassConsent}
                 >
-                  Bypass Consent (Admin Elevation)
+                  {bypassingConsent ? 'Authorizing Bypass...' : 'Bypass Consent (Admin Elevation)'}
                 </button>
               )}
             </div>
           </div>
         )}
 
-        {/* Viewport Canvas or Live MeshCentral WebRTC Iframe */}
-        <div style={{ flex: 1, position: 'relative', background: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}>
-          {useLiveMeshIframe &&
-          sessionDescriptor?.meshRelayUrl &&
-          /^https?:\/\//i.test(sessionDescriptor.meshRelayUrl) ? (
-            <iframe
-              src={sessionDescriptor.meshRelayUrl}
-              title={`MeshCentral Live WebRTC — ${device.hostname}`}
-              sandbox="allow-scripts allow-same-origin allow-forms"
-              referrerPolicy="no-referrer"
-              style={{ width: '100%', height: '100%', border: 'none' }}
-            />
+        {consentError && !consentGranted && (
+          <div style={{ padding: '0.5rem 1.5rem', background: 'rgba(239, 68, 68, 0.14)', borderBottom: '1px solid rgba(239, 68, 68, 0.35)', color: '#f87171', fontSize: '0.8rem' }}>
+            {consentError}
+          </div>
+        )}
+
+        {/* Live MeshCentral WebRTC Iframe or Honest Connection Diagnostics */}
+        <div style={{ flex: 1, position: 'relative', background: '#070b14', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+          {liveStreamActive && consentGranted && safeMeshRelayUrl ? (
+            <>
+              <div
+                style={{
+                  padding: '0.35rem 1rem',
+                  background: 'rgba(15, 23, 42, 0.9)',
+                  borderBottom: '1px solid rgba(255, 255, 255, 0.08)',
+                  fontSize: '0.73rem',
+                  color: 'var(--text-dim)',
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  gap: '0.75rem',
+                  flexWrap: 'wrap'
+                }}
+              >
+                <span>
+                  Connected via {sessionDescriptor?.shareLinkSource === 'meshcentral_share_link' ? 'authenticated MeshCentral Share Link' : 'MeshCentral Direct Node Relay'}. Use the native MeshCentral toolbar inside the stream for Ctrl+Alt+Del, clipboard, audio, and monitor selection.
+                </span>
+                <button
+                  type="button"
+                  className="btn-glass"
+                  style={{ padding: '0.18rem 0.55rem', fontSize: '0.71rem' }}
+                  onClick={() => setSessionRetrySeq((s) => s + 1)}
+                >
+                  <RefreshCw size={11} /> Re-Negotiate
+                </button>
+              </div>
+              <iframe
+                src={safeMeshRelayUrl}
+                title={`MeshCentral Live WebRTC — ${device.hostname}`}
+                sandbox="allow-scripts allow-same-origin allow-forms"
+                referrerPolicy="no-referrer"
+                style={{ flex: 1, width: '100%', height: '100%', border: 'none' }}
+              />
+            </>
+          ) : liveStreamActive && !consentGranted ? (
+            <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '2rem' }}>
+              <div className="glass-card" style={{ maxWidth: '520px', textAlign: 'center', padding: '2rem' }}>
+                <Shield size={32} color="#fbbf24" style={{ marginBottom: '0.75rem' }} />
+                <h3 style={{ margin: '0 0 0.5rem' }}>Waiting for User Privacy Consent</h3>
+                <p style={{ fontSize: '0.84rem', color: 'var(--text-muted)', margin: 0 }}>
+                  Live video relay for {device.hostname} is ready and will mount as soon as consent is approved or bypassed.
+                </p>
+              </div>
+            </div>
           ) : (
-            <canvas
-              ref={canvasRef}
-              width={1280}
-              height={720}
-              style={{
-                width: '100%',
-                height: '100%',
-                objectFit: 'contain',
-                cursor: consentGranted ? 'default' : 'wait'
-              }}
-            />
+            <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '2rem' }}>
+              <div className="glass-card" style={{ maxWidth: '600px', width: '100%', padding: '1.75rem', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                  <AlertTriangle size={24} color="#fbbf24" />
+                  <div>
+                    <h3 style={{ margin: 0, fontSize: '1.08rem' }}>
+                      {sessionLoading
+                        ? `Negotiating Live MeshCentral Relay for ${device.hostname}...`
+                        : 'Live Remote Display Relay Unavailable'}
+                    </h3>
+                    <div style={{ fontSize: '0.78rem', color: 'var(--text-dim)', marginTop: '0.2rem' }}>
+                      Device Status: <strong>{String(device.status || 'unknown').toUpperCase()}</strong> • MeshCentral Bridge:{' '}
+                      <strong style={{ color: sessionDescriptor?.meshBridgeConnected ? '#34d399' : '#f87171' }}>
+                        {sessionDescriptor?.meshBridgeConnected ? 'Connected' : 'Disconnected'}
+                      </strong>
+                    </div>
+                  </div>
+                </div>
+
+                <div style={{ background: 'rgba(239, 68, 68, 0.1)', border: '1px solid rgba(239, 68, 68, 0.25)', borderRadius: '8px', padding: '0.85rem 1rem', fontSize: '0.8rem', color: '#fca5a5', lineHeight: 1.5 }}>
+                  {sessionDescriptor?.meshRelayError ||
+                    (device.status !== 'online'
+                      ? `${device.hostname} is currently ${device.status}. Bring the endpoint online (or use Wake-on-LAN / Power Control) before starting a live remote stream.`
+                      : 'MeshCentral did not return a live sharing URL for this node. Verify Settings -> MeshCentral URL & Login Token and ensure the agent is online in MeshCentral.')}
+                </div>
+
+                {sessionMode === 'ghost' && (
+                  <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', lineHeight: 1.45 }}>
+                    Note: Ghost / Backstage mode uses MeshCentral&apos;s background terminal relay (<code>{sessionDescriptor?.displayDriver || 'Background PTY'}</code>) rather than an interactive desktop screen capture so the logged-in user is never interrupted.
+                  </div>
+                )}
+
+                <div style={{ display: 'flex', gap: '0.65rem', flexWrap: 'wrap' }}>
+                  <button
+                    type="button"
+                    className="btn-glass btn-primary"
+                    onClick={() => setSessionRetrySeq((s) => s + 1)}
+                    disabled={sessionLoading}
+                  >
+                    <RefreshCw size={14} className={sessionLoading ? 'spin' : ''} />
+                    <span>{sessionLoading ? 'Connecting...' : 'Retry Connection'}</span>
+                  </button>
+                  {safeServerUrl && (
+                    <button
+                      type="button"
+                      className="btn-glass"
+                      onClick={() => window.open(safeServerUrl, '_blank', 'noopener,noreferrer')}
+                    >
+                      <ExternalLink size={14} />
+                      <span>Open MeshCentral Console</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
           )}
 
           {/* Tech-Side Remote Self-Elevation Popover */}
@@ -1029,7 +811,7 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
                 position: 'absolute',
                 top: '16px',
                 right: '16px',
-                width: '410px',
+                width: 'min(410px, 92vw)',
                 background: 'rgba(15, 23, 42, 0.97)',
                 border: '1px solid rgba(245, 158, 11, 0.45)',
                 borderRadius: '12px',
@@ -1135,17 +917,12 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
             </div>
           )}
 
-          {/* Real-time Performance & OS Isolation HUD */}
+          {/* Honest Session & Relay Status Bar */}
           <div
             style={{
-              position: 'absolute',
-              bottom: '12px',
-              left: '16px',
-              right: '16px',
-              background: 'rgba(15, 23, 42, 0.88)',
-              border: '1px solid var(--glass-border)',
-              borderRadius: '6px',
-              padding: '5px 12px',
+              background: 'rgba(15, 23, 42, 0.94)',
+              borderTop: '1px solid var(--glass-border)',
+              padding: '6px 16px',
               fontSize: '0.72rem',
               color: 'var(--text-muted)',
               display: 'flex',
@@ -1161,9 +938,22 @@ export const RemoteScreenModal: React.FC<RemoteScreenModalProps> = ({
               <span>Isolation: <strong style={{ color: sessionMode === 'ghost' ? '#c084fc' : '#10b981' }}>{sessionDescriptor?.sessionIsolation || 'Active'}</strong></span>
             </div>
             <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
-              <span>Latency: <strong style={{ color: '#10b981' }}>{latencyMs} ms</strong></span>
-              <span>FPS: <strong>{sessionMode === 'amt_kvm' ? 30 : fps}</strong></span>
-              <span>Resolution: <strong>{sessionDescriptor?.resolution || '2560x1440'}</strong></span>
+              <span>
+                Relay Source:{' '}
+                <strong style={{ color: liveStreamActive ? '#10b981' : '#fbbf24' }}>
+                  {sessionDescriptor?.shareLinkSource === 'meshcentral_share_link'
+                    ? 'MeshCentral Authenticated Share Link'
+                    : sessionDescriptor?.shareLinkSource === 'meshcentral_gotonode'
+                      ? 'MeshCentral Direct Node Relay'
+                      : 'Not Connected'}
+                </strong>
+              </span>
+              <span>
+                MeshCentral Bridge:{' '}
+                <strong style={{ color: sessionDescriptor?.meshBridgeConnected ? '#10b981' : '#f87171' }}>
+                  {sessionDescriptor?.meshBridgeConnected ? 'Connected' : 'Disconnected'}
+                </strong>
+              </span>
             </div>
           </div>
         </div>

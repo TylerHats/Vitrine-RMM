@@ -42,10 +42,12 @@ export const AlertsCenterView: React.FC<AlertsCenterViewProps> = ({
   const [statusFilter, setStatusFilter] = useState<string>('open');
   const [severityFilter, setSeverityFilter] = useState<string>('all');
   const [incidents, setIncidents] = useState<AlertIncident[]>([]);
+  const [allIncidents, setAllIncidents] = useState<AlertIncident[]>([]);
   const [channels, setChannels] = useState<NotificationChannel[]>([]);
   const [loading, setLoading] = useState(false);
   const [evaluating, setEvaluating] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [noticeIsError, setNoticeIsError] = useState(false);
   const [assignInputs, setAssignInputs] = useState<Record<string, string>>({});
 
   // New Notification Channel state
@@ -63,17 +65,23 @@ export const AlertsCenterView: React.FC<AlertsCenterViewProps> = ({
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
-      const [incList, chanList] = await Promise.all([
+      const tenantFilter = selectedTenantId !== 'all' ? selectedTenantId : undefined;
+      const needsSeparateSummary = statusFilter !== 'all' || severityFilter !== 'all';
+      const [incList, summaryList, chanList] = await Promise.all([
         fetchAlertIncidents({
           status: statusFilter === 'all' ? undefined : statusFilter,
           severity: severityFilter === 'all' ? undefined : severityFilter,
-          tenant_id: selectedTenantId !== 'all' ? selectedTenantId : undefined
+          tenant_id: tenantFilter
         }),
+        needsSeparateSummary
+          ? fetchAlertIncidents({ tenant_id: tenantFilter }).catch(() => [])
+          : Promise.resolve(null),
         currentUser?.role !== 'client_admin'
           ? fetchNotificationChannels().catch(() => [])
           : Promise.resolve([])
       ]);
       setIncidents(incList);
+      setAllIncidents(summaryList ?? incList);
       setChannels(chanList);
     } finally {
       setLoading(false);
@@ -145,9 +153,9 @@ export const AlertsCenterView: React.FC<AlertsCenterViewProps> = ({
     }
   };
 
-  const criticalCount = incidents.filter((i) => i.severity === 'critical' && i.status !== 'resolved').length;
-  const openCount = incidents.filter((i) => i.status === 'open').length;
-  const ackCount = incidents.filter((i) => i.status === 'acknowledged').length;
+  const criticalCount = allIncidents.filter((i) => i.severity === 'critical' && i.status !== 'resolved').length;
+  const openCount = allIncidents.filter((i) => i.status === 'open').length;
+  const ackCount = allIncidents.filter((i) => i.status === 'acknowledged').length;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }} id="alerts-center-view">
@@ -222,7 +230,7 @@ export const AlertsCenterView: React.FC<AlertsCenterViewProps> = ({
       </div>
 
       {notice && (() => {
-        const isAlertErr = !notice.startsWith('✓') && /fail|error|required/i.test(notice);
+        const isAlertErr = noticeIsError || (!notice.startsWith('✓') && /fail|error|required/i.test(notice));
         return (
           <div
             className="glass-card"
@@ -230,7 +238,7 @@ export const AlertsCenterView: React.FC<AlertsCenterViewProps> = ({
               padding: '0.75rem 1.15rem',
               background: isAlertErr ? 'rgba(239, 68, 68, 0.12)' : 'rgba(56, 189, 248, 0.12)',
               borderColor: isAlertErr ? 'rgba(239, 68, 68, 0.35)' : 'rgba(56, 189, 248, 0.35)',
-              color: isAlertErr ? '#fca5a5' : 'var(--text-main)',
+              color: isAlertErr ? '#f87171' : 'var(--text-main)',
               fontSize: '0.82rem'
             }}
           >
@@ -300,10 +308,10 @@ export const AlertsCenterView: React.FC<AlertsCenterViewProps> = ({
                         <span
                           className={`status-pill ${
                             inc.severity === 'critical'
-                              ? 'status-offline'
+                              ? 'status-critical'
                               : inc.severity === 'warning'
                               ? 'status-reboot'
-                              : 'status-online'
+                              : 'status-info'
                           }`}
                           style={{ fontSize: '0.7rem', display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}
                         >
@@ -580,9 +588,25 @@ export const AlertsCenterView: React.FC<AlertsCenterViewProps> = ({
                                 <button
                                   type="button"
                                   className="btn-glass btn-icon"
+                                  title="Delete notification channel"
                                   onClick={async () => {
-                                    await deleteNotificationChannel(ch.id);
-                                    loadData();
+                                    if (!confirm(`Delete notification channel "${ch.name}"?`)) return;
+                                    setNotice(null);
+                                    setNoticeIsError(false);
+                                    try {
+                                      const res: any = await deleteNotificationChannel(ch.id);
+                                      if (res?.success === false) {
+                                        setNoticeIsError(true);
+                                        setNotice(res.error || `Failed to delete notification channel "${ch.name}".`);
+                                        return;
+                                      }
+                                      setNoticeIsError(false);
+                                      setNotice(`✓ Deleted notification channel "${ch.name}".`);
+                                      loadData();
+                                    } catch (err: any) {
+                                      setNoticeIsError(true);
+                                      setNotice(err?.message || `Failed to delete notification channel "${ch.name}".`);
+                                    }
                                   }}
                                 >
                                   <Trash2 size={13} color="#ef4444" />

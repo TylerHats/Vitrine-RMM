@@ -96,7 +96,17 @@ export interface LapsCredential {
   rotationPendingOnline?: boolean;
   pendingRotationReason?: string | null;
   pendingAccountName?: string | null;
-  rotationStatus?: 'active' | 'rotated_live' | 'deferred_until_online' | 'skipped_pending_offboard';
+  provisioned?: boolean;
+  verifiedOnEndpoint?: boolean;
+  error?: string;
+  pushOutput?: string;
+  rotationStatus?:
+    | 'active'
+    | 'rotated_live'
+    | 'deferred_until_online'
+    | 'skipped_pending_offboard'
+    | 'not_provisioned'
+    | 'push_failed';
 }
 
 const MASK = '••••••••••••••••';
@@ -118,11 +128,30 @@ export function getLapsCredential(
     if (deviceExists.lifecycle_state && deviceExists.lifecycle_state !== 'active') {
       return null;
     }
-    return rotateLapsPassword(deviceId, {
-      reveal,
-      actorUsername: options?.actorUsername || 'system',
-      forceInitialProvision: true
-    });
+    let unprovisionedPolicy: any = null;
+    try {
+      unprovisionedPolicy = resolveEffectiveDevicePolicy(deviceId);
+    } catch {}
+    const accountName = sanitizeLapsAccountName(unprovisionedPolicy?.lapsAccountName || 'LocalAdmin');
+    return {
+      deviceId,
+      accountName,
+      passwordMode: unprovisionedPolicy?.lapsPasswordMode || 'random',
+      autoCreateAccount: unprovisionedPolicy?.lapsAutoCreateAccount ?? true,
+      sid500BuiltinDisabled: unprovisionedPolicy?.lapsDisableBuiltinSid500Admin !== false,
+      cleanupOldAccountAction: unprovisionedPolicy?.lapsCleanupOldAccountOnRename || 'disable',
+      expiresAt: '',
+      lastRotated: '',
+      autoRotateScheduled: Boolean(unprovisionedPolicy?.lapsAutoRotateDays),
+      rotationPendingOnline: false,
+      pendingRotationReason:
+        deviceExists.status === 'online'
+          ? 'No LAPS password has been provisioned on this endpoint yet. Click "Provision Account & Set Password Now" to push and verify a local admin password.'
+          : 'No LAPS password has been provisioned on this endpoint yet, and the device is currently offline.',
+      provisioned: false,
+      verifiedOnEndpoint: false,
+      rotationStatus: 'not_provisioned'
+    };
   }
 
   let policy: any = null;
@@ -204,6 +233,8 @@ export function getLapsCredential(
     rotationPendingOnline,
     pendingRotationReason: pendingReason,
     pendingAccountName: row.pending_account_name || null,
+    provisioned: true,
+    verifiedOnEndpoint: !rotationPendingOnline,
     rotationStatus:
       deviceExists.lifecycle_state === 'pending_offboard'
         ? 'skipped_pending_offboard'
@@ -331,9 +362,6 @@ export async function rotateLapsPasswordVerifiedAsync(
   }
 
   const existingRow = db.prepare('SELECT * FROM laps_vault WHERE device_id = ?').get(deviceId) as any;
-  if (device.status !== 'online') {
-    return rotateLapsPassword(deviceId, options);
-  }
 
   let policy: any = null;
   try {
@@ -344,47 +372,111 @@ export async function rotateLapsPasswordVerifiedAsync(
   const autoCreateAccount = policy?.lapsAutoCreateAccount ?? true;
   const sid500Disabled = policy?.lapsDisableBuiltinSid500Admin !== false ? 1 : 0;
   const cleanupAction: 'disable' | 'delete' | 'keep' = policy?.lapsCleanupOldAccountOnRename || 'disable';
-  const candidatePass = generateNewLapsSecret(policy, accountName);
 
-  // If a live tunnel or companion agent exists, verify delivery BEFORE overwriting vaulted password!
-  const hasTunnelOrCompanion = Boolean(
-    (meshBridge.getStatus().connected && device.mesh_node_id) || device.agent_auth_token
-  );
-  if (hasTunnelOrCompanion) {
-    const pushRes = await meshBridge.verifyAndPushLapsCredentialToNode(deviceId, {
-      accountName,
-      password: candidatePass,
-      autoCreateAccount,
-      disableSid500: Boolean(sid500Disabled),
-      previousAccountName:
-        existingRow?.account_name && existingRow.account_name !== accountName ? existingRow.account_name : null,
-      cleanupOldAccountAction: cleanupAction
-    });
+  const buildUnprovisionedResult = (
+    rotationStatus: 'deferred_until_online' | 'push_failed',
+    reason: string,
+    pushOutput?: string
+  ): LapsCredential => ({
+    deviceId,
+    accountName,
+    passwordMode: policy?.lapsPasswordMode || 'random',
+    autoCreateAccount,
+    sid500BuiltinDisabled: Boolean(sid500Disabled),
+    cleanupOldAccountAction: cleanupAction,
+    expiresAt: '',
+    lastRotated: '',
+    autoRotateScheduled: Boolean(policy?.lapsAutoRotateDays),
+    rotationPendingOnline: rotationStatus === 'deferred_until_online',
+    pendingRotationReason: reason,
+    error: reason,
+    pushOutput,
+    provisioned: false,
+    verifiedOnEndpoint: false,
+    rotationStatus
+  });
 
-    if (!pushRes.delivered) {
-      if (existingRow) {
-        const deferReason = `Deferred rotation on ${device.hostname}: Live agent verification did not succeed (${pushRes.output.slice(0, 120)}). Current vaulted password preserved to prevent lockout.`;
-        db.prepare(`
-          UPDATE laps_vault
-          SET rotation_pending_online = 1, pending_rotation_reason = ?, pending_account_name = ?
-          WHERE device_id = ?
-        `).run(deferReason, accountName, deviceId);
-        return getLapsCredential(deviceId, Boolean(options?.reveal), {
-          actorUsername: options?.actorUsername,
-          skipAccessExpiryMutation: true
-        })!;
-      }
-      // Initial seed when push did not verify: seed with rotation_pending_online = 1
-      return rotateLapsPassword(deviceId, options);
+  if (device.status !== 'online') {
+    if (!existingRow && !options?.forceFinalArchiveSnapshot) {
+      return buildUnprovisionedResult(
+        'deferred_until_online',
+        `Device ${device.hostname} is offline. Bring it online before provisioning LAPS so Vitrine can create/update '${accountName}' and verify the password on the endpoint.`
+      );
     }
-
-    return rotateLapsPassword(deviceId, {
-      ...options,
-      preVerifiedPlaintextPassword: candidatePass
-    });
+    return rotateLapsPassword(deviceId, options);
   }
 
-  return rotateLapsPassword(deviceId, options);
+  const candidatePass = generateNewLapsSecret(policy, accountName);
+
+  // Verify live MeshCentral execution BEFORE committing any password into laps_vault!
+  // Never allow offline or companion-only `agent_tasks` queue fallback to change endpoint password to a discarded credential (C-7).
+  const hasLiveMeshTunnel = Boolean(meshBridge.getStatus().connected && device.mesh_node_id);
+  if (!hasLiveMeshTunnel) {
+    const noTunnelMsg = `No live MeshCentral relay tunnel is connected for ${device.hostname}; cannot verify local account '${accountName}' on the endpoint.`;
+    if (existingRow) {
+      db.prepare(`
+        UPDATE laps_vault
+        SET rotation_pending_online = 1, pending_rotation_reason = ?, pending_account_name = ?
+        WHERE device_id = ?
+      `).run(noTunnelMsg, accountName, deviceId);
+      const preserved = getLapsCredential(deviceId, Boolean(options?.reveal), {
+        actorUsername: options?.actorUsername,
+        skipAccessExpiryMutation: true
+      })!;
+      return { ...preserved, rotationPendingOnline: true, verifiedOnEndpoint: false, error: noTunnelMsg };
+    }
+    return buildUnprovisionedResult('push_failed', noTunnelMsg);
+  }
+
+  const pushRes = await meshBridge.verifyAndPushLapsCredentialToNode(deviceId, {
+    accountName,
+    password: candidatePass,
+    autoCreateAccount,
+    disableSid500: Boolean(sid500Disabled),
+    previousAccountName:
+      existingRow?.account_name && existingRow.account_name !== accountName ? existingRow.account_name : null,
+    cleanupOldAccountAction: cleanupAction
+  });
+
+  const verifiedLive = Boolean(pushRes.delivered && pushRes.verifiedLive !== false);
+  if (!verifiedLive) {
+    const snippet = (pushRes.output || 'No verification output returned by endpoint agent').slice(0, 180);
+    if (existingRow) {
+      const deferReason = `Deferred rotation on ${device.hostname}: Live agent verification did not succeed (${snippet}). Current vaulted password preserved to prevent lockout.`;
+      db.prepare(`
+        UPDATE laps_vault
+        SET rotation_pending_online = 1, pending_rotation_reason = ?, pending_account_name = ?
+        WHERE device_id = ?
+      `).run(deferReason, accountName, deviceId);
+      const preserved = getLapsCredential(deviceId, Boolean(options?.reveal), {
+        actorUsername: options?.actorUsername,
+        skipAccessExpiryMutation: true
+      })!;
+      return {
+        ...preserved,
+        verifiedOnEndpoint: false,
+        error: deferReason,
+        pushOutput: pushRes.output
+      };
+    }
+    return buildUnprovisionedResult(
+      'push_failed',
+      `Failed to verify local admin account '${accountName}' on ${device.hostname}: ${snippet}`,
+      pushRes.output
+    );
+  }
+
+  const committed = rotateLapsPassword(deviceId, {
+    ...options,
+    preVerifiedPlaintextPassword: candidatePass
+  });
+  return {
+    ...committed,
+    provisioned: true,
+    verifiedOnEndpoint: true,
+    pushOutput: pushRes.output,
+    rotationStatus: 'rotated_live'
+  };
 }
 
 export function rotateLapsPassword(
@@ -526,25 +618,12 @@ export function rotateLapsPassword(
   const previousEncrypted = existingRow?.encrypted_password || null;
   const previousIv = existingRow?.iv || null;
 
-  // SAFETY GUARDRAIL #3: If synchronous rotateLapsPassword is called on an online device WITHOUT pre-verification,
-  // attempt to push first; if pushing fails on an existing vault row, DO NOT blindly overwrite encrypted_password!
-  let pushedSynchronously = isPreVerified;
+  // SAFETY GUARDRAIL #3: Synchronous rotateLapsPassword without pre-verification must NEVER overwrite
+  // an existing vaulted credential or claim live verification on an unverified/companion-only endpoint (C-7).
+  const pushedSynchronously = isPreVerified;
   if (!isPreVerified && device.status === 'online') {
-    try {
-      pushedSynchronously = meshBridge.pushLapsCredentialToNode(deviceId, {
-        accountName,
-        password: newPass,
-        autoCreateAccount,
-        disableSid500: Boolean(sid500Disabled),
-        previousAccountName: previousAccount && previousAccount !== accountName ? previousAccount : null,
-        cleanupOldAccountAction: cleanupAction
-      });
-    } catch {
-      pushedSynchronously = false;
-    }
-
-    if (!pushedSynchronously && existingRow) {
-      const deferReason = `Deferred rotation on ${device.hostname}: Live tunnel push did not succeed; current vaulted password preserved until verified check-in.`;
+    if (existingRow) {
+      const deferReason = `Deferred rotation on ${device.hostname}: Live MeshCentral verification is required before rotating vaulted password.`;
       db.prepare(`
         UPDATE laps_vault
         SET rotation_pending_online = 1,

@@ -27,7 +27,10 @@ export const AuditExplorerView: React.FC = () => {
   }, [search, username, action, limit]);
 
   useEffect(() => {
-    loadLogs();
+    const timer = setTimeout(() => {
+      loadLogs();
+    }, 250);
+    return () => clearTimeout(timer);
   }, [loadLogs]);
 
   const currentFilters = {

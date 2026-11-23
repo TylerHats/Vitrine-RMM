@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Sparkles,
   Globe,
@@ -16,12 +16,15 @@ import {
   Copy,
   Check,
   Download,
+  Upload,
   AlertTriangle,
-  AlertCircle
+  AlertCircle,
+  Send
 } from 'lucide-react';
 import { Settings, MeshDiscoveryResult, LocalMeshCentralDetection } from '../types/index.js';
 import {
   updateSettings,
+  uploadBrandLogo,
   fetchLocalMeshCentralStatus,
   generateMeshCentralLoginToken,
   applyLocalMeshCentralConfig,
@@ -29,6 +32,7 @@ import {
   importFromMeshServer,
   testCodeSigningPipeline,
   testProxyTlsSetup,
+  testSmtp,
   createSystemBackup,
   revealBackupRecoveryKey,
   acknowledgeBackupRecoveryKey,
@@ -36,6 +40,7 @@ import {
 } from '../services/api.js';
 import { copyToClipboard } from '../utils/clipboard.js';
 import { MfaChallengeModal } from './MfaChallengeModal.js';
+import { IconCropModal } from './IconCropModal.js';
 
 function parseMeshTokenPair(raw?: string | null): {
   user: string;
@@ -73,6 +78,7 @@ function parseMeshTokenPair(raw?: string | null): {
 
 interface OnboardingWizardModalProps {
   settings: Settings;
+  adminEmail?: string;
   onClose: () => void;
   onSaved: (updated: Settings) => void;
 }
@@ -86,7 +92,7 @@ const STEP_GUIDES: Record<
     subtitle: 'How Vitrine adapts to OS Light/Dark mode and serves your public client support portal',
     bullets: [
       'System Auto Theme: Setting Web UI and Endpoint Tray Theme to "System Auto" listens to browser prefers-color-scheme and Windows HKCU\\...\\Personalize\\AppsUseLightTheme (plus GNOME/macOS equivalents) automatically.',
-      'Modern GUI Installer: Replaces MeshCentral\'s dated gray Win32 prompt with a signed glassmorphic WPF/PE installer using your custom Windows Service Name.',
+      'Guided Installer: Replaces basic command-line prompts with a branded wizard using your custom Windows Service Name.',
       'Dedicated QuickSupport Endpoint: Point a CNAME (e.g., remote.yourdomain.com) or path (/remote, /temporarysession) to Vitrine so clients can launch non-admin temporary sessions.'
     ],
     codeSnippet: `# DNS CNAME Setup for Dedicated Client QuickSupport Portal:
@@ -94,10 +100,10 @@ remote.yourdomain.com.  300  IN  CNAME  rmm.yourdomain.com.
 # Accessible at: https://remote.yourdomain.com/remote or https://rmm.yourdomain.com/temporarysession`
   },
   2: {
-    title: 'Walkthrough: Connecting MeshCentral 2 & Login Token Setup',
-    subtitle: 'Connecting to a remote MeshCentral 2 server or an isolated co-resident instance on the same host',
+    title: 'Walkthrough: Connecting MeshCentral & Login Token Setup',
+    subtitle: 'Connecting to a remote MeshCentral server or an isolated co-resident instance on the same host',
     bullets: [
-      'Remote or Co-Resident Deployment: Vitrine connects over MeshCentral 2 WebSockets whether MeshCentral runs in another container/VM or locally on the same host. If MeshCentral is detected locally on this host, Vitrine keeps itself isolated and offers an optional config helper.',
+      'Remote or Co-Resident Deployment: Vitrine connects over MeshCentral WebSockets whether MeshCentral runs in another container/VM or locally on the same host. If MeshCentral is detected locally on this host, Vitrine keeps itself isolated and offers an optional config helper.',
       'Option A (Web UI — Easiest with 2FA/TOTP): Sign into MeshCentral -> My Account -> Account Security -> Login Tokens -> Create ("Vitrine RMM"), then paste the generated Token Username (~t:...) and Token Password into the two fields.',
       'Option B (Auto-Generate in Vitrine): Use the "Auto-Generate in Vitrine" tab with your MeshCentral admin username/password (+ 6-digit TOTP if 2FA is active) to mint a persistent Login Token over TLS without saving your admin password.',
       'Option C (CLI via meshctrl.js): Run meshctrl.js LoginTokens --add "Vitrine RMM" from your MeshCentral installation folder (include --token <6-digit-TOTP> if 2FA is enabled). Login Tokens bypass 2FA permanently so your admin account can keep MFA enabled.'
@@ -106,7 +112,7 @@ remote.yourdomain.com.  300  IN  CNAME  rmm.yourdomain.com.
 # My Account -> Account Security -> Login Tokens -> Create -> Name: "Vitrine RMM"
 # Paste the returned Username (~t:...) and Password into Vitrine's two Token fields.
 
-# Option C (CLI on your MeshCentral 2 host — replace path if not in /opt/meshcentral):
+# Option C (CLI on your MeshCentral host — replace path if not in /opt/meshcentral):
 cd /path/to/meshcentral   # e.g. /opt/meshcentral or /home/<user>/meshcentral
 node node_modules/meshcentral/meshctrl.js --url wss://127.0.0.1:4430 \\
   --loginuser admin --loginpass 'YourPass' --token 123456 \\
@@ -114,28 +120,28 @@ node node_modules/meshcentral/meshctrl.js --url wss://127.0.0.1:4430 \\
 
 # Optional settings inside meshcentral-data/config.json under "settings":
 "allowFraming": true,
-"disableAgentUpdate": true  # Lets Vitrine keep MS2 agent binaries Authenticode-signed!`
+"disableAgentUpdate": true  # Lets Vitrine keep MeshCentral agent binaries Authenticode-signed!`
   },
   3: {
     title: 'Walkthrough: Setting Up the 3-Stage Authenticode & Code Signing API',
-    subtitle: 'Ensuring the Modern GUI Installer, Companion Scripts, and Native MS2 Binary stay signed',
+    subtitle: 'Ensuring the Modern GUI Installer, Companion Scripts, and Native MeshCentral Binary stay signed',
     bullets: [
-      'Why 3-Stage Signing Matters: Antivirus/SmartScreen flags unsigned wrappers OR unsigned inner binaries. Vitrine signs (1) the native MS2 meshagent binary, (2) the Vitrine Tray/Elevation scripts, and (3) the outer Modern GUI Installer.',
-      'Keeping MS2 Updates Signed: When MeshCentral updates, stock MS2 normally pushes unsigned agent updates. Vitrine intercepts new MS2 agent binaries, signs them via your Signing API, and caches them in signedagents/ before allowing endpoints to update.',
+      'Why 3-Stage Signing Matters: Antivirus/SmartScreen flags unsigned wrappers OR unsigned inner binaries. Vitrine signs (1) the native MeshCentral meshagent binary, (2) the Vitrine Tray/Elevation scripts, and (3) the outer Modern GUI Installer.',
+      'Keeping Agent Updates Signed: When MeshCentral updates, stock MeshCentral normally pushes unsigned agent updates. Vitrine intercepts new MeshCentral agent binaries, signs them via your Signing API, and caches them in signedagents/ before allowing endpoints to update.',
       'Supported Signers: SignPath.io REST API, Azure KeyVault / DigiCert KeyLocker webhook, or a local osslsigncode / signtool microservice.'
     ],
     codeSnippet: `# Example SignTool / osslsigncode Signing Webhook Endpoint:
-POST http://10.10.10.20:5000/sign
+POST https://signer.msp-domain.example/sign
 Content-Type: multipart/form-data; name="file"
 # Returns SHA-256 Authenticode + RFC 3161 Timestamped PE/PS1 binary`
   },
   4: {
-    title: 'Walkthrough: Reverse Proxy WebSockets vs. Built-In Let\'s Encrypt TLS',
+    title: 'Walkthrough: Reverse Proxy WebSockets vs. External ACME / Certbot TLS',
     subtitle: 'Preventing WebSocket disconnects while accessing Vitrine locally during initial setup',
     bullets: [
-      'Local First-Boot Access: During initial OOBE setup, access Vitrine directly via http://localhost:8080 or your LAN IP.',
-      'Option A (Reverse Proxy Handles TLS): If using Nginx, Nginx Proxy Manager, Caddy, or Traefik in front of Vitrine & MS2, you MUST pass WebSocket Upgrade headers and increase proxy_read_timeout so live PTY shells and KVM streams do not drop every 60 seconds.',
-      'Option B (Vitrine Handles TLS via Let\'s Encrypt): Vitrine can manage ACME HTTP-01/DNS-01 certificates directly and terminate TLS 1.3 natively.'
+      'Local First-Boot Access: During initial guided setup, access Vitrine directly via http://localhost:8080 or your LAN IP.',
+      'Option A (Reverse Proxy Handles TLS — Recommended): If using Nginx, Nginx Proxy Manager, Caddy, Traefik, or Cloudflare Tunnel in front of Vitrine & MeshCentral, pass WebSocket Upgrade headers and increase proxy_read_timeout so live PTY shells and KVM streams do not drop every 60 seconds.',
+      'Option B (External Let\'s Encrypt / ACME Certificates): Terminate TLS with Caddy/Traefik/Certbot and supply the issued certificate paths in your container or reverse proxy.'
     ],
     codeSnippet: `# Critical Reverse Proxy Headers for Vitrine + MeshCentral WebSockets:
 proxy_http_version 1.1;
@@ -172,6 +178,7 @@ https://rmm.yourdomain.com/api/auth/oidc/callback`
 
 export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
   settings,
+  adminEmail,
   onClose,
   onSaved
 }) => {
@@ -182,7 +189,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
     tray_theme_mode: settings.tray_theme_mode || 'system',
     installer_gui_style: settings.installer_gui_style || 'modern_glass',
     installer_service_name: settings.installer_service_name || 'VitrineAgent',
-    quicksupport_custom_domain: settings.quicksupport_custom_domain || 'remote.vitrine.local',
+    quicksupport_custom_domain: settings.quicksupport_custom_domain ?? '',
     quicksupport_url_path: settings.quicksupport_url_path || '/remote',
     tls_mode: settings.tls_mode || 'reverse_proxy',
     reverse_proxy_type: settings.reverse_proxy_type || 'nginx',
@@ -197,8 +204,48 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
   const [saveError, setSaveError] = useState<string | null>(null);
   const [showSaveMfa, setShowSaveMfa] = useState(false);
   const [pendingMfaAction, setPendingMfaAction] = useState<'save' | 'local_cfg'>('save');
+  const [codeSigningManuallyToggled, setCodeSigningManuallyToggled] = useState(false);
+  const [oidcManuallyToggled, setOidcManuallyToggled] = useState(false);
   const [guideOpenForStep, setGuideOpenForStep] = useState<number | null>(null);
   const [copiedProxyConfig, setCopiedProxyConfig] = useState(false);
+
+  // Step 1: Brand / Default Companion Tray Icon Upload State
+  const logoInputRef = useRef<HTMLInputElement | null>(null);
+  const [cropLogoFile, setCropLogoFile] = useState<File | null>(null);
+  const [uploadingLogo, setUploadingLogo] = useState(false);
+  const [logoUploadMsg, setLogoUploadMsg] = useState<string | null>(null);
+  const [logoUploadError, setLogoUploadError] = useState(false);
+
+  const handleWizardLogoSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (logoInputRef.current) logoInputRef.current.value = '';
+    if (!file) return;
+    setLogoUploadMsg(null);
+    setLogoUploadError(false);
+    setCropLogoFile(file);
+  };
+
+  const handleWizardLogoCropped = async (cropped: { filename: string; base64Data: string }) => {
+    setCropLogoFile(null);
+    setUploadingLogo(true);
+    setLogoUploadMsg(null);
+    setLogoUploadError(false);
+    try {
+      const res = await uploadBrandLogo(cropped.filename, cropped.base64Data);
+      if (res.success && res.brand_logo_url) {
+        setFormData((prev) => ({ ...prev, brand_logo_url: res.brand_logo_url }));
+        setLogoUploadMsg('Square custom icon saved for Web UI, installers & agent tray defaults.');
+      } else {
+        setLogoUploadError(true);
+        setLogoUploadMsg(res.error || 'Failed to upload custom icon.');
+      }
+    } catch (err: any) {
+      setLogoUploadError(true);
+      setLogoUploadMsg(err?.message || 'Failed to upload custom icon.');
+    } finally {
+      setUploadingLogo(false);
+    }
+  };
 
   // Step 2: Local Detection, Two-Field Token, Auto-Generate, & Live MS2 Discovery State
   const initialTokenPair = parseMeshTokenPair(settings.meshcentral_api_token);
@@ -387,24 +434,50 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
   const [testingProxy, setTestingProxy] = useState(false);
   const [proxyTestChecks, setProxyTestChecks] = useState<Array<{ name: string; status: string; detail: string }> | null>(null);
 
+  // Step 5: Outbound SMTP Credential Verification & Test Email State
+  const [smtpTestRecipient, setSmtpTestRecipient] = useState(adminEmail || '');
+  const [smtpTestingMode, setSmtpTestingMode] = useState<'verify' | 'send' | null>(null);
+  const [smtpTestResult, setSmtpTestResult] = useState<string | null>(null);
+  const [smtpTestIsError, setSmtpTestIsError] = useState(false);
+
   // Step 6: Initial Baseline Backup Option + OIDC Test + Backup Encryption Key Escrow
   const [createInitialBackup, setCreateInitialBackup] = useState(true);
   const [testingOidc, setTestingOidc] = useState(false);
   const [oidcTestMsg, setOidcTestMsg] = useState<string | null>(null);
   const [oidcIsError, setOidcIsError] = useState(false);
   const [revealedWizardBackupKey, setRevealedWizardBackupKey] = useState<string | null>(null);
+  const [revealingBackupKey, setRevealingBackupKey] = useState(false);
+  const [backupKeyError, setBackupKeyError] = useState<string | null>(null);
+  const [acknowledgingBackupKey, setAcknowledgingBackupKey] = useState(false);
+  const [backupKeyAckNotice, setBackupKeyAckNotice] = useState<string | null>(null);
   const [showWizardBackupKeyMfa, setShowWizardBackupKeyMfa] = useState(false);
   const [copiedWizardBackupKey, setCopiedWizardBackupKey] = useState(false);
 
   const handleRevealWizardBackupKey = async () => {
-    const res = await revealBackupRecoveryKey();
-    if (res.mfaRequired) {
-      setShowWizardBackupKeyMfa(true);
-      return;
-    }
-    if (res.success && res.passphrase) {
-      setRevealedWizardBackupKey(res.passphrase);
-      setFormData((prev) => ({ ...prev, backup_key_acknowledged: 1 }));
+    if (revealingBackupKey) return;
+    setRevealingBackupKey(true);
+    setBackupKeyError(null);
+    try {
+      const res = await revealBackupRecoveryKey();
+      if (res.mfaRequired) {
+        setShowWizardBackupKeyMfa(true);
+        return;
+      }
+      if (res.success && res.passphrase) {
+        setRevealedWizardBackupKey(res.passphrase);
+        setFormData((prev) => ({ ...prev, backup_key_acknowledged: 1 }));
+        setBackupKeyAckNotice(null);
+      } else {
+        setBackupKeyError(
+          res.error || 'Unable to reveal the backup recovery passphrase. Please try again.'
+        );
+      }
+    } catch (err: any) {
+      setBackupKeyError(
+        err?.message || 'Unable to reach Vitrine server to reveal the backup recovery passphrase.'
+      );
+    } finally {
+      setRevealingBackupKey(false);
     }
   };
 
@@ -438,6 +511,20 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
         allowSelfSigned: Boolean(formData.meshcentral_allow_self_signed)
       });
       setDiscoveryResult(res);
+    } catch (err: any) {
+      setDiscoveryResult({
+        success: false,
+        reachable: false,
+        authenticated: false,
+        meshVersion: '',
+        coexistenceSafe: false,
+        tlsVerified: false,
+        summary: err?.message || 'MeshCentral discovery request failed.',
+        error: err?.message || 'Unable to connect to MeshCentral server.',
+        discoveredGroups: [],
+        discoveredAgents: [],
+        serverUrl: formData.meshcentral_url || ''
+      });
     } finally {
       setDiscoveringMesh(false);
     }
@@ -476,9 +563,12 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
     try {
       const res = await testCodeSigningPipeline(formData.code_signing_url);
       if (res.success) {
+        if (!codeSigningManuallyToggled) {
+          setFormData((prev) => ({ ...prev, code_signing_enabled: 1 }));
+        }
         setSignerIsError(false);
         setSignerResult(
-          `Verified 3-Stage Signing Pipeline (${res.hsmStatus}) • ${res.ms2AutoUpdateProtection}`
+          `Verified Code Signing Pipeline (${res.hsmStatus}) • ${res.ms2AutoUpdateProtection}`
         );
       } else {
         setSignerIsError(true);
@@ -502,8 +592,59 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
         quicksupport_custom_domain: formData.quicksupport_custom_domain
       });
       setProxyTestChecks(res.checks);
+    } catch (err: any) {
+      setProxyTestChecks([
+        {
+          name: 'Proxy & TLS Verification',
+          status: 'fail',
+          detail: err?.message || 'Failed to verify reverse proxy / TLS setup.'
+        }
+      ]);
     } finally {
       setTestingProxy(false);
+    }
+  };
+
+  const runSmtpTest = async (verifyOnly: boolean) => {
+    const host = String(formData.smtp_host || '').trim();
+    if (!host) {
+      setSmtpTestIsError(true);
+      setSmtpTestResult('Enter an SMTP Relay Host first.');
+      return;
+    }
+    const recipient = smtpTestRecipient.trim();
+    if (!verifyOnly && (!recipient || !recipient.includes('@'))) {
+      setSmtpTestIsError(true);
+      setSmtpTestResult('Enter a valid recipient email address to send a test email.');
+      return;
+    }
+
+    setSmtpTestingMode(verifyOnly ? 'verify' : 'send');
+    setSmtpTestResult(null);
+    setSmtpTestIsError(false);
+    try {
+      const res = await testSmtp({
+        host,
+        port: Number(formData.smtp_port) || 587,
+        user: formData.smtp_user || '',
+        pass: formData.smtp_pass || '',
+        from: formData.smtp_from || 'alerts@vitrine.local',
+        ...(verifyOnly ? { verifyOnly: true } : { to: recipient, verifyOnly: false })
+      });
+      setSmtpTestIsError(!res.success);
+      setSmtpTestResult(
+        res.message ||
+          (res.success
+            ? verifyOnly
+              ? 'SMTP connection and credentials verified.'
+              : `Test email dispatched to ${recipient}.`
+            : res.error || 'SMTP test failed.')
+      );
+    } catch (err: any) {
+      setSmtpTestIsError(true);
+      setSmtpTestResult(`SMTP test failed: ${err?.message || 'Connection error'}`);
+    } finally {
+      setSmtpTestingMode(null);
     }
   };
 
@@ -520,6 +661,37 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
         header_up X-Forwarded-For {remote_host}
     }
 }`;
+    }
+
+    if (proxyType === 'traefik') {
+      return `# Traefik v3 Dynamic File Provider (http/routes.yml)
+http:
+  routers:
+    vitrine-rmm:
+      rule: "Host(\`${rmmDomain}\`) || Host(\`${qsDomain}\`)"
+      entryPoints:
+        - websecure
+      tls:
+        certResolver: letsencrypt
+      service: vitrine-rmm
+  services:
+    vitrine-rmm:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:8080"`;
+    }
+
+    if (proxyType === 'cloudflare') {
+      return `# Cloudflare Tunnel (cloudflared config.yml)
+tunnel: <YOUR-TUNNEL-UUID>
+credentials-file: /etc/cloudflared/<YOUR-TUNNEL-UUID>.json
+
+ingress:
+  - hostname: ${rmmDomain}
+    service: http://127.0.0.1:8080
+  - hostname: ${qsDomain}
+    service: http://127.0.0.1:8080
+  - service: http_status:404`;
     }
 
     return `server {
@@ -560,19 +732,19 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
         return;
       }
       if (!res.success) {
-        setSaveError(res.error || 'Failed to save OOBE configuration.');
+        setSaveError(res.error || 'Failed to save initial setup configuration.');
         return;
       }
       if (createInitialBackup) {
         await createSystemBackup({
           triggerType: 'manual',
-          notes: 'Initial Post-OOBE Baseline Backup Snapshot'
+          notes: 'Initial Post-Setup Baseline Backup Snapshot'
         }).catch(() => {});
       }
       onSaved(res.settings);
       onClose();
     } catch (err: any) {
-      setSaveError(err?.message || 'Failed to save OOBE configuration.');
+      setSaveError(err?.message || 'Failed to save initial setup configuration.');
     } finally {
       setSaving(false);
     }
@@ -580,7 +752,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
 
   const steps = [
     { num: 1, title: '1. Brand & GUI', icon: Palette },
-    { num: 2, title: '2. MS2 & Import', icon: Server },
+    { num: 2, title: '2. Mesh & Import', icon: Server },
     { num: 3, title: '3. Code Signing', icon: KeyRound },
     { num: 4, title: '4. Proxy & TLS', icon: Lock },
     { num: 5, title: '5. SMTP & Alerts', icon: Mail },
@@ -594,7 +766,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
         <div className="modal-header">
           <div className="modal-title" style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
             <Sparkles size={20} style={{ color: '#00f2fe' }} />
-            <span>Vitrine RMM Comprehensive OOBE Setup &amp; Co-Existence Wizard</span>
+            <span>Initial Setup Wizard</span>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
             <button
@@ -611,7 +783,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
               }}
             >
               <HelpCircle size={14} />
-              <span>Step {step} Hand-Held Setup Guide</span>
+              <span>Step {step} Setup Guide</span>
             </button>
             <button className="btn-glass btn-icon" onClick={onClose} id="close-wizard-btn">
               <X size={18} />
@@ -768,7 +940,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                       })
                     }
                   >
-                    <option value="modern_glass">Modern Vitrine GUI Wrapper (Clean PE Headers + Low AV False-Positive)</option>
+                    <option value="modern_glass">Branded Guided Installer (Recommended)</option>
                     <option value="silent_headless">Zero-Touch Silent Service Installer (GPO / Intune)</option>
                     <option value="native_ms2">Stock MeshCentral 2 Native Dialog</option>
                   </select>
@@ -783,6 +955,75 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                     value={formData.installer_service_name || 'VitrineAgent'}
                     onChange={(e) => setFormData({ ...formData, installer_service_name: e.target.value })}
                   />
+                </div>
+              </div>
+
+              <div
+                style={{
+                  background: 'rgba(255, 255, 255, 0.03)',
+                  border: '1px solid var(--glass-border)',
+                  padding: '0.9rem 1rem',
+                  borderRadius: '8px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: '1rem',
+                  flexWrap: 'wrap'
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.85rem' }}>
+                  {formData.brand_logo_url ? (
+                    <img
+                      src={formData.brand_logo_url}
+                      alt="Brand Logo"
+                      style={{ height: '38px', width: '38px', borderRadius: '8px', objectFit: 'contain', background: 'rgba(0,0,0,0.35)', padding: '3px' }}
+                    />
+                  ) : (
+                    <div
+                      style={{
+                        height: '38px',
+                        width: '38px',
+                        borderRadius: '8px',
+                        background: 'rgba(0, 242, 254, 0.1)',
+                        border: '1px dashed rgba(0, 242, 254, 0.35)',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        color: 'var(--primary)'
+                      }}
+                    >
+                      <Palette size={18} />
+                    </div>
+                  )}
+                  <div>
+                    <div style={{ fontSize: '0.84rem', fontWeight: 600 }}>Brand Logo &amp; Default Companion Tray Icon</div>
+                    <div style={{ fontSize: '0.74rem', color: 'var(--text-muted)' }}>
+                      Used across the Web UI, agent installer GUI, and endpoint system tray (can be overridden per Client, Site, or Role in Policies).
+                    </div>
+                    {logoUploadMsg && (
+                      <div style={{ fontSize: '0.73rem', marginTop: '0.25rem', color: logoUploadError ? '#f87171' : '#34d399' }}>
+                        {logoUploadMsg}
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <div>
+                  <input
+                    ref={logoInputRef}
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp,image/x-icon,.ico"
+                    style={{ display: 'none' }}
+                    onChange={handleWizardLogoSelect}
+                  />
+                  <button
+                    type="button"
+                    className="btn-glass"
+                    style={{ fontSize: '0.78rem' }}
+                    disabled={uploadingLogo}
+                    onClick={() => logoInputRef.current?.click()}
+                  >
+                    <Upload size={14} /> {uploadingLogo ? 'Uploading...' : formData.brand_logo_url ? 'Change Icon / Logo' : 'Upload Icon / Logo'}
+                  </button>
                 </div>
               </div>
             </div>
@@ -806,7 +1047,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
               )}
 
               <div style={{ display: 'grid', gridTemplateColumns: '1.5fr auto', gap: '0.85rem', alignItems: 'end' }}>
-                <div className="form-group">
+                <div className="form-group" style={{ marginBottom: 0 }}>
                   <label className="form-label">Primary MeshCentral 2 Server Endpoint URL</label>
                   <input
                     type="text"
@@ -822,17 +1063,17 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                   className="btn-glass btn-primary"
                   onClick={handleTestDiscoverMesh}
                   disabled={discoveringMesh}
-                  style={{ height: '38px' }}
+                  style={{ height: '40px', whiteSpace: 'nowrap' }}
                 >
                   <RefreshCw size={14} className={discoveringMesh ? 'spin' : ''} />
-                  <span>{discoveringMesh ? 'Scanning MS2...' : 'Test & Discover Fleet'}</span>
+                  <span>{discoveringMesh ? 'Scanning MeshCentral...' : 'Test & Discover Fleet'}</span>
                 </button>
               </div>
 
               {!useCombinedTokenMode ? (
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.85rem' }}>
                   <div className="form-group">
-                    <label className="form-label">Login Token Username (from MS2)</label>
+                    <label className="form-label">Login Token Username (from MeshCentral)</label>
                     <input
                       type="text"
                       className="glass-input"
@@ -843,7 +1084,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                   </div>
 
                   <div className="form-group">
-                    <label className="form-label">Login Token Password (from MS2)</label>
+                    <label className="form-label">Login Token Password (from MeshCentral)</label>
                     <input
                       type="password"
                       className="glass-input"
@@ -884,7 +1125,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                     ? 'Switch to separate Token Username + Password fields'
                     : 'Paste a raw base64 x-meshauth string or cookie token instead'}
                 </button>
-                <label style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', cursor: 'pointer', color: 'var(--text-primary)' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', cursor: 'pointer', color: 'var(--text-main)' }}>
                   <input
                     type="checkbox"
                     checked={Boolean(formData.meshcentral_allow_self_signed)}
@@ -948,7 +1189,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                     </div>
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 0.8fr auto', gap: '0.6rem', alignItems: 'end' }}>
                       <div className="form-group">
-                        <label className="form-label" style={{ fontSize: '0.72rem' }}>MS2 Admin Username</label>
+                        <label className="form-label" style={{ fontSize: '0.72rem' }}>MeshCentral Admin Username</label>
                         <input
                           type="text"
                           className="glass-input"
@@ -958,7 +1199,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                         />
                       </div>
                       <div className="form-group">
-                        <label className="form-label" style={{ fontSize: '0.72rem' }}>MS2 Admin Password</label>
+                        <label className="form-label" style={{ fontSize: '0.72rem' }}>MeshCentral Admin Password</label>
                         <input
                           type="password"
                           className="glass-input"
@@ -1155,7 +1396,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.85rem' }}>
                     <div style={{ background: 'rgba(255,255,255,0.03)', padding: '0.75rem', borderRadius: '8px' }}>
                       <div style={{ fontSize: '0.75rem', fontWeight: 700, color: 'var(--primary)', marginBottom: '0.4rem' }}>
-                        DISCOVERED MS2 DEVICE GROUPS ({discoveryResult.discoveredGroups.length})
+                        DISCOVERED MESHCENTRAL DEVICE GROUPS ({discoveryResult.discoveredGroups.length})
                       </div>
                       {discoveryResult.discoveredGroups.map((g) => (
                         <div key={g.meshGroupId} style={{ fontSize: '0.75rem', padding: '0.3rem 0', borderBottom: '1px solid rgba(255,255,255,0.06)', display: 'flex', justifyContent: 'space-between' }}>
@@ -1171,7 +1412,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
 
                     <div style={{ background: 'rgba(255,255,255,0.03)', padding: '0.75rem', borderRadius: '8px' }}>
                       <div style={{ fontSize: '0.75rem', fontWeight: 700, color: 'var(--primary)', marginBottom: '0.4rem' }}>
-                        UNIMPORTED MS2 AGENTS ({discoveryResult.discoveredAgents.length})
+                        UNIMPORTED MESHCENTRAL AGENTS ({discoveryResult.discoveredAgents.length})
                       </div>
                       {discoveryResult.discoveredAgents.map((a) => (
                         <div key={a.meshNodeId} style={{ fontSize: '0.75rem', padding: '0.3rem 0', borderBottom: '1px solid rgba(255,255,255,0.06)', display: 'flex', justifyContent: 'space-between' }}>
@@ -1190,23 +1431,23 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem', fontSize: '0.78rem' }}>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', cursor: 'pointer' }}>
                       <input type="checkbox" checked={importNewGroups} onChange={(e) => setImportNewGroups(e.target.checked)} />
-                      <span>Import unmatched MS2 Device Groups as Vitrine Clients &amp; Sites</span>
+                      <span>Import unmatched MeshCentral Device Groups as Vitrine Clients &amp; Sites</span>
                     </label>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', cursor: 'pointer' }}>
                       <input type="checkbox" checked={autoDeployCompanion} onChange={(e) => setAutoDeployCompanion(e.target.checked)} />
-                      <span>Auto-push signed Vitrine Tray Companion over MS2 channel when online</span>
+                      <span>Queue signed Vitrine Tray Companion for auto-deploy when setup completes (and on reconnect)</span>
                     </label>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', cursor: 'pointer' }}>
                       <input type="checkbox" checked={enforceLapsOnImport} onChange={(e) => setEnforceLapsOnImport(e.target.checked)} />
-                      <span>Provision LAPS Managed Local Admin account on imported endpoints</span>
+                      <span>Provision LAPS Managed Local Admin account on online endpoints when setup completes</span>
                     </label>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', cursor: 'pointer' }}>
                       <input type="checkbox" checked={lockSignedUpdates} onChange={(e) => setLockSignedUpdates(e.target.checked)} />
-                      <span>Lock MS2 agent updates to Vitrine Code-Signed binaries only</span>
+                      <span>Lock MeshCentral agent updates to Vitrine Code-Signed binaries only</span>
                     </label>
                   </div>
 
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
                     <button
                       type="button"
                       className="btn-glass btn-primary"
@@ -1215,7 +1456,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                       style={{ fontSize: '0.78rem' }}
                     >
                       <CheckCircle2 size={14} />
-                      <span>{importingMesh ? 'Importing & Pushing Add-ons...' : 'Execute MS2 Import & Queue Companion Add-Ons'}</span>
+                      <span>{importingMesh ? 'Importing Endpoints...' : 'Execute MeshCentral Import & Save Queue Preferences'}</span>
                     </button>
                     {importSummary && (
                       <span style={{ fontSize: '0.76rem', color: importIsError ? '#f87171' : '#34d399', fontWeight: 600 }}>
@@ -1228,29 +1469,49 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
             </div>
           )}
 
-          {/* STEP 3: 3-STAGE CODE SIGNING & MS2 AGENT BINARY PROTECTION */}
+          {/* STEP 3: CODE SIGNING & AGENT BINARY PROTECTION */}
           {step === 3 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1.15rem' }}>
               <div className="form-group">
                 <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer', fontWeight: 700 }}>
                   <input
                     type="checkbox"
-                    checked={Boolean(formData.code_signing_enabled ?? 1)}
-                    onChange={(e) => setFormData({ ...formData, code_signing_enabled: e.target.checked ? 1 : 0 })}
+                    checked={Boolean(formData.code_signing_enabled)}
+                    onChange={(e) => {
+                      setCodeSigningManuallyToggled(true);
+                      setFormData({ ...formData, code_signing_enabled: e.target.checked ? 1 : 0 });
+                    }}
                   />
-                  <span>Enable 3-Stage Authenticode &amp; RFC 3161 Code Signing Pipeline</span>
+                  <span>Enable Automated Authenticode &amp; RFC 3161 Code Signing Pipeline</span>
                 </label>
               </div>
 
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '0.85rem', alignItems: 'end' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 1fr auto', gap: '0.85rem', alignItems: 'end' }}>
                 <div className="form-group">
                   <label className="form-label">Code Signing HSM / SignPath / Webhook Endpoint URL</label>
                   <input
                     type="text"
                     className="glass-input"
-                    placeholder="http://10.10.10.20:5000/sign"
+                    placeholder="https://signer.msp-domain.example/sign"
                     value={formData.code_signing_url || ''}
-                    onChange={(e) => setFormData({ ...formData, code_signing_url: e.target.value })}
+                    onChange={(e) => {
+                      const nextUrl = e.target.value;
+                      setFormData((prev) => ({
+                        ...prev,
+                        code_signing_url: nextUrl,
+                        ...(!codeSigningManuallyToggled && nextUrl.trim().length > 0 ? { code_signing_enabled: 1 } : {})
+                      }));
+                    }}
+                  />
+                </div>
+                <div className="form-group">
+                  <label className="form-label">Signing API Key / Bearer Token (Vaulted)</label>
+                  <input
+                    type="password"
+                    className="glass-input"
+                    placeholder="Optional signing webhook key"
+                    value={formData.code_signing_api_key || ''}
+                    onChange={(e) => setFormData({ ...formData, code_signing_api_key: e.target.value })}
                   />
                 </div>
                 <button
@@ -1261,7 +1522,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                   style={{ height: '38px' }}
                 >
                   <Shield size={14} />
-                  <span>{testingSigner ? 'Verifying HSM...' : 'Verify 3-Stage Signing'}</span>
+                  <span>{testingSigner ? 'Verifying...' : 'Verify Signing API'}</span>
                 </button>
               </div>
 
@@ -1272,7 +1533,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                     checked={Boolean(formData.code_signing_sign_ms2_binary ?? 1)}
                     onChange={(e) => setFormData({ ...formData, code_signing_sign_ms2_binary: e.target.checked ? 1 : 0 })}
                   />
-                  <span><strong>Stage 1:</strong> Sign Native MS2 Agent Binary &amp; Lock MS2 Auto-Updates to Signed Cache</span>
+                  <span><strong>Stage 1:</strong> Sign Native MeshCentral Agent Binary &amp; Lock Auto-Updates to Signed Cache</span>
                 </label>
 
                 <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
@@ -1325,7 +1586,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
           {step === 4 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
               <div style={{ background: 'rgba(0, 242, 254, 0.08)', border: '1px solid rgba(0, 242, 254, 0.25)', padding: '0.75rem 1rem', borderRadius: '8px', fontSize: '0.78rem' }}>
-                <strong>Local Setup Expected:</strong> You are currently configuring Vitrine locally. Choose whether an upstream Reverse Proxy or Vitrine&apos;s built-in Let&apos;s Encrypt client will handle public TLS termination and WebSocket upgrades (`wss://`).
+                <strong>Local Setup Expected:</strong> You are currently configuring Vitrine locally. Choose whether an upstream Reverse Proxy or external Let&apos;s Encrypt / ACME tooling handles public TLS termination and WebSocket upgrades (<code>wss://</code>).
               </div>
 
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: '1rem', alignItems: 'end' }}>
@@ -1341,8 +1602,8 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                       })
                     }
                   >
-                    <option value="reverse_proxy">External Reverse Proxy Handles TLS (Nginx / Caddy / Traefik)</option>
-                    <option value="letsencrypt">Vitrine Built-In Let&apos;s Encrypt ACME Auto-TLS</option>
+                    <option value="reverse_proxy">External Reverse Proxy Handles TLS (Nginx / Caddy / Traefik / Cloudflare)</option>
+                    <option value="letsencrypt">External Let&apos;s Encrypt / Certbot Certificates (Reverse Proxy Recommended)</option>
                     <option value="self_signed">Internal LAN Self-Signed TLS Certificate</option>
                   </select>
                 </div>
@@ -1429,12 +1690,40 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
               </div>
 
               {proxyTestChecks && (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', background: 'rgba(16, 185, 129, 0.1)', border: '1px solid rgba(16, 185, 129, 0.3)', padding: '0.7rem 0.9rem', borderRadius: '8px', fontSize: '0.76rem' }}>
-                  {proxyTestChecks.map((c, idx) => (
-                    <div key={idx}>
-                      <strong style={{ color: '#34d399' }}>✓ {c.name}:</strong> {c.detail}
-                    </div>
-                  ))}
+                <div
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '0.35rem',
+                    background: proxyTestChecks.some((c) => ['fail', 'error'].includes(String(c.status).toLowerCase()))
+                      ? 'rgba(239, 68, 68, 0.1)'
+                      : proxyTestChecks.some((c) => ['warn', 'warning'].includes(String(c.status).toLowerCase()))
+                        ? 'rgba(245, 158, 11, 0.1)'
+                        : 'rgba(16, 185, 129, 0.1)',
+                    border: `1px solid ${
+                      proxyTestChecks.some((c) => ['fail', 'error'].includes(String(c.status).toLowerCase()))
+                        ? 'rgba(239, 68, 68, 0.35)'
+                        : proxyTestChecks.some((c) => ['warn', 'warning'].includes(String(c.status).toLowerCase()))
+                          ? 'rgba(245, 158, 11, 0.35)'
+                          : 'rgba(16, 185, 129, 0.3)'
+                    }`,
+                    padding: '0.7rem 0.9rem',
+                    borderRadius: '8px',
+                    fontSize: '0.76rem'
+                  }}
+                >
+                  {proxyTestChecks.map((c, idx) => {
+                    const st = String(c.status || '').toLowerCase();
+                    const isFail = st === 'fail' || st === 'error';
+                    const isWarn = st === 'warn' || st === 'warning';
+                    const color = isFail ? '#f87171' : isWarn ? '#fbbf24' : '#34d399';
+                    const mark = isFail ? '✕' : isWarn ? '!' : '✓';
+                    return (
+                      <div key={idx}>
+                        <strong style={{ color }}>{mark} {c.name}:</strong> {c.detail}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>
@@ -1449,6 +1738,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                   <input
                     type="text"
                     className="glass-input"
+                    placeholder="smtp.office365.com"
                     value={formData.smtp_host || ''}
                     onChange={(e) => setFormData({ ...formData, smtp_host: e.target.value })}
                   />
@@ -1458,8 +1748,13 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                   <input
                     type="number"
                     className="glass-input"
-                    value={formData.smtp_port || 587}
-                    onChange={(e) => setFormData({ ...formData, smtp_port: parseInt(e.target.value, 10) })}
+                    value={formData.smtp_port ?? ''}
+                    onChange={(e) =>
+                      setFormData({
+                        ...formData,
+                        smtp_port: e.target.value === '' ? undefined : parseInt(e.target.value, 10)
+                      })
+                    }
                   />
                 </div>
               </div>
@@ -1488,10 +1783,113 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                   <input
                     type="text"
                     className="glass-input"
+                    placeholder="alerts@yourdomain.com"
                     value={formData.smtp_from || ''}
                     onChange={(e) => setFormData({ ...formData, smtp_from: e.target.value })}
                   />
                 </div>
+              </div>
+
+              <div
+                style={{
+                  background: 'rgba(0, 242, 254, 0.05)',
+                  border: '1px solid rgba(0, 242, 254, 0.2)',
+                  borderRadius: '8px',
+                  padding: '1rem',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '0.75rem'
+                }}
+              >
+                <div
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    flexWrap: 'wrap',
+                    gap: '0.5rem'
+                  }}
+                >
+                  <div style={{ fontSize: '0.8rem', fontWeight: 700, color: 'var(--primary)' }}>
+                    VERIFY SMTP CREDENTIALS &amp; TEST DELIVERY
+                  </div>
+                  <button
+                    type="button"
+                    id="oobe-smtp-verify-btn"
+                    className="btn-glass"
+                    style={{ fontSize: '0.78rem', padding: '0.35rem 0.75rem' }}
+                    disabled={smtpTestingMode !== null || !String(formData.smtp_host || '').trim()}
+                    onClick={() => runSmtpTest(true)}
+                  >
+                    <Shield size={14} />{' '}
+                    {smtpTestingMode === 'verify' ? 'Verifying Credentials...' : 'Test Connection & Credentials'}
+                  </button>
+                </div>
+
+                <div
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: '1fr auto',
+                    gap: '0.75rem',
+                    alignItems: 'end'
+                  }}
+                >
+                  <div className="form-group" style={{ marginBottom: 0 }}>
+                    <label className="form-label" htmlFor="oobe-smtp-test-recipient">
+                      Send Test Email To (Recipient)
+                    </label>
+                    <input
+                      id="oobe-smtp-test-recipient"
+                      type="email"
+                      className="glass-input"
+                      placeholder="admin@yourdomain.com"
+                      value={smtpTestRecipient}
+                      onChange={(e) => setSmtpTestRecipient(e.target.value)}
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    id="oobe-smtp-send-test-btn"
+                    className="btn-glass btn-primary"
+                    disabled={
+                      smtpTestingMode !== null ||
+                      !String(formData.smtp_host || '').trim() ||
+                      !smtpTestRecipient.trim()
+                    }
+                    onClick={() => runSmtpTest(false)}
+                  >
+                    <Send size={14} />{' '}
+                    {smtpTestingMode === 'send' ? 'Sending Test Email...' : 'Send Test Email'}
+                  </button>
+                </div>
+
+                {smtpTestResult && (
+                  <div
+                    id="oobe-smtp-test-result"
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.5rem',
+                      padding: '0.65rem 0.85rem',
+                      borderRadius: '6px',
+                      fontSize: '0.78rem',
+                      background: smtpTestIsError
+                        ? 'rgba(239, 68, 68, 0.14)'
+                        : 'rgba(16, 185, 129, 0.12)',
+                      border: `1px solid ${
+                        smtpTestIsError ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)'
+                      }`,
+                      color: smtpTestIsError ? '#f87171' : '#34d399'
+                    }}
+                  >
+                    {smtpTestIsError ? (
+                      <AlertCircle size={15} style={{ flexShrink: 0 }} />
+                    ) : (
+                      <CheckCircle2 size={15} style={{ flexShrink: 0 }} />
+                    )}
+                    <span>{smtpTestResult}</span>
+                  </div>
+                )}
               </div>
 
               <div style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid var(--glass-border)', borderRadius: '8px', padding: '1rem', display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
@@ -1520,7 +1918,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                     checked={Boolean(formData.update_create_psa_ticket ?? 1)}
                     onChange={(e) => setFormData({ ...formData, update_create_psa_ticket: e.target.checked ? 1 : 0 })}
                   />
-                  <span>Automatically open a PSA / ITFlow Maintenance Ticket when an update is ready</span>
+                  <span>Automatically open a Service Desk Maintenance Ticket when an update is ready</span>
                 </label>
               </div>
             </div>
@@ -1534,9 +1932,12 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                   <input
                     type="checkbox"
                     checked={Boolean(formData.oidc_enabled)}
-                    onChange={(e) => setFormData({ ...formData, oidc_enabled: e.target.checked ? 1 : 0 })}
+                    onChange={(e) => {
+                      setOidcManuallyToggled(true);
+                      setFormData({ ...formData, oidc_enabled: e.target.checked ? 1 : 0 });
+                    }}
                   />
-                  <span>Enable Enterprise OpenID Connect (OIDC + PKCE) Single Sign-On</span>
+                  <span>Enable OpenID Connect (OIDC + PKCE) Single Sign-On</span>
                 </label>
                 <button
                   type="button"
@@ -1552,6 +1953,9 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                         issuerUrl: formData.oidc_issuer_url,
                         clientId: formData.oidc_client_id
                       });
+                      if (res.success && !oidcManuallyToggled) {
+                        setFormData((prev) => ({ ...prev, oidc_enabled: 1 }));
+                      }
                       setOidcIsError(!res.success);
                       setOidcTestMsg(
                         res.success
@@ -1578,7 +1982,16 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                     className="glass-input"
                     placeholder="https://auth.internal/application/o/vitrine/"
                     value={formData.oidc_issuer_url || ''}
-                    onChange={(e) => setFormData({ ...formData, oidc_issuer_url: e.target.value })}
+                    onChange={(e) => {
+                      const nextIssuer = e.target.value;
+                      setFormData((prev) => ({
+                        ...prev,
+                        oidc_issuer_url: nextIssuer,
+                        ...(!oidcManuallyToggled && nextIssuer.trim() && String(prev.oidc_client_id || '').trim()
+                          ? { oidc_enabled: 1 }
+                          : {})
+                      }));
+                    }}
                   />
                 </div>
                 <div className="form-group">
@@ -1587,7 +2000,16 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                     type="text"
                     className="glass-input"
                     value={formData.oidc_client_id || ''}
-                    onChange={(e) => setFormData({ ...formData, oidc_client_id: e.target.value })}
+                    onChange={(e) => {
+                      const nextClientId = e.target.value;
+                      setFormData((prev) => ({
+                        ...prev,
+                        oidc_client_id: nextClientId,
+                        ...(!oidcManuallyToggled && nextClientId.trim() && String(prev.oidc_issuer_url || '').trim()
+                          ? { oidc_enabled: 1 }
+                          : {})
+                      }));
+                    }}
                   />
                 </div>
                 <div className="form-group">
@@ -1637,17 +2059,60 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                   <div style={{ display: 'flex', gap: '0.45rem' }}>
                     <button
                       type="button"
+                      id="oobe-reveal-backup-key-btn"
                       className="btn-glass"
                       style={{ fontSize: '0.74rem', padding: '0.28rem 0.65rem', borderColor: 'rgba(245, 158, 11, 0.45)', color: '#fbbf24' }}
+                      disabled={revealingBackupKey}
                       onClick={handleRevealWizardBackupKey}
                     >
-                      <KeyRound size={13} /> Reveal Auto-Generated Recovery Key (MFA)
+                      <KeyRound size={13} />{' '}
+                      {revealingBackupKey ? 'Revealing Key...' : 'Reveal Auto-Generated Recovery Key (MFA)'}
                     </button>
                   </div>
                 </div>
                 <div style={{ fontSize: '0.77rem', color: 'var(--text-muted)', lineHeight: 1.45 }}>
                   All <code>.vrmm-backup.gz</code> archives are encrypted with AES-256-GCM. Save your recovery passphrase in 1Password/Bitwarden now—or set a custom passphrase below—so you can restore backups on a replacement server if this host is ever lost.
                 </div>
+
+                {backupKeyError && (
+                  <div
+                    id="oobe-backup-key-error"
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.5rem',
+                      padding: '0.55rem 0.75rem',
+                      borderRadius: '6px',
+                      background: 'rgba(239, 68, 68, 0.14)',
+                      border: '1px solid rgba(239, 68, 68, 0.35)',
+                      color: '#f87171',
+                      fontSize: '0.76rem'
+                    }}
+                  >
+                    <AlertCircle size={14} style={{ flexShrink: 0 }} />
+                    <span>{backupKeyError}</span>
+                  </div>
+                )}
+
+                {backupKeyAckNotice && (
+                  <div
+                    id="oobe-backup-key-ack-notice"
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.5rem',
+                      padding: '0.55rem 0.75rem',
+                      borderRadius: '6px',
+                      background: 'rgba(16, 185, 129, 0.12)',
+                      border: '1px solid rgba(16, 185, 129, 0.35)',
+                      color: '#34d399',
+                      fontSize: '0.76rem'
+                    }}
+                  >
+                    <CheckCircle2 size={14} style={{ flexShrink: 0 }} />
+                    <span>{backupKeyAckNotice}</span>
+                  </div>
+                )}
 
                 {revealedWizardBackupKey && (
                   <div style={{ display: 'flex', gap: '0.45rem', alignItems: 'center', flexWrap: 'wrap' }}>
@@ -1708,12 +2173,30 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                     type="button"
                     className="btn-glass"
                     style={{ fontSize: '0.74rem', padding: '0.45rem 0.75rem' }}
+                    disabled={acknowledgingBackupKey}
                     onClick={async () => {
-                      await acknowledgeBackupRecoveryKey();
-                      setFormData((prev) => ({ ...prev, backup_key_acknowledged: 1 }));
+                      if (acknowledgingBackupKey) return;
+                      setAcknowledgingBackupKey(true);
+                      setBackupKeyError(null);
+                      try {
+                        const res = await acknowledgeBackupRecoveryKey();
+                        if (res.success) {
+                          setFormData((prev) => ({ ...prev, backup_key_acknowledged: 1 }));
+                          setBackupKeyAckNotice('✓ Backup recovery key marked as escrowed offline.');
+                        } else {
+                          setBackupKeyError(res.error || 'Failed to mark backup recovery key as escrowed.');
+                        }
+                      } catch (err: any) {
+                        setBackupKeyError(
+                          err?.message || 'Unable to reach Vitrine server while acknowledging backup key.'
+                        );
+                      } finally {
+                        setAcknowledgingBackupKey(false);
+                      }
                     }}
                   >
-                    <CheckCircle2 size={13} /> Mark Key Escrowed
+                    <CheckCircle2 size={13} />{' '}
+                    {acknowledgingBackupKey ? 'Saving...' : 'Mark Key Escrowed'}
                   </button>
                 </div>
               </div>
@@ -1769,7 +2252,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                     checked={createInitialBackup}
                     onChange={(e) => setCreateInitialBackup(e.target.checked)}
                   />
-                  <span>Create an initial self-restoring baseline backup archive (DB + LAPS Vault + Branding) upon completing OOBE</span>
+                  <span>Create an initial self-restoring baseline backup archive (DB + LAPS Vault + Branding) upon completing guided setup</span>
                 </label>
               </div>
             </div>
@@ -1823,7 +2306,7 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
                 disabled={saving}
                 id="save-wizard-btn"
               >
-                <CheckCircle2 size={16} /> Complete OOBE Setup &amp; Save Configuration
+                <CheckCircle2 size={16} /> Complete Guided Setup &amp; Save Configuration
               </button>
             )}
           </div>
@@ -1917,9 +2400,17 @@ export const OnboardingWizardModal: React.FC<OnboardingWizardModalProps> = ({
             handleSave();
           }
         }}
-        title={pendingMfaAction === 'local_cfg' ? 'Step-Up MFA: Update Local MeshCentral config.json' : 'Step-Up MFA: Complete OOBE Setup'}
+        title={pendingMfaAction === 'local_cfg' ? 'Step-Up MFA: Update Local MeshCentral config.json' : 'Step-Up MFA: Complete Guided Setup'}
         description="Enter your 6-digit TOTP authenticator code or recovery code to authorize this configuration update."
         secretType="system_settings"
+      />
+
+      <IconCropModal
+        isOpen={Boolean(cropLogoFile)}
+        file={cropLogoFile}
+        title="Crop Brand & Agent Tray Icon"
+        onCancel={() => setCropLogoFile(null)}
+        onConfirm={handleWizardLogoCropped}
       />
     </div>
   );

@@ -650,10 +650,10 @@ export class BackupService {
     }
     const actuallyEncrypted = Boolean(encryptionRequested && encryptionPassphrase);
 
-    // Include .vault-key.json inside archive ONLY when encrypted or explicitly opted out of encryption
+    // Include .vault-key.json inside archive ONLY when encrypted (never bundle plaintext master key in unencrypted archives! H-13)
     let vaultKeyJson: string | null = null;
     const vaultKeyPath = path.join(DATA_DIR_PATH, '.vault-key.json');
-    if (fs.existsSync(vaultKeyPath)) {
+    if (actuallyEncrypted && fs.existsSync(vaultKeyPath)) {
       try {
         vaultKeyJson = fs.readFileSync(vaultKeyPath, 'utf8');
       } catch {}
@@ -1062,7 +1062,8 @@ export class BackupService {
     backupId: string,
     resolutionMode?: 'auto_migrate' | 'upgrade_software_to_match' | 'compatibility_safe_import',
     passphraseOverride?: string,
-    actorUsername = 'admin'
+    actorUsername = 'admin',
+    actorSessionId?: string
   ) {
     const row = db.prepare('SELECT * FROM system_backups WHERE id = ?').get(backupId) as any;
     if (!row) {
@@ -1135,9 +1136,15 @@ export class BackupService {
       actorUsername
     });
 
-    // Capture current system_backups catalog and active auth_sessions so they survive atomic DB replacement
+    // Capture current system_backups catalog and ONLY the initiating Super Admin's active session (H-13)
     const preservedBackups = db.prepare('SELECT * FROM system_backups').all() as any[];
-    const preservedSessions = db.prepare('SELECT * FROM auth_sessions').all() as any[];
+    let actorSessionRow: any = null;
+    if (actorSessionId) {
+      const hashedActor = crypto.createHash('sha256').update(actorSessionId, 'utf8').digest('hex');
+      actorSessionRow = db
+        .prepare('SELECT * FROM auth_sessions WHERE token_hash = ? OR token_hash = ? LIMIT 1')
+        .get(actorSessionId, hashedActor);
+    }
 
     let migrationsApplied = false;
 
@@ -1147,14 +1154,59 @@ export class BackupService {
       const existingLapsCount = (db.prepare('SELECT COUNT(*) as c FROM laps_vault').get() as any)?.c || 0;
       const vkPath = path.join(DATA_DIR_PATH, '.vault-key.json');
       const isEmptySystem = existingDevicesCount === 0 && existingLapsCount === 0;
+      let tablesToImport = parsed.tablesSnapshot as Record<string, any[]>;
+
       if (!fs.existsSync(vkPath) || isEmptySystem) {
         this.restoreVaultKeyFromArchive(parsed.vaultKeyJson, true);
+      } else if (parsed.vaultKeyJson && typeof parsed.vaultKeyJson === 'string') {
+        // Re-encrypt vault secrets cleanly from archive master key to active instance master key
+        const currentVkRaw = fs.readFileSync(vkPath, 'utf8');
+        const decryptedMap = new Map<string, string>();
+        try {
+          if (this.restoreVaultKeyFromArchive(parsed.vaultKeyJson, true)) {
+            for (const [tbl, rows] of Object.entries(tablesToImport)) {
+              if (!Array.isArray(rows)) continue;
+              rows.forEach((row, rIdx) => {
+                if (!row || typeof row !== 'object') return;
+                for (const [col, val] of Object.entries(row)) {
+                  if (typeof val === 'string' && val.startsWith('enc:')) {
+                    const plain = decryptVaultSecret(val);
+                    if (plain && !plain.startsWith('enc:')) {
+                      decryptedMap.set(`${tbl}:${rIdx}:${col}`, plain);
+                    }
+                  }
+                }
+              });
+            }
+          }
+        } finally {
+          fs.writeFileSync(vkPath, currentVkRaw, { encoding: 'utf8', mode: 0o600 });
+          reloadVaultMasterKey();
+        }
+        if (decryptedMap.size > 0) {
+          const cloned: Record<string, any[]> = {};
+          for (const [tbl, rows] of Object.entries(tablesToImport)) {
+            if (!Array.isArray(rows)) continue;
+            cloned[tbl] = rows.map((row, rIdx) => {
+              if (!row || typeof row !== 'object') return row;
+              const copy = { ...row };
+              for (const col of Object.keys(copy)) {
+                const plain = decryptedMap.get(`${tbl}:${rIdx}:${col}`);
+                if (plain !== undefined) {
+                  copy[col] = encryptVaultSecret(plain);
+                }
+              }
+              return copy;
+            });
+          }
+          tablesToImport = cloned;
+        }
       }
 
       db.pragma('foreign_keys = OFF');
       try {
         const importTx = db.transaction(() => {
-          for (const [tableName, rows] of Object.entries(parsed.tablesSnapshot as Record<string, any[]>)) {
+          for (const [tableName, rows] of Object.entries(tablesToImport)) {
             if (!/^[a-zA-Z0-9_]+$/.test(tableName) || !Array.isArray(rows)) continue;
             if (tableName === 'system_backups' || tableName === 'auth_sessions') continue;
 
@@ -1189,11 +1241,41 @@ export class BackupService {
         };
       }
 
-      // Restore .vault-key.json (supporting both masterSecretHex and legacy masterKeyHex) and reload in-memory master key cache!
-      this.restoreVaultKeyFromArchive(parsed.vaultKeyJson, true);
-
       const tempReplacePath = `${DB_FILE_PATH}.restore-${Date.now()}.tmp`;
       fs.writeFileSync(tempReplacePath, decodedDb, { mode: 0o600 });
+
+      // Run PRAGMA integrity_check on the staged temp DB BEFORE swapping live vitrine.db!
+      try {
+        const SqliteCtor = db.constructor as new (filePath: string, opts?: Record<string, unknown>) => any;
+        const stagedDb = new SqliteCtor(tempReplacePath, { readonly: true, fileMustExist: true });
+        let integrityResult = '';
+        try {
+          const checkRow = stagedDb.prepare('PRAGMA integrity_check').get() as Record<string, unknown> | undefined;
+          integrityResult = checkRow ? String(Object.values(checkRow)[0] || '').toLowerCase() : '';
+        } finally {
+          stagedDb.close();
+        }
+        if (integrityResult !== 'ok') {
+          try {
+            if (fs.existsSync(tempReplacePath)) fs.unlinkSync(tempReplacePath);
+          } catch {}
+          return {
+            success: false,
+            error: `Backup SQLite database failed PRAGMA integrity_check (${integrityResult || 'unknown'}); live database left untouched.`
+          };
+        }
+      } catch (integErr: any) {
+        try {
+          if (fs.existsSync(tempReplacePath)) fs.unlinkSync(tempReplacePath);
+        } catch {}
+        return {
+          success: false,
+          error: `Backup SQLite database failed integrity verification: ${integErr?.message || 'corrupt database'}`
+        };
+      }
+
+      // Restore .vault-key.json (supporting both masterSecretHex and legacy masterKeyHex) and reload in-memory master key cache!
+      this.restoreVaultKeyFromArchive(parsed.vaultKeyJson, true);
 
       // Pause background scheduler ticks during atomic SQLite handle swap
       try {
@@ -1220,7 +1302,7 @@ export class BackupService {
       }
       migrationsApplied = compat.status === 'older_db_auto_migratable';
 
-      // Re-register backup catalog & active sessions (whose user_id exists in restored DB)
+      // Re-register backup catalog & ONLY the initiating Super Admin's active session (whose user_id exists in restored DB)
       const insBak = db.prepare(`
         INSERT OR REPLACE INTO system_backups (
           id, filename, file_path, size_bytes, trigger_type, app_version, git_commit,
@@ -1249,23 +1331,52 @@ export class BackupService {
         );
       }
 
-      const insSess = db.prepare(`
-        INSERT OR IGNORE INTO auth_sessions (token_hash, user_id, expires_at, mfa_verified_until, ip_address, user_agent, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `);
-      for (const s of preservedSessions) {
-        const userStillExists = db.prepare('SELECT id FROM users WHERE id = ?').get(s.user_id);
+      if (actorSessionRow) {
+        const userStillExists = db.prepare('SELECT id FROM users WHERE id = ?').get(actorSessionRow.user_id);
         if (userStillExists) {
-          insSess.run(
-            s.token_hash,
-            s.user_id,
-            s.expires_at,
-            s.mfa_verified_until,
-            s.ip_address,
-            s.user_agent,
-            s.created_at
+          db.prepare(`
+            INSERT OR IGNORE INTO auth_sessions (token_hash, user_id, expires_at, mfa_verified_until, ip_address, user_agent, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            actorSessionRow.token_hash,
+            actorSessionRow.user_id,
+            actorSessionRow.expires_at,
+            actorSessionRow.mfa_verified_until,
+            actorSessionRow.ip_address,
+            actorSessionRow.user_agent,
+            actorSessionRow.created_at
           );
         }
+      }
+    }
+
+    // 2C. Restore MeshCentral config.json when present inside authorized directories
+    if (parsed.meshConfigJson && typeof parsed.meshConfigJson === 'string') {
+      try {
+        const parsedMc = JSON.parse(parsed.meshConfigJson);
+        if (parsedMc && typeof parsedMc === 'object' && ('settings' in parsedMc || 'domains' in parsedMc)) {
+          let targetConfigPath: string | undefined;
+          try {
+            const srvRow = db
+              .prepare('SELECT local_config_path FROM mesh_servers WHERE local_config_path IS NOT NULL LIMIT 1')
+              .get() as { local_config_path?: string } | undefined;
+            if (srvRow?.local_config_path && isAllowedMeshConfigPath(srvRow.local_config_path)) {
+              targetConfigPath = srvRow.local_config_path;
+            }
+          } catch {}
+          if (!targetConfigPath) {
+            targetConfigPath = [
+              '/opt/meshcentral/meshcentral-data/config.json',
+              path.resolve(process.cwd(), 'dev-meshcentral/meshcentral-data/config.json'),
+              path.resolve(process.cwd(), '../dev-meshcentral/meshcentral-data/config.json')
+            ].find((p) => isAllowedMeshConfigPath(p));
+          }
+          if (targetConfigPath && fs.existsSync(targetConfigPath) && !fs.lstatSync(targetConfigPath).isSymbolicLink()) {
+            fs.writeFileSync(targetConfigPath, parsed.meshConfigJson, { encoding: 'utf8', mode: 0o600 });
+          }
+        }
+      } catch {
+        // Non-fatal if MeshCentral config directory is unavailable or read-only
       }
     }
 

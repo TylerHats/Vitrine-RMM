@@ -1,16 +1,20 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { KeyRound, ShieldAlert, Copy, RotateCcw, X, CheckCircle, Eye, Clock, AlertCircle } from 'lucide-react';
-import { Device, LapsCredential } from '../types/index.js';
+import { AuthUser, Device, LapsCredential } from '../types/index.js';
 import { fetchLapsPassword, rotateLapsPassword } from '../services/api.js';
 import { MfaChallengeModal } from './MfaChallengeModal.js';
 import { copyToClipboard } from '../utils/clipboard.js';
+import { hasPermission } from '../utils/permissions.js';
 
 interface LapsModalProps {
   device: Device;
+  currentUser?: AuthUser | null;
   onClose: () => void;
 }
 
-export const LapsModal: React.FC<LapsModalProps> = ({ device, onClose }) => {
+export const LapsModal: React.FC<LapsModalProps> = ({ device, currentUser, onClose }) => {
+  const canRevealLaps = hasPermission(currentUser, 'laps:reveal');
+  const canRotateLaps = hasPermission(currentUser, 'laps:rotate');
   const [lapsData, setLapsData] = useState<LapsCredential | null>(null);
   const [isRevealed, setIsRevealed] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -33,11 +37,10 @@ export const LapsModal: React.FC<LapsModalProps> = ({ device, onClose }) => {
           setShowMfa(true);
           return;
         }
+        setLapsData(data);
         if (data.error) {
           setError(data.error);
-          return;
         }
-        setLapsData(data);
         if (reveal && isPasswordCleartext(data.password)) {
           setIsRevealed(true);
           setCountdown(900);
@@ -84,11 +87,10 @@ export const LapsModal: React.FC<LapsModalProps> = ({ device, onClose }) => {
         setShowMfa(true);
         return;
       }
+      setLapsData(data);
       if (data.error) {
         setError(data.error);
-        return;
       }
-      setLapsData(data);
       if (revealAfterRotate && isPasswordCleartext(data.password)) {
         setIsRevealed(true);
         setCountdown(900);
@@ -106,13 +108,23 @@ export const LapsModal: React.FC<LapsModalProps> = ({ device, onClose }) => {
     loadLaps(true);
   };
 
+  const isProvisioned = Boolean(
+    lapsData &&
+      lapsData.provisioned !== false &&
+      lapsData.rotationStatus !== 'not_provisioned' &&
+      lapsData.rotationStatus !== 'push_failed' &&
+      (lapsData.lastRotated || lapsData.password)
+  );
+
   const handleRotate = async () => {
-    const promptMsg =
-      device.lifecycle_state === 'pending_offboard'
+    const acc = lapsData?.accountName || 'LocalAdmin';
+    const promptMsg = !isProvisioned
+      ? `Provision local admin account '${acc}' and set a verified LAPS password on ${device.hostname}?`
+      : device.lifecycle_state === 'pending_offboard'
         ? `${device.hostname} is queued in Pending Offboarding. Scheduled/manual rotations are skipped so the current local admin password is never lost before offboarding completes.`
         : device.status !== 'online'
           ? `${device.hostname} is currently OFFLINE. Queue a deferred rotation that will ONLY execute once the endpoint returns online (keeping the current working password intact in Vitrine so you are never locked out)?`
-          : `Immediately rotate the local administrator (${lapsData?.accountName || 'LocalAdmin'}) password on ${device.hostname}?`;
+          : `Immediately rotate the local administrator (${acc}) password on ${device.hostname}?`;
     if (confirm(promptMsg)) {
       await executeRotation(device.status === 'online' && device.lifecycle_state !== 'pending_offboard');
     }
@@ -167,8 +179,8 @@ export const LapsModal: React.FC<LapsModalProps> = ({ device, onClose }) => {
               <div
                 style={{
                   display: 'flex',
-                  alignItems: 'center',
-                  gap: '0.5rem',
+                  flexDirection: 'column',
+                  gap: '0.45rem',
                   background: 'rgba(239, 68, 68, 0.14)',
                   border: '1px solid rgba(239, 68, 68, 0.3)',
                   padding: '0.65rem 0.85rem',
@@ -177,8 +189,42 @@ export const LapsModal: React.FC<LapsModalProps> = ({ device, onClose }) => {
                   color: '#f87171'
                 }}
               >
-                <AlertCircle size={15} />
-                <span>{error}</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <AlertCircle size={15} style={{ flexShrink: 0 }} />
+                  <span>{error}</span>
+                </div>
+                {lapsData?.pushOutput && (
+                  <details style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>
+                    <summary style={{ cursor: 'pointer' }}>Agent Verification Output</summary>
+                    <pre style={{ marginTop: '0.35rem', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontFamily: 'var(--font-mono)' }}>
+                      {lapsData.pushOutput}
+                    </pre>
+                  </details>
+                )}
+              </div>
+            )}
+
+            {lapsData && !isProvisioned && (
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  gap: '0.6rem',
+                  background: 'rgba(245, 158, 11, 0.14)',
+                  border: '1px solid rgba(245, 158, 11, 0.38)',
+                  padding: '0.75rem 0.9rem',
+                  borderRadius: '8px',
+                  fontSize: '0.77rem',
+                  color: 'var(--text-main)',
+                  lineHeight: 1.45
+                }}
+              >
+                <ShieldAlert size={16} style={{ flexShrink: 0, marginTop: '0.1rem', color: '#fbbf24' }} />
+                <div>
+                  <strong>Account &apos;{lapsData.accountName}&apos; Not Yet Provisioned on Endpoint:</strong>{' '}
+                  {lapsData.pendingRotationReason ||
+                    `No verified local admin credential has been created on ${device.hostname} yet. Click "Provision Account & Set Password Now" below once the device is online.`}
+                </div>
               </div>
             )}
 
@@ -203,37 +249,38 @@ export const LapsModal: React.FC<LapsModalProps> = ({ device, onClose }) => {
               </div>
             )}
 
-            {(device.status !== 'online' ||
-              lapsData?.rotationPendingOnline ||
-              device.lifecycle_state === 'pending_offboard') && (
-              <div
-                style={{
-                  display: 'flex',
-                  alignItems: 'flex-start',
-                  gap: '0.6rem',
-                  background: 'rgba(56, 189, 248, 0.12)',
-                  border: '1px solid rgba(56, 189, 248, 0.35)',
-                  padding: '0.7rem 0.9rem',
-                  borderRadius: '8px',
-                  fontSize: '0.75rem',
-                  color: 'var(--text-main)',
-                  lineHeight: 1.45
-                }}
-              >
-                <Clock size={16} style={{ flexShrink: 0, marginTop: '0.1rem', color: 'var(--primary)' }} />
-                <div>
-                  <strong>
-                    {device.lifecycle_state === 'pending_offboard'
-                      ? 'Pending Offboarding Guard Active (Scheduled Rotations Skipped):'
-                      : 'Offline Lockout Protection Active (Rotation Deferred Until Online):'}
-                  </strong>{' '}
-                  {lapsData?.pendingRotationReason ||
-                    (device.lifecycle_state === 'pending_offboard'
-                      ? 'Because this endpoint is pending offboarding, scheduled LAPS rotations are skipped so the current local admin password remains intact.'
-                      : 'Because this endpoint is currently offline, Vitrine preserves the last confirmed working password in the vault and defers any scheduled rotation until the agent reconnects.')}
+            {isProvisioned &&
+              (device.status !== 'online' ||
+                lapsData?.rotationPendingOnline ||
+                device.lifecycle_state === 'pending_offboard') && (
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'flex-start',
+                    gap: '0.6rem',
+                    background: 'rgba(56, 189, 248, 0.12)',
+                    border: '1px solid rgba(56, 189, 248, 0.35)',
+                    padding: '0.7rem 0.9rem',
+                    borderRadius: '8px',
+                    fontSize: '0.75rem',
+                    color: 'var(--text-main)',
+                    lineHeight: 1.45
+                  }}
+                >
+                  <Clock size={16} style={{ flexShrink: 0, marginTop: '0.1rem', color: 'var(--primary)' }} />
+                  <div>
+                    <strong>
+                      {device.lifecycle_state === 'pending_offboard'
+                        ? 'Pending Offboarding Guard Active (Scheduled Rotations Skipped):'
+                        : 'Offline Lockout Protection Active (Rotation Deferred Until Online):'}
+                    </strong>{' '}
+                    {lapsData?.pendingRotationReason ||
+                      (device.lifecycle_state === 'pending_offboard'
+                        ? 'Because this endpoint is pending offboarding, scheduled LAPS rotations are skipped so the current local admin password remains intact.'
+                        : 'Because this endpoint is currently offline, Vitrine preserves the last confirmed working password in the vault and defers any scheduled rotation until the agent reconnects.')}
+                  </div>
                 </div>
-              </div>
-            )}
+              )}
 
             <div className="form-group" style={{ marginBottom: 0 }}>
               <div
@@ -247,7 +294,7 @@ export const LapsModal: React.FC<LapsModalProps> = ({ device, onClose }) => {
                 <label className="form-label" style={{ margin: 0 }}>
                   Local Admin Username
                 </label>
-                {lapsData?.sid500BuiltinDisabled !== false && (
+                {device.os_type === 'windows' && lapsData?.sid500BuiltinDisabled === true && (
                   <span className="status-pill status-online" style={{ fontSize: '0.68rem' }}>
                     SID -500 Built-in Admin Disabled
                   </span>
@@ -284,29 +331,36 @@ export const LapsModal: React.FC<LapsModalProps> = ({ device, onClose }) => {
                 <input
                   type="text"
                   className="glass-input"
-                  style={{ fontFamily: 'var(--font-mono)', letterSpacing: isRevealed ? '0.05em' : '0.2em' }}
+                  style={{
+                    fontFamily: isProvisioned ? 'var(--font-mono)' : undefined,
+                    letterSpacing: !isProvisioned ? 'normal' : isRevealed ? '0.05em' : '0.2em',
+                    color: !isProvisioned ? 'var(--text-dim)' : undefined
+                  }}
                   readOnly
                   value={
-                    isRevealed && isPasswordCleartext(lapsData?.password)
-                      ? lapsData?.password
-                      : '••••••••••••••••••••'
+                    !isProvisioned
+                      ? 'Not yet provisioned — no password stored in vault'
+                      : isRevealed && isPasswordCleartext(lapsData?.password)
+                        ? lapsData?.password
+                        : '••••••••••••••••••••'
                   }
                 />
-                {isRevealed && isPasswordCleartext(lapsData?.password) ? (
+                {isProvisioned && isRevealed && isPasswordCleartext(lapsData?.password) ? (
                   <button type="button" className="btn-glass" onClick={handleCopy} title="Copy to clipboard">
                     {copied ? <CheckCircle size={16} color="#10b981" /> : <Copy size={16} />}
                   </button>
-                ) : (
+                ) : canRevealLaps ? (
                   <button
                     type="button"
                     className="btn-glass btn-primary"
                     onClick={handleRevealClick}
-                    disabled={loading}
+                    disabled={loading || !isProvisioned}
+                    title={!isProvisioned ? 'Provision account on endpoint first' : 'Reveal vaulted password'}
                     id="reveal-laps-btn"
                   >
                     <Eye size={16} /> Reveal
                   </button>
-                )}
+                ) : null}
               </div>
             </div>
 
@@ -335,10 +389,10 @@ export const LapsModal: React.FC<LapsModalProps> = ({ device, onClose }) => {
 
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.75rem', color: 'var(--text-dim)' }}>
               <span>
-                Last Rotated: {lapsData?.lastRotated ? new Date(lapsData.lastRotated).toLocaleDateString() : 'Recent'}
+                Last Rotated: {isProvisioned && lapsData?.lastRotated ? new Date(lapsData.lastRotated).toLocaleDateString() : 'Not provisioned'}
               </span>
               <span>
-                Expires: {lapsData?.expiresAt ? new Date(lapsData.expiresAt).toLocaleDateString() : 'Policy Controlled'}
+                Expires: {isProvisioned && lapsData?.expiresAt ? new Date(lapsData.expiresAt).toLocaleDateString() : 'Pending Provisioning'}
               </span>
             </div>
 
@@ -360,21 +414,28 @@ export const LapsModal: React.FC<LapsModalProps> = ({ device, onClose }) => {
             </div>
           </div>
 
-          <div className="modal-footer" style={{ display: 'flex', justifyContent: 'space-between' }}>
-            <button
-              type="button"
-              className="btn-glass"
-              onClick={handleRotate}
-              disabled={loading || device.lifecycle_state === 'archived'}
-              style={{ color: 'var(--primary)' }}
-            >
-              <RotateCcw size={14} />{' '}
-              {device.lifecycle_state === 'pending_offboard'
-                ? 'Rotation Skipped (Pending Offboard)'
-                : device.status !== 'online'
-                  ? 'Queue Rotation for Next Check-In'
-                  : 'Rotate Password Now'}
-            </button>
+          <div className="modal-footer" style={{ display: 'flex', justifyContent: canRotateLaps ? 'space-between' : 'flex-end' }}>
+            {canRotateLaps && (
+              <button
+                type="button"
+                className="btn-glass"
+                onClick={handleRotate}
+                disabled={loading || device.lifecycle_state === 'archived' || (!isProvisioned && device.status !== 'online')}
+                title={!isProvisioned && device.status !== 'online' ? 'Endpoint must be online to provision and verify a new local admin account' : undefined}
+                style={{ color: 'var(--primary)' }}
+              >
+                <RotateCcw size={14} />{' '}
+                {!isProvisioned
+                  ? device.status !== 'online'
+                    ? 'Endpoint Offline — Cannot Provision'
+                    : 'Provision Account & Set Password Now'
+                  : device.lifecycle_state === 'pending_offboard'
+                    ? 'Rotation Skipped (Pending Offboard)'
+                    : device.status !== 'online'
+                      ? 'Queue Rotation for Next Check-In'
+                      : 'Rotate Password Now'}
+              </button>
+            )}
             <button type="button" className="btn-glass btn-primary" onClick={onClose}>
               Done
             </button>

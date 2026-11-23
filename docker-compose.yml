@@ -1,6 +1,6 @@
 services:
   vitrine-rmm:
-    build: .
+    # build: .
     image: tylerhats/vitrine-rmm:latest
     container_name: vitrine-rmm
     ports:
@@ -15,8 +15,13 @@ services:
       - BRANDING_DIR=/app/branding
       - NODE_ENV=production
       - VITRINE_DOCKER=true
+      # Production reverse-proxy & secret-management options:
+      # - VITRINE_TRUST_PROXY=true
+      # - VITRINE_PUBLIC_URL=https://rmm.example.com
+      # - VITRINE_MASTER_KEY=your_64_char_hex_master_key
+      # - VITRINE_ALLOW_PRIVATE_OIDC=true
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:' + (process.env.PORT || 8080) + '/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -24,9 +29,13 @@ services:
     restart: unless-stopped
 
   # Optional isolated MeshCentral 2 container (only started with `docker compose --profile full-stack up -d`).
-  # Networking note:
+  # Networking & TLS notes:
   # - Inside Vitrine RMM Settings (container-to-container), use internal URL: https://meshcentral:443
+  # - MeshCentral serves a self-signed TLS certificate inside the isolated Docker network by default;
+  #   enable "Allow Self-Signed TLS" in Vitrine Settings/Wizard (or set MESHCENTRAL_ALLOW_SELF_SIGNED=true).
   # - For external agents/browsers reaching the host, set MESHCENTRAL_HOSTNAME to your public FQDN/IP (host port 4430 -> container 443).
+  # - Security reminder: once you finish creating your MeshCentral admin account, set MESHCENTRAL_ALLOW_NEW_ACCOUNTS=false
+  #   and re-run `docker compose --profile full-stack up -d` to disable public account registration.
   meshcentral:
     image: ghcr.io/ylianst/meshcentral:latest
     container_name: vitrine-meshcentral
@@ -34,8 +43,10 @@ services:
     ports:
       - "4430:443"
     environment:
+      - NODE_ENV=production
       - HOSTNAME=${MESHCENTRAL_HOSTNAME:-meshcentral}
       - REVERSE_PROXY=${MESHCENTRAL_REVERSE_PROXY:-false}
+      - ALLOW_FRAMING=true
       - ALLOW_NEW_ACCOUNTS=${MESHCENTRAL_ALLOW_NEW_ACCOUNTS:-true}
     volumes:
       - meshcentral_data:/opt/meshcentral/meshcentral-data

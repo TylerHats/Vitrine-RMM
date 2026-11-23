@@ -3,6 +3,7 @@ import { Download, X, Shield, Copy, Check, Ticket, ExternalLink, Sparkles } from
 import { Tenant, Settings, SigningStageReport, AuthUser } from '../types/index.js';
 import { generateInstaller } from '../services/api.js';
 import { copyToClipboard } from '../utils/clipboard.js';
+import { sanitizeSafeUrl } from '../utils/urlSafety.js';
 
 interface AgentInstallerModalProps {
   isOpen?: boolean;
@@ -29,12 +30,12 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
   const [tenantId, setTenantId] = useState(
     initialSelected && initialSelected !== 'all' ? initialSelected : tenants[0]?.id || ''
   );
+  const [siteId, setSiteId] = useState('');
   const [mode, setMode] = useState<'permanent' | 'quicksupport'>('permanent');
   const [platform, setPlatform] = useState<'windows' | 'linux' | 'macos'>('windows');
-  const [deviceRole, setDeviceRole] = useState('workstation');
+  const [deviceRole, setDeviceRole] = useState('auto');
   const [ticketNumber, setTicketNumber] = useState('');
   const [generating, setGenerating] = useState(false);
-  const [signingStepProgress, setSigningStepProgress] = useState(0);
 
   const [result, setResult] = useState<{
     tokenId?: string;
@@ -51,15 +52,12 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
-  const timersRef = useRef<Array<ReturnType<typeof setTimeout>>>([]);
-
-  const clearTimers = () => {
-    timersRef.current.forEach(clearTimeout);
-    timersRef.current = [];
-  };
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    return () => clearTimers();
+    return () => {
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+    };
   }, []);
 
   if (!isOpen) return null;
@@ -73,22 +71,18 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
       return;
     }
     if (requireTicket && !ticketNumber.trim()) {
-      setError('A valid PSA / ITFlow Ticket # is strictly required by policy before downloading permanent installers.');
+      setError('A valid Support Ticket # is strictly required by policy before downloading permanent installers.');
       return;
     }
 
-    clearTimers();
     setGenerating(true);
     setError(null);
     setResult(null);
-    setSigningStepProgress(1);
-
-    timersRef.current.push(setTimeout(() => setSigningStepProgress(2), 250));
-    timersRef.current.push(setTimeout(() => setSigningStepProgress(3), 500));
 
     try {
       const res = await generateInstaller({
-        tenant_id: tenantId,
+        tenant_id: tenantId || undefined,
+        site_id: siteId || undefined,
         platform,
         device_role: deviceRole,
         mode,
@@ -97,25 +91,15 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
       });
 
       if (!res.success) {
-        clearTimers();
-        setGenerating(false);
-        setSigningStepProgress(0);
         setError(res.error || 'Failed to generate installer.');
         return;
       }
 
-      timersRef.current.push(
-        setTimeout(() => {
-          setGenerating(false);
-          setSigningStepProgress(4);
-          setResult(res);
-        }, 400)
-      );
+      setResult(res);
     } catch (err: any) {
-      clearTimers();
-      setGenerating(false);
-      setSigningStepProgress(0);
       setError(err?.message || 'Communication error with installer provisioning & signing engine.');
+    } finally {
+      setGenerating(false);
     }
   };
 
@@ -123,9 +107,15 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
     if (result?.downloadCommand) {
       await copyToClipboard(result.downloadCommand);
       setCopied(true);
-      timersRef.current.push(setTimeout(() => setCopied(false), 2000));
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = setTimeout(() => setCopied(false), 2000);
     }
   };
+
+  const safeInstallerUrl = sanitizeSafeUrl(result?.installerUrl);
+
+  const selectedTenantObj = tenants.find((t) => t.id === tenantId);
+  const availableSites = selectedTenantObj?.sites || [];
 
   return (
     <div className="modal-backdrop" id="installer-modal" style={{ zIndex: 1050 }}>
@@ -133,7 +123,7 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
         <div className="modal-header">
           <div className="modal-title">
             <Download size={20} style={{ color: 'var(--primary)' }} />
-            <span>Provision &amp; Code-Sign Modern Vitrine Agent Installer</span>
+            <span>Download Agent Installer</span>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
             {onOpenQuickSupportPortal && (
@@ -147,7 +137,7 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
                 style={{ fontSize: '0.75rem', display: 'flex', alignItems: 'center', gap: '0.35rem', color: 'var(--primary)' }}
               >
                 <ExternalLink size={13} />
-                <span>Open Client /remote Portal</span>
+                <span>Open Client QuickSupport Portal</span>
               </button>
             )}
             <button className="btn-glass btn-icon" onClick={onClose}>
@@ -168,7 +158,11 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' }}>
               <button
                 type="button"
-                onClick={() => !generating && !result && setMode('permanent')}
+                onClick={() => {
+                  if (generating || result) return;
+                  setMode('permanent');
+                  if (!tenantId && tenants[0]?.id) setTenantId(tenants[0].id);
+                }}
                 style={{
                   padding: '0.75rem',
                   borderRadius: '8px',
@@ -181,16 +175,21 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
               >
                 <div style={{ fontWeight: 700, fontSize: '0.84rem', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
                   <Shield size={14} color="var(--primary)" />
-                  <span>Permanent Resident Agent (Modern GUI)</span>
+                  <span>Managed Device Agent (Permanent)</span>
                 </div>
                 <div style={{ fontSize: '0.72rem', color: 'var(--text-dim)', marginTop: '0.2rem' }}>
-                  Installs signed SYSTEM service, OS-theme System Tray, &amp; LAPS local admin vault.
+                  Installs background service, system tray, &amp; local admin credential management.
                 </div>
               </button>
 
               <button
                 type="button"
-                onClick={() => !generating && !result && setMode('quicksupport')}
+                onClick={() => {
+                  if (generating || result) return;
+                  setMode('quicksupport');
+                  setTenantId('');
+                  setSiteId('');
+                }}
                 style={{
                   padding: '0.75rem',
                   borderRadius: '8px',
@@ -203,27 +202,54 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
               >
                 <div style={{ fontWeight: 700, fontSize: '0.84rem', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
                   <Sparkles size={14} color="#10b981" />
-                  <span>QuickSupport Temporary Session (No Admin)</span>
+                  <span>On-Demand QuickSupport (No Admin)</span>
                 </div>
                 <div style={{ fontSize: '0.72rem', color: 'var(--text-dim)', marginTop: '0.2rem' }}>
-                  Runs without local admin rights; includes Tech-Side Remote Self-Elevation button.
+                  Runs without local admin rights; supports remote privilege elevation when needed.
                 </div>
               </button>
             </div>
 
-            {/* Target Client / Mesh Group */}
-            <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 1fr', gap: '1rem' }}>
+            {/* Target Client / Site Location / Role (embeds policy-resolved icon & branding into EXE) */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '0.85rem' }}>
               <div className="form-group">
-                <label className="form-label">Client Tenant (MeshCentral Group Sync)</label>
+                <label className="form-label">
+                  {mode === 'quicksupport' ? 'Branding Profile / Client' : 'Client Tenant'}
+                </label>
                 <select
                   className="glass-select"
                   value={tenantId}
-                  onChange={(e) => setTenantId(e.target.value)}
+                  onChange={(e) => {
+                    setTenantId(e.target.value);
+                    setSiteId('');
+                  }}
                   disabled={generating || Boolean(result)}
                 >
+                  {mode === 'quicksupport' && (
+                    <option value="">Dedicated QuickSupport Profile (Default)</option>
+                  )}
                   {tenants.map((t) => (
                     <option key={t.id} value={t.id}>
                       {t.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="form-group">
+                <label className="form-label">Site Location</label>
+                <select
+                  className="glass-select"
+                  value={siteId}
+                  onChange={(e) => setSiteId(e.target.value)}
+                  disabled={generating || Boolean(result) || mode === 'quicksupport' || availableSites.length === 0}
+                >
+                  <option value="">
+                    {availableSites.length === 0 ? 'Client Default (No Sites)' : 'Client Default (All Sites)'}
+                  </option>
+                  {availableSites.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name}
                     </option>
                   ))}
                 </select>
@@ -237,10 +263,15 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
                   onChange={(e) => setDeviceRole(e.target.value)}
                   disabled={generating || Boolean(result) || mode === 'quicksupport'}
                 >
-                  <option value="workstation">Desktop / Workstation</option>
-                  <option value="laptop">Roaming Laptop</option>
-                  <option value="server">Core Production Server</option>
-                  <option value="hypervisor">Hypervisor Host</option>
+                  <option value="auto">Auto-Detect Hardware &amp; OS (Recommended)</option>
+                  <option value="Desktop">Desktop</option>
+                  <option value="Laptop">Laptop</option>
+                  <option value="Server">Server</option>
+                  <option value="Domain Controller">Domain Controller</option>
+                  <option value="Hypervisor">Hypervisor</option>
+                  <option value="Virtual Machine">Virtual Machine</option>
+                  <option value="Virtual Server">Virtual Server</option>
+                  <option value="Workstation">Workstation</option>
                 </select>
               </div>
             </div>
@@ -251,9 +282,9 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.75rem' }}>
                 {(
                   [
-                    { id: 'windows', label: 'Windows', sub: 'Modern WPF/PE + Tray' },
-                    { id: 'linux', label: 'Linux', sub: 'systemd + XDG Tray' },
-                    { id: 'macos', label: 'macOS', sub: 'Universal ARM64/Intel' }
+                    { id: 'windows', label: 'Windows', sub: 'Windows Service + System Tray' },
+                    { id: 'linux', label: 'Linux', sub: 'systemd Service + Tray' },
+                    { id: 'macos', label: 'macOS', sub: 'Universal ARM64 / Intel' }
                   ] as const
                 ).map((p) => (
                   <div
@@ -282,7 +313,7 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.35rem' }}>
                   <label className="form-label" style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
                     <Ticket size={14} color="#f59e0b" />
-                    <span>PSA Ticket # (ITFlow / ConnectWise)</span>
+                    <span>Support Ticket #</span>
                   </label>
                   {requireTicket ? (
                     <span style={{ fontSize: '0.7rem', color: '#f87171', fontWeight: 600 }}>Strictly Required</span>
@@ -301,12 +332,22 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
               </div>
             )}
 
-            {/* Live 3-Stage Code Signing Verification Progress */}
+            {/* Honest Server Code-Signing Pipeline Status */}
             {(generating || result?.signingPipeline) && (
               <div
                 style={{
-                  background: 'rgba(16, 185, 129, 0.08)',
-                  border: '1px solid rgba(16, 185, 129, 0.28)',
+                  background: generating
+                    ? 'rgba(56, 189, 248, 0.08)'
+                    : result?.signingPipeline?.allSigned
+                      ? 'rgba(16, 185, 129, 0.08)'
+                      : 'rgba(245, 158, 11, 0.09)',
+                  border: `1px solid ${
+                    generating
+                      ? 'rgba(56, 189, 248, 0.28)'
+                      : result?.signingPipeline?.allSigned
+                        ? 'rgba(16, 185, 129, 0.28)'
+                        : 'rgba(245, 158, 11, 0.32)'
+                  }`,
                   padding: '0.9rem 1rem',
                   borderRadius: '8px',
                   display: 'flex',
@@ -315,46 +356,52 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
                 }}
               >
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', fontWeight: 700, color: '#34d399' }}>
-                    <Shield size={16} color="#10b981" />
-                    <span>
-                      {generating
-                        ? 'Executing 3-Stage Packaging & Signing Pipeline...'
-                        : result?.signingPipeline?.allSigned
-                        ? 'All 3 Package Stages Verified & Cryptographically Signed'
-                        : 'Package Prepared & Token Provisioned'}
-                    </span>
-                  </div>
-                  <span style={{ fontSize: '0.74rem', fontWeight: 700, color: '#10b981' }}>
-                    {generating ? `${Math.min(95, signingStepProgress * 32)}%` : '100% Ready'}
-                  </span>
-                </div>
-
-                <div style={{ width: '100%', height: '6px', background: 'rgba(255,255,255,0.1)', borderRadius: '999px', overflow: 'hidden' }}>
                   <div
                     style={{
-                      width: generating ? `${Math.min(95, signingStepProgress * 32)}%` : '100%',
-                      height: '100%',
-                      background: 'linear-gradient(90deg, #00f2fe, #10b981)',
-                      transition: 'width 0.25s ease'
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.5rem',
+                      fontSize: '0.8rem',
+                      fontWeight: 700,
+                      color: generating
+                        ? 'var(--primary)'
+                        : result?.signingPipeline?.allSigned
+                          ? '#34d399'
+                          : '#fbbf24'
                     }}
-                  />
+                  >
+                    <Shield size={16} />
+                    <span>
+                      {generating
+                        ? 'Provisioning Enrollment Token & Running Server Signing Pipeline...'
+                        : result?.signingPipeline?.allSigned
+                          ? 'All Package Components Verified & Digitally Signed'
+                          : 'Enrollment Token Provisioned (Unsigned / Partial Signing Pipeline)'}
+                    </span>
+                  </div>
                 </div>
 
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.28rem', fontSize: '0.73rem', color: 'var(--text-muted)' }}>
-                  <div>
-                    {signingStepProgress >= 1 ? '✓' : '○'}{' '}
-                    <strong>Stage 1 (Core MS2 Agent Binary):</strong> Signed &amp; cached in <code>signedagents/</code> so MS2 updates stay signed
+                {result?.signingPipeline?.stages && result.signingPipeline.stages.length > 0 && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.3rem', fontSize: '0.73rem', color: 'var(--text-muted)' }}>
+                    {result.signingPipeline.stages.map((st, idx) => {
+                      const isOk = st.status === 'signed' || st.status === 'verified';
+                      const isWarn = st.status === 'bypassed';
+                      const marker = isOk ? '✓' : isWarn ? '○' : '✕';
+                      const markerColor = isOk ? '#34d399' : isWarn ? '#fbbf24' : '#f87171';
+                      return (
+                        <div key={st.stepNumber || idx} style={{ display: 'flex', justifyContent: 'space-between', gap: '0.5rem' }}>
+                          <span>
+                            <span style={{ color: markerColor, fontWeight: 700, marginRight: '0.35rem' }}>{marker}</span>
+                            <strong>Step {st.stepNumber || idx + 1} ({st.component}):</strong> {st.description}
+                          </span>
+                          <span style={{ color: markerColor, textTransform: 'uppercase', fontSize: '0.68rem', fontWeight: 700, whiteSpace: 'nowrap' }}>
+                            {st.status}
+                          </span>
+                        </div>
+                      );
+                    })}
                   </div>
-                  <div>
-                    {signingStepProgress >= 2 ? '✓' : '○'}{' '}
-                    <strong>Stage 2 (Companion &amp; Elevation Helper):</strong> System Tray, LAPS Sync &amp; Self-Elevation RPC signed
-                  </div>
-                  <div>
-                    {signingStepProgress >= 3 ? '✓' : '○'}{' '}
-                    <strong>Stage 3 (Modern Vitrine GUI Installer):</strong> Clean PE headers &amp; RFC 3161 timestamp verified
-                  </div>
-                </div>
+                )}
               </div>
             )}
 
@@ -401,23 +448,32 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
                 </div>
 
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
-                  <a
-                    href={result.installerUrl}
-                    download
-                    className="btn-glass btn-primary"
-                    style={{ textDecoration: 'none', flex: 1, justifyContent: 'center', display: 'flex', alignItems: 'center', gap: '0.5rem' }}
-                  >
-                    <Download size={16} />
-                    <span>
-                      Download Signed {platform.toUpperCase()} {mode === 'quicksupport' ? 'QuickSupport' : 'Modern GUI Installer'}
-                    </span>
-                  </a>
+                  {safeInstallerUrl && (
+                    <a
+                      href={safeInstallerUrl}
+                      download
+                      className="btn-glass btn-primary"
+                      style={{ textDecoration: 'none', flex: 1, justifyContent: 'center', display: 'flex', alignItems: 'center', gap: '0.5rem' }}
+                    >
+                      <Download size={16} />
+                      <span>
+                        Download {result.codeSigned ? 'Signed ' : ''}
+                        {platform.toUpperCase()}{' '}
+                        {platform === 'windows'
+                          ? mode === 'quicksupport'
+                            ? 'QuickSupport App (.exe)'
+                            : 'Windows Installer (.exe)'
+                          : mode === 'quicksupport'
+                            ? 'QuickSupport Script (.sh)'
+                            : 'Deploy Script (.sh)'}
+                      </span>
+                    </a>
+                  )}
                   <button
                     type="button"
                     className="btn-glass"
                     onClick={() => {
                       setResult(null);
-                      setSigningStepProgress(0);
                     }}
                   >
                     Generate Another
