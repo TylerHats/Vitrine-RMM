@@ -12,15 +12,20 @@ import {
 } from '../policy/index.js';
 import { executeScheduledAutomationNow, matchesCronExpression } from '../automation/index.js';
 import { quoteBashLiteral, quotePowerShellLiteral } from '../agent/installerGenerator.js';
+import { agentSocketHub } from '../agent/socketHub.js';
 import { meshBridge } from '../meshcentral/index.js';
 import { pruneTelemetryHistory } from '../telemetry/index.js';
 import { decryptVaultSecret } from '../vault/index.js';
 import { codeSigningService } from '../signing/index.js';
+import { addItflowTicketNote, getItflowRuntimeConfig, pullItflowTicketUpdates, syncAllItflowAssets } from '../itflow/index.js';
 
 let fastTimer: ReturnType<typeof setInterval> | null = null;
 let conditionTimer: ReturnType<typeof setInterval> | null = null;
 let tickInProgress = false;
 let conditionTickInProgress = false;
+let itflowAssetSyncInProgress = false;
+let itflowTicketPullInProgress = false;
+let lastItflowTicketPullAtMs = 0;
 let schedulerPausedForDbSwap = false;
 
 // Ensure atomic SQLite restores pause background ticks cleanly
@@ -324,6 +329,45 @@ export async function runMaintenanceAndLifecycleTick(): Promise<{
     }
   } catch {}
 
+  // 4c. Periodic ITFlow Asset Sync (respecting configured interval)
+  try {
+    const itfCfg = getItflowRuntimeConfig();
+    if (itfCfg.enabled && itfCfg.apiBase && itfCfg.apiKey && !itflowAssetSyncInProgress) {
+      const rawTs = itfCfg.lastAssetSyncAt ? String(itfCfg.lastAssetSyncAt) : '';
+      const normTs = rawTs ? (rawTs.includes('T') ? rawTs : `${rawTs.replace(' ', 'T')}Z`) : '';
+      const lastMs = normTs ? new Date(normTs).getTime() : 0;
+      const intervalMs = Math.max(5, Number(itfCfg.syncIntervalMin || 60)) * 60_000;
+      if (!lastMs || Number.isNaN(lastMs) || Date.now() - lastMs >= intervalMs) {
+        itflowAssetSyncInProgress = true;
+        try {
+          await syncAllItflowAssets({ force: false });
+        } finally {
+          itflowAssetSyncInProgress = false;
+        }
+      }
+    }
+  } catch {}
+
+  // 4d. Periodic Bidirectional ITFlow Ticket & Reply Pull (every 5 minutes)
+  try {
+    const itfCfg = getItflowRuntimeConfig();
+    if (
+      itfCfg.enabled &&
+      itfCfg.apiBase &&
+      itfCfg.apiKey &&
+      !itflowTicketPullInProgress &&
+      Date.now() - lastItflowTicketPullAtMs >= 5 * 60_000
+    ) {
+      itflowTicketPullInProgress = true;
+      lastItflowTicketPullAtMs = Date.now();
+      try {
+        await pullItflowTicketUpdates();
+      } finally {
+        itflowTicketPullInProgress = false;
+      }
+    }
+  } catch {}
+
   // 5. Drift-Free Scheduled Backup Execution & Offsite Sync
   try {
     const settings = (db.prepare('SELECT * FROM settings WHERE id = 1').get() || {}) as any;
@@ -468,6 +512,11 @@ export async function runMaintenanceAndLifecycleTick(): Promise<{
             VALUES (?, ?, 'backup_job', ?, 'queued')
           `).run(taskId, dev.id, taskPayload);
         }
+        agentSocketHub.dispatchTaskIfConnected(dev.id, {
+          id: taskId,
+          task_type: 'backup_job',
+          payload_json: taskPayload
+        });
       }
     }
   } catch {}
@@ -639,6 +688,21 @@ export async function runSelfHealingWatchdogSweep(): Promise<void> {
               remOutput.slice(0, 4000),
               new Date().toISOString()
             );
+          } catch {}
+          try {
+            const openTkt = db
+              .prepare(
+                "SELECT id FROM psa_tickets WHERE device_id = ? AND status NOT IN ('Resolved', 'Closed') AND external_provider = 'itflow' AND external_ticket_id IS NOT NULL ORDER BY created_at DESC LIMIT 1"
+              )
+              .get(dev.id) as { id?: string } | undefined;
+            if (openTkt?.id) {
+              await addItflowTicketNote({
+                localTicketId: openTkt.id,
+                author: 'Vitrine Self-Healing Watchdog',
+                body: `[Self-Healing ${remStatus}] Monitor '${mon.name || condType}':\n${remOutput.slice(0, 1500)}`,
+                noteType: 'Internal'
+              });
+            }
           } catch {}
           if (remStatus === 'Failed' && Boolean(mon.alert_on_failure)) {
             try {

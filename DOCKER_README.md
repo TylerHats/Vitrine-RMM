@@ -1,16 +1,16 @@
-# Vitrine RMM — Official Multi-Arch Docker Image (`v2.7.0`)
+# Vitrine RMM — Official Multi-Arch Docker Image (`v2.8.0`)
 
-Vitrine RMM is a modern, glassmorphic, self-hosted Remote Monitoring and Management (RMM) platform engineered for enterprise MSP fleet governance, zero-trust credential vaulting, OpenID Connect (`OIDC` + `S256 PKCE`) SSO, native 6-section UCRT Windows PE installers, live hypervisor orchestration, and low-latency remote control powered by MeshCentral 2.
+Vitrine RMM is a modern, glassmorphic, self-hosted Remote Monitoring and Management (RMM) platform engineered for enterprise MSP fleet governance, zero-trust credential vaulting, OpenID Connect (`OIDC` + `S256 PKCE`) SSO, native 6-section UCRT Windows PE & C++17 POSIX WSS agents, broadened bidirectional ITFlow & PSA integration, live hypervisor orchestration, and low-latency remote control powered by MeshCentral 2.
 
 ---
 
 ## 🏗️ Supported Architectures (`linux/amd64` & `linux/arm64`)
 
-Both `tylerhats/vitrine-rmm:latest` and `tylerhats/vitrine-rmm:2.7.0` are published as **multi-architecture OCI manifests** supporting:
+Both `tylerhats/vitrine-rmm:latest` and `tylerhats/vitrine-rmm:2.8.0` are published as **multi-architecture OCI manifests** supporting:
 *   **`linux/amd64`** — Intel / AMD `x86_64` bare-metal servers, Proxmox VMs, and cloud instances.
 *   **`linux/arm64`** — ARM64 servers, AWS Graviton, Oracle Ampere, Apple Silicon Docker hosts, and Raspberry Pi 5 appliances.
 
-Both architecture images pre-compile all **5 native 64-bit Windows PE executable templates** (`vitrine-installer-template.exe`, `vitrine-companion-setup-template.exe`, `vitrine-quicksupport-template.exe`, `vitrine-companion-template.exe`, and `vitrine-tray-template.exe`) during the image build via **Clang + LLD + MinGW-w64 UCRT** (`ucrtbase.dll`, clean 6 PE sections `[.text, .rdata, .data, .pdata, .rsrc, .reloc]`, zero `VirtualProtect`/`VirtualQuery` imports), and dynamically serve **cross-distro Linux agent installers & theme-aware desktop companions** supporting **Debian/Ubuntu (`apt`)**, **RHEL/Fedora/Rocky/Alma (`dnf`/`yum`)**, and **Arch/Manjaro (`pacman`)** with `curl`-optional Python fallback and headless server mode — so runtime downloads require zero compiler overhead.
+Both architecture images pre-compile all **5 native 64-bit Windows PE executable templates** (`vitrine-installer-template.exe`, `vitrine-companion-setup-template.exe`, `vitrine-quicksupport-template.exe`, `vitrine-companion-template.exe`, and `vitrine-tray-template.exe`) via **Clang + LLD + MinGW-w64 UCRT** AND pre-compile all **4 unified C++17 Linux native agents** (`vitrine-agent-linux-x86_64`, `vitrine-agent-linux-headless-x86_64`, `vitrine-agent-linux-arm64`, and `vitrine-agent-linux-headless-arm64`) for click-to-run **`.deb` / `.rpm` GUI installers**, **Headless `.sh`**, and persistent **WSS (`/ws/agent`) + HTTP fallback** — so runtime downloads require zero compiler overhead. *(Note: macOS native binaries require Apple's proprietary `MacOSX.sdk` and can be built via `osxcross` or supplied via `backend/posix-agent/prebuilt/vitrine-agent-macos-universal`.)*
 
 Docker automatically pulls the native image matching your host CPU architecture.
 
@@ -88,8 +88,8 @@ Open `http://localhost:8080` in your browser:
 
 ## 🏷️ Image Tags & Updating
 
-*   `tylerhats/vitrine-rmm:latest` — Latest stable multi-arch production release (`v2.7.0`, `linux/amd64` + `linux/arm64`).
-*   `tylerhats/vitrine-rmm:2.7.0` — Pinned version tag for reproducible deployments (`linux/amd64` + `linux/arm64`).
+*   `tylerhats/vitrine-rmm:latest` — Latest stable multi-arch production release (`v2.8.0`, `linux/amd64` + `linux/arm64`).
+*   `tylerhats/vitrine-rmm:2.8.0` — Pinned version tag for reproducible deployments (`linux/amd64` + `linux/arm64`).
 
 Because containers are immutable, Vitrine RMM automatically detects `VITRINE_DOCKER=true` in **Settings -> Updates & System Backups** and displays update availability alongside exact upgrade commands:
 
@@ -127,7 +127,7 @@ docker compose up -d
 ## 📁 Persistent Volumes & Disaster Recovery (`/app/data` & `/app/branding`)
 
 *   `/app/data` (`chmod 700` inside container):
-    *   `vitrine.db`: SQLite WAL database (Schema `v18`).
+    *   `vitrine.db`: SQLite WAL database (Schema `v19`).
     *   `.vault-key.json`: Auto-generated instance master secret & KDF salt (`0600` permissions, unless overridden by `VITRINE_MASTER_KEY` / `LAPS_MASTER_SECRET`).
     *   `install-meta.json`: Installed version/commit metadata created by bare-metal installs (optional in Docker).
     *   `backups/`: Scheduled, manual, and pre-upgrade AES-256-GCM `.vrmm-backup.gz` (`VRMMENC1`) archives.

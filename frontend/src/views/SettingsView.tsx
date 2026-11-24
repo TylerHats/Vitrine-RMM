@@ -134,6 +134,7 @@ import { copyToClipboard } from '../utils/clipboard.js';
 import { sanitizeSafeUrl } from '../utils/urlSafety.js';
 import { MfaChallengeModal } from '../components/MfaChallengeModal.js';
 import { IconCropModal } from '../components/IconCropModal.js';
+import { ItflowSetupWizardModal } from '../components/ItflowSetupWizardModal.js';
 
 function isErrorMessage(msg?: string | null): boolean {
   if (!msg) return false;
@@ -228,6 +229,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   tenants: propTenants
 }) => {
   const [formData, setRawFormData] = useState<Settings>({ ...settings });
+  const [showItflowWizard, setShowItflowWizard] = useState(false);
   const isDirtyRef = useRef(false);
   const lastSettingsSnapshotRef = useRef<string>(JSON.stringify(settings));
   const setFormData = useCallback((updater: React.SetStateAction<Settings>) => {
@@ -4736,7 +4738,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   Self-Update Engine (Stable Releases vs. Alpha Commits) &amp; Watchdog Auto-Rollback
                 </h3>
                 <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', margin: '0.2rem 0 0 0' }}>
-                  Installed Version: <strong>v{updaterStatus?.installedVersion || formData.installed_version || '2.7.0'}</strong> • Installed Commit:{' '}
+                  Installed Version: <strong>v{updaterStatus?.installedVersion || formData.installed_version || '2.8.0'}</strong> • Installed Commit:{' '}
                   <code>{updaterStatus?.installedCommit || formData.installed_commit || 'HEAD'}</code> • DB Schema:{' '}
                   <code>v{backupStorage.currentAppSchemaVersion}</code> • Mode:{' '}
                   <strong>
@@ -5405,14 +5407,24 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
         {/* PSA Webhook & OIDC Identity Provider Integration Card */}
         <div className="glass-card" style={{ display: showSection('notifications') ? undefined : 'none' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem', marginBottom: '1.15rem' }}>
-            <Webhook size={20} color="var(--primary)" />
-            <div>
-              <h3 style={{ fontSize: '1.1rem', fontWeight: 600, margin: 0 }}>PSA Bi-Directional Webhook &amp; OIDC Identity Provider</h3>
-              <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-                Configure HMAC-SHA256 PSA ticket dispatch (ITFlow, HaloPSA, Autotask) and OIDC SSO parameters
-              </span>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.65rem', marginBottom: '1.15rem' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem' }}>
+              <Webhook size={20} color="var(--primary)" />
+              <div>
+                <h3 style={{ fontSize: '1.1rem', fontWeight: 600, margin: 0 }}>PSA Bi-Directional Webhook &amp; OIDC Identity Provider</h3>
+                <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                  Configure HMAC-SHA256 PSA ticket dispatch (ITFlow, HaloPSA, Autotask) and OIDC SSO parameters
+                </span>
+              </div>
             </div>
+            <button
+              type="button"
+              className="btn-glass btn-primary"
+              style={{ fontSize: '0.78rem', padding: '0.4rem 0.85rem' }}
+              onClick={() => setShowItflowWizard(true)}
+            >
+              Launch Guided ITFlow Setup Wizard
+            </button>
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr 1fr', gap: '1.25rem', marginBottom: '1rem' }}>
@@ -5678,7 +5690,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <div style={{ padding: '0.75rem', borderRadius: '8px', background: 'var(--glass-bg)', border: '1px solid var(--glass-border)' }}>
                   <div style={{ fontSize: '0.73rem', color: 'var(--text-muted)' }}>Installed Software Target</div>
                   <div style={{ fontSize: '1.05rem', fontWeight: 700, color: '#38bdf8' }}>
-                    Schema v{schemaMismatchModal.appSchemaVersion} (App v{updaterStatus?.installedVersion || '2.7.0'})
+                    Schema v{schemaMismatchModal.appSchemaVersion} (App v{updaterStatus?.installedVersion || '2.8.0'})
                   </div>
                 </div>
               </div>
@@ -5763,6 +5775,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         title={cropIconRequest?.mode === 'quicksupport' ? 'Crop QuickSupport EXE & Portal Icon' : 'Crop Global Brand & EXE Icon'}
         onCancel={() => setCropIconRequest(null)}
         onConfirm={handleCropModalConfirm}
+      />
+
+      <ItflowSetupWizardModal
+        isOpen={showItflowWizard}
+        onClose={() => setShowItflowWizard(false)}
       />
     </div>
   );

@@ -33,6 +33,9 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
   const [siteId, setSiteId] = useState('');
   const [mode, setMode] = useState<'permanent' | 'quicksupport'>('permanent');
   const [platform, setPlatform] = useState<'windows' | 'linux' | 'macos'>('windows');
+  const [linuxFormat, setLinuxFormat] = useState<'deb' | 'rpm' | 'sh'>('deb');
+  const [linuxVariant, setLinuxVariant] = useState<'desktop' | 'headless'>('desktop');
+  const [linuxArch, setLinuxArch] = useState<'amd64' | 'arm64'>('amd64');
   const [deviceRole, setDeviceRole] = useState('auto');
   const [ticketNumber, setTicketNumber] = useState('');
   const [generating, setGenerating] = useState(false);
@@ -44,6 +47,9 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
     codeSigned?: boolean;
     ticketBound?: string | null;
     quickSupportPublicUrl?: string;
+    packageFormat?: 'deb' | 'rpm' | 'sh' | 'exe';
+    packageVariant?: 'desktop' | 'headless';
+    packageArch?: 'amd64' | 'arm64';
     signingPipeline?: {
       allSigned: boolean;
       strictVerified: boolean;
@@ -87,7 +93,12 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
         device_role: deviceRole,
         mode,
         ticket_number: ticketNumber.trim() || undefined,
-        technician: currentUser?.username || undefined
+        technician: currentUser?.username || undefined,
+        ...(platform === 'linux' && mode === 'permanent'
+          ? { format: linuxFormat, variant: linuxVariant, arch: linuxArch }
+          : platform === 'linux'
+            ? { format: 'sh', variant: 'desktop', arch: linuxArch }
+            : {})
       });
 
       if (!res.success) {
@@ -283,7 +294,7 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
                 {(
                   [
                     { id: 'windows', label: 'Windows', sub: 'Windows Service + System Tray' },
-                    { id: 'linux', label: 'Linux', sub: 'systemd Service + Tray' },
+                    { id: 'linux', label: 'Linux', sub: '.deb / .rpm Native or Headless .sh' },
                     { id: 'macos', label: 'macOS', sub: 'Universal ARM64 / Intel' }
                   ] as const
                 ).map((p) => (
@@ -306,6 +317,123 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
                 ))}
               </div>
             </div>
+
+            {platform === 'linux' && mode === 'permanent' && (
+              <div
+                style={{
+                  background: 'rgba(148, 163, 184, 0.1)',
+                  border: '1px solid var(--glass-border)',
+                  borderRadius: '8px',
+                  padding: '0.85rem',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '0.7rem'
+                }}
+              >
+                <div style={{ display: 'grid', gridTemplateColumns: '1.3fr 1fr', gap: '0.75rem' }}>
+                  <div>
+                    <label className="form-label" style={{ fontSize: '0.74rem' }}>Linux Package Format</label>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.45rem' }}>
+                      {(
+                        [
+                          { id: 'deb', label: '.deb GUI', sub: 'Ubuntu / Debian' },
+                          { id: 'rpm', label: '.rpm GUI', sub: 'RHEL / Fedora' },
+                          { id: 'sh', label: '.sh Script', sub: 'Terminal / CLI' }
+                        ] as const
+                      ).map((fmt) => (
+                        <button
+                          key={fmt.id}
+                          type="button"
+                          disabled={generating || Boolean(result)}
+                          onClick={() => setLinuxFormat(fmt.id)}
+                          className="btn-glass"
+                          style={{
+                            flexDirection: 'column',
+                            padding: '0.45rem 0.5rem',
+                            gap: '0.1rem',
+                            border: `1px solid ${linuxFormat === fmt.id ? 'var(--primary)' : 'var(--glass-border)'}`,
+                            background: linuxFormat === fmt.id ? 'rgba(0, 242, 254, 0.14)' : 'rgba(148, 163, 184, 0.08)'
+                          }}
+                        >
+                          <span style={{ fontWeight: 700, fontSize: '0.78rem' }}>{fmt.label}</span>
+                          <span style={{ fontSize: '0.64rem', color: 'var(--text-dim)' }}>{fmt.sub}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="form-label" style={{ fontSize: '0.74rem' }}>CPU Architecture</label>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '0.45rem' }}>
+                      {(
+                        [
+                          { id: 'amd64', label: 'x86_64', sub: 'amd64' },
+                          { id: 'arm64', label: 'ARM64', sub: 'aarch64' }
+                        ] as const
+                      ).map((ar) => (
+                        <button
+                          key={ar.id}
+                          type="button"
+                          disabled={generating || Boolean(result)}
+                          onClick={() => setLinuxArch(ar.id)}
+                          className="btn-glass"
+                          style={{
+                            flexDirection: 'column',
+                            padding: '0.45rem 0.5rem',
+                            gap: '0.1rem',
+                            border: `1px solid ${linuxArch === ar.id ? 'var(--primary)' : 'var(--glass-border)'}`,
+                            background: linuxArch === ar.id ? 'rgba(0, 242, 254, 0.14)' : 'rgba(148, 163, 184, 0.08)'
+                          }}
+                        >
+                          <span style={{ fontWeight: 700, fontSize: '0.78rem' }}>{ar.label}</span>
+                          <span style={{ fontSize: '0.64rem', color: 'var(--text-dim)' }}>{ar.sub}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="form-label" style={{ fontSize: '0.74rem' }}>Agent Runtime Profile</label>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '0.5rem' }}>
+                    {(
+                      [
+                        {
+                          id: 'desktop',
+                          label: 'Desktop Workstation (Full GUI + Confirmation)',
+                          sub: 'Double-click package shows branded install confirmation window'
+                        },
+                        {
+                          id: 'headless',
+                          label: 'Headless Linux Server (Lightweight Zero-GUI)',
+                          sub: 'Minimal CLI footprint without desktop/tray/confirmation dependencies'
+                        }
+                      ] as const
+                    ).map((vr) => (
+                      <button
+                        key={vr.id}
+                        type="button"
+                        disabled={generating || Boolean(result)}
+                        onClick={() => setLinuxVariant(vr.id)}
+                        className="btn-glass"
+                        style={{
+                          flexDirection: 'column',
+                          alignItems: 'flex-start',
+                          textAlign: 'left',
+                          padding: '0.5rem 0.65rem',
+                          gap: '0.15rem',
+                          border: `1px solid ${linuxVariant === vr.id ? 'var(--primary)' : 'var(--glass-border)'}`,
+                          background: linuxVariant === vr.id ? 'rgba(0, 242, 254, 0.14)' : 'rgba(148, 163, 184, 0.08)'
+                        }}
+                      >
+                        <span style={{ fontWeight: 600, fontSize: '0.75rem' }}>{vr.label}</span>
+                        <span style={{ fontSize: '0.65rem', color: 'var(--text-dim)' }}>{vr.sub}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* PSA Ticket Locking */}
             {mode === 'permanent' && (
@@ -409,7 +537,7 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
             {result && (
               <div
                 style={{
-                  background: 'rgba(0, 0, 0, 0.35)',
+                  background: 'rgba(148, 163, 184, 0.1)',
                   border: '1px solid var(--primary)',
                   borderRadius: '8px',
                   padding: '1rem',
@@ -465,7 +593,15 @@ export const AgentInstallerModal: React.FC<AgentInstallerModalProps> = ({
                             : 'Windows Installer (.exe)'
                           : mode === 'quicksupport'
                             ? 'QuickSupport Script (.sh)'
-                            : 'Deploy Script (.sh)'}
+                            : platform === 'linux'
+                              ? (result.packageFormat || linuxFormat) === 'deb'
+                                ? `${(result.packageVariant || linuxVariant) === 'headless' ? 'Headless ' : ''}Package (.deb)`
+                                : (result.packageFormat || linuxFormat) === 'rpm'
+                                  ? `${(result.packageVariant || linuxVariant) === 'headless' ? 'Headless ' : ''}Package (.rpm)`
+                                  : (result.packageVariant || linuxVariant) === 'headless'
+                                    ? 'Headless Server Script (.sh)'
+                                    : 'Deploy Script (.sh)'
+                              : 'Deploy Script (.sh)'}
                       </span>
                     </a>
                   )}

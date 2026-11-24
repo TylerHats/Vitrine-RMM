@@ -1,438 +1,184 @@
-import React, { useState, useEffect } from 'react';
+import React, { useMemo, useState } from 'react';
 import {
-  Monitor,
-  Laptop,
-  Server,
-  EyeOff,
-  Terminal,
-  KeyRound,
-  ShieldAlert,
-  ShieldCheck,
-  RotateCcw,
   Cpu,
-  HardDrive,
   CheckCircle,
-  Plus,
+  RotateCcw,
+  ShieldAlert,
+  HardDrive,
+  Monitor,
+  Server,
+  Laptop,
+  ArrowRight,
   Download,
-  RefreshCw,
-  Trash2,
-  X,
-  Archive,
-  Zap,
-  FileSpreadsheet
+  AlertTriangle,
+  Wifi,
+  Building2
 } from 'lucide-react';
-import { Device, SmartGroup, SmartGroupRule, BreakGlassRecoveryEntry, AuthUser } from '../types/index.js';
-import {
-  fetchSmartGroups,
-  createSmartGroup,
-  deleteSmartGroup,
-  scanPatches,
-  forceArchiveDevice,
-  simulateDeviceCheckin,
-  purgeArchivedDevice,
-  exportBreakGlassSheet,
-  seedDemoLabData,
-  deleteTenant,
-  offboardTenant
-} from '../services/api.js';
-import { MfaChallengeModal } from '../components/MfaChallengeModal.js';
+import { Device, Tenant, AuthUser, DevicesPresetFilter } from '../types/index.js';
+import { seedDemoLabData } from '../services/api.js';
 import { isSuperAdmin, canMutateFleet } from '../utils/permissions.js';
-import { matchesDeviceSearch } from '../utils/deviceHelpers.js';
-
-function sanitizeCsvCell(val: unknown): string {
-  const raw = String(val ?? '');
-  const safe = /^[=+\-@\t\r]/.test(raw) ? `'${raw}` : raw;
-  return `"${safe.replace(/"/g, '""')}"`;
-}
 
 interface FleetDashboardProps {
   devices: Device[];
-  searchQuery: string;
+  tenants: Tenant[];
   selectedTenantId: string;
-  onOpenRemote: (device: Device, isGhost: boolean) => void;
-  onOpenBgTools: (device: Device, initialTab?: string) => void;
-  onOpenLaps: (device: Device) => void;
-  onOpenQuarantine: (device: Device) => void;
   onSelectDevice: (device: Device) => void;
+  onNavigateDevices: (preset?: DevicesPresetFilter) => void;
   onOpenInstaller?: () => void;
   onOpenOnboarding?: () => void;
   onRefreshFleet?: () => void;
-  onResetTenantFilter?: () => void;
   currentUser?: AuthUser | null;
 }
 
 export const FleetDashboard: React.FC<FleetDashboardProps> = ({
   devices,
-  searchQuery,
+  tenants,
   selectedTenantId,
-  onOpenRemote,
-  onOpenBgTools,
-  onOpenLaps,
-  onOpenQuarantine,
   onSelectDevice,
+  onNavigateDevices,
   onOpenInstaller,
   onOpenOnboarding,
   onRefreshFleet,
-  onResetTenantFilter,
   currentUser
 }) => {
   const enableLabDemo = import.meta.env.VITE_ENABLE_LAB_DEMO === 'true';
-  const [smartGroup, setSmartGroup] = useState('all');
-  const [lifecycleView, setLifecycleView] = useState<'active' | 'pending_offboard' | 'archived'>('active');
-  const [customGroups, setCustomGroups] = useState<SmartGroup[]>([]);
-  const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const [showNewGroupModal, setShowNewGroupModal] = useState(false);
-  const [newGroupName, setNewGroupName] = useState('');
-  const [newGroupLogic, setNewGroupLogic] = useState<'AND' | 'OR'>('AND');
-  const [newGroupRules, setNewGroupRules] = useState<SmartGroupRule[]>([
-    { field: 'cpu_usage', op: '>', value: '70' }
-  ]);
-  const [newGroupDesc, setNewGroupDesc] = useState('');
-  const [bulkStatusMsg, setBulkStatusMsg] = useState<string | null>(null);
-  const [localDevices, setLocalDevices] = useState<Device[]>(devices);
-  const [showBreakGlassMfa, setShowBreakGlassMfa] = useState(false);
-  const [breakGlassRows, setBreakGlassRows] = useState<BreakGlassRecoveryEntry[] | null>(null);
-  useEffect(() => {
-    setSelectedIds([]);
-  }, [selectedTenantId, lifecycleView, smartGroup, searchQuery]);
-
-  useEffect(() => {
-    setSelectedIds((prev) => prev.filter((id) => devices.some((d) => d.id === id)));
-  }, [devices]);
-
   const canMutate = canMutateFleet(currentUser);
+  const [statusBanner, setStatusBanner] = useState<string | null>(null);
 
-  useEffect(() => {
-    setLocalDevices(devices);
-  }, [devices]);
+  const tenantScopedDevices = useMemo(
+    () => (selectedTenantId === 'all' ? devices : devices.filter((d) => d.tenant_id === selectedTenantId)),
+    [devices, selectedTenantId]
+  );
 
-  useEffect(() => {
-    fetchSmartGroups()
-      .then(setCustomGroups)
-      .catch(() => {});
-  }, []);
+  const activeDevices = useMemo(
+    () => tenantScopedDevices.filter((d) => (d.lifecycle_state || 'active') === 'active'),
+    [tenantScopedDevices]
+  );
 
-  const evaluateSingleRule = (d: Device, rule: SmartGroupRule): boolean => {
-    const fieldVal = (d as any)[rule.field];
-    const targetStr = String(rule.value ?? '').toLowerCase();
-    const actualStr = String(fieldVal ?? '').toLowerCase();
-    const actualNum = Number(fieldVal ?? 0);
-    const targetNum = Number(rule.value ?? 0);
-    switch (rule.op) {
-      case '=':
-        return actualStr === targetStr;
-      case '!=':
-        return actualStr !== targetStr;
-      case '>':
-        return actualNum > targetNum;
-      case '<':
-        return actualNum < targetNum;
-      case '>=':
-        return actualNum >= targetNum;
-      case '<=':
-        return actualNum <= targetNum;
-      case 'contains':
-        return actualStr.includes(targetStr);
-      case 'not_contains':
-        return !actualStr.includes(targetStr);
-      default:
-        return true;
-    }
-  };
-
-  const evaluateCustomRule = (d: Device, grp: SmartGroup): boolean => {
-    if (Array.isArray(grp.matchedDeviceIds)) {
-      return grp.matchedDeviceIds.includes(d.id);
-    }
-    const raw = grp.criteria_json || '';
-    try {
-      const parsed = JSON.parse(raw);
-      if (parsed && Array.isArray(parsed.rules)) {
-        const logic = parsed.logic === 'OR' ? 'OR' : 'AND';
-        return logic === 'OR'
-          ? parsed.rules.some((rl: SmartGroupRule) => evaluateSingleRule(d, rl))
-          : parsed.rules.every((rl: SmartGroupRule) => evaluateSingleRule(d, rl));
-      }
-    } catch {
-      // Legacy string expression fallback
-    }
-    const r = raw.toLowerCase();
-    if (r.includes('pending_reboot = 1')) return d.pending_reboot === 1;
-    if (r.includes('edr_status != active')) return d.edr_status !== 'Active';
-    if (r.includes('bitlocker_status not like')) return !d.bitlocker_status?.includes('Encrypted');
-    if (r.includes('os_type in')) return d.os_type === 'linux' || d.os_type === 'macos';
-    const cpuMatch = r.match(/cpu_usage\s*>\s*(\d+)/);
-    if (cpuMatch) return d.cpu_usage > Number(cpuMatch[1]);
-    return (
-      d.hostname.toLowerCase().includes(r) ||
-      d.device_role.toLowerCase().includes(r) ||
-      d.os_version.toLowerCase().includes(r)
-    );
-  };
-
-  const tenantScopedDevices =
-    selectedTenantId === 'all' ? localDevices : localDevices.filter((d) => d.tenant_id === selectedTenantId);
-  const activeLifecycleCount = tenantScopedDevices.filter((d) => (d.lifecycle_state || 'active') === 'active').length;
-  const pendingOffboardCount = tenantScopedDevices.filter((d) => d.lifecycle_state === 'pending_offboard').length;
-  const archivedVaultCount = tenantScopedDevices.filter((d) => d.lifecycle_state === 'archived').length;
-
-  // Filter devices based on lifecycle, tenant, search, and dynamic smart groups
-  const filteredDevices = localDevices.filter((d) => {
-    const state = d.lifecycle_state || 'active';
-    if (state !== lifecycleView) return false;
-
-    // Tenant filter
-    if (selectedTenantId !== 'all' && d.tenant_id !== selectedTenantId) {
-      return false;
-    }
-
-    // Search query
-    if (searchQuery.trim() && !matchesDeviceSearch(d, searchQuery, { tenantName: d.tenant_name, siteName: d.site_name })) {
-      return false;
-    }
-
-    // Dynamic Smart Groups (Feature 27)
-    if (smartGroup === 'pending_reboot') return d.pending_reboot === 1;
-    if (smartGroup === 'isolated') return d.quarantined === 1;
-    if (smartGroup === 'unencrypted') return !d.bitlocker_status?.includes('Encrypted');
-    if (smartGroup === 'multi_os') return d.os_type === 'linux' || d.os_type === 'macos';
-    if (smartGroup === 'servers') {
-      return (
-        d.device_role.toLowerCase().includes('server') ||
-        d.device_role.toLowerCase().includes('controller') ||
-        d.device_role.toLowerCase().includes('hypervisor')
-      );
-    }
-
-    const customGrp = customGroups.find((cg) => cg.id === smartGroup);
-    if (customGrp) {
-      return evaluateCustomRule(d, customGrp);
-    }
-
-    return true;
-  });
-
-  // Aggregate metrics (Tenant-scoped Active Fleet + Archive awareness)
-  const activeDevices = tenantScopedDevices.filter((d) => (d.lifecycle_state || 'active') === 'active');
   const totalCount = activeDevices.length;
   const onlineCount = activeDevices.filter((d) => d.status === 'online').length;
   const rebootCount = activeDevices.filter((d) => d.pending_reboot === 1).length;
   const isolatedCount = activeDevices.filter((d) => d.quarantined === 1).length;
   const bitlockerCount = tenantScopedDevices.filter((d) => d.bitlocker_status?.includes('Encrypted')).length;
+  const wssCount = activeDevices.filter((d) => Boolean(d.ws_connected) || d.agent_transport === 'wss').length;
 
-  const handleForceArchive = async (d: Device) => {
-    const res = await forceArchiveDevice(d.id);
-    if (res.success) {
-      setLocalDevices((prev) =>
-        prev.map((item) => (item.id === d.id ? { ...item, lifecycle_state: 'archived', status: 'offline' } : item))
-      );
-      setBulkStatusMsg(res.message);
-      setTimeout(() => setBulkStatusMsg(null), 5000);
+  const osBreakdown = useMemo(() => {
+    const counts = { windows: 0, linux: 0, macos: 0 };
+    for (const d of activeDevices) {
+      if (d.os_type === 'linux') counts.linux++;
+      else if (d.os_type === 'macos') counts.macos++;
+      else counts.windows++;
     }
-  };
+    return counts;
+  }, [activeDevices]);
 
-  const handleSimulateWakeCheckIn = async (d: Device) => {
-    const res = await simulateDeviceCheckin(d.id);
-    if (res.success) {
-      if (res.actionTaken === 'resurrected_from_archive') {
-        setLocalDevices((prev) =>
-          prev.map((item) => (item.id === d.id ? { ...item, lifecycle_state: 'active', status: 'online' } : item))
-        );
-      } else if (res.actionTaken === 'queued_offboard_completed_to_archive' || res.actionTaken === 'quiet_offboard_executed') {
-        setLocalDevices((prev) =>
-          prev.map((item) => (item.id === d.id ? { ...item, lifecycle_state: 'archived', status: 'offline' } : item))
-        );
-      }
-      setBulkStatusMsg(`${d.hostname}: ${res.message}`);
-      setTimeout(() => setBulkStatusMsg(null), 6500);
+  const roleBreakdown = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const d of activeDevices) {
+      const role = d.device_role || 'Workstation';
+      map.set(role, (map.get(role) || 0) + 1);
     }
-  };
+    return Array.from(map.entries()).sort((a, b) => b[1] - a[1]);
+  }, [activeDevices]);
 
-  const handlePurgeArchived = async (d: Device) => {
-    if (!confirm(`Permanently purge ${d.hostname} from the Data Archive Vault? Its BitLocker recovery key and LAPS password history will be irreversibly deleted.`)) {
-      return;
-    }
-    const res = await purgeArchivedDevice(d.id);
-    if (res.success) {
-      setLocalDevices((prev) => prev.filter((item) => item.id !== d.id));
-      setBulkStatusMsg(`Permanently purged ${d.hostname} from the Data Archive Vault.`);
-      setTimeout(() => setBulkStatusMsg(null), 5000);
-    }
-  };
+  const attentionDevices = useMemo(() => {
+    return activeDevices
+      .map((d) => {
+        const reasons: string[] = [];
+        let weight = 0;
+        if (d.quarantined === 1) {
+          reasons.push('Cyber Isolated');
+          weight += 100;
+        }
+        if (d.smart_status === 'Failing' || d.smart_status === 'Warning') {
+          reasons.push(`SMART ${d.smart_status}`);
+          weight += 80;
+        }
+        const isServer = /server|controller|hypervisor/i.test(d.device_role || '');
+        if (d.status === 'offline' && isServer) {
+          reasons.push('Offline Server');
+          weight += 70;
+        } else if (d.status === 'offline') {
+          reasons.push('Offline');
+          weight += 20;
+        }
+        if (d.pending_reboot === 1) {
+          reasons.push('Reboot Pending');
+          weight += 30;
+        }
+        if (!d.bitlocker_status?.includes('Encrypted') && !d.has_bitlocker_key) {
+          reasons.push('Unencrypted');
+          weight += 15;
+        }
+        return { device: d, reasons, weight };
+      })
+      .filter((item) => item.reasons.length > 0)
+      .sort((a, b) => b.weight - a.weight)
+      .slice(0, 8);
+  }, [activeDevices]);
 
-  const handleBreakGlassExportSuccess = async () => {
-    const res = await exportBreakGlassSheet({
-      tenantId: selectedTenantId === 'all' ? undefined : selectedTenantId,
-      includeArchived: true
+  const clientSummaries = useMemo(() => {
+    const targetTenants = selectedTenantId === 'all' ? tenants : tenants.filter((t) => t.id === selectedTenantId);
+    return targetTenants.map((t) => {
+      const devs = devices.filter((d) => d.tenant_id === t.id && (d.lifecycle_state || 'active') === 'active');
+      const online = devs.filter((d) => d.status === 'online').length;
+      const alerts = devs.filter((d) => d.quarantined === 1 || d.pending_reboot === 1 || d.smart_status !== 'Healthy').length;
+      return { tenant: t, total: devs.length, online, alerts };
     });
-    if (res.entries) {
-      setBreakGlassRows(res.entries);
-    }
-  };
-
-  const downloadBreakGlassCsv = () => {
-    if (!breakGlassRows) return;
-    const headers = [
-      'Hostname',
-      'Client',
-      'Site',
-      'Lifecycle State',
-      'Serial Number',
-      'LAPS Admin Account',
-      'Current LAPS Password',
-      'Previous LAPS Account',
-      'Previous (N-1) LAPS Password',
-      'SID -500 Built-in Admin Disabled',
-      'BitLocker Status',
-      'BitLocker Recovery Key'
-    ];
-    const rows = breakGlassRows.map((r) => [
-      r.hostname,
-      r.tenantName,
-      r.siteName,
-      r.lifecycleState,
-      r.serialNumber,
-      r.lapsAccountName,
-      r.currentLapsPassword,
-      r.previousLapsAccountName || '',
-      r.previousLapsPassword || '',
-      r.sid500BuiltinDisabled ? 'Yes' : 'No',
-      r.bitlockerStatus,
-      r.bitlockerRecoveryKey
-    ]);
-    const csvContent = [headers, ...rows]
-      .map((row) => row.map((v) => sanitizeCsvCell(v)).join(','))
-      .join('\n');
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `vitrine-break-glass-laps-bitlocker-${new Date().toISOString().slice(0, 10)}.csv`;
-    link.click();
-    URL.revokeObjectURL(url);
-  };
-
-  const toggleSelectAll = () => {
-    if (selectedIds.length === filteredDevices.length && filteredDevices.length > 0) {
-      setSelectedIds([]);
-    } else {
-      setSelectedIds(filteredDevices.map((d) => d.id));
-    }
-  };
-
-  const toggleSelectRow = (id: string) => {
-    setSelectedIds((prev) => (prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]));
-  };
-
-  const handleExportCsv = () => {
-    const targetList =
-      selectedIds.length > 0 ? filteredDevices.filter((d) => selectedIds.includes(d.id)) : filteredDevices;
-    const headers = ['Hostname', 'Role', 'Tenant', 'Site', 'IP Address', 'OS', 'Status', 'CPU %', 'RAM Used GB', 'BitLocker'];
-    const rows = targetList.map((d) => [
-      d.hostname,
-      d.device_role,
-      d.tenant_name || 'Unassigned',
-      d.site_name || 'Default Site',
-      d.ip_address,
-      d.os_version,
-      d.status,
-      d.cpu_usage.toFixed(1),
-      d.ram_used_gb.toFixed(1),
-      d.bitlocker_status
-    ]);
-    const csvContent = [headers, ...rows].map((row) => row.map((v) => sanitizeCsvCell(v)).join(',')).join('\n');
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `vitrine-fleet-export-${new Date().toISOString().slice(0, 10)}.csv`;
-    link.click();
-    URL.revokeObjectURL(url);
-  };
-
-  const handleBulkPatchScan = async () => {
-    const res = await scanPatches(selectedIds.length > 0 ? selectedIds : undefined);
-    setBulkStatusMsg(`Patch scan completed across ${selectedIds.length || filteredDevices.length} endpoints (${res.patches?.length || 0} updates indexed).`);
-    setTimeout(() => setBulkStatusMsg(null), 4000);
-  };
+  }, [tenants, devices, selectedTenantId]);
 
   const handleSeedDemoLab = async () => {
     const res = await seedDemoLabData();
     if (res.success) {
-      setBulkStatusMsg('Evaluation lab dataset seeded. Refreshing fleet inventory...');
+      setStatusBanner('Evaluation lab dataset seeded. Refreshing fleet inventory...');
       onRefreshFleet?.();
-      setTimeout(() => setBulkStatusMsg(null), 4000);
+      setTimeout(() => setStatusBanner(null), 4000);
     }
-  };
-
-  const handleCreateSmartGroup = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newGroupName.trim() || newGroupRules.length === 0) return;
-    const criteriaPayload = JSON.stringify({
-      logic: newGroupLogic,
-      rules: newGroupRules
-    });
-    const summaryStr = newGroupRules.map((r) => `${r.field} ${r.op} ${r.value}`).join(` ${newGroupLogic} `);
-    const res = await createSmartGroup({
-      name: newGroupName.trim(),
-      criteria_json: criteriaPayload,
-      description: newGroupDesc.trim() || `Dynamic query: ${summaryStr}`
-    });
-    if (res.success && res.id) {
-      const updated = await fetchSmartGroups();
-      setCustomGroups(updated);
-      setSmartGroup(res.id);
-      setShowNewGroupModal(false);
-      setNewGroupName('');
-      setNewGroupDesc('');
-      setNewGroupRules([{ field: 'cpu_usage', op: '>', value: '70' }]);
-    }
-  };
-
-  const handleOffboardCurrentClient = async () => {
-    if (selectedTenantId === 'all') return;
-    if (!confirm('Archive this client organization and queue clean offboarding across its endpoints?')) return;
-    const res = await offboardTenant(selectedTenantId, { mode: 'archive_client', reason: 'Client archived by Super Admin' });
-    if (res.success) {
-      setBulkStatusMsg(res.message);
-      onRefreshFleet?.();
-    }
-  };
-
-  const handleDeleteEmptyClient = async () => {
-    if (selectedTenantId === 'all') return;
-    if (!confirm('Delete this client organization? (Active/archived devices must be offboarded or purged first.)')) return;
-    const res = await deleteTenant(selectedTenantId);
-    if (res.success) {
-      setBulkStatusMsg('Client organization removed.');
-      onResetTenantFilter?.();
-      onRefreshFleet?.();
-    } else {
-      setBulkStatusMsg(res.error || 'Cannot delete client while endpoints remain attached.');
-    }
-  };
-
-  const handleDeleteCustomGroup = async (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    await deleteSmartGroup(id);
-    setCustomGroups((prev) => prev.filter((g) => g.id !== id));
-    if (smartGroup === id) setSmartGroup('all');
   };
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '1.75rem' }} id="fleet-dashboard-view">
-      {/* Metrics Row */}
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }} id="fleet-dashboard-view">
+      {/* Header */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.75rem' }}>
+        <div>
+          <h2 style={{ fontFamily: 'var(--font-heading)', fontSize: '1.5rem', fontWeight: 700, margin: 0 }}>
+            Fleet Overview Dashboard
+          </h2>
+          <span style={{ fontSize: '0.84rem', color: 'var(--text-muted)' }}>
+            Real-time health metrics, OS &amp; role posture, and client availability summary
+          </span>
+        </div>
+        <button className="btn-glass btn-primary" onClick={() => onNavigateDevices({})} id="dashboard-open-devices-btn">
+          <Monitor size={15} /> Open All Devices ({totalCount}) <ArrowRight size={14} />
+        </button>
+      </div>
+
+      {statusBanner && (
+        <div className="glass-card" style={{ padding: '0.75rem 1.25rem', color: '#34d399', borderColor: 'rgba(16, 185, 129, 0.35)' }}>
+          ✓ {statusBanner}
+        </div>
+      )}
+
+      {/* Executive KPI Cards (Clickable to jump to Devices view with preset filter) */}
       <div className="metrics-grid">
-        <div className="glass-card">
+        <div
+          className="glass-card glass-card-interactive"
+          style={{ cursor: 'pointer' }}
+          onClick={() => onNavigateDevices({ status: 'all' })}
+        >
           <div className="metric-header">
             <span className="metric-title">TOTAL ENDPOINTS</span>
             <div className="metric-icon-wrap"><Cpu size={18} /></div>
           </div>
           <div className="metric-value">{totalCount}</div>
-          <div className="metric-subtext">{onlineCount} actively connected to MeshCentral</div>
+          <div className="metric-subtext">{onlineCount} online • {wssCount} live WSS</div>
         </div>
 
-        <div className="glass-card">
+        <div
+          className="glass-card glass-card-interactive"
+          style={{ cursor: 'pointer' }}
+          onClick={() => onNavigateDevices({ status: 'online' })}
+        >
           <div className="metric-header">
             <span className="metric-title">ONLINE AVAILABILITY</span>
             <div className="metric-icon-wrap" style={{ background: 'rgba(16, 185, 129, 0.1)', color: '#10b981', borderColor: 'rgba(16, 185, 129, 0.25)' }}>
@@ -442,10 +188,14 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
           <div className="metric-value" style={{ color: '#34d399' }}>
             {((onlineCount / (totalCount || 1)) * 100).toFixed(0)}%
           </div>
-          <div className="metric-subtext">Telemetry rate: 10s - 30s interval</div>
+          <div className="metric-subtext">Click to view online endpoints</div>
         </div>
 
-        <div className="glass-card">
+        <div
+          className="glass-card glass-card-interactive"
+          style={{ cursor: 'pointer' }}
+          onClick={() => onNavigateDevices({ status: 'reboot_pending' })}
+        >
           <div className="metric-header">
             <span className="metric-title">PENDING REBOOTS</span>
             <div className="metric-icon-wrap" style={{ background: 'rgba(245, 158, 11, 0.1)', color: '#f59e0b', borderColor: 'rgba(245, 158, 11, 0.25)' }}>
@@ -453,10 +203,14 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
             </div>
           </div>
           <div className="metric-value" style={{ color: '#fbbf24' }}>{rebootCount}</div>
-          <div className="metric-subtext">CBS &amp; Windows Update flags detected</div>
+          <div className="metric-subtext">Endpoints awaiting restart</div>
         </div>
 
-        <div className="glass-card">
+        <div
+          className="glass-card glass-card-interactive"
+          style={{ cursor: 'pointer' }}
+          onClick={() => onNavigateDevices({ status: 'isolated' })}
+        >
           <div className="metric-header">
             <span className="metric-title">CYBER ISOLATED</span>
             <div className="metric-icon-wrap" style={{ background: 'rgba(239, 68, 68, 0.1)', color: '#ef4444', borderColor: 'rgba(239, 68, 68, 0.25)' }}>
@@ -466,10 +220,14 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
           <div className="metric-value" style={{ color: isolatedCount > 0 ? '#f87171' : 'var(--text-main)' }}>
             {isolatedCount}
           </div>
-          <div className="metric-subtext">Quarantined endpoints with RMM tunnel</div>
+          <div className="metric-subtext">Quarantined endpoints</div>
         </div>
 
-        <div className="glass-card">
+        <div
+          className="glass-card glass-card-interactive"
+          style={{ cursor: 'pointer' }}
+          onClick={() => onNavigateDevices({ smartGroup: 'unencrypted' })}
+        >
           <div className="metric-header">
             <span className="metric-title">DISK ENCRYPTION</span>
             <div className="metric-icon-wrap" style={{ background: 'rgba(0, 242, 254, 0.1)', color: 'var(--primary)', borderColor: 'rgba(0, 242, 254, 0.2)' }}>
@@ -477,679 +235,222 @@ export const FleetDashboard: React.FC<FleetDashboardProps> = ({
             </div>
           </div>
           <div className="metric-value">{bitlockerCount} / {tenantScopedDevices.length}</div>
-          <div className="metric-subtext">BitLocker / LUKS / FileVault Escrowed (Incl. Archive)</div>
+          <div className="metric-subtext">BitLocker / LUKS / FileVault</div>
         </div>
       </div>
 
-      {/* Lifecycle Category Switcher (Active Fleet vs. Pending Offboard Queue vs. Data Archive Vault) */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.75rem', padding: '0.85rem 1.1rem', borderRadius: '10px', background: 'var(--glass-bg)', border: '1px solid var(--glass-border)' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.55rem', flexWrap: 'wrap' }}>
-          <span style={{ fontSize: '0.78rem', fontWeight: 700, color: 'var(--text-dim)', marginRight: '0.25rem' }}>
-            LIFECYCLE VIEW:
-          </span>
-          <button
-            className={`btn-glass ${lifecycleView === 'active' ? 'btn-primary' : ''}`}
-            style={{ fontSize: '0.8rem', padding: '0.35rem 0.85rem' }}
-            onClick={() => setLifecycleView('active')}
-          >
-            Active Fleet ({activeLifecycleCount})
-          </button>
-          <button
-            className={`btn-glass ${lifecycleView === 'pending_offboard' ? 'btn-primary' : ''}`}
-            style={{
-              fontSize: '0.8rem',
-              padding: '0.35rem 0.85rem',
-              borderColor: pendingOffboardCount > 0 ? 'rgba(245, 158, 11, 0.45)' : undefined,
-              color: lifecycleView === 'pending_offboard' ? '#fff' : pendingOffboardCount > 0 ? '#fbbf24' : undefined
-            }}
-            onClick={() => setLifecycleView('pending_offboard')}
-          >
-            ⏳ Pending Offboard Queue ({pendingOffboardCount})
-          </button>
-          <button
-            className={`btn-glass ${lifecycleView === 'archived' ? 'btn-primary' : ''}`}
-            style={{ fontSize: '0.8rem', padding: '0.35rem 0.85rem' }}
-            onClick={() => setLifecycleView('archived')}
-          >
-            <Archive size={13} /> Data Archive Vault ({archivedVaultCount} — BitLocker &amp; LAPS Preserved)
-          </button>
-        </div>
-
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
-          {selectedTenantId !== 'all' && isSuperAdmin(currentUser) && (
-            <>
-              <button
-                className="btn-glass"
-                style={{ fontSize: '0.76rem', padding: '0.35rem 0.7rem' }}
-                onClick={handleOffboardCurrentClient}
-                title="Archive selected client organization and offboard its endpoints"
-              >
-                <Archive size={13} /> Archive Client
-              </button>
-              {localDevices.filter((d) => d.tenant_id === selectedTenantId).length === 0 && (
-                <button
-                  className="btn-glass btn-danger"
-                  style={{ fontSize: '0.76rem', padding: '0.35rem 0.7rem' }}
-                  onClick={handleDeleteEmptyClient}
-                  title="Delete empty client tenant"
-                >
-                  <Trash2 size={13} /> Delete Empty Client
+      {devices.length === 0 ? (
+        <div className="glass-card" style={{ textAlign: 'center', padding: '3rem 1.5rem' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.85rem' }}>
+            <div style={{ fontWeight: 700, fontSize: '1.08rem' }}>No Endpoints Enrolled Yet</div>
+            <div style={{ fontSize: '0.84rem', color: 'var(--text-muted)', maxWidth: '540px' }}>
+              Your Vitrine control plane starts clean with zero fake demo clients. Provision a signed agent installer, import existing device groups from MeshCentral 2, or load the optional evaluation lab dataset.
+            </div>
+            <div style={{ display: 'flex', gap: '0.65rem', flexWrap: 'wrap', justifyContent: 'center', marginTop: '0.35rem' }}>
+              {onOpenInstaller && canMutate && (
+                <button className="btn-glass btn-primary" onClick={onOpenInstaller}>
+                  <Download size={14} /> Provision Signed Agent
                 </button>
               )}
-            </>
-          )}
-          {isSuperAdmin(currentUser) && (
-            <button
-              className="btn-glass"
-              style={{ fontSize: '0.78rem', padding: '0.4rem 0.85rem', borderColor: 'rgba(245, 158, 11, 0.45)', color: '#fbbf24' }}
-              onClick={() => setShowBreakGlassMfa(true)}
-              title="Step-Up MFA-gated emergency offline Break-Glass export containing current + N-1 LAPS passwords and BitLocker recovery keys across Active & Archived endpoints"
-            >
-              <FileSpreadsheet size={14} /> Export Break-Glass Sheet (LAPS + BitLocker)
-            </button>
-          )}
-        </div>
-      </div>
-
-      {/* Dynamic Smart Device Groups (Feature 27) */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem', flexWrap: 'wrap' }}>
-        <span style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--text-dim)', marginRight: '0.35rem' }}>
-          SMART GROUPS:
-        </span>
-        {[
-          { id: 'all', label: 'All Fleet Devices' },
-          { id: 'servers', label: 'Servers & Hypervisors' },
-          { id: 'pending_reboot', label: '⚠️ Pending Reboot' },
-          { id: 'isolated', label: '🛡️ Cyber Isolated' },
-          { id: 'unencrypted', label: '🔓 Missing BitLocker' },
-          { id: 'multi_os', label: '🐧 Linux & macOS' }
-        ].map((g) => (
-          <button
-            key={g.id}
-            className={`btn-glass ${smartGroup === g.id ? 'btn-primary' : ''}`}
-            style={{ padding: '0.35rem 0.85rem', fontSize: '0.8rem' }}
-            onClick={() => setSmartGroup(g.id)}
-            id={`smart-group-${g.id}`}
-          >
-            {g.label}
-          </button>
-        ))}
-
-        {customGroups.map((cg) => (
-          <button
-            key={cg.id}
-            className={`btn-glass ${smartGroup === cg.id ? 'btn-primary' : ''}`}
-            style={{ padding: '0.35rem 0.75rem', fontSize: '0.8rem', display: 'flex', alignItems: 'center', gap: '0.4rem' }}
-            onClick={() => setSmartGroup(cg.id)}
-            title={`${cg.description || ''} (${cg.criteria_json})`}
-          >
-            <span>
-              ⚡ {cg.name}
-              {typeof cg.matchedCount === 'number' ? ` (${cg.matchedCount})` : ''}
-            </span>
-            {canMutate && (
-              <Trash2
-                size={12}
-                style={{ opacity: 0.7 }}
-                onClick={(e) => handleDeleteCustomGroup(cg.id, e)}
-              />
-            )}
-          </button>
-        ))}
-
-        {canMutate && (
-          <button
-            className="btn-glass"
-            style={{ padding: '0.35rem 0.75rem', fontSize: '0.78rem', borderStyle: 'dashed' }}
-            onClick={() => setShowNewGroupModal(true)}
-          >
-            <Plus size={13} /> New Smart Group
-          </button>
-        )}
-      </div>
-
-      {bulkStatusMsg && (() => {
-        const isBulkErr = /^(cannot|error|failed|⚠)/i.test(bulkStatusMsg.trim());
-        return (
-          <div
-            className="glass-card"
-            style={{
-              padding: '0.75rem 1.25rem',
-              background: isBulkErr ? 'rgba(239, 68, 68, 0.12)' : 'rgba(16, 185, 129, 0.12)',
-              borderColor: isBulkErr ? 'rgba(239, 68, 68, 0.35)' : 'rgba(16, 185, 129, 0.35)',
-              color: isBulkErr ? '#fca5a5' : '#34d399',
-              fontSize: '0.85rem',
-              fontWeight: 500
-            }}
-          >
-            {isBulkErr ? '⚠ ' : '✓ '}{bulkStatusMsg}
-          </div>
-        );
-      })()}
-
-      {/* Fleet Table */}
-      <div className="glass-card" style={{ padding: 0 }}>
-        <div style={{ padding: '1.25rem 1.5rem', borderBottom: '1px solid var(--glass-border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.75rem' }}>
-          <div>
-            <h3 style={{ fontFamily: 'var(--font-heading)', fontSize: '1.15rem', fontWeight: 600 }}>
-              Managed Fleet Inventory
-            </h3>
-            <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>
-              Showing {filteredDevices.length} endpoints matching current policy scope
-              {selectedIds.length > 0 && ` • ${selectedIds.length} selected`}
-            </span>
-          </div>
-
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
-            {canMutate && selectedIds.length > 0 && (
-              <button
-                className="btn-glass btn-primary"
-                style={{ fontSize: '0.78rem', padding: '0.4rem 0.85rem' }}
-                onClick={handleBulkPatchScan}
-              >
-                <RefreshCw size={14} /> Scan Selected ({selectedIds.length})
-              </button>
-            )}
-            <button
-              className="btn-glass"
-              style={{ fontSize: '0.78rem', padding: '0.4rem 0.85rem' }}
-              onClick={handleExportCsv}
-            >
-              <Download size={14} /> Export CSV
-            </button>
-          </div>
-        </div>
-
-        <div className="table-wrapper" style={{ border: 'none', borderRadius: 0 }}>
-          <table className="glass-table">
-            <thead>
-              <tr>
-                <th style={{ width: '36px' }}>
-                  <input
-                    type="checkbox"
-                    checked={filteredDevices.length > 0 && selectedIds.length === filteredDevices.length}
-                    onChange={toggleSelectAll}
-                  />
-                </th>
-                <th>Status</th>
-                <th>Endpoint / Role</th>
-                <th>Client / Site</th>
-                <th>Operating System</th>
-                <th>CPU &amp; RAM Load</th>
-                <th>Security &amp; Health</th>
-                <th style={{ textAlign: 'right' }}>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {filteredDevices.map((d) => (
-                <tr key={d.id} id={`device-row-${d.id}`}>
-                  <td>
-                    <input
-                      type="checkbox"
-                      checked={selectedIds.includes(d.id)}
-                      onChange={() => toggleSelectRow(d.id)}
-                    />
-                  </td>
-                  <td>
-                    <span
-                      className={`status-pill ${
-                        d.lifecycle_state === 'archived'
-                          ? 'status-offline'
-                          : d.lifecycle_state === 'pending_offboard'
-                          ? 'status-reboot'
-                          : d.quarantined
-                          ? 'status-isolated'
-                          : d.pending_reboot
-                          ? 'status-reboot'
-                          : d.status === 'online'
-                          ? 'status-online'
-                          : 'status-offline'
-                      }`}
-                    >
-                      <div className="pulse-dot" />
-                      {d.lifecycle_state === 'archived'
-                        ? 'Archived Vault'
-                        : d.lifecycle_state === 'pending_offboard'
-                        ? 'Pending Offboard'
-                        : d.quarantined
-                        ? 'Isolated'
-                        : d.pending_reboot
-                        ? 'Reboot Req'
-                        : d.status}
-                    </span>
-                  </td>
-
-                  <td>
-                    <div style={{ display: 'flex', flexDirection: 'column' }}>
-                      <span
-                        style={{ fontWeight: 600, color: 'var(--text-main)', cursor: 'pointer' }}
-                        onClick={() => onSelectDevice(d)}
-                        className="hover-underline"
-                      >
-                        {d.hostname}
-                      </span>
-                      <span style={{ fontSize: '0.72rem', color: 'var(--text-dim)', display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
-                        {(() => {
-                          const r = (d.device_role || '').toLowerCase();
-                          if (r.includes('laptop')) return <Laptop size={12} color="#38bdf8" />;
-                          if (r.includes('server') || r.includes('hypervisor') || r.includes('controller')) return <Server size={12} color="#a78bfa" />;
-                          if (r.includes('virtual')) return <Cpu size={12} color="#34d399" />;
-                          return <Monitor size={12} color="var(--text-dim)" />;
-                        })()}
-                        {d.device_role} • {d.ip_address}
-                        {d.offboard_reason ? ` • ${d.offboard_reason}` : ''}
-                      </span>
-                    </div>
-                  </td>
-
-                  <td>
-                    <div style={{ display: 'flex', flexDirection: 'column' }}>
-                      <span style={{ fontSize: '0.82rem', fontWeight: 500 }}>{d.tenant_name || 'Unassigned'}</span>
-                      <span style={{ fontSize: '0.72rem', color: 'var(--text-dim)' }}>{d.site_name || 'Default Site'}</span>
-                    </div>
-                  </td>
-
-                  <td>
-                    <div style={{ display: 'flex', flexDirection: 'column' }}>
-                      <span style={{ fontSize: '0.82rem' }}>{d.os_version}</span>
-                      <span style={{ fontSize: '0.7rem', color: 'var(--text-dim)' }}>{d.os_build}</span>
-                    </div>
-                  </td>
-
-                  <td style={{ minWidth: '185px' }}>
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.5rem', fontSize: '0.72rem', whiteSpace: 'nowrap' }}>
-                        <span>CPU: {d.status === 'offline' && d.cpu_usage <= 0 ? '—' : `${d.cpu_usage.toFixed(1)}%`}</span>
-                        <span>
-                          RAM:{' '}
-                          {d.ram_used_gb > 0
-                            ? `${d.ram_used_gb.toFixed(1)}/${d.ram_total_gb.toFixed(0)}GB`
-                            : d.ram_total_gb > 0
-                            ? `— / ${d.ram_total_gb.toFixed(0)}GB`
-                            : '—'}
-                        </span>
-                      </div>
-                      <div style={{ width: '100%', height: '5px', background: 'rgba(148, 163, 184, 0.22)', borderRadius: '3px', overflow: 'hidden' }}>
-                        <div
-                          style={{
-                            width: `${Math.min(100, d.cpu_usage)}%`,
-                            height: '100%',
-                            background: d.cpu_usage > 80 ? '#ef4444' : 'var(--primary)'
-                          }}
-                        />
-                      </div>
-                    </div>
-                  </td>
-
-                  <td>
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.2rem' }}>
-                      <span
-                        style={{
-                          fontSize: '0.75rem',
-                          color: d.edr_status === 'Active' ? '#10b981' : '#f59e0b',
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: '0.35rem'
-                        }}
-                      >
-                        <ShieldCheck size={12} /> {d.edr_status === 'Active' ? d.edr_name || 'EDR Active' : d.edr_status || 'Unmonitored'}
-                      </span>
-                      <span style={{ fontSize: '0.7rem', color: d.has_bitlocker_key || d.bitlocker_status?.includes('Encrypted') ? '#38bdf8' : '#f59e0b' }}>
-                        🔒 {d.has_bitlocker_key || d.bitlocker_status?.includes('Encrypted') ? 'BitLocker Escrowed' : 'Unencrypted'}
-                      </span>
-                    </div>
-                  </td>
-
-                  <td style={{ textAlign: 'right' }}>
-                    {canMutate ? (
-                      <div className="action-group" style={{ justifyContent: 'flex-end' }}>
-                        {d.lifecycle_state === 'pending_offboard' && (
-                          <button
-                            className="btn-glass"
-                            style={{ padding: '0.25rem 0.55rem', fontSize: '0.72rem', borderColor: 'rgba(245, 158, 11, 0.45)', color: '#fbbf24' }}
-                            title="Force move this offline pending-offboard endpoint directly into the Data Archive Vault now"
-                            onClick={() => handleForceArchive(d)}
-                          >
-                            <Archive size={13} /> Force Archive
-                          </button>
-                        )}
-
-                        {enableLabDemo && (d.lifecycle_state === 'pending_offboard' || d.lifecycle_state === 'archived') && (
-                          <button
-                            className="btn-glass"
-                            style={{ padding: '0.25rem 0.55rem', fontSize: '0.72rem', borderColor: 'rgba(56, 189, 248, 0.45)', color: '#38bdf8' }}
-                            title="Lab demo: simulate this endpoint checking back in"
-                            onClick={() => handleSimulateWakeCheckIn(d)}
-                          >
-                            <Zap size={13} /> Simulate Wake / Check-In
-                          </button>
-                        )}
-
-                        {d.lifecycle_state === 'archived' && (
-                          <button
-                            className="btn-glass btn-icon"
-                            title="Explicitly & permanently purge this archived endpoint (deletes preserved BitLocker & LAPS keys)"
-                            onClick={() => handlePurgeArchived(d)}
-                          >
-                            <Trash2 size={14} color="#ef4444" />
-                          </button>
-                        )}
-
-                        {/* Feature 7: Interactive Screen Control */}
-                        {(!d.lifecycle_state || d.lifecycle_state === 'active') && (
-                          <>
-                            <button
-                              className="btn-glass btn-icon"
-                              title="Low-Latency Screen Control (KVM)"
-                              onClick={() => onOpenRemote(d, false)}
-                              id={`btn-remote-${d.id}`}
-                            >
-                              <Monitor size={15} color="#00f2fe" />
-                            </button>
-
-                            {/* Feature 8: Ghost Session (Headless / Background Remote Desktop) */}
-                            <button
-                              className="btn-glass btn-icon"
-                              title="Ghost Session (Headless Remote Desktop)"
-                              onClick={() => onOpenRemote(d, true)}
-                              id={`btn-ghost-${d.id}`}
-                            >
-                              <EyeOff size={15} color="#c084fc" />
-                            </button>
-
-                            {/* Feature 11-15: Background Management Suite */}
-                            <button
-                              className="btn-glass btn-icon"
-                              title="Silent Background Suite (Shell, Task Manager, Services, Registry, Files)"
-                              onClick={() => onOpenBgTools(d, 'terminal')}
-                              id={`btn-bg-tools-${d.id}`}
-                            >
-                              <Terminal size={15} />
-                            </button>
-                          </>
-                        )}
-
-                        {/* Feature 32: LAPS Vault (Available on Active AND Archived endpoints!) */}
-                        <button
-                          className="btn-glass btn-icon"
-                          title="Automated LAPS Vault (Local Admin Password & Historical Archive)"
-                          onClick={() => onOpenLaps(d)}
-                          id={`btn-laps-${d.id}`}
-                        >
-                          <KeyRound size={15} color="#fbbf24" />
-                        </button>
-
-                        {/* Feature 31: Cyber Isolation */}
-                        {(!d.lifecycle_state || d.lifecycle_state === 'active') && (
-                          <button
-                            className={`btn-glass btn-icon ${d.quarantined ? 'btn-danger' : ''}`}
-                            title={d.quarantined ? 'Isolated: Click to restore network' : 'One-Click Cyber Isolation'}
-                            onClick={() => onOpenQuarantine(d)}
-                            id={`btn-quarantine-${d.id}`}
-                          >
-                            <ShieldAlert size={15} color={d.quarantined ? '#ef4444' : '#94a3b8'} />
-                          </button>
-                        )}
-                      </div>
-                    ) : (
-                      <span style={{ fontSize: '0.72rem', color: 'var(--text-dim)' }}>Read-Only</span>
-                    )}
-                  </td>
-                </tr>
-              ))}
-              {filteredDevices.length === 0 && (
-                <tr>
-                  <td colSpan={8} style={{ textAlign: 'center', padding: '3rem 1.5rem' }}>
-                    {localDevices.length === 0 ? (
-                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.85rem' }}>
-                        <div style={{ fontWeight: 700, fontSize: '1rem' }}>No Endpoints Enrolled Yet</div>
-                        <div style={{ fontSize: '0.82rem', color: 'var(--text-muted)', maxWidth: '520px' }}>
-                          Your Vitrine control plane starts clean with zero fake demo clients. Provision a signed agent installer, import existing device groups from MeshCentral 2, or load the optional evaluation lab dataset.
-                        </div>
-                        <div style={{ display: 'flex', gap: '0.65rem', flexWrap: 'wrap', justifyContent: 'center', marginTop: '0.35rem' }}>
-                          {onOpenInstaller && canMutate && (
-                            <button className="btn-glass btn-primary" onClick={onOpenInstaller}>
-                              <Download size={14} /> Provision Signed Agent
-                            </button>
-                          )}
-                          {onOpenOnboarding && isSuperAdmin(currentUser) && (
-                            <button className="btn-glass" onClick={onOpenOnboarding}>
-                              Import from MeshCentral
-                            </button>
-                          )}
-                          {enableLabDemo && isSuperAdmin(currentUser) && (
-                            <button className="btn-glass" onClick={handleSeedDemoLab}>
-                              Load Lab Demo Dataset
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    ) : (
-                      <span style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>
-                        No endpoints match the selected lifecycle state or filter criteria.
-                      </span>
-                    )}
-                  </td>
-                </tr>
+              {onOpenOnboarding && isSuperAdmin(currentUser) && (
+                <button className="btn-glass" onClick={onOpenOnboarding}>
+                  Import from MeshCentral
+                </button>
               )}
-            </tbody>
-          </table>
+              {enableLabDemo && isSuperAdmin(currentUser) && (
+                <button className="btn-glass" onClick={handleSeedDemoLab}>
+                  Load Lab Demo Dataset
+                </button>
+              )}
+            </div>
+          </div>
         </div>
-      </div>
+      ) : (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(360px, 1fr))', gap: '1.25rem' }}>
+          {/* Fleet Breakdown Card */}
+          <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '1.1rem' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h3 style={{ margin: 0, fontSize: '1.02rem', fontWeight: 600 }}>Fleet Breakdown &amp; Transport</h3>
+              <span style={{ fontSize: '0.74rem', color: 'var(--text-dim)', display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
+                <Wifi size={13} color="#38bdf8" /> {wssCount} WSS / {Math.max(0, totalCount - wssCount)} HTTP
+              </span>
+            </div>
 
-      {/* Create Smart Group Modal */}
-      {showNewGroupModal && (
-        <div className="modal-overlay" onClick={() => setShowNewGroupModal(false)}>
-          <div className="glass-modal" style={{ maxWidth: '480px', padding: '1.5rem' }} onClick={(e) => e.stopPropagation()}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-              <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 700 }}>Create Dynamic Smart Group</h3>
-              <button className="btn-glass btn-icon" onClick={() => setShowNewGroupModal(false)}>
-                <X size={16} />
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
+              {[
+                { key: 'windows', label: 'Windows', count: osBreakdown.windows, color: '#38bdf8' },
+                { key: 'linux', label: 'Linux', count: osBreakdown.linux, color: '#34d399' },
+                { key: 'macos', label: 'macOS', count: osBreakdown.macos, color: '#c084fc' }
+              ].map((os) => {
+                const pct = totalCount > 0 ? Math.round((os.count / totalCount) * 100) : 0;
+                return (
+                  <div
+                    key={os.key}
+                    style={{ cursor: 'pointer' }}
+                    onClick={() =>
+                      onNavigateDevices({
+                        extraFilter: { field: 'os_type', operator: 'is', value: os.key }
+                      })
+                    }
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', marginBottom: '0.25rem' }}>
+                      <span>{os.label}</span>
+                      <span style={{ color: 'var(--text-muted)' }}>
+                        {os.count} ({pct}%)
+                      </span>
+                    </div>
+                    <div style={{ height: '7px', borderRadius: '4px', background: 'rgba(148, 163, 184, 0.16)', overflow: 'hidden' }}>
+                      <div style={{ width: `${pct}%`, height: '100%', background: os.color }} />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div style={{ borderTop: '1px solid var(--glass-border)', paddingTop: '0.85rem' }}>
+              <div style={{ fontSize: '0.74rem', fontWeight: 600, color: 'var(--text-dim)', marginBottom: '0.5rem' }}>
+                DEVICE ROLES
+              </div>
+              <div style={{ display: 'flex', gap: '0.45rem', flexWrap: 'wrap' }}>
+                {roleBreakdown.map(([role, count]) => (
+                  <button
+                    key={role}
+                    type="button"
+                    className="btn-glass"
+                    style={{ fontSize: '0.74rem', padding: '0.28rem 0.65rem' }}
+                    onClick={() => onNavigateDevices({ deviceRole: role })}
+                  >
+                    {role.toLowerCase().includes('laptop') ? (
+                      <Laptop size={12} color="#38bdf8" />
+                    ) : role.toLowerCase().includes('server') || role.toLowerCase().includes('hypervisor') ? (
+                      <Server size={12} color="#a78bfa" />
+                    ) : (
+                      <Monitor size={12} />
+                    )}
+                    <span>
+                      {role}: <strong>{count}</strong>
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* Attention Required Card */}
+          <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h3 style={{ margin: 0, fontSize: '1.02rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
+                <AlertTriangle size={16} color="#fbbf24" /> Attention Required
+              </h3>
+              <button
+                type="button"
+                className="btn-glass"
+                style={{ fontSize: '0.73rem', padding: '0.25rem 0.6rem' }}
+                onClick={() => onNavigateDevices({})}
+              >
+                View All in Devices
               </button>
             </div>
-            <form onSubmit={handleCreateSmartGroup} style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
-              <div>
-                <label style={{ fontSize: '0.78rem', color: 'var(--text-dim)', display: 'block', marginBottom: '0.25rem' }}>
-                  Smart Group Name
-                </label>
-                <input
-                  type="text"
-                  required
-                  className="glass-input"
-                  placeholder="e.g. High CPU Workstations"
-                  value={newGroupName}
-                  onChange={(e) => setNewGroupName(e.target.value)}
-                />
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.55rem' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <label style={{ fontSize: '0.78rem', color: 'var(--text-dim)' }}>
-                    Compound Dynamic Conditions
-                  </label>
-                  <select
-                    className="glass-select"
-                    style={{ width: 'auto', padding: '0.2rem 0.55rem', fontSize: '0.75rem' }}
-                    value={newGroupLogic}
-                    onChange={(e) => setNewGroupLogic(e.target.value as 'AND' | 'OR')}
-                  >
-                    <option value="AND">Match ALL Rules (AND)</option>
-                    <option value="OR">Match ANY Rule (OR)</option>
-                  </select>
-                </div>
 
-                {newGroupRules.map((rule, rIdx) => (
-                  <div key={rIdx} style={{ display: 'grid', gridTemplateColumns: '1.2fr 0.9fr 1fr auto', gap: '0.4rem', alignItems: 'center' }}>
-                    <select
-                      className="glass-select"
-                      style={{ fontSize: '0.76rem', padding: '0.35rem 0.45rem' }}
-                      value={rule.field}
-                      onChange={(e) => {
-                        const copy = [...newGroupRules];
-                        copy[rIdx] = { ...copy[rIdx], field: e.target.value };
-                        setNewGroupRules(copy);
-                      }}
-                    >
-                      <option value="cpu_usage">CPU %</option>
-                      <option value="ram_used_gb">RAM Used (GB)</option>
-                      <option value="disk_free_gb">Disk Free (GB)</option>
-                      <option value="os_type">OS Type (windows/linux/macos)</option>
-                      <option value="device_role">Device Role</option>
-                      <option value="status">Online Status</option>
-                      <option value="pending_reboot">Pending Reboot (0/1)</option>
-                      <option value="edr_status">EDR Status</option>
-                      <option value="bitlocker_status">Disk Encryption</option>
-                      <option value="hostname">Hostname</option>
-                    </select>
-                    <select
-                      className="glass-select"
-                      style={{ fontSize: '0.76rem', padding: '0.35rem 0.45rem' }}
-                      value={rule.op}
-                      onChange={(e) => {
-                        const copy = [...newGroupRules];
-                        copy[rIdx] = { ...copy[rIdx], op: e.target.value as any };
-                        setNewGroupRules(copy);
-                      }}
-                    >
-                      <option value="=">=</option>
-                      <option value="!=">!=</option>
-                      <option value=">">&gt;</option>
-                      <option value="<">&lt;</option>
-                      <option value="contains">Contains</option>
-                      <option value="not_contains">Not Contains</option>
-                    </select>
-                    <input
-                      type="text"
-                      required
-                      className="glass-input"
-                      style={{ fontSize: '0.76rem', padding: '0.35rem 0.5rem' }}
-                      value={String(rule.value)}
-                      onChange={(e) => {
-                        const copy = [...newGroupRules];
-                        copy[rIdx] = { ...copy[rIdx], value: e.target.value };
-                        setNewGroupRules(copy);
-                      }}
-                    />
-                    {newGroupRules.length > 1 && (
-                      <button
-                        type="button"
-                        className="btn-glass btn-icon"
-                        onClick={() => setNewGroupRules(newGroupRules.filter((_, idx) => idx !== rIdx))}
-                      >
-                        <Trash2 size={12} color="#ef4444" />
-                      </button>
-                    )}
+            {attentionDevices.length === 0 ? (
+              <div style={{ padding: '2rem 1rem', textAlign: 'center', color: '#34d399', fontSize: '0.85rem' }}>
+                All active endpoints are online, healthy, and encrypted.
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem' }}>
+                {attentionDevices.map(({ device, reasons }) => (
+                  <div
+                    key={device.id}
+                    onClick={() => onSelectDevice(device)}
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      gap: '0.65rem',
+                      padding: '0.55rem 0.75rem',
+                      borderRadius: '8px',
+                      background: 'rgba(255, 255, 255, 0.03)',
+                      border: '1px solid var(--glass-border)',
+                      cursor: 'pointer'
+                    }}
+                  >
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontWeight: 600, fontSize: '0.82rem' }}>{device.hostname}</div>
+                      <div style={{ fontSize: '0.7rem', color: 'var(--text-dim)' }}>
+                        {device.tenant_name || 'Unassigned'} • {device.device_role}
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', gap: '0.3rem', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                      {reasons.slice(0, 2).map((r) => (
+                        <span
+                          key={r}
+                          className={`status-pill ${
+                            r === 'Cyber Isolated' || r.includes('Failing') || r === 'Offline Server'
+                              ? 'status-isolated'
+                              : r === 'Offline' || r === 'Unencrypted'
+                              ? 'status-offline'
+                              : 'status-reboot'
+                          }`}
+                          style={{ fontSize: '0.66rem', padding: '0.15rem 0.5rem' }}
+                        >
+                          {r}
+                        </span>
+                      ))}
+                    </div>
                   </div>
                 ))}
-
-                <button
-                  type="button"
-                  className="btn-glass"
-                  style={{ fontSize: '0.75rem', alignSelf: 'flex-start' }}
-                  onClick={() => setNewGroupRules([...newGroupRules, { field: 'os_type', op: '=', value: 'windows' }])}
-                >
-                  <Plus size={12} /> Add Condition Row
-                </button>
               </div>
-              <div>
-                <label style={{ fontSize: '0.78rem', color: 'var(--text-dim)', display: 'block', marginBottom: '0.25rem' }}>
-                  Description
-                </label>
-                <input
-                  type="text"
-                  className="glass-input"
-                  placeholder="Optional description..."
-                  value={newGroupDesc}
-                  onChange={(e) => setNewGroupDesc(e.target.value)}
-                />
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem', marginTop: '0.5rem' }}>
-                <button type="button" className="btn-glass" onClick={() => setShowNewGroupModal(false)}>
-                  Cancel
-                </button>
-                <button type="submit" className="btn-glass btn-primary">
-                  Save Smart Group
-                </button>
-              </div>
-            </form>
+            )}
           </div>
-        </div>
-      )}
 
-      {/* Step-Up MFA Challenge for Emergency Break-Glass Sheet Export */}
-      <MfaChallengeModal
-        isOpen={showBreakGlassMfa}
-        onClose={() => setShowBreakGlassMfa(false)}
-        onSuccess={handleBreakGlassExportSuccess}
-        title="Step-Up MFA: Emergency Break-Glass LAPS & BitLocker Export"
-        description="Enter your 6-digit authenticator code to export all current + N-1 historical LAPS passwords and BitLocker recovery keys (including Archived endpoints)."
-        secretType="laps_credential"
-        deviceId="fleet-break-glass"
-      />
+          {/* Client Organizations Summary */}
+          <div className="glass-card" style={{ gridColumn: '1 / -1', display: 'flex', flexDirection: 'column', gap: '0.9rem' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h3 style={{ margin: 0, fontSize: '1.02rem', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
+                <Building2 size={16} color="var(--primary)" /> Client Organizations
+              </h3>
+              <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
+                Click a client to inspect its endpoints in Devices
+              </span>
+            </div>
 
-      {/* Emergency Break-Glass Sheet Modal */}
-      {breakGlassRows && (
-        <div className="modal-backdrop" onClick={() => setBreakGlassRows(null)}>
-          <div className="glass-modal" style={{ maxWidth: '940px' }} onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">
-              <div className="modal-title" style={{ color: '#fbbf24' }}>
-                <FileSpreadsheet size={20} color="#fbbf24" />
-                <span>Emergency Break-Glass Recovery Sheet (LAPS + BitLocker Escrowed Keys)</span>
-              </div>
-              <button className="btn-glass btn-icon" onClick={() => setBreakGlassRows(null)}>
-                <X size={18} />
-              </button>
-            </div>
-            <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-              <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                Includes both <strong>Active</strong> and <strong>Archived Vault</strong> endpoints so you never lose a BitLocker recovery key or LAPS password months after offboarding a machine.
-              </div>
-              <div className="table-wrapper" style={{ maxHeight: '360px', overflowY: 'auto' }}>
-                <table className="glass-table">
-                  <thead>
-                    <tr>
-                      <th>Hostname / State</th>
-                      <th>Client / Site</th>
-                      <th>LAPS Admin Account</th>
-                      <th>Current Password</th>
-                      <th>N-1 Previous Password</th>
-                      <th>BitLocker Recovery Key</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {breakGlassRows.map((r) => (
-                      <tr key={r.deviceId}>
-                        <td>
-                          <div style={{ fontWeight: 600, fontSize: '0.8rem' }}>{r.hostname}</div>
-                          <span className={`status-pill ${r.lifecycleState === 'archived' ? 'status-offline' : 'status-online'}`} style={{ fontSize: '0.65rem' }}>
-                            {r.lifecycleState}
-                          </span>
-                        </td>
-                        <td style={{ fontSize: '0.76rem' }}>
-                          <div>{r.tenantName}</div>
-                          <div style={{ color: 'var(--text-dim)', fontSize: '0.68rem' }}>{r.siteName}</div>
-                        </td>
-                        <td style={{ fontSize: '0.78rem' }}>
-                          <code>{r.lapsAccountName}</code>
-                          {r.previousLapsAccountName && r.previousLapsAccountName !== r.lapsAccountName && (
-                            <div style={{ fontSize: '0.68rem', color: '#38bdf8' }}>Prev: {r.previousLapsAccountName}</div>
-                          )}
-                        </td>
-                        <td style={{ fontFamily: 'var(--font-mono)', fontSize: '0.76rem', color: '#34d399' }}>{r.currentLapsPassword}</td>
-                        <td style={{ fontFamily: 'var(--font-mono)', fontSize: '0.74rem', color: 'var(--text-muted)' }}>{r.previousLapsPassword || '—'}</td>
-                        <td style={{ fontFamily: 'var(--font-mono)', fontSize: '0.74rem', color: '#38bdf8' }}>{r.bitlockerRecoveryKey}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-            <div className="modal-footer" style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <button className="btn-glass" onClick={downloadBreakGlassCsv}>
-                <Download size={14} /> Download Plaintext Break-Glass CSV
-              </button>
-              <button className="btn-glass btn-primary" onClick={() => setBreakGlassRows(null)}>
-                Close
-              </button>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))', gap: '0.75rem' }}>
+              {clientSummaries.map(({ tenant, total, online, alerts }) => {
+                const pct = total > 0 ? Math.round((online / total) * 100) : 0;
+                return (
+                  <div
+                    key={tenant.id}
+                    onClick={() => onNavigateDevices({ tenantId: tenant.id })}
+                    className="glass-card-interactive"
+                    style={{
+                      padding: '0.85rem 1rem',
+                      borderRadius: '10px',
+                      background: 'rgba(255, 255, 255, 0.03)',
+                      border: '1px solid var(--glass-border)',
+                      cursor: 'pointer',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '0.45rem'
+                    }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.4rem' }}>
+                      <strong style={{ fontSize: '0.86rem' }}>{tenant.name}</strong>
+                      <span style={{ fontSize: '0.72rem', color: '#34d399', fontWeight: 600 }}>
+                        {online}/{total} online
+                      </span>
+                    </div>
+                    <div style={{ height: '5px', borderRadius: '3px', background: 'rgba(148, 163, 184, 0.16)', overflow: 'hidden' }}>
+                      <div style={{ width: `${pct}%`, height: '100%', background: pct >= 80 ? '#10b981' : '#f59e0b' }} />
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem', color: 'var(--text-dim)' }}>
+                      <span>{tenant.sites?.length || 0} location(s)</span>
+                      <span style={{ color: alerts > 0 ? '#fbbf24' : 'var(--text-dim)' }}>
+                        {alerts > 0 ? `${alerts} flagged` : 'All clear'}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </div>
         </div>

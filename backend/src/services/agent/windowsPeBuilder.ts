@@ -3,7 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import * as ResEdit from 'resedit';
 import { BRANDING_DIR_PATH, db } from '../../db/index.js';
-import { imageBufferToMultiSizeIco } from './iconProcessor.js';
+import { imageBufferToMultiSizeIco, sanitizeAndSquareBrandingPng } from './iconProcessor.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -77,6 +77,35 @@ export function resolveBrandingIconBuffer(iconUrl?: string): Buffer | null {
   return null;
 }
 
+export function resolveBrandingPngBuffer(iconUrl?: string, targetSize = 128): Buffer | null {
+  try {
+    const settings = (db.prepare('SELECT brand_logo_url FROM settings WHERE id = 1').get() || {}) as {
+      brand_logo_url?: string;
+    };
+    const candidateUrl = String(iconUrl || settings.brand_logo_url || '').trim();
+    const candidates: string[] = [];
+
+    if (candidateUrl.startsWith('/branding/')) {
+      const rel = candidateUrl.slice('/branding/'.length).replace(/[^a-zA-Z0-9._-]/g, '');
+      if (rel) candidates.push(path.join(BRANDING_DIR_PATH, rel));
+    }
+    candidates.push(
+      path.join(BRANDING_DIR_PATH, 'logo.png'),
+      path.join(BRANDING_DIR_PATH, 'logo.ico')
+    );
+
+    for (const p of candidates) {
+      if (!fs.existsSync(p) || !fs.statSync(p).isFile()) continue;
+      const raw = fs.readFileSync(p);
+      const png = sanitizeAndSquareBrandingPng(raw, targetSize);
+      if (png) return png;
+    }
+  } catch {
+    // Fall back to null
+  }
+  return null;
+}
+
 export function buildStampedWindowsPe(
   templateName: WindowsTemplateName,
   options: WindowsPeStampOptions
@@ -94,11 +123,11 @@ export function buildStampedWindowsPe(
   }
 
   // Stamp branded VS_VERSION_INFO properties
-  const versionStr = options.fileVersion || '2.7.0.0';
+  const versionStr = options.fileVersion || '2.8.0.0';
   const verParts = versionStr.split('.').map((n) => Math.max(0, Math.min(65535, Number.parseInt(n, 10) || 0)));
   const vMajor = verParts[0] ?? 2;
-  const vMinor = verParts[1] ?? 6;
-  const vMicro = verParts[2] ?? 1;
+  const vMinor = verParts[1] ?? 8;
+  const vMicro = verParts[2] ?? 0;
   const vRev = verParts[3] ?? 0;
 
   const vis = ResEdit.Resource.VersionInfo.fromEntries(res.entries);

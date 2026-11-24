@@ -28,6 +28,13 @@ import {
 } from '../services/auth/index.js';
 import { generateQrCodeSvg } from '../services/auth/qrcode.js';
 import { quotePowerShellLiteral } from '../services/agent/installerGenerator.js';
+import {
+  processAgentCheckin,
+  processAgentTaskResult,
+  type AgentCheckinPayload,
+  type AgentTaskResultPayload
+} from '../services/agent/checkinProcessor.js';
+import { agentSocketHub } from '../services/agent/socketHub.js';
 import { handleAgentCheckInOrWake } from '../services/offboarding/index.js';
 import { meshBridge } from '../services/meshcentral/index.js';
 import {
@@ -35,6 +42,7 @@ import {
   resolveEffectiveDevicePolicy,
   syncTicketWithExternalPsas
 } from '../services/policy/index.js';
+import { addItflowTicketNote, getItflowRuntimeConfig } from '../services/itflow/index.js';
 import {
   runScheduledAutomationNow,
   computeNextCronRunIso,
@@ -224,40 +232,7 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       return reply.status(429).send({ error: 'Too many check-in requests', retryAfterSec: rate.retryAfterSec });
     }
 
-    const body = (request.body || {}) as {
-      deviceId?: string;
-      hostname?: string;
-      osType?: string;
-      osVersion?: string;
-      macAddress?: string;
-      serialNumber?: string;
-      cpuUsage?: number;
-      ramUsedGb?: number;
-      ramUsage?: number;
-      ramTotalGb?: number;
-      diskFreeGb?: number;
-      diskUsage?: number;
-      diskTotalGb?: number;
-      edrStatus?: string;
-      avStatus?: string;
-      bitlockerStatus?: string;
-      bitlockerEncrypted?: boolean;
-      bitlockerRecoveryKey?: string;
-      loggedInUser?: string;
-      rebootRequired?: boolean;
-      rebootPending?: boolean;
-      uptimeSeconds?: number;
-      netRxMbps?: number;
-      netTxMbps?: number;
-      networkMbps?: number;
-      hardwareDetails?: Record<string, any>;
-      companionVersion?: string;
-      ipAddress?: string;
-      gatewayIp?: string;
-      interfaceName?: string;
-      arpNeighbors?: Array<{ ip: string; mac: string }>;
-      installedSoftware?: Array<{ name: string; version: string; publisher?: string }>;
-    };
+    const body = (request.body || {}) as AgentCheckinPayload;
 
     const auth = authenticateAgentRequest(request, body.deviceId, body.hostname);
     if (!auth.valid) {
@@ -291,297 +266,7 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       return reply.status(401).send({ error: 'Invalid or unrecognized x-vitrine-agent-token' });
     }
 
-    const dev = auth.device;
-    const encryptedRecoveryKey =
-      body.bitlockerRecoveryKey && String(body.bitlockerRecoveryKey).trim().length >= 8
-        ? encryptVaultSecret(String(body.bitlockerRecoveryKey).trim())
-        : null;
-
-    const reqIp = String(request.ip || '').trim();
-    const reqIsLoopback = reqIp === '127.0.0.1' || reqIp === '::1' || reqIp === '::ffff:127.0.0.1';
-    const rawIp = body.ipAddress != null ? String(body.ipAddress).trim() : '';
-    const reportedIsLoopback = rawIp === '127.0.0.1' || rawIp === '::1' || rawIp.toLowerCase() === 'localhost';
-    const safeCheckinIp = rawIp && (!reportedIsLoopback || reqIsLoopback) ? rawIp : null;
-
-    const effRamTotal =
-      body.ramTotalGb != null && Number.isFinite(Number(body.ramTotalGb))
-        ? Number(body.ramTotalGb)
-        : Number(dev.ram_total_gb || 0);
-    const resolvedRamUsedGb =
-      body.ramUsedGb != null && Number.isFinite(Number(body.ramUsedGb))
-        ? Number(body.ramUsedGb)
-        : body.ramUsage != null && Number.isFinite(Number(body.ramUsage)) && effRamTotal > 0
-          ? Number(((Number(body.ramUsage) / 100) * effRamTotal).toFixed(2))
-          : null;
-
-    const effDiskTotal =
-      body.diskTotalGb != null && Number.isFinite(Number(body.diskTotalGb))
-        ? Number(body.diskTotalGb)
-        : Number(dev.disk_total_gb || 0);
-    const resolvedDiskFreeGb =
-      body.diskFreeGb != null && Number.isFinite(Number(body.diskFreeGb))
-        ? Number(body.diskFreeGb)
-        : body.diskUsage != null && Number.isFinite(Number(body.diskUsage)) && effDiskTotal > 0
-          ? Number((((100 - Math.min(100, Math.max(0, Number(body.diskUsage)))) / 100) * effDiskTotal).toFixed(2))
-          : null;
-
-    const resolvedEdr = body.edrStatus ?? body.avStatus ?? null;
-    const resolvedBitlocker =
-      body.bitlockerStatus ??
-      (body.bitlockerEncrypted !== undefined
-        ? body.bitlockerEncrypted
-          ? dev.os_type === 'macos'
-            ? 'FileVault Enabled'
-            : dev.os_type === 'linux'
-              ? 'LUKS Encrypted'
-              : 'Encrypted (AES-256)'
-          : 'Unencrypted'
-        : null);
-
-    const rawReboot = body.rebootRequired !== undefined ? body.rebootRequired : body.rebootPending;
-    const rebootInt = rawReboot != null ? (rawReboot ? 1 : 0) : null;
-
-    const hwSys = body.hardwareDetails?.system;
-    const hwCpu = body.hardwareDetails?.cpu;
-    const hwNet = body.hardwareDetails?.network;
-    const resolvedSerial = String(hwSys?.serialNumber || body.serialNumber || '').trim();
-    const resolvedManufacturer = String(hwSys?.manufacturer || '').trim();
-    const resolvedModel = String(hwSys?.model || '').trim();
-    const resolvedBiosVer = String(hwSys?.biosVersion || '').trim();
-    const resolvedCpuModel = String(hwCpu?.model || '').trim();
-    const resolvedCpuCores =
-      hwCpu?.logicalCores != null && Number.isFinite(Number(hwCpu.logicalCores)) && Number(hwCpu.logicalCores) > 0
-        ? Math.floor(Number(hwCpu.logicalCores))
-        : null;
-    const resolvedMac = String(body.macAddress || hwNet?.primaryMac || '').trim();
-
-    db.prepare(`
-      UPDATE devices SET
-        status = CASE WHEN quarantined = 1 THEN 'isolated' ELSE 'online' END,
-        companion_installed = 1,
-        companion_version = COALESCE(?, companion_version),
-        os_version = COALESCE(?, os_version),
-        ip_address = COALESCE(?, ip_address),
-        mac_address = COALESCE(NULLIF(?, ''), mac_address),
-        serial_number = COALESCE(NULLIF(?, ''), serial_number),
-        manufacturer = COALESCE(NULLIF(?, ''), manufacturer),
-        model = COALESCE(NULLIF(?, ''), model),
-        bios_version = COALESCE(NULLIF(?, ''), bios_version),
-        cpu_model = COALESCE(NULLIF(?, ''), cpu_model),
-        cpu_cores = COALESCE(?, cpu_cores),
-        cpu_usage = COALESCE(?, cpu_usage),
-        ram_used_gb = COALESCE(?, ram_used_gb),
-        ram_total_gb = COALESCE(?, ram_total_gb),
-        disk_free_gb = COALESCE(?, disk_free_gb),
-        disk_total_gb = COALESCE(?, disk_total_gb),
-        edr_status = COALESCE(?, edr_status),
-        bitlocker_status = COALESCE(?, bitlocker_status),
-        bitlocker_key = COALESCE(?, bitlocker_key),
-        logged_in_user = COALESCE(?, logged_in_user),
-        reboot_required = COALESCE(?, reboot_required),
-        pending_reboot = COALESCE(?, pending_reboot),
-        pending_reboot_since = CASE
-          WHEN ? = 1 THEN COALESCE(pending_reboot_since, CURRENT_TIMESTAMP)
-          WHEN ? = 0 THEN NULL
-          ELSE pending_reboot_since
-        END,
-        uptime_seconds = COALESCE(?, uptime_seconds),
-        last_seen = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(
-      body.companionVersion || '2.7.0',
-      body.osVersion ?? null,
-      safeCheckinIp,
-      resolvedMac,
-      resolvedSerial,
-      resolvedManufacturer,
-      resolvedModel,
-      resolvedBiosVer,
-      resolvedCpuModel,
-      resolvedCpuCores,
-      body.cpuUsage != null && Number.isFinite(Number(body.cpuUsage)) ? Number(body.cpuUsage) : null,
-      resolvedRamUsedGb,
-      body.ramTotalGb != null && Number.isFinite(Number(body.ramTotalGb)) ? Number(body.ramTotalGb) : null,
-      resolvedDiskFreeGb,
-      body.diskTotalGb != null && Number.isFinite(Number(body.diskTotalGb)) ? Number(body.diskTotalGb) : null,
-      resolvedEdr,
-      resolvedBitlocker,
-      encryptedRecoveryKey,
-      body.loggedInUser ?? null,
-      rebootInt,
-      rebootInt,
-      rebootInt,
-      rebootInt,
-      body.uptimeSeconds != null && Number.isFinite(Number(body.uptimeSeconds)) ? Math.floor(Number(body.uptimeSeconds)) : null,
-      dev.id
-    );
-
-    const parsedNetRx =
-      body.netRxMbps != null && Number.isFinite(Number(body.netRxMbps))
-        ? Number(body.netRxMbps)
-        : body.networkMbps != null && Number.isFinite(Number(body.networkMbps))
-          ? Number(body.networkMbps)
-          : null;
-    const parsedNetTx =
-      body.netTxMbps != null && Number.isFinite(Number(body.netTxMbps))
-        ? Number(body.netTxMbps)
-        : null;
-
-    recordDeviceTelemetrySample(dev.id, {
-      cpuUsage: body.cpuUsage != null && Number.isFinite(Number(body.cpuUsage)) ? Number(body.cpuUsage) : null,
-      ramUsedGb: resolvedRamUsedGb,
-      ramTotalGb: body.ramTotalGb != null && Number.isFinite(Number(body.ramTotalGb)) ? Number(body.ramTotalGb) : null,
-      diskFreeGb: resolvedDiskFreeGb,
-      diskTotalGb: body.diskTotalGb != null && Number.isFinite(Number(body.diskTotalGb)) ? Number(body.diskTotalGb) : null,
-      netRxMbps: parsedNetRx,
-      netTxMbps: parsedNetTx,
-      uptimeSeconds:
-        body.uptimeSeconds != null && Number.isFinite(Number(body.uptimeSeconds))
-          ? Math.floor(Number(body.uptimeSeconds))
-          : null,
-      loggedInUser: body.loggedInUser ?? null,
-      hardwareDetails: body.hardwareDetails ?? null
-    });
-
-    if (body.gatewayIp || safeCheckinIp) {
-      const lastNet = db
-        .prepare('SELECT local_ip, gateway_ip FROM network_history WHERE device_id = ? ORDER BY connected_at DESC LIMIT 1')
-        .get(dev.id) as { local_ip?: string; gateway_ip?: string } | undefined;
-      const curIp = safeCheckinIp || dev.ip_address;
-      if (!lastNet || lastNet.local_ip !== curIp || (body.gatewayIp && lastNet.gateway_ip !== body.gatewayIp)) {
-        db.prepare(`
-          INSERT INTO network_history (id, device_id, interface_name, local_ip, gateway_ip, public_ip)
-          VALUES (?, ?, ?, ?, ?, ?)
-        `).run(
-          `nh-${crypto.randomUUID().slice(0, 8)}`,
-          dev.id,
-          body.interfaceName || 'primary',
-          curIp,
-          body.gatewayIp || '',
-          request.ip || ''
-        );
-      }
-    }
-
-    if (Array.isArray(body.installedSoftware) && body.installedSoftware.length > 0) {
-      const syncTx = db.transaction((items: Array<{ name: string; version: string; publisher?: string }>) => {
-        for (const sw of items.slice(0, 300)) {
-          if (!sw.name) continue;
-          const existing = db
-            .prepare('SELECT id FROM software_inventory WHERE device_id = ? AND LOWER(name) = LOWER(?) LIMIT 1')
-            .get(dev.id, sw.name) as { id: string } | undefined;
-          if (existing) {
-            db.prepare('UPDATE software_inventory SET version = ?, publisher = COALESCE(?, publisher) WHERE id = ?').run(
-              sw.version || 'unknown',
-              sw.publisher || null,
-              existing.id
-            );
-          } else {
-            db.prepare(`
-              INSERT INTO software_inventory (id, device_id, name, version, publisher, install_date)
-              VALUES (?, ?, ?, ?, ?, date('now'))
-            `).run(
-              `sw-${crypto.randomUUID().slice(0, 8)}`,
-              dev.id,
-              sw.name,
-              sw.version || 'unknown',
-              sw.publisher || 'Installed Package'
-            );
-          }
-        }
-      });
-      syncTx(body.installedSoftware);
-    }
-
-    const lifecycle = handleAgentCheckInOrWake(dev.id, 'wake_checkin');
-
-    // Fetch queued tasks for this endpoint and mark them dispatched
-    const pendingTasks = db
-      .prepare(`
-        SELECT id, task_type, payload_json, created_at
-        FROM agent_tasks
-        WHERE device_id = ? AND status = 'queued'
-        ORDER BY created_at ASC
-        LIMIT 10
-      `)
-      .all(dev.id) as any[];
-
-    if (pendingTasks.length > 0) {
-      const markDispatched = db.prepare(
-        "UPDATE agent_tasks SET status = 'dispatched', dispatched_at = CURRENT_TIMESTAMP WHERE id = ?"
-      );
-      for (const t of pendingTasks) {
-        markDispatched.run(t.id);
-      }
-    }
-
-    // Also include recent unread technician chat messages for the Tray helper
-    const unreadChats = db
-      .prepare(`
-        SELECT id, sender, message, created_at
-        FROM chat_messages
-        WHERE device_id = ? AND sender_role = 'technician' AND read_status = 0
-        ORDER BY created_at ASC
-        LIMIT 10
-      `)
-      .all(dev.id) as any[];
-    if (unreadChats.length > 0) {
-      db.prepare("UPDATE chat_messages SET read_status = 1 WHERE device_id = ? AND sender_role = 'technician'").run(dev.id);
-    }
-
-    let trayConfig: Record<string, unknown> | null = null;
-    try {
-      const effPolicy = resolveEffectiveDevicePolicy(dev.id);
-      trayConfig = {
-        brandName: effPolicy.trayBrandName,
-        iconUrl: effPolicy.trayIconUrl,
-        themeMode: effPolicy.trayThemeMode,
-        enabled: effPolicy.trayEnabled,
-        tooltip: effPolicy.trayTooltip,
-        supportUrl: effPolicy.traySupportUrl,
-        supportPhone: effPolicy.traySupportPhone,
-        supportEmail: effPolicy.traySupportEmail,
-        menuItems: effPolicy.trayMenuItems
-      };
-    } catch {
-      trayConfig = null;
-    }
-
-    const signingRow =
-      pendingTasks.length > 0
-        ? ((db.prepare('SELECT code_signing_enabled FROM settings WHERE id = 1').get() || {}) as {
-            code_signing_enabled?: number;
-          })
-        : null;
-    const isSigningEnabled = Boolean(signingRow?.code_signing_enabled);
-
-    return {
-      success: true,
-      deviceId: dev.id,
-      lifecycle,
-      trayConfig,
-      tasks: pendingTasks.map((t) => {
-        const payload = safeJsonParse<Record<string, any>>(t.payload_json, {});
-        if (
-          !isSigningEnabled &&
-          !payload.executionPolicy &&
-          ['script', 'run_script', 'patch_scan', 'patch_install', 'software_deploy', 'backup_job'].includes(
-            String(t.task_type || '')
-          )
-        ) {
-          payload.executionPolicy = 'Bypass';
-        }
-        return {
-          id: t.id,
-          type: t.task_type,
-          task_type: t.task_type,
-          payload,
-          payload_json: JSON.stringify(payload)
-        };
-      }),
-      unreadChats,
-      timestamp: new Date().toISOString()
-    };
+    return processAgentCheckin(auth.device, body, request.ip || '', 'http');
   });
 
   server.post('/api/agent/tasks/:id/result', async (request, reply) => {
@@ -601,92 +286,8 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       return reply.status(401).send({ error: 'Invalid x-vitrine-agent-token' });
     }
 
-    const body = (request.body || {}) as {
-      exitCode?: number;
-      stdout?: string;
-      stderr?: string;
-      output?: string;
-      status?: 'completed' | 'failed';
-      durationMs?: number;
-    };
-
-    const exitCode = Number(body.exitCode ?? 0);
-    const finalStatus = body.status || (exitCode === 0 ? 'completed' : 'failed');
-    const stdout = String(body.stdout ?? body.output ?? '');
-    const stderr = String(body.stderr || '');
-
-    db.prepare(`
-      UPDATE agent_tasks
-      SET status = ?,
-          exit_code = ?,
-          stdout = ?,
-          stderr = ?,
-          result_json = ?,
-          completed_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `).run(
-      finalStatus,
-      exitCode,
-      stdout,
-      stderr,
-      JSON.stringify({ stdout, stderr, exitCode, durationMs: body.durationMs || 0 }),
-      id
-    );
-
-    const payload = safeJsonParse<Record<string, any>>(task.payload_json, {});
-    if (payload.executionId) {
-      db.prepare(`
-        UPDATE script_executions
-        SET status = ?,
-            exit_code = ?,
-            output = ?,
-            stdout = ?,
-            stderr = ?,
-            duration_ms = COALESCE(?, duration_ms)
-        WHERE id = ?
-      `).run(
-        exitCode === 0 ? 'Completed (Companion)' : 'Failed',
-        exitCode,
-        [stdout, stderr].filter(Boolean).join('\n'),
-        stdout,
-        stderr,
-        body.durationMs || null,
-        payload.executionId
-      );
-    }
-
-    if (payload.deploymentId) {
-      db.prepare(`
-        UPDATE software_deployments
-        SET status = ?,
-            exit_code = ?,
-            output = ?,
-            completed_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `).run(
-        exitCode === 0 ? 'installed' : 'failed',
-        exitCode,
-        [stdout, stderr].filter(Boolean).join('\n'),
-        payload.deploymentId
-      );
-    }
-
-    const backupJobId = payload.backupJobId || payload.jobId;
-    if (backupJobId) {
-      const combinedOut = [stdout, stderr].filter(Boolean).join('\n');
-      const bytesMatch = stdout.trim().match(/(\d+)\s*$/);
-      const parsedBytes = bytesMatch ? Number(bytesMatch[1]) : null;
-      db.prepare(`
-        UPDATE device_backup_jobs
-        SET status = ?,
-            bytes_processed = COALESCE(?, bytes_processed),
-            output = ?,
-            completed_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `).run(exitCode === 0 ? 'completed' : 'failed', parsedBytes, combinedOut, backupJobId);
-    }
-
-    return { success: true, taskId: id, status: finalStatus };
+    const body = (request.body || {}) as AgentTaskResultPayload;
+    return processAgentTaskResult(task, body);
   });
 
   // Allow end-user System Tray helper to send chat reply or quick ticket!
@@ -1334,10 +935,12 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
         }
       } else if (!execRes.live && dev.companion_installed) {
         const taskId = `task-${crypto.randomUUID().slice(0, 10)}`;
+        const payloadStr = JSON.stringify({ deploymentId: depId, language: shell, shell, code: cmd, runAs: 'system' });
         db.prepare(`
           INSERT INTO agent_tasks (id, device_id, task_type, payload_json, status)
           VALUES (?, ?, 'script', ?, 'queued')
-        `).run(taskId, dev.id, JSON.stringify({ deploymentId: depId, language: shell, shell, code: cmd, runAs: 'system' }));
+        `).run(taskId, dev.id, payloadStr);
+        agentSocketHub.dispatchTaskIfConnected(dev.id, { id: taskId, task_type: 'script', payload_json: payloadStr });
       }
 
       db.prepare(`
@@ -2106,6 +1709,19 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       body.notes || ''
     );
 
+    try {
+      const itflowCfg = getItflowRuntimeConfig();
+      if (itflowCfg.enabled && itflowCfg.options.syncTimeEntries && tkt.external_provider === 'itflow' && tkt.external_ticket_id) {
+        await addItflowTicketNote({
+          localTicketId: id,
+          author: getActorUsername(request),
+          body: `[Time Entry: ${mins}m ${body.billable !== false ? 'Billable' : 'Non-Billable'} — ${body.work_type || 'Remote Engineering'}]\n${body.notes || 'Work logged in Vitrine RMM.'}`,
+          noteType: 'Internal',
+          timeWorkedSec: mins * 60
+        });
+      }
+    } catch {}
+
     return {
       success: true,
       entry: db.prepare('SELECT * FROM psa_time_entries WHERE id = ?').get(entryId)
@@ -2538,10 +2154,12 @@ export async function registerParityRoutes(server: FastifyInstance): Promise<voi
       }
     } else if (!execRes.live && dev.companion_installed) {
       const taskId = `task-${crypto.randomUUID().slice(0, 10)}`;
+      const payloadStr = JSON.stringify({ backupJobId: jobId, language: shell, shell, code: cmd, runAs: 'system' });
       db.prepare(`
         INSERT INTO agent_tasks (id, device_id, task_type, payload_json, status)
         VALUES (?, ?, 'script', ?, 'queued')
-      `).run(taskId, dev.id, JSON.stringify({ backupJobId: jobId, language: shell, shell, code: cmd, runAs: 'system' }));
+      `).run(taskId, dev.id, payloadStr);
+      agentSocketHub.dispatchTaskIfConnected(dev.id, { id: taskId, task_type: 'script', payload_json: payloadStr });
     }
 
     if (bpol?.id && status !== 'failed') {

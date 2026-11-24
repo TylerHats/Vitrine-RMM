@@ -36,9 +36,10 @@ import {
   Download,
   BarChart3,
   Server,
-  ChevronDown
+  ChevronDown,
+  ExternalLink
 } from 'lucide-react';
-import { AuthUser, Device, CustomFieldDefinition, OemWarranty, ChatMessage, HardwareHistoryItem, NetworkHistoryItem, SoftwareItem, DeviceNote, SessionRecording, WakeOnLanResult, DeviceBackupJob, DocumentationArticle, TelemetryHistoryResponse, DeviceHardwareDetails, Settings } from '../types/index.js';
+import { AuthUser, Device, DeviceItflowStatus, CustomFieldDefinition, OemWarranty, ChatMessage, HardwareHistoryItem, NetworkHistoryItem, SoftwareItem, DeviceNote, SessionRecording, WakeOnLanResult, DeviceBackupJob, DocumentationArticle, TelemetryHistoryResponse, DeviceHardwareDetails, Settings } from '../types/index.js';
 import {
   fetchDeviceCustomFields,
   revealDeviceSecretCustomFields,
@@ -77,7 +78,9 @@ import {
   fetchDeviceTelemetryHistory,
   sampleDeviceTelemetryNow,
   fetchDeviceHardwareDetails,
-  updateDeviceRole
+  updateDeviceRole,
+  syncSingleDeviceToItflow,
+  fetchDeviceDetail
 } from '../services/api.js';
 import { MfaChallengeModal } from '../components/MfaChallengeModal.js';
 import { TelemetryChartCard } from '../components/TelemetryCharts.js';
@@ -259,6 +262,9 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
   const [securityActionOutput, setSecurityActionOutput] = useState<string | null>(null);
   const [runningSecAction, setRunningSecAction] = useState<string | null>(null);
   const [linkedDocs, setLinkedDocs] = useState<DocumentationArticle[]>([]);
+  const [itflowInfo, setItflowInfo] = useState<DeviceItflowStatus | null>(device.itflow || null);
+  const [syncingItflow, setSyncingItflow] = useState(false);
+  const [itflowNotice, setItflowNotice] = useState<string | null>(null);
 
   useEffect(() => {
     setIsMaintenanceActive(Boolean(device.maintenance_active));
@@ -328,6 +334,13 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
 
   useEffect(() => {
     setTelemetryNotice(null);
+    setItflowNotice(null);
+    setItflowInfo(device.itflow || null);
+    fetchDeviceDetail(device.id)
+      .then((full) => {
+        if (full?.itflow) setItflowInfo(full.itflow);
+      })
+      .catch(() => {});
     fetchWarranty(device.id).then((w) => setWarranty(w)).catch(() => setWarranty(null));
 
     fetchDeviceCustomFields(device.id)
@@ -2379,6 +2392,127 @@ export const DeviceDetailView: React.FC<DeviceDetailViewProps> = ({
                 )}
               </div>
             </div>
+          </div>
+
+          {/* ITFlow Asset Synchronization Card */}
+          <div className="glass-card" id="device-itflow-sync-card">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.85rem', marginBottom: '1rem' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem', flexWrap: 'wrap' }}>
+                <Server size={20} color="var(--primary)" />
+                <h3 style={{ fontSize: '1.1rem', fontWeight: 600 }}>ITFlow Asset Sync</h3>
+                {itflowInfo ? (
+                  !itflowInfo.enabled ? (
+                    <span className="status-pill status-reboot">Integration Disabled</span>
+                  ) : !itflowInfo.mappingEnabled ? (
+                    <span className="status-pill status-reboot">Client Sync Disabled</span>
+                  ) : itflowInfo.lastError ? (
+                    <span className="status-pill status-offline">Sync Error</span>
+                  ) : itflowInfo.itflowAssetId ? (
+                    <span className="status-pill status-online">Synced (#{itflowInfo.itflowAssetId})</span>
+                  ) : (
+                    <span className="status-pill status-reboot">Pending Initial Sync</span>
+                  )
+                ) : (
+                  <span className="status-pill status-reboot">Checking...</span>
+                )}
+              </div>
+              <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                {itflowInfo?.assetUrl && (
+                  <a
+                    href={itflowInfo.assetUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="btn-glass"
+                    style={{ fontSize: '0.78rem', textDecoration: 'none' }}
+                  >
+                    <ExternalLink size={13} /> Open in ITFlow
+                  </a>
+                )}
+                {canMutate && (
+                  <button
+                    type="button"
+                    className="btn-glass btn-primary"
+                    disabled={syncingItflow || !itflowInfo?.enabled || !itflowInfo?.mappingEnabled}
+                    onClick={async () => {
+                      setSyncingItflow(true);
+                      setItflowNotice(null);
+                      try {
+                        const res = await syncSingleDeviceToItflow(device.id);
+                        if (res.itflow) setItflowInfo(res.itflow);
+                        if (res.success) {
+                          setItflowNotice(`✓ Asset ${res.action || 'synced'} in ITFlow${res.assetId ? ` (Asset #${res.assetId})` : ''}.`);
+                        } else {
+                          setItflowNotice(`⚠ ${res.error || 'Failed to sync asset to ITFlow.'}`);
+                        }
+                      } finally {
+                        setSyncingItflow(false);
+                      }
+                    }}
+                    style={{ fontSize: '0.78rem' }}
+                  >
+                    <RotateCw size={13} className={syncingItflow ? 'animate-spin' : ''} />
+                    <span>{syncingItflow ? 'Syncing Asset...' : 'Sync Asset to ITFlow'}</span>
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {itflowNotice && (
+              <div
+                style={{
+                  marginBottom: '0.85rem',
+                  padding: '0.55rem 0.8rem',
+                  borderRadius: '8px',
+                  fontSize: '0.8rem',
+                  background: itflowNotice.startsWith('⚠') ? 'rgba(239, 68, 68, 0.14)' : 'rgba(16, 185, 129, 0.12)',
+                  color: itflowNotice.startsWith('⚠') ? '#ef4444' : '#059669',
+                  border: `1px solid ${itflowNotice.startsWith('⚠') ? 'rgba(239, 68, 68, 0.3)' : 'rgba(16, 185, 129, 0.3)'}`
+                }}
+              >
+                {itflowNotice}
+              </div>
+            )}
+
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '1rem', fontSize: '0.84rem' }}>
+              <div>
+                <span style={{ color: 'var(--text-dim)', fontSize: '0.74rem' }}>TARGET ITFLOW CLIENT</span>
+                <div style={{ fontWeight: 600 }}>
+                  {itflowInfo?.itflowClientName
+                    ? `${itflowInfo.itflowClientName} (#${itflowInfo.itflowClientId})`
+                    : itflowInfo?.itflowClientId
+                    ? `Client #${itflowInfo.itflowClientId}`
+                    : 'Unmapped'}
+                </div>
+              </div>
+              <div>
+                <span style={{ color: 'var(--text-dim)', fontSize: '0.74rem' }}>ITFLOW ASSET ID</span>
+                <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 600, color: 'var(--primary)' }}>
+                  {itflowInfo?.itflowAssetId ? `#${itflowInfo.itflowAssetId}` : 'Not created yet'}
+                </div>
+              </div>
+              <div>
+                <span style={{ color: 'var(--text-dim)', fontSize: '0.74rem' }}>LAST SYNCED TO ITFLOW</span>
+                <div style={{ fontWeight: 600 }}>
+                  {itflowInfo?.lastSyncedAt ? new Date(itflowInfo.lastSyncedAt).toLocaleString() : 'Never'}
+                </div>
+              </div>
+            </div>
+
+            {itflowInfo?.lastError && (
+              <div
+                style={{
+                  marginTop: '0.85rem',
+                  padding: '0.55rem 0.8rem',
+                  borderRadius: '8px',
+                  fontSize: '0.78rem',
+                  background: 'rgba(239, 68, 68, 0.12)',
+                  color: '#fca5a5',
+                  border: '1px solid rgba(239, 68, 68, 0.3)'
+                }}
+              >
+                Last sync error: {itflowInfo.lastError}
+              </div>
+            )}
           </div>
 
           {/* Security & Cryptographic Identity */}

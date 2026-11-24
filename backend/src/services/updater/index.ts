@@ -99,7 +99,7 @@ function buildBaselineCommits(): CommitInfo[] {
       sha: APP_INSTALLED_COMMIT,
       date: new Date().toISOString(),
       author: 'Tyler Hatfield',
-      message: 'release(v2.7.0): native 6-section UCRT Windows executables, 4-tier icon cropper, QuickSupport branding, and full Windows companion inventory & tray chat parity',
+      message: 'release(v2.8.0): dedicated Devices inventory & NinjaRMM filters, native Linux .deb/.rpm & C++17 POSIX agents, WSS /ws/agent transport & bidirectional ITFlow sync',
       schemaVersion: APP_SCHEMA_VERSION
     }
   ];
@@ -132,16 +132,29 @@ const BASELINE_STABLE_RELEASES: ReleaseInfo[] = [
 - **Atomic Self-Backup & Live SQLite Restore**: \`VACUUM INTO\` consistent database snapshots, optional AES-256-GCM archive encryption, AWS SigV4 S3/B2/R2 offsite sync, and schema compatibility checks.`
   },
   {
+    version: '2.7.0',
+    tag: 'v2.7.0',
+    commitSha: '0af0e42',
+    publishedAt: '2026-11-23T00:00:00Z',
+    schemaVersion: 18,
+    title: 'Vitrine RMM v2.7.0 — Native 6-Section UCRT Windows PE Agents, Custom Icon Cropper & Full Telemetry Parity',
+    releaseNotes: `### Highlights in v2.7.0
+- **Native 6-Section Clang+LLD+UCRT Windows PE Agents**: Rebuilt all 5 Windows executables with clean 6-section MSVC-style PEs and EV Authenticode signing.
+- **4-Tier Custom Icon Cropper & QuickSupport Branding**: Interactive square icon sanitization embedded natively into generated \`.exe\` resources and Linux trays.
+- **Cross-Distro Linux Companion & Theme-Aware Tray Parity**: Debian/Ubuntu, RHEL/Fedora, and Arch/Manjaro parity with live System Light/Dark tracking.`
+  },
+  {
     version: APP_VERSION,
     tag: `v${APP_VERSION}`,
     commitSha: APP_INSTALLED_COMMIT,
     publishedAt: new Date().toISOString(),
     schemaVersion: APP_SCHEMA_VERSION,
-    title: `Vitrine RMM v${APP_VERSION} — Native 6-Section UCRT Windows PE Agents, Custom Icon Cropper & Full Telemetry Parity`,
+    title: `Vitrine RMM v${APP_VERSION} — Dedicated Devices Inventory & Filters, Native Linux .deb/.rpm & POSIX C++ Agents, WSS Transport & Bidirectional ITFlow Sync`,
     releaseNotes: `### Highlights in v${APP_VERSION} (Stable Release)
-- **Native 6-Section Clang+LLD+UCRT Windows PE Agents**: Rebuilt the Windows Installer, Companion Service, Companion Setup, System Tray, and QuickSupport launcher as standalone native C++ executables with clean 6-section MSVC-style PEs and EV Authenticode signing.
-- **4-Tier Custom Icon Cropper & QuickSupport Branding**: Interactive square icon sanitization and per-Client/Site/Role/QuickSupport branding embedded natively into generated \`.exe\` resources and live tray icons.
-- **Full Windows Companion Telemetry & Tray Chat Parity**: Native SMBIOS, CPU, DIMM, volume, adapter, installed software, BitLocker status, and two-way technician-to-tray chat delivery.`
+- **Dedicated Devices Page, Column Sorting & NinjaRMM-Style Filtering**: Separated mass endpoint management from Fleet Dashboard with asc/desc column sorting and searchable \`+ More Filters\` (IPs, Logged-In User, Installed Software, Custom Fields with secret exclusion).
+- **Native Click-to-Run Linux \`.deb\`/\`.rpm\` GUI Packages & Compiled C++17 POSIX Agents**: Branded packages with GTK3 confirmation dialog, Headless Linux Server agent/\`.sh\`, \`x86_64\` & \`arm64\` cross-compilation, and \`curl\`/\`wget\` fallback QuickSupport.
+- **Native WSS \`/ws/agent\` Transport & Automatic HTTP Fallback**: Live bidirectional WebSocket transport across Windows (WinHTTP) and POSIX C++17 agents with live \`rpc_exec\` execution even without MeshCentral.
+- **Broadened Bidirectional ITFlow Integration**: Guided fuzzy-matching Setup Wizard, many-to-one mapping, Move vs Duplicate asset remapping, device-level sync status card, and two-way ticket/notes/reply sync.`
   }
 ];
 
@@ -201,7 +214,7 @@ export class SystemUpdaterService {
               .slice()
               .reverse()
               .map((r: any) => {
-                const tag = String(r.tag_name || 'v2.7.0').trim();
+                const tag = String(r.tag_name || 'v2.8.0').trim();
                 const ver = tag.replace(/^v/i, '');
                 const rawTargetCommitish = String(r.target_commitish || '').trim();
                 const isHexCommitSha = /^[0-9a-f]{7,40}$/i.test(rawTargetCommitish);

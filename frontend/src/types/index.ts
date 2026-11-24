@@ -62,6 +62,13 @@ export interface Device {
   net_tx_mbps?: number;
   uptime_seconds?: number;
   hardware_details_json?: string;
+  public_ip?: string;
+  ws_connected?: number | boolean;
+  agent_transport?: string;
+  agent_binary_variant?: string;
+  pending_patch_count?: number;
+  software_count?: number;
+  tags_json?: string;
   lifecycle_state?: 'active' | 'pending_offboard' | 'archived';
   tenant_lifecycle_state?: 'active' | 'pending_offboard' | 'archived';
   offboard_queued_at?: string | null;
@@ -71,6 +78,18 @@ export interface Device {
   offboard_laps_action_taken?: 'remove_account' | 'disable_account' | 'keep_account_rotate_final' | 'keep_account_as_is' | null;
   resurrected_at?: string | null;
   resurrect_count?: number;
+  itflow?: DeviceItflowStatus;
+}
+
+export interface DeviceItflowStatus {
+  enabled: boolean;
+  mappingEnabled: boolean;
+  itflowClientId: number | null;
+  itflowClientName: string | null;
+  itflowAssetId: number | null;
+  assetUrl: string | null;
+  lastSyncedAt: string | null;
+  lastError: string | null;
 }
 
 export interface Tenant {
@@ -107,6 +126,8 @@ export interface ConditionAlertRule {
   notifyEmail: boolean;
   createPsaTicket: boolean;
   autoResolveTicket: boolean;
+  psaNoteOnUpdate?: boolean;
+  psaNoteType?: 'Internal' | 'Public';
 }
 
 export interface TrayMenuItem {
@@ -400,6 +421,12 @@ export interface Settings {
   backup_offsite_bucket?: string;
   backup_offsite_access_key?: string;
   backup_offsite_secret_key?: string;
+  itflow_enabled?: number | boolean;
+  itflow_setup_completed?: number | boolean;
+  itflow_sync_interval_min?: number;
+  itflow_last_asset_sync_at?: string | null;
+  itflow_last_asset_sync_summary?: string | null;
+  itflow_config_json?: string;
 }
 
 export interface AppNotification {
@@ -1324,4 +1351,129 @@ export interface DeviceHardwareDetails {
     lastSeen: string;
   };
   lastHardwareScanAt?: string | null;
+}
+
+export type DeviceFilterOperator =
+  | 'contains'
+  | 'not_contains'
+  | 'is'
+  | 'is_not'
+  | 'starts_with'
+  | 'ends_with'
+  | 'gt'
+  | 'gte'
+  | 'lt'
+  | 'lte'
+  | 'is_empty'
+  | 'is_not_empty';
+
+export interface DeviceFilterRule {
+  id?: string;
+  field: string;
+  operator: DeviceFilterOperator;
+  value: string;
+}
+
+export interface DeviceFilterOptions {
+  roles: string[];
+  osVersions: string[];
+  users: string[];
+  softwareNames: string[];
+  customFields: Array<{
+    key: string;
+    label: string;
+    field_type: string;
+    options?: string | null;
+  }>;
+}
+
+export type DeviceSortKey =
+  | 'status'
+  | 'hostname'
+  | 'device_role'
+  | 'tenant_name'
+  | 'site_name'
+  | 'logged_in_user'
+  | 'ip_address'
+  | 'public_ip'
+  | 'os_version'
+  | 'cpu_usage'
+  | 'ram_used_gb'
+  | 'edr_status'
+  | 'last_seen';
+
+export interface DeviceQueryRequest {
+  tenantId?: string;
+  siteId?: string;
+  deviceRole?: string;
+  status?: string;
+  lifecycleState?: string;
+  search?: string;
+  smartGroupId?: string;
+  combinator?: 'AND' | 'OR';
+  filters?: Array<{ field: string; operator: string; value: string }>;
+  sortBy?: DeviceSortKey;
+  sortDir?: 'asc' | 'desc';
+}
+
+export interface DevicesPresetFilter {
+  tenantId?: string;
+  siteId?: string;
+  deviceRole?: string;
+  status?: string;
+  smartGroup?: string;
+  lifecycleView?: 'active' | 'pending_offboard' | 'archived';
+  extraFilter?: DeviceFilterRule;
+}
+
+export interface PsaTicketNote {
+  id: string;
+  ticket_id: string;
+  author: string;
+  note_type: 'Internal' | 'Public' | string;
+  body: string;
+  time_worked_sec: number;
+  synced_external: number | boolean;
+  external_reply_id?: string | null;
+  created_at: string;
+}
+
+export interface ItflowClientRecord {
+  client_id: number;
+  client_name: string;
+  client_type?: string;
+  client_website?: string;
+  client_notes?: string;
+  primary_location_name?: string;
+  primary_contact_email?: string;
+}
+
+export interface ItflowLocationRecord {
+  location_id: number;
+  location_name: string;
+  location_client_id: number;
+  location_address?: string;
+  location_city?: string;
+  location_state?: string;
+  location_zip?: string;
+  location_primary?: number;
+}
+
+export interface ItflowTenantMappingSuggestion {
+  tenant_id: string;
+  tenant_name: string;
+  tenant_contact_email?: string;
+  device_count: number;
+  sites: Array<{ id: string; name: string }>;
+  existing_mapping: {
+    itflow_client_id: number | null;
+    itflow_client_name: string | null;
+    itflow_default_location_id: number | null;
+    sync_enabled: boolean;
+    synced_asset_count: number;
+  } | null;
+  suggested_client_id: number | null;
+  suggested_client_name: string | null;
+  confidence: number;
+  match_reason: string;
 }

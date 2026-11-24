@@ -2,6 +2,12 @@ import crypto from 'crypto';
 import { db } from '../../db/index.js';
 import { maskSecretValue, decryptVaultSecret, safeOutboundFetch } from '../vault/index.js';
 import { sendAlertEmailUsingStoredSettings } from '../smtp/index.js';
+import {
+  getItflowRuntimeConfig,
+  createItflowTicket,
+  updateItflowTicket,
+  addItflowTicketNote
+} from '../itflow/index.js';
 
 export interface ConditionAlertRule {
   conditionId: string;
@@ -15,6 +21,8 @@ export interface ConditionAlertRule {
   notifyEmail: boolean;
   createPsaTicket: boolean;
   autoResolveTicket: boolean;
+  psaNoteOnUpdate?: boolean;
+  psaNoteType?: 'Internal' | 'Public';
 }
 
 export function getDefaultConditionAlertRules(tier?: string, targetId?: string | null): ConditionAlertRule[] {
@@ -203,7 +211,11 @@ export function parsePolicyAlertRules(
   tier?: string,
   targetId?: string | null
 ): ConditionAlertRule[] {
-  const defaults = getDefaultConditionAlertRules(tier, targetId);
+  const defaults = getDefaultConditionAlertRules(tier, targetId).map((r) => ({
+    ...r,
+    psaNoteOnUpdate: r.psaNoteOnUpdate ?? true,
+    psaNoteType: r.psaNoteType ?? ('Internal' as const)
+  }));
   if (!rawJson) return defaults;
   try {
     const parsed = JSON.parse(rawJson);
@@ -218,16 +230,21 @@ export function parsePolicyAlertRules(
 }
 
 function mergeAlertRules(baseRules: ConditionAlertRule[], overrideJson?: string | null): ConditionAlertRule[] {
-  if (!overrideJson) return baseRules;
+  const normalizedBase = baseRules.map((r) => ({
+    ...r,
+    psaNoteOnUpdate: r.psaNoteOnUpdate ?? true,
+    psaNoteType: r.psaNoteType ?? ('Internal' as const)
+  }));
+  if (!overrideJson) return normalizedBase;
   try {
     const parsed = JSON.parse(overrideJson);
-    if (!Array.isArray(parsed)) return baseRules;
-    return baseRules.map((rule) => {
+    if (!Array.isArray(parsed)) return normalizedBase;
+    return normalizedBase.map((rule) => {
       const override = parsed.find((o: any) => o.conditionId === rule.conditionId);
       return override ? { ...rule, ...override } : rule;
     });
   } catch {
-    return baseRules;
+    return normalizedBase;
   }
 }
 
@@ -1048,30 +1065,56 @@ export async function syncTicketWithExternalPsas(ticket: {
   clientName: string;
   priority: string;
   details?: string;
+  deviceId?: string | null;
+  tenantId?: string | null;
 }): Promise<void> {
   const detailsText =
     ticket.details ||
     `Created automatically by Vitrine RMM Condition Engine (${ticket.ticketNumber}) for client ${ticket.clientName}.`;
 
-  // 1. Legacy Settings ITFlow Connector
-  try {
-    const settings = db.prepare('SELECT itflow_url, itflow_api_key FROM settings WHERE id = 1').get() as any;
-    const apiKey = decryptVaultSecret(settings?.itflow_api_key);
-    if (settings?.itflow_url && apiKey && !settings.itflow_url.includes('itflow.internal')) {
-      await safeOutboundFetch(`${settings.itflow_url.replace(/\/$/, '')}/tickets/create.php`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          api_key: apiKey,
-          ticket_subject: ticket.title,
-          ticket_priority: ticket.priority,
-          ticket_details: detailsText
-        }),
-        timeoutMs: 5000,
-        safety: { allowLoopback: true, allowPrivateLan: true }
-      });
-    }
-  } catch {}
+  // 1. Unified ITFlow Service Connector (client/asset-linked) or fallback legacy ITFlow settings connector
+  const itflowCfg = getItflowRuntimeConfig();
+  let handledByUnifiedItflow = false;
+  if (itflowCfg.enabled && ticket.localTicketId) {
+    try {
+      const existingTkt = db
+        .prepare('SELECT external_provider, external_ticket_id FROM psa_tickets WHERE id = ?')
+        .get(ticket.localTicketId) as { external_provider?: string; external_ticket_id?: string } | undefined;
+      if (existingTkt?.external_provider === 'itflow' && existingTkt?.external_ticket_id) {
+        handledByUnifiedItflow = true;
+      } else {
+        const res = await createItflowTicket({
+          localTicketId: ticket.localTicketId,
+          tenantId: ticket.tenantId,
+          deviceId: ticket.deviceId,
+          clientName: ticket.clientName,
+          subject: ticket.title,
+          details: detailsText,
+          priority: ticket.priority
+        });
+        if (res.ok) handledByUnifiedItflow = true;
+      }
+    } catch {}
+  } else {
+    try {
+      const settings = db.prepare('SELECT itflow_url, itflow_api_key FROM settings WHERE id = 1').get() as any;
+      const apiKey = decryptVaultSecret(settings?.itflow_api_key);
+      if (settings?.itflow_url && apiKey && !settings.itflow_url.includes('itflow.internal')) {
+        await safeOutboundFetch(`${settings.itflow_url.replace(/\/$/, '')}/tickets/create.php`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            api_key: apiKey,
+            ticket_subject: ticket.title,
+            ticket_priority: ticket.priority,
+            ticket_details: detailsText
+          }),
+          timeoutMs: 5000,
+          safety: { allowLoopback: true, allowPrivateLan: true }
+        });
+      }
+    } catch {}
+  }
 
   // 2. Multi-PSA Integrations Table (`psa_integrations`)
   let integrations: any[] = [];
@@ -1088,6 +1131,9 @@ export async function syncTicketWithExternalPsas(ticket: {
     if (!baseUrl || (!apiKey && !clientSecret)) continue;
 
     const provider = String(psa.provider || '').toLowerCase();
+    if (provider === 'itflow' && handledByUnifiedItflow) {
+      continue;
+    }
     try {
       let endpoint = `${baseUrl}/api/tickets`;
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -1262,19 +1308,47 @@ export async function evaluateFleetAlertConditions(): Promise<{
     // 2. Scoped PSA ticket auto-resolution (strictly scoped by device_id or client_name + escaped LIKE!)
     if (!rule.autoResolveTicket) return;
     const escapedPrefix = escapeSqlLikePrefix(`[${rule.label}] ${entityName}:`);
+    const openTicketsToResolve = (isAppliance
+      ? db
+          .prepare(
+            "SELECT id, external_provider, external_ticket_id FROM psa_tickets WHERE status != 'Resolved' AND status != 'Closed' AND client_name = ? AND title LIKE ? ESCAPE '\\'"
+          )
+          .all(clientName || 'Global MSP', `${escapedPrefix}%`)
+      : db
+          .prepare(
+            "SELECT id, external_provider, external_ticket_id FROM psa_tickets WHERE status != 'Resolved' AND status != 'Closed' AND device_id = ? AND title LIKE ? ESCAPE '\\'"
+          )
+          .all(entityId, `${escapedPrefix}%`)) as Array<{
+      id: string;
+      external_provider?: string | null;
+      external_ticket_id?: string | null;
+    }>;
+
     const res = isAppliance
       ? db
           .prepare(
-            "UPDATE psa_tickets SET status = 'Resolved' WHERE status != 'Resolved' AND client_name = ? AND title LIKE ? ESCAPE '\\'"
+            "UPDATE psa_tickets SET status = 'Resolved', updated_at = CURRENT_TIMESTAMP WHERE status != 'Resolved' AND status != 'Closed' AND client_name = ? AND title LIKE ? ESCAPE '\\'"
           )
           .run(clientName || 'Global MSP', `${escapedPrefix}%`)
       : db
           .prepare(
-            "UPDATE psa_tickets SET status = 'Resolved' WHERE status != 'Resolved' AND device_id = ? AND title LIKE ? ESCAPE '\\'"
+            "UPDATE psa_tickets SET status = 'Resolved', updated_at = CURRENT_TIMESTAMP WHERE status != 'Resolved' AND status != 'Closed' AND device_id = ? AND title LIKE ? ESCAPE '\\'"
           )
           .run(entityId, `${escapedPrefix}%`);
     if (res.changes > 0) {
       autoResolvedTickets += res.changes;
+      for (const tkt of openTicketsToResolve) {
+        if (tkt.external_provider === 'itflow' && tkt.external_ticket_id) {
+          await addItflowTicketNote({
+            localTicketId: tkt.id,
+            author: 'Vitrine Condition Engine',
+            body: `Condition cleared automatically on endpoint telemetry recovery (${rule.label} on ${entityName}).`,
+            noteType: rule.psaNoteType === 'Public' ? 'Public' : 'Internal',
+            status: 'Resolved'
+          }).catch(() => {});
+          await updateItflowTicket(tkt.id, { status: 'Resolved' }).catch(() => {});
+        }
+      }
     }
   };
 
@@ -1425,12 +1499,13 @@ export async function evaluateFleetAlertConditions(): Promise<{
         const localTicketId = `tkt-cond-${crypto.randomUUID()}`;
 
         db.prepare(`
-          INSERT INTO psa_tickets (id, ticket_number, title, client_name, device_id, status, priority)
-          VALUES (?, ?, ?, ?, ?, 'Open', ?)
+          INSERT INTO psa_tickets (id, ticket_number, title, description, client_name, device_id, status, priority)
+          VALUES (?, ?, ?, ?, ?, ?, 'Open', ?)
         `).run(
           localTicketId,
           ticketNum,
           fullTitle,
+          detail,
           clientName || 'Global MSP',
           isAppliance ? null : entityId,
           priority
@@ -1444,9 +1519,19 @@ export async function evaluateFleetAlertConditions(): Promise<{
           localTicketId,
           ticketNumber: ticketNum,
           title: fullTitle,
+          details: detail,
           clientName: clientName || 'Global MSP',
-          priority
+          priority,
+          deviceId: isAppliance ? null : entityId,
+          tenantId: resolvedTenantId
         });
+      } else if (!isDeduplicated && rule.psaNoteOnUpdate !== false && existingOpenTicket?.id) {
+        await addItflowTicketNote({
+          localTicketId: existingOpenTicket.id,
+          author: 'Vitrine Condition Engine',
+          body: `[Condition Active Update — ${rule.label}] ${detail}`,
+          noteType: rule.psaNoteType === 'Public' ? 'Public' : 'Internal'
+        }).catch(() => {});
       }
     }
 

@@ -19,6 +19,7 @@ import {
 } from './services/auth/index.js';
 import { hmacVerifyToken } from './services/vault/index.js';
 import { meshBridge } from './services/meshcentral/index.js';
+import { agentSocketHub } from './services/agent/socketHub.js';
 import { startScheduler, stopScheduler } from './services/scheduler/index.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -973,6 +974,14 @@ async function startServer() {
   });
 
   // ============================================================================
+  // Native & Companion Agent Bidirectional WebSocket Hub (/ws/agent)
+  // ============================================================================
+  server.get('/ws/agent', { websocket: true }, (rawSocket, req) => {
+    const socket = (rawSocket as any).socket || rawSocket;
+    agentSocketHub.handleConnection(socket, req);
+  });
+
+  // ============================================================================
   // Register REST API Routes
   // ============================================================================
   await registerApiRoutes(server);
@@ -1027,6 +1036,7 @@ async function startServer() {
   const gracefulShutdown = async (signal: string) => {
     console.log(`\n[Vitrine RMM] Received ${signal} — shutting down cleanly...`);
     stopScheduler();
+    agentSocketHub.shutdown();
     try {
       await server.close();
     } catch {

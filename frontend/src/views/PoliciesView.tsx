@@ -2029,6 +2029,14 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
                             <label style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', cursor: 'pointer' }}>
                               <input
                                 type="checkbox"
+                                checked={rule.psaNoteOnUpdate !== false}
+                                onChange={(e) => handleUpdateAlertRule(idx, { psaNoteOnUpdate: e.target.checked })}
+                              />
+                              <span>Add PSA Update Notes</span>
+                            </label>
+                            <label style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', cursor: 'pointer' }}>
+                              <input
+                                type="checkbox"
                                 checked={rule.autoResolveTicket}
                                 onChange={(e) => handleUpdateAlertRule(idx, { autoResolveTicket: e.target.checked })}
                               />
@@ -2036,16 +2044,28 @@ export const PoliciesView: React.FC<PoliciesViewProps> = ({ devices, tenants = [
                             </label>
                           </div>
 
-                          <select
-                            className="glass-select"
-                            style={{ width: 'auto', padding: '0.15rem 0.45rem', fontSize: '0.7rem' }}
-                            value={rule.severity}
-                            onChange={(e) => handleUpdateAlertRule(idx, { severity: e.target.value as any })}
-                          >
-                            <option value="info">Severity: Info</option>
-                            <option value="warning">Severity: Warning</option>
-                            <option value="critical">Severity: Critical</option>
-                          </select>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
+                            <select
+                              className="glass-select"
+                              style={{ width: 'auto', padding: '0.15rem 0.45rem', fontSize: '0.7rem' }}
+                              value={rule.psaNoteType || 'Internal'}
+                              onChange={(e) => handleUpdateAlertRule(idx, { psaNoteType: e.target.value as 'Internal' | 'Public' })}
+                              title="ITFlow / PSA automated note visibility"
+                            >
+                              <option value="Internal">Note: Internal</option>
+                              <option value="Public">Note: Public</option>
+                            </select>
+                            <select
+                              className="glass-select"
+                              style={{ width: 'auto', padding: '0.15rem 0.45rem', fontSize: '0.7rem' }}
+                              value={rule.severity}
+                              onChange={(e) => handleUpdateAlertRule(idx, { severity: e.target.value as any })}
+                            >
+                              <option value="info">Severity: Info</option>
+                              <option value="warning">Severity: Warning</option>
+                              <option value="critical">Severity: Critical</option>
+                            </select>
+                          </div>
                         </div>
                       </div>
                     ))}

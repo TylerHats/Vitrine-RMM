@@ -1,6 +1,7 @@
 import React from 'react';
 import {
   LayoutDashboard,
+  Monitor,
   ShieldCheck,
   RefreshCw,
   Code2,
@@ -51,13 +52,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onCloseMobile,
   currentUser,
   meshConnected = false,
-  appVersion = '2.7.0'
+  appVersion = '2.8.0'
 }) => {
   const isClientAdmin = currentUser?.role === 'client_admin';
   const isSuperAdmin = Boolean(currentUser && checkIsSuperAdmin(currentUser));
 
   const coreNavItems = [
     { id: 'dashboard', label: 'Fleet Dashboard', icon: LayoutDashboard, allowClient: true },
+    { id: 'devices', label: 'Devices', icon: Monitor, allowClient: true },
     { id: 'alerts', label: 'Alerts & Incidents', icon: BellRing, allowClient: true },
     { id: 'policies', label: 'Policies', icon: ShieldCheck, allowClient: false },
     { id: 'patching', label: 'Patch & Software', icon: RefreshCw, allowClient: true },

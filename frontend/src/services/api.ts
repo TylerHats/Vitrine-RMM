@@ -56,7 +56,13 @@ import {
   ActiveAuthSession,
   AuditLogRecord,
   TelemetryHistoryResponse,
-  DeviceHardwareDetails
+  DeviceHardwareDetails,
+  DeviceQueryRequest,
+  DeviceFilterOptions,
+  PsaTicketNote,
+  ItflowClientRecord,
+  ItflowLocationRecord,
+  ItflowTenantMappingSuggestion
 } from '../types/index.js';
 
 const API_BASE = '/api';
@@ -568,6 +574,17 @@ export async function fetchDevices(): Promise<Device[]> {
   return requestJson<Device[]>('/devices');
 }
 
+export async function fetchDeviceFilterOptions(): Promise<DeviceFilterOptions> {
+  return requestJson<DeviceFilterOptions>('/devices/filter-options');
+}
+
+export async function queryDevices(req: DeviceQueryRequest): Promise<{ devices: Device[]; totalCount: number }> {
+  return requestJson<{ devices: Device[]; totalCount: number }>('/devices/query', {
+    method: 'POST',
+    body: JSON.stringify(req)
+  });
+}
+
 export async function fetchDevice(id: string): Promise<Device> {
   return requestJson<Device>(`/devices/${encodeURIComponent(id)}`);
 }
@@ -1020,11 +1037,17 @@ export async function fetchPsaTickets(): Promise<
     id: string;
     ticket_number: string;
     title: string;
+    description?: string;
     client_name: string;
     device_id: string;
     status: string;
     priority: string;
+    external_provider?: string | null;
+    external_ticket_id?: string | null;
+    external_client_id?: number | null;
+    external_asset_id?: number | null;
     created_at: string;
+    updated_at?: string | null;
   }>
 > {
   return requestJson('/psa/tickets');
@@ -1032,6 +1055,7 @@ export async function fetchPsaTickets(): Promise<
 
 export async function createPsaTicket(data: {
   title: string;
+  description?: string;
   client_name: string;
   device_id?: string;
   priority?: string;
@@ -1045,13 +1069,208 @@ export async function createPsaTicket(data: {
 
 export async function updatePsaTicket(
   id: string,
-  updates: { status?: string; priority?: string }
-): Promise<{ success: boolean }> {
+  updates: {
+    title?: string;
+    description?: string;
+    status?: string;
+    priority?: string;
+    note?: string;
+    note_type?: 'Internal' | 'Public';
+    time_worked_sec?: number;
+  }
+): Promise<{ success: boolean; ticket?: any }> {
   return requestJson(`/psa/tickets/${encodeURIComponent(id)}`, {
     method: 'PUT',
     body: JSON.stringify(updates),
     returnErrorPayload: true
   });
+}
+
+export async function fetchPsaTicketNotes(ticketId: string): Promise<PsaTicketNote[]> {
+  return requestJson(`/psa/tickets/${encodeURIComponent(ticketId)}/notes`);
+}
+
+export async function addPsaTicketNote(
+  ticketId: string,
+  data: {
+    body: string;
+    note_type?: 'Internal' | 'Public';
+    time_worked_sec?: number;
+    status?: string;
+  }
+): Promise<{ success: boolean; note: PsaTicketNote; syncedExternal?: boolean; error?: string }> {
+  return requestJson(`/psa/tickets/${encodeURIComponent(ticketId)}/notes`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
+// ============================================================================
+// Guided ITFlow PSA & Asset Sync API
+// ============================================================================
+export async function fetchItflowStatus(): Promise<{
+  enabled: boolean;
+  setupCompleted: boolean;
+  url: string;
+  apiBase: string;
+  hasApiKey: boolean;
+  maskedApiKey: string;
+  syncIntervalMin: number;
+  lastAssetSyncAt: string | null;
+  lastAssetSyncSummary: string | null;
+  allowSelfSigned: boolean;
+  options: Record<string, any>;
+  mappings: Array<{
+    tenant_id: string;
+    tenant_name: string;
+    tenant_contact_email?: string;
+    itflow_client_id: number | null;
+    itflow_client_name: string | null;
+    itflow_default_location_id: number | null;
+    sync_enabled: boolean;
+    auto_created: boolean;
+    last_synced_at?: string | null;
+    device_count: number;
+    synced_asset_count: number;
+  }>;
+  siteMappings: any[];
+}> {
+  return requestJson('/itflow/status');
+}
+
+export async function testItflowConnection(data: {
+  url?: string;
+  apiKey?: string;
+  allowSelfSigned?: boolean;
+}): Promise<{
+  ok: boolean;
+  apiBase?: string;
+  clientCount?: number;
+  sampleClients?: Array<{ client_id: number; client_name: string }>;
+  message: string;
+}> {
+  return requestJson('/itflow/test', {
+    method: 'POST',
+    body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
+export async function discoverItflowClients(data?: {
+  url?: string;
+  apiKey?: string;
+  allowSelfSigned?: boolean;
+}): Promise<{
+  success: boolean;
+  clients: ItflowClientRecord[];
+  locations: ItflowLocationRecord[];
+  suggestions: ItflowTenantMappingSuggestion[];
+  error?: string;
+}> {
+  return requestJson('/itflow/discover', {
+    method: 'POST',
+    body: JSON.stringify(data || {}),
+    returnErrorPayload: true
+  });
+}
+
+export async function saveItflowConfig(data: {
+  url?: string;
+  apiKey?: string;
+  enabled?: boolean;
+  setupCompleted?: boolean;
+  syncIntervalMin?: number;
+  options?: Record<string, any>;
+}): Promise<{ success: boolean; config?: any; error?: string }> {
+  return requestJson('/itflow/config', {
+    method: 'PUT',
+    body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
+export async function fetchItflowRemappingImpact(tenantId: string): Promise<{
+  tenantId: string;
+  currentClientId: number | null;
+  currentClientName: string | null;
+  syncEnabled: boolean;
+  syncedAssetCount: number;
+  sampleHostnames: string[];
+}> {
+  return requestJson(`/itflow/remapping-impact/${encodeURIComponent(tenantId)}`);
+}
+
+export async function applyItflowMappings(data: {
+  assignments: any[];
+  url?: string;
+  apiKey?: string;
+  allowSelfSigned?: boolean;
+  markSetupCompleted?: boolean;
+  triggerInitialSync?: boolean;
+}): Promise<{
+  success: boolean;
+  mappingResult?: any;
+  syncResult?: any;
+  error?: string;
+}> {
+  return requestJson('/itflow/mappings', {
+    method: 'PUT',
+    body: JSON.stringify(data),
+    returnErrorPayload: true
+  });
+}
+
+export async function triggerItflowAssetSync(data?: {
+  force?: boolean;
+  tenantId?: string;
+}): Promise<{
+  success: boolean;
+  totalEligible: number;
+  created: number;
+  updated: number;
+  skipped: number;
+  failed: number;
+  error?: string;
+}> {
+  return requestJson('/itflow/sync-assets', {
+    method: 'POST',
+    body: JSON.stringify(data || {}),
+    returnErrorPayload: true
+  });
+}
+
+export async function triggerItflowTicketPull(localTicketId?: string): Promise<{
+  success: boolean;
+  checked: number;
+  updatedTickets: number;
+  importedNotes: number;
+  errors: string[];
+  error?: string;
+}> {
+  return requestJson('/itflow/sync-tickets', {
+    method: 'POST',
+    body: JSON.stringify(localTicketId ? { localTicketId } : {}),
+    returnErrorPayload: true
+  });
+}
+
+export async function syncSingleDeviceToItflow(deviceId: string): Promise<{
+  success: boolean;
+  ok?: boolean;
+  action?: 'created' | 'updated' | 'skipped' | 'failed';
+  assetId?: number;
+  error?: string;
+  itflow?: import('../types/index.js').DeviceItflowStatus;
+}> {
+  return requestJson(`/devices/${encodeURIComponent(deviceId)}/itflow-sync`, {
+    method: 'POST',
+    returnErrorPayload: true
+  });
+}
+
+export async function fetchDeviceDetail(deviceId: string): Promise<import('../types/index.js').Device> {
+  return requestJson<import('../types/index.js').Device>(`/devices/${encodeURIComponent(deviceId)}`);
 }
 
 export async function testSmtp(data: {
@@ -1945,6 +2164,9 @@ export async function generateInstaller(data: {
   platform?: 'windows' | 'linux' | 'macos';
   mode?: 'permanent' | 'quicksupport';
   mesh_server_id?: string;
+  format?: 'deb' | 'rpm' | 'sh';
+  variant?: 'desktop' | 'headless';
+  arch?: 'amd64' | 'arm64';
 }): Promise<{
   success: boolean;
   tokenId?: string;
@@ -1952,6 +2174,9 @@ export async function generateInstaller(data: {
   mode?: 'permanent' | 'quicksupport';
   tenantName?: string;
   ticketBound?: string | null;
+  packageFormat?: 'deb' | 'rpm' | 'sh' | 'exe';
+  packageVariant?: 'desktop' | 'headless';
+  packageArch?: 'amd64' | 'arm64';
   codeSigned?: boolean;
   signingPipeline?: {
     allSigned: boolean;
@@ -1960,6 +2185,7 @@ export async function generateInstaller(data: {
   };
   downloadCommand?: string;
   installerUrl?: string;
+  deployUrl?: string;
   quickSupportPublicUrl?: string;
   error?: string;
 }> {
@@ -1970,7 +2196,8 @@ export async function generateInstaller(data: {
   });
   if (!res.success) return res;
   const resolvedMode: 'permanent' | 'quicksupport' = res.mode || data.mode || 'permanent';
-  const deployUrl = res.deployUrl || `${window.location.origin}${res.downloadUrl}`;
+  const downloadEndpoint = `${window.location.origin}${res.downloadUrl}`;
+  const deployUrl = res.deployUrl || downloadEndpoint;
   const isWin = (data.platform || 'windows') === 'windows';
   const isQuickSupport = resolvedMode === 'quicksupport';
   const winExeName = isQuickSupport ? 'QuickSupport-VitrineAgent.exe' : 'Install-VitrineAgent.exe';
@@ -1979,18 +2206,22 @@ export async function generateInstaller(data: {
       ? `powershell -NoProfile -Command "$p=Join-Path $env:TEMP '${winExeName}'; Invoke-WebRequest -UseBasicParsing -Uri '${deployUrl}' -OutFile $p; Start-Process -FilePath $p"`
       : `powershell -NoProfile -Command "$p=Join-Path $env:TEMP '${winExeName}'; Invoke-WebRequest -UseBasicParsing -Uri '${deployUrl}' -OutFile $p; Start-Process -FilePath $p -ArgumentList '/S' -Wait; Remove-Item $p -Force -ErrorAction SilentlyContinue"`
     : isQuickSupport
-      ? `curl -fsSL '${deployUrl}' | bash`
-      : `curl -fsSL '${deployUrl}' | sudo bash`;
+      ? `(command -v curl >/dev/null 2>&1 && curl -fsSL '${deployUrl}' || wget -qO- '${deployUrl}') | bash`
+      : `(command -v curl >/dev/null 2>&1 && curl -fsSL '${deployUrl}' || wget -qO- '${deployUrl}') | sudo bash`;
   return {
     success: true,
     tokenId: res.token,
     platform: data.platform || 'windows',
     mode: resolvedMode,
+    packageFormat: res.packageFormat,
+    packageVariant: res.packageVariant,
+    packageArch: res.packageArch,
     ticketBound: data.ticket_number || null,
     codeSigned: Boolean(res.signingPipeline?.allSigned),
     signingPipeline: res.signingPipeline,
     downloadCommand: oneLiner,
     installerUrl: res.downloadUrl,
+    deployUrl,
     quickSupportPublicUrl: `${window.location.origin}/remote`
   };
 }
@@ -2306,6 +2537,7 @@ export async function createQuickSupportSession(data: {
   session: QuickSupportSession;
   signingPipeline: { allSigned: boolean; strictVerified: boolean; stages: SigningStageReport[] };
   downloadUrl: string;
+  deployUrl?: string;
   error?: string;
 }> {
   return requestJson('/quicksupport/sessions', {

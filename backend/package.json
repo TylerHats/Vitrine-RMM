@@ -1,6 +1,6 @@
 {
   "name": "vitrine-rmm-backend",
-  "version": "2.7.0",
+  "version": "2.8.0",
   "type": "module",
   "description": "Backend API and MeshCentral 2 bridge for Vitrine RMM",
   "main": "dist/server.js",
@@ -9,7 +9,7 @@
   },
   "scripts": {
     "dev": "tsx watch src/server.ts",
-    "build": "tsc && bash windows-agent/build.sh",
+    "build": "tsc && bash windows-agent/build.sh && bash posix-agent/build.sh",
     "start": "node dist/server.js",
     "seed": "node --input-type=module -e \"import('./dist/db/index.js').then(m => m.initDatabase())\""
   },

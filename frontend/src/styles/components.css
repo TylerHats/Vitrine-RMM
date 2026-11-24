@@ -407,6 +407,18 @@
   vertical-align: middle;
 }
 
+.glass-table-compact th {
+  padding: 0.68rem 0.58rem;
+  white-space: nowrap;
+  font-size: 0.68rem;
+  letter-spacing: 0.04em;
+}
+
+.glass-table-compact td {
+  padding: 0.72rem 0.58rem;
+  font-size: 0.8rem;
+}
+
 .glass-table tr:hover td {
   background: var(--glass-bg-hover);
 }

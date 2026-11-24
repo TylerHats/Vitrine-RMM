@@ -7,9 +7,17 @@ import { safeOutboundFetch } from '../vault/index.js';
 import {
   buildStampedWindowsPe,
   resolveBrandingIconBuffer,
+  resolveBrandingPngBuffer,
   resolveWindowsTemplatePath,
   type WindowsTemplateName
 } from './windowsPeBuilder.js';
+import {
+  buildDebianPackage,
+  buildRpmPackage,
+  buildDefaultBrandPng,
+  buildLinuxInstallConfirmPy,
+  resolveCompiledPosixBinary
+} from './linuxPackageBuilder.js';
 import {
   getDefaultTrayMenuItems,
   resolveEffectiveDevicePolicy,
@@ -32,6 +40,9 @@ export interface InstallerOptions {
   meshServerId?: string;
   allowSelfSignedTls?: boolean;
   targetDeviceId?: string;
+  linuxFormat?: 'deb' | 'rpm' | 'sh';
+  linuxVariant?: 'desktop' | 'headless';
+  arch?: 'amd64' | 'arm64';
 }
 
 export interface SigningStageReport {
@@ -328,6 +339,7 @@ export class InstallerGeneratorService {
     return {
       settings,
       tenantId,
+      tenantName: sanitizeSingleLine(tenantRow?.name, '', 80),
       siteId,
       deviceRole,
       brandName,
@@ -838,6 +850,21 @@ export class InstallerGeneratorService {
         signingPipeline
       };
     } else if (options.os === 'linux') {
+      const linuxFormat = options.linuxFormat || 'sh';
+      const linuxVariant = options.linuxVariant || 'desktop';
+      const pkgArch: 'amd64' | 'arm64' = options.arch === 'arm64' ? 'arm64' : 'amd64';
+
+      if (!ctx.isQuickSupport && !ctx.isCompanionOnly && (linuxFormat === 'deb' || linuxFormat === 'rpm')) {
+        const pkgBuf = this.buildLinuxPackageInstaller(linuxFormat, pkgArch, linuxVariant, ctx);
+        return {
+          filename: `install-${ctx.serviceName.toLowerCase()}-${pkgArch}.${linuxFormat}`,
+          contentType:
+            linuxFormat === 'deb' ? 'application/vnd.debian.binary-package' : 'application/x-rpm',
+          content: pkgBuf,
+          signingPipeline
+        };
+      }
+
       const script = this.generateLinuxInstaller({
         brandName: ctx.resolvedTrayBrand || ctx.brandName,
         primaryColor: ctx.primaryColor,
@@ -846,6 +873,7 @@ export class InstallerGeneratorService {
         meshGroupId: ctx.meshGroupId,
         enrollmentToken: ctx.enrollmentToken,
         tenantId: ctx.tenantId,
+        tenantName: ctx.tenantName,
         serviceName: ctx.serviceName.toLowerCase(),
         trayThemeMode: ctx.resolvedTrayTheme,
         trayEnabled: ctx.resolvedTrayEnabled,
@@ -856,6 +884,7 @@ export class InstallerGeneratorService {
         traySupportEmail: ctx.resolvedTraySupportEmail,
         trayMenuItems: ctx.resolvedMenuItems,
         isQuickSupport: ctx.isQuickSupport,
+        headless: !ctx.isQuickSupport && linuxVariant === 'headless',
         sessionCode: ctx.sessionCode,
         lapsAutoCreate: ctx.lapsAutoCreate,
         lapsAccountName: ctx.lapsAccountName,
@@ -866,7 +895,9 @@ export class InstallerGeneratorService {
       return {
         filename: ctx.isQuickSupport
           ? `quicksupport-${ctx.serviceName.toLowerCase()}.sh`
-          : `install-${ctx.serviceName.toLowerCase()}.sh`,
+          : linuxVariant === 'headless'
+            ? `install-${ctx.serviceName.toLowerCase()}-headless.sh`
+            : `install-${ctx.serviceName.toLowerCase()}.sh`,
         contentType: 'text/x-shellscript; charset=utf-8',
         content: script,
         signingPipeline
@@ -999,6 +1030,343 @@ export class InstallerGeneratorService {
     return `${full}\necho "COMPANION_DEPLOY_OK"`;
   }
 
+  private buildLinuxPackageInstaller(
+    format: 'deb' | 'rpm',
+    arch: 'amd64' | 'arm64',
+    variant: 'desktop' | 'headless',
+    ctx: ReturnType<InstallerGeneratorService['resolveInstallerContext']>
+  ): Buffer {
+    const cleanBrand = sanitizeSingleLine(ctx.resolvedTrayBrand || ctx.brandName, 'Vitrine RMM', 64);
+    const slug = sanitizeIdentifier(ctx.serviceName, 'vitrineagent', 36).toLowerCase().replace(/[^a-z0-9-]/g, '') || 'vitrineagent';
+    const pkgName = `${slug}-agent`;
+    const installDir = `/opt/${slug}`;
+    const trayDir = `/var/lib/${slug}/tray`;
+    const sleepSec = Math.max(10, Math.min(3600, Math.round(Number(ctx.telemetryIntervalSec || 25))));
+    const isHeadless = variant === 'headless';
+
+    const companionConfigJson = JSON.stringify({
+      BrandName: cleanBrand,
+      ServiceName: slug,
+      serviceSlug: slug,
+      VitrineServerUrl: ctx.vitrineServerUrl,
+      TelemetryIntervalSec: sleepSec,
+      AllowSelfSignedTls: Boolean(ctx.allowSelfSignedTls),
+      IconUrl: ctx.resolvedTrayIconUrl || '',
+      ThemeMode: ctx.resolvedTrayTheme || 'system',
+      TrayEnabled: !isHeadless && ctx.resolvedTrayEnabled !== false,
+      Tooltip: ctx.resolvedTrayTooltip || `${cleanBrand} Support`,
+      SupportUrl: ctx.resolvedTraySupportUrl || '',
+      SupportPhone: ctx.resolvedTraySupportPhone || '',
+      SupportEmail: ctx.resolvedTraySupportEmail || '',
+      MenuItems: ctx.resolvedMenuItems || getDefaultTrayMenuItems(),
+      isQuickSupport: false,
+      headless: isHeadless
+    });
+
+    const bootstrapJson = JSON.stringify({
+      brandName: cleanBrand,
+      tenantName: ctx.tenantName || '',
+      tenantId: ctx.tenantId,
+      siteId: ctx.siteId || '',
+      deviceRole: ctx.deviceRole || '',
+      vitrineServerUrl: ctx.vitrineServerUrl,
+      meshServerUrl: ctx.meshServerUrl,
+      meshGroupId: ctx.meshGroupId.replace(/^mesh\/\//, ''),
+      enrollmentToken: ctx.enrollmentToken,
+      serviceName: slug,
+      themeMode: ctx.resolvedTrayTheme || 'system',
+      allowSelfSignedTls: Boolean(ctx.allowSelfSignedTls),
+      lapsAutoCreate: ctx.lapsAutoCreate === 1,
+      lapsAccountName: sanitizeIdentifier(ctx.lapsAccountName, 'LocalAdmin', 20),
+      trayEnabled: !isHeadless && ctx.resolvedTrayEnabled !== false,
+      headless: isHeadless
+    });
+
+    const compiledBin = resolveCompiledPosixBinary(isHeadless ? 'linux-headless' : 'linux-desktop', arch);
+    const fallbackPy = buildLinuxCompanionPy(sleepSec);
+    const hasCompiledBin = Boolean(compiledBin && compiledBin.length > 1024);
+    const execStartLine = hasCompiledBin
+      ? `${installDir}/vitrine-agent${isHeadless ? ' --headless' : ''}`
+      : `/usr/bin/env python3 ${installDir}/vitrine-companion.py`;
+
+    const systemdUnit = [
+      '[Unit]',
+      `Description=${cleanBrand} Endpoint Telemetry & Task Agent`,
+      'After=network-online.target',
+      'Wants=network-online.target',
+      '',
+      '[Service]',
+      'Type=simple',
+      `ExecStart=${execStartLine}`,
+      'Restart=always',
+      'RestartSec=10',
+      '',
+      '[Install]',
+      'WantedBy=multi-user.target',
+      ''
+    ].join('\n');
+
+    const brandPng = resolveBrandingPngBuffer(ctx.resolvedTrayIconUrl, 128) || buildDefaultBrandPng(128);
+    const xmlEsc = (s: string) =>
+      s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+    const metainfoXml = [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<component type="desktop-application">',
+      `  <id>com.vitrine.${slug}</id>`,
+      `  <name>${xmlEsc(cleanBrand)} Endpoint Agent</name>`,
+      `  <summary>${xmlEsc(ctx.welcomeText || 'Managed IT Endpoint Monitoring & Remote Support Agent')}</summary>`,
+      '  <metadata_license>FSFAP</metadata_license>',
+      '  <project_license>LicenseRef-proprietary</project_license>',
+      '  <description>',
+      `    <p>${xmlEsc(cleanBrand)} Endpoint Agent provides secure telemetry, automated patch compliance, and remote IT assistance${ctx.tenantName ? ` for ${xmlEsc(ctx.tenantName)}` : ''}.</p>`,
+      '  </description>',
+      `  <launchable type="desktop-id">${slug}-agent.desktop</launchable>`,
+      `  <icon type="stock">${slug}</icon>`,
+      '</component>',
+      ''
+    ].join('\n');
+
+    const appDesktop = [
+      '[Desktop Entry]',
+      'Type=Application',
+      `Name=${cleanBrand} Endpoint Agent`,
+      `Comment=${ctx.welcomeText || 'Managed Endpoint Support'}`,
+      `Icon=${slug}`,
+      'NoDisplay=true',
+      'Categories=System;',
+      ''
+    ].join('\n');
+
+    const files = [
+      { path: `${installDir}/companion-config.json`, content: Buffer.from(companionConfigJson, 'utf8'), mode: 0o644 },
+      { path: `${installDir}/install-bootstrap.json`, content: Buffer.from(bootstrapJson, 'utf8'), mode: 0o600 },
+      { path: `${installDir}/vitrine-companion.py`, content: Buffer.from(fallbackPy, 'utf8'), mode: 0o700 },
+      { path: `/etc/systemd/system/${slug}-companion.service`, content: Buffer.from(systemdUnit, 'utf8'), mode: 0o644 },
+      { path: `/usr/share/icons/hicolor/128x128/apps/${slug}.png`, content: brandPng, mode: 0o644 },
+      { path: `/usr/share/applications/${slug}-agent.desktop`, content: Buffer.from(appDesktop, 'utf8'), mode: 0o644 },
+      { path: `/usr/share/metainfo/com.vitrine.${slug}.metainfo.xml`, content: Buffer.from(metainfoXml, 'utf8'), mode: 0o644 }
+    ];
+
+    if (hasCompiledBin && compiledBin) {
+      files.push({ path: `${installDir}/vitrine-agent`, content: compiledBin, mode: 0o755 });
+    }
+    if (!isHeadless) {
+      files.push(
+        { path: `${installDir}/brand-icon.png`, content: brandPng, mode: 0o644 },
+        { path: `${installDir}/vitrine-install-confirm.py`, content: Buffer.from(buildLinuxInstallConfirmPy(), 'utf8'), mode: 0o755 },
+        { path: `${installDir}/vitrine-tray.py`, content: Buffer.from(buildLinuxTrayPy(), 'utf8'), mode: 0o755 }
+      );
+    }
+
+    const postinst = [
+      '#!/usr/bin/env bash',
+      'set -e',
+      `SLUG=${quoteBashLiteral(slug)}`,
+      `INSTALL_DIR=${quoteBashLiteral(installDir)}`,
+      `TRAY_DIR=${quoteBashLiteral(trayDir)}`,
+      `BRAND_NAME=${quoteBashLiteral(cleanBrand)}`,
+      `TENANT_NAME=${quoteBashLiteral(ctx.tenantName || '')}`,
+      `TENANT_ID=${quoteBashLiteral(ctx.tenantId)}`,
+      `VITRINE_URL=${quoteBashLiteral(ctx.vitrineServerUrl)}`,
+      `MESH_URL=${quoteBashLiteral(ctx.meshServerUrl)}`,
+      `MESH_GROUP=${quoteBashLiteral(ctx.meshGroupId.replace(/^mesh\/\//, ''))}`,
+      `TOKEN=${quoteBashLiteral(ctx.enrollmentToken)}`,
+      `THEME_MODE=${quoteBashLiteral(ctx.resolvedTrayTheme || 'system')}`,
+      `LAPS_CREATE=${quoteBashLiteral(String(ctx.lapsAutoCreate))}`,
+      `LAPS_USER=${quoteBashLiteral(sanitizeIdentifier(ctx.lapsAccountName, 'LocalAdmin', 20))}`,
+      `TRAY_ENABLED=${quoteBashLiteral(!isHeadless && ctx.resolvedTrayEnabled !== false ? '1' : '0')}`,
+      `HEADLESS=${quoteBashLiteral(isHeadless ? '1' : '0')}`,
+      `INSECURE_FLAG=${quoteBashLiteral(ctx.allowSelfSignedTls ? '--insecure' : '')}`,
+      `TARGET_DEV_ID=${quoteBashLiteral(ctx.targetDeviceId || '')}`,
+      '',
+      'mkdir -p "$INSTALL_DIR" "/var/lib/$SLUG" "$TRAY_DIR/inbox" "$TRAY_DIR/outbox"',
+      'chmod 755 "$INSTALL_DIR" "/var/lib/$SLUG" "$TRAY_DIR" "$TRAY_DIR/inbox"',
+      'chmod 1777 "$TRAY_DIR/outbox"',
+      'if [ "$HEADLESS" = "0" ] && [ -f "$INSTALL_DIR/brand-icon.png" ]; then',
+      '  cp "$INSTALL_DIR/brand-icon.png" "$TRAY_DIR/tray-icon.png" 2>/dev/null || true',
+      '  chmod 644 "$TRAY_DIR/tray-icon.png" 2>/dev/null || true',
+      'fi',
+      '',
+      'if [ "$LAPS_CREATE" = "1" ] && ! id "$LAPS_USER" >/dev/null 2>&1; then',
+      '  useradd -m -s /bin/bash "$LAPS_USER" || true',
+      '  INIT_PASS="$(head -c 24 /dev/urandom | base64 | tr -dc "A-Za-z0-9" | head -c 24)!9vR"',
+      '  printf "%s:%s\\n" "$LAPS_USER" "$INIT_PASS" | chpasswd 2>/dev/null || true',
+      '  if getent group sudo >/dev/null 2>&1; then usermod -aG sudo "$LAPS_USER" 2>/dev/null || true; elif getent group wheel >/dev/null 2>&1; then usermod -aG wheel "$LAPS_USER" 2>/dev/null || true; fi',
+      '  if [ -d /etc/sudoers.d ]; then',
+      '    printf "%s ALL=(ALL:ALL) ALL\\n" "$LAPS_USER" > "/etc/sudoers.d/90-vitrine-laps"',
+      '    chmod 0440 "/etc/sudoers.d/90-vitrine-laps"',
+      '    if command -v visudo >/dev/null 2>&1 && ! visudo -cf "/etc/sudoers.d/90-vitrine-laps" >/dev/null 2>&1; then rm -f "/etc/sudoers.d/90-vitrine-laps"; fi',
+      '  fi',
+      'fi',
+      '',
+      '# Optional MeshCentral agent bootstrap (non-fatal if MeshCentral is absent or offline)',
+      'ARCH="$(uname -m)"',
+      'MESH_TYPE=6',
+      'if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then MESH_TYPE=25; fi',
+      'if [ -n "$MESH_URL" ] && command -v curl >/dev/null 2>&1; then',
+      '  if [ -n "$MESH_GROUP" ]; then curl ${INSECURE_FLAG} -fsSL --max-time 8 "$MESH_URL/meshsettings?id=$MESH_GROUP" -o "$INSTALL_DIR/meshagent.msh" 2>/dev/null || true; fi',
+      '  if curl ${INSECURE_FLAG} -fsSL --max-time 12 "$MESH_URL/meshagents?id=$MESH_TYPE" -o "$INSTALL_DIR/meshagent" 2>/dev/null && [ -s "$INSTALL_DIR/meshagent" ]; then',
+      '    chmod 755 "$INSTALL_DIR/meshagent"',
+      '    mkdir -p "$INSTALL_DIR/meshcore"',
+      '    if [ -s "$INSTALL_DIR/meshagent.msh" ]; then cp "$INSTALL_DIR/meshagent.msh" "$INSTALL_DIR/meshcore/meshagent.msh" && chmod 600 "$INSTALL_DIR/meshcore/meshagent.msh"; fi',
+      '    (cd "$INSTALL_DIR" && "$INSTALL_DIR/meshagent" -install --installPath="$INSTALL_DIR/meshcore") >/dev/null 2>&1 || true',
+      '  fi',
+      'fi',
+      '',
+      '# Enroll with Vitrine Control Plane',
+      'HOSTNAME_VAL="$(hostname)"',
+      'IP_ADDR="$(hostname -I 2>/dev/null | awk \'{print $1}\' || echo 127.0.0.1)"',
+      'MAC_ADDR="$(ip link show 2>/dev/null | awk \'/link\\/ether/ {print $2; exit}\' || echo "")"',
+      'if [ -x "$INSTALL_DIR/vitrine-agent" ]; then',
+      '  HW_ENROLL_JSON="$("$INSTALL_DIR/vitrine-agent" --print-enroll-hw 2>/dev/null || echo \'{}\')"',
+      'else',
+      '  HW_ENROLL_JSON="$(python3 "$INSTALL_DIR/vitrine-companion.py" --print-enroll-hw 2>/dev/null || echo \'{}\')"',
+      'fi',
+      'ENROLLED_OK="0"',
+      'ENROLL_JSON="$(python3 -c \'import json,sys; hw=json.loads(sys.argv[9]) if sys.argv[9].strip().startswith("{") else {}; d={"token":sys.argv[1],"enrollmentToken":sys.argv[1],"tenantId":sys.argv[2],"hostname":sys.argv[3],"osType":"linux","ipAddress":sys.argv[4] or "127.0.0.1","macAddress":sys.argv[5] or "","deviceId":sys.argv[6] or None,"trayThemeMode":sys.argv[7] or "system","agentVariant":sys.argv[8]}; d.update(hw); print(json.dumps(d))\' "$TOKEN" "$TENANT_ID" "$HOSTNAME_VAL" "$IP_ADDR" "$MAC_ADDR" "$TARGET_DEV_ID" "$THEME_MODE" ' + quoteBashLiteral(isHeadless ? 'posix-headless' : 'posix-desktop') + ' "$HW_ENROLL_JSON")"',
+      'ENROLL_RESP="$(python3 -c \'import ssl,sys,urllib.request; ctx=ssl._create_unverified_context() if sys.argv[3]=="--insecure" else ssl.create_default_context(); req=urllib.request.Request(sys.argv[1],data=sys.argv[2].encode("utf-8"),method="POST",headers={"Content-Type":"application/json"}); sys.stdout.write(urllib.request.urlopen(req,timeout=20,context=ctx).read().decode("utf-8"))\' "$VITRINE_URL/api/agent/enroll" "$ENROLL_JSON" "$INSECURE_FLAG" 2>/dev/null || true)"',
+      'if [ -n "$ENROLL_RESP" ]; then',
+      '  if python3 - "$ENROLL_RESP" "$VITRINE_URL" "$TENANT_ID" "$INSTALL_DIR/agent-identity.json" "$INSECURE_FLAG" "$SLUG" <<\'PYEOF\'',
+      'import json, os, sys',
+      'resp = json.loads(sys.argv[1])',
+      'tok = resp.get("agentToken") or resp.get("agentAuthToken")',
+      'if tok:',
+      '    out = {"deviceId": resp.get("deviceId"), "agentToken": tok, "agentAuthToken": tok, "vitrineServerUrl": sys.argv[2], "tenantId": sys.argv[3], "insecureTls": sys.argv[5] == "--insecure", "serviceSlug": sys.argv[6]}',
+      '    fd = os.open(sys.argv[4], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)',
+      '    with os.fdopen(fd, "w") as f: json.dump(out, f)',
+      '    sys.exit(0)',
+      'sys.exit(1)',
+      'PYEOF',
+      '  then ENROLLED_OK="1"; fi',
+      'fi',
+      'rm -f "$INSTALL_DIR/install-bootstrap.json"',
+      '',
+      'if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then',
+      '  systemctl daemon-reload >/dev/null 2>&1 || true',
+      '  systemctl enable "$SLUG-companion.service" >/dev/null 2>&1 || true',
+      '  systemctl restart "$SLUG-companion.service" >/dev/null 2>&1 || true',
+      'fi',
+      '',
+      'if [ "$TRAY_ENABLED" = "1" ] && [ "$HEADLESS" = "0" ]; then',
+      '  mkdir -p /etc/xdg/autostart 2>/dev/null || true',
+      '  cat > "/etc/xdg/autostart/${SLUG}-tray.desktop" <<DESKEOF',
+      '[Desktop Entry]',
+      'Type=Application',
+      'Name=${BRAND_NAME} Support Tray',
+      'Exec=/usr/bin/env python3 ${INSTALL_DIR}/vitrine-tray.py',
+      'Terminal=false',
+      'X-GNOME-Autostart-enabled=true',
+      'DESKEOF',
+      '  chmod 644 "/etc/xdg/autostart/${SLUG}-tray.desktop"',
+      'else',
+      '  rm -f "/etc/xdg/autostart/${SLUG}-tray.desktop"',
+      'fi',
+      '',
+      'if [ "$HEADLESS" = "0" ]; then',
+      '  python3 - "$INSTALL_DIR/install-confirm.json" "$BRAND_NAME" "$TENANT_NAME" "$HOSTNAME_VAL" "$ENROLLED_OK" "$THEME_MODE" <<\'PYCONF\'',
+      'import json, os, sys',
+      'with open(sys.argv[1], "w", encoding="utf-8") as f:',
+      '    json.dump({"brandName": sys.argv[2], "tenantName": sys.argv[3], "hostname": sys.argv[4], "enrolled": sys.argv[5] == "1", "themeMode": sys.argv[6]}, f)',
+      'os.chmod(sys.argv[1], 0o644)',
+      'PYCONF',
+      '  GUI_USER="${SUDO_USER:-}"',
+      '  if [ -z "$GUI_USER" ] || [ "$GUI_USER" = "root" ]; then',
+      '    GUI_USER="$(loginctl list-sessions --no-legend 2>/dev/null | awk \'$3 != "" && $3 != "root" && $3 != "gdm" && $3 != "lightdm" && $3 != "sddm" {print $3; exit}\' || true)"',
+      '  fi',
+      '  if [ -z "$GUI_USER" ] || [ "$GUI_USER" = "root" ]; then',
+      '    for sock in /run/user/*/wayland-[0-9]* /run/user/*/bus; do',
+      '      if [ -S "$sock" ]; then',
+      '        CAND_UID="$(basename "$(dirname "$sock")")"',
+      '        CAND_USER="$(id -nu "$CAND_UID" 2>/dev/null || true)"',
+      '        if [ -n "$CAND_USER" ] && [ "$CAND_USER" != "root" ] && [ "$CAND_USER" != "gdm" ] && [ "$CAND_USER" != "lightdm" ]; then GUI_USER="$CAND_USER"; break; fi',
+      '      fi',
+      '    done',
+      '  fi',
+      '  if [ -z "$GUI_USER" ] || [ "$GUI_USER" = "root" ]; then',
+      '    RAW_WHO="$(who | awk \'{print $1; exit}\' || true)"',
+      '    case "$RAW_WHO" in [0-9]*) GUI_USER="$(id -nu "$RAW_WHO" 2>/dev/null || true)";; *) GUI_USER="$RAW_WHO";; esac',
+      '  fi',
+      '  if [ -n "$GUI_USER" ] && [ "$GUI_USER" != "root" ] && id "$GUI_USER" >/dev/null 2>&1; then',
+      '    GUI_UID="$(id -u "$GUI_USER")"',
+      '    GUI_RT="/run/user/$GUI_UID"',
+      '    if [ -d "$GUI_RT" ]; then',
+      '      GUI_DISP=""; GUI_WL=""',
+      '      for s in "$GUI_RT"/wayland-[0-9]*; do [ -S "$s" ] && GUI_WL="$(basename "$s")" && break; done',
+      '      if [ -n "${DISPLAY:-}" ]; then GUI_DISP="$DISPLAY"; elif [ -S /tmp/.X11-unix/X0 ]; then GUI_DISP=":0"; elif [ -S /tmp/.X11-unix/X1 ]; then GUI_DISP=":1"; fi',
+      '      if [ -n "$GUI_DISP" ] || [ -n "$GUI_WL" ]; then',
+      '        GUI_CMD=(env "XDG_RUNTIME_DIR=$GUI_RT")',
+      '        [ -n "$GUI_DISP" ] && GUI_CMD+=("DISPLAY=$GUI_DISP")',
+      '        [ -n "$GUI_WL" ] && GUI_CMD+=("WAYLAND_DISPLAY=$GUI_WL")',
+      '        [ -S "$GUI_RT/bus" ] && GUI_CMD+=("DBUS_SESSION_BUS_ADDRESS=unix:path=$GUI_RT/bus")',
+      '        nohup su -s /bin/sh "$GUI_USER" -c "${GUI_CMD[*]} python3 ${INSTALL_DIR}/vitrine-install-confirm.py >/dev/null 2>&1 &" >/dev/null 2>&1 || true',
+      '        if [ "$TRAY_ENABLED" = "1" ]; then',
+      '          pkill -f "${INSTALL_DIR}/vitrine-tray.py" >/dev/null 2>&1 || true',
+      '          nohup su -s /bin/sh "$GUI_USER" -c "${GUI_CMD[*]} python3 ${INSTALL_DIR}/vitrine-tray.py >/dev/null 2>&1 &" >/dev/null 2>&1 || true',
+      '        fi',
+      '      fi',
+      '    fi',
+      '  fi',
+      'fi',
+      'exit 0',
+      ''
+    ].join('\n');
+
+    const prerm = [
+      '#!/usr/bin/env bash',
+      `SLUG=${quoteBashLiteral(slug)}`,
+      `INSTALL_DIR=${quoteBashLiteral(installDir)}`,
+      'if [ "${1:-}" = "remove" ] || [ "${1:-}" = "0" ]; then',
+      '  pkill -f "$INSTALL_DIR/vitrine-tray.py" >/dev/null 2>&1 || true',
+      '  if command -v systemctl >/dev/null 2>&1; then',
+      '    systemctl disable --now "$SLUG-companion.service" >/dev/null 2>&1 || true',
+      '  fi',
+      '  rm -f "/etc/xdg/autostart/${SLUG}-tray.desktop"',
+      'fi',
+      'exit 0',
+      ''
+    ].join('\n');
+
+    const postrm = [
+      '#!/usr/bin/env bash',
+      `SLUG=${quoteBashLiteral(slug)}`,
+      `INSTALL_DIR=${quoteBashLiteral(installDir)}`,
+      'if [ "${1:-}" = "purge" ] || [ "${1:-}" = "remove" ] || [ "${1:-}" = "0" ]; then',
+      '  rm -rf "/var/lib/$SLUG" "$INSTALL_DIR" "/etc/systemd/system/${SLUG}-companion.service"',
+      '  command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true',
+      'fi',
+      'exit 0',
+      ''
+    ].join('\n');
+
+    const directories = [
+      { path: installDir, mode: 0o755 },
+      { path: '/etc/systemd/system', mode: 0o755 },
+      { path: '/usr/share/icons/hicolor/128x128/apps', mode: 0o755 },
+      { path: '/usr/share/applications', mode: 0o755 },
+      { path: '/usr/share/metainfo', mode: 0o755 }
+    ];
+
+    const pkgSpec = {
+      format,
+      arch,
+      packageName: pkgName,
+      version: '2.8.0',
+      release: '1',
+      summary: `${cleanBrand} Endpoint Management & Support Agent`,
+      description: `Managed endpoint telemetry, automation, and remote support agent for ${cleanBrand}${ctx.tenantName ? ` (${ctx.tenantName})` : ''}.`,
+      maintainer: `${cleanBrand} IT <support@vitrine.local>`,
+      url: ctx.vitrineServerUrl,
+      directories,
+      files,
+      postinst,
+      prerm,
+      postrm
+    };
+
+    return format === 'deb' ? buildDebianPackage(pkgSpec) : buildRpmPackage(pkgSpec);
+  }
+
   private generateLinuxInstaller(vars: {
     brandName: string;
     primaryColor: string;
@@ -1007,6 +1375,7 @@ export class InstallerGeneratorService {
     meshGroupId: string;
     enrollmentToken: string;
     tenantId: string;
+    tenantName?: string;
     serviceName: string;
     trayThemeMode: 'system' | 'dark' | 'light';
     trayEnabled?: boolean;
@@ -1017,6 +1386,7 @@ export class InstallerGeneratorService {
     traySupportEmail?: string;
     trayMenuItems?: TrayMenuItem[];
     isQuickSupport: boolean;
+    headless?: boolean;
     sessionCode?: string;
     lapsAutoCreate: number;
     lapsAccountName: string;
@@ -1031,6 +1401,7 @@ export class InstallerGeneratorService {
     const safeUnitBrand = cleanBrand.replace(/["\\]/g, '').trim() || 'Vitrine RMM';
     const curlTlsFlag = vars.allowSelfSignedTls ? '--insecure ' : '';
     const sleepSec = Math.max(10, Math.min(3600, Math.round(Number(vars.telemetryIntervalSec || 25))));
+    const isHeadless = !vars.isQuickSupport && Boolean(vars.headless);
     const companionConfigJson = JSON.stringify({
       BrandName: cleanBrand,
       ServiceName: safeServiceName,
@@ -1040,24 +1411,28 @@ export class InstallerGeneratorService {
       AllowSelfSignedTls: Boolean(vars.allowSelfSignedTls),
       IconUrl: vars.trayIconUrl || '',
       ThemeMode: vars.trayThemeMode || 'system',
-      TrayEnabled: vars.trayEnabled !== false,
+      TrayEnabled: !isHeadless && vars.trayEnabled !== false,
       Tooltip: vars.trayTooltip || `${cleanBrand} Support`,
       SupportUrl: vars.traySupportUrl || '',
       SupportPhone: vars.traySupportPhone || '',
       SupportEmail: vars.traySupportEmail || '',
       MenuItems: vars.trayMenuItems || getDefaultTrayMenuItems(),
       isQuickSupport: Boolean(vars.isQuickSupport),
+      headless: isHeadless,
       SessionCode: vars.sessionCode || ''
     });
     const companionPy = buildLinuxCompanionPy(sleepSec);
     const trayPy = buildLinuxTrayPy();
+    const confirmPy = buildLinuxInstallConfirmPy();
+    const binComponent = isHeadless ? 'posix-headless' : 'posix-desktop';
+    const agentVariantLabel = vars.isQuickSupport ? 'posix-quicksupport' : isHeadless ? 'posix-headless' : 'posix-desktop';
 
     const lines = [
       '#!/usr/bin/env bash',
       '# ==============================================================================',
-      `# ${safeCommentBrand} - Linux Cross-Distro Agent, Companion & Desktop Tray`,
+      `# ${safeCommentBrand} - Linux Cross-Distro ${isHeadless ? 'Headless Server Agent' : 'Agent, Companion & Desktop Tray'}`,
       `# Distros: Debian / Ubuntu / RHEL / Fedora / Rocky / Alma / Arch`,
-      `# Mode: ${vars.isQuickSupport ? 'QuickSupport On-Demand (User Space)' : 'Permanent Systemd Service + Desktop Tray'}`,
+      `# Mode: ${vars.isQuickSupport ? 'QuickSupport On-Demand (User Space)' : isHeadless ? 'Permanent Systemd Headless Server Service' : 'Permanent Systemd Service + Desktop Tray'}`,
       '# ==============================================================================',
       'set -euo pipefail',
       '',
@@ -1187,28 +1562,57 @@ export class InstallerGeneratorService {
       '  fi',
       'fi',
       '',
-      '# Write Cross-Distro Companion Worker & Theme-Aware Desktop Tray',
+      '# Write Cross-Distro Companion Worker & Fetch Compiled Native POSIX Binary (with Python Fallback)',
+      'USE_NATIVE_BIN=0',
+      'BIN_ARCH="amd64"',
+      'if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then BIN_ARCH="arm64"; fi',
+      `BIN_DL_URL="$VITRINE_SERVER_URL/api/agent/binary?component=${binComponent}&arch=$BIN_ARCH&token=$ENROLLMENT_TOKEN"`,
+      'if http_get_file "$BIN_DL_URL" "$INSTALL_DIR/vitrine-agent" 2>/dev/null && [ -s "$INSTALL_DIR/vitrine-agent" ]; then',
+      '  chmod 755 "$INSTALL_DIR/vitrine-agent"',
+      '  if "$INSTALL_DIR/vitrine-agent" --version >/dev/null 2>&1; then',
+      '    USE_NATIVE_BIN=1',
+      '  else',
+      '    rm -f "$INSTALL_DIR/vitrine-agent"',
+      '  fi',
+      'fi',
       "cat > \"$INSTALL_DIR/vitrine-companion.py\" <<'PYAGENT'",
       companionPy,
       'PYAGENT',
       'chmod 700 "$INSTALL_DIR/vitrine-companion.py"',
       '',
-      "cat > \"$INSTALL_DIR/vitrine-tray.py\" <<'PYTRAY'",
-      trayPy,
-      'PYTRAY',
-      vars.isQuickSupport
-        ? 'chmod 700 "$INSTALL_DIR/vitrine-tray.py"'
-        : 'chmod 755 "$INSTALL_DIR/vitrine-tray.py"',
-      '',
+      ...(isHeadless
+        ? []
+        : [
+            "cat > \"$INSTALL_DIR/vitrine-tray.py\" <<'PYTRAY'",
+            trayPy,
+            'PYTRAY',
+            vars.isQuickSupport
+              ? 'chmod 700 "$INSTALL_DIR/vitrine-tray.py"'
+              : 'chmod 755 "$INSTALL_DIR/vitrine-tray.py"',
+            ...(vars.isQuickSupport
+              ? []
+              : [
+                  "cat > \"$INSTALL_DIR/vitrine-install-confirm.py\" <<'PYCONF'",
+                  confirmPy,
+                  'PYCONF',
+                  'chmod 755 "$INSTALL_DIR/vitrine-install-confirm.py"'
+                ]),
+            ''
+          ]),
       '# Enroll with VitrineRMM Control Plane (including full hardware/role telemetry)',
       'HOSTNAME_VAL="$(hostname)"',
       'IP_ADDR="$(hostname -I 2>/dev/null | awk \'{print $1}\')"',
       'MAC_ADDR="$(ip link show 2>/dev/null | awk \'/link\\/ether/ {print $2; exit}\')"',
-      'HW_ENROLL_JSON="$(python3 "$INSTALL_DIR/vitrine-companion.py" --print-enroll-hw 2>/dev/null || echo \'{}\')"',
+      'if [ "$USE_NATIVE_BIN" = "1" ]; then',
+      '  HW_ENROLL_JSON="$("$INSTALL_DIR/vitrine-agent" --print-enroll-hw 2>/dev/null || echo \'{}\')"',
+      'else',
+      '  HW_ENROLL_JSON="$(python3 "$INSTALL_DIR/vitrine-companion.py" --print-enroll-hw 2>/dev/null || echo \'{}\')"',
+      'fi',
       '',
-      'ENROLL_JSON="$(python3 -c \'import json,sys; hw=json.loads(sys.argv[8]) if sys.argv[8].strip().startswith("{") else {}; d={"token":sys.argv[1],"enrollmentToken":sys.argv[1],"tenantId":sys.argv[2],"hostname":sys.argv[3],"osType":"linux","ipAddress":sys.argv[4] or "127.0.0.1","macAddress":sys.argv[5] or "","deviceId":sys.argv[6] or None,"trayThemeMode":sys.argv[7] or "system"}; d.update(hw); print(json.dumps(d))\' "$ENROLLMENT_TOKEN" "$TENANT_ID" "$HOSTNAME_VAL" "$IP_ADDR" "$MAC_ADDR" ' + quoteBashLiteral(vars.targetDeviceId || '') + ' "$TRAY_THEME" "$HW_ENROLL_JSON")"',
+      'ENROLLED_OK="0"',
+      'ENROLL_JSON="$(python3 -c \'import json,sys; hw=json.loads(sys.argv[9]) if sys.argv[9].strip().startswith("{") else {}; d={"token":sys.argv[1],"enrollmentToken":sys.argv[1],"tenantId":sys.argv[2],"hostname":sys.argv[3],"osType":"linux","ipAddress":sys.argv[4] or "127.0.0.1","macAddress":sys.argv[5] or "","deviceId":sys.argv[6] or None,"trayThemeMode":sys.argv[7] or "system","agentVariant":sys.argv[8]}; d.update(hw); print(json.dumps(d))\' "$ENROLLMENT_TOKEN" "$TENANT_ID" "$HOSTNAME_VAL" "$IP_ADDR" "$MAC_ADDR" ' + quoteBashLiteral(vars.targetDeviceId || '') + ' "$TRAY_THEME" ' + quoteBashLiteral(agentVariantLabel) + ' "$HW_ENROLL_JSON")"',
       'if ENROLL_RESP="$(http_post_json "$VITRINE_SERVER_URL/api/agent/enroll" "$ENROLL_JSON" 2>/dev/null)"; then',
-      '  python3 - "$ENROLL_RESP" "$VITRINE_SERVER_URL" "$TENANT_ID" "$INSTALL_DIR/agent-identity.json" "$CURL_TLS_FLAG" "$SERVICE_NAME" <<\'PYEOF\'',
+      '  if python3 - "$ENROLL_RESP" "$VITRINE_SERVER_URL" "$TENANT_ID" "$INSTALL_DIR/agent-identity.json" "$CURL_TLS_FLAG" "$SERVICE_NAME" <<\'PYEOF\'',
       'import json, os, sys',
       'resp = json.loads(sys.argv[1])',
       'tok = resp.get("agentToken") or resp.get("agentAuthToken")',
@@ -1225,17 +1629,28 @@ export class InstallerGeneratorService {
       '    fd = os.open(sys.argv[4], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)',
       '    with os.fdopen(fd, "w") as f:',
       '        json.dump(out, f)',
+      '    sys.exit(0)',
+      'sys.exit(1)',
       'PYEOF',
+      '  then ENROLLED_OK="1"; fi',
       'fi',
       '',
       ...(vars.isQuickSupport
         ? [
-            'nohup python3 "$INSTALL_DIR/vitrine-companion.py" >/dev/null 2>&1 &',
+            'if [ "$USE_NATIVE_BIN" = "1" ]; then',
+            '  nohup "$INSTALL_DIR/vitrine-agent" >/dev/null 2>&1 &',
+            'else',
+            '  nohup python3 "$INSTALL_DIR/vitrine-companion.py" >/dev/null 2>&1 &',
+            'fi',
             'if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then',
             '  nohup python3 "$INSTALL_DIR/vitrine-tray.py" --quicksupport --code "${SESSION_CODE:-$ENROLLMENT_TOKEN}" >/dev/null 2>&1 &',
             'fi'
           ]
         : [
+            'EXEC_START="/usr/bin/env python3 ${INSTALL_DIR}/vitrine-companion.py"',
+            'if [ "$USE_NATIVE_BIN" = "1" ]; then',
+            `  EXEC_START="\${INSTALL_DIR}/vitrine-agent${isHeadless ? ' --headless' : ''}"`,
+            'fi',
             'if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then',
             '  UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}-companion.service"',
             '  cat > "$UNIT_PATH" <<\'EOF\'',
@@ -1245,14 +1660,14 @@ export class InstallerGeneratorService {
             '',
             '[Service]',
             'Type=simple',
-            'ExecStart=/usr/bin/env python3 __VITRINE_EXEC__',
+            'ExecStart=__VITRINE_EXEC__',
             'Restart=always',
             'RestartSec=10',
             '',
             '[Install]',
             'WantedBy=multi-user.target',
             'EOF',
-            '  python3 - "$UNIT_PATH" "$SAFE_UNIT_BRAND Endpoint Telemetry & Task Companion" "${INSTALL_DIR}/vitrine-companion.py" <<\'PYUNIT\'',
+            '  python3 - "$UNIT_PATH" "$SAFE_UNIT_BRAND Endpoint Telemetry & Task Companion" "$EXEC_START" <<\'PYUNIT\'',
             'import sys',
             'p, desc, exec_p = sys.argv[1], sys.argv[2].replace("\\n", " ").replace("\\r", " "), sys.argv[3].replace("\\n", "").replace("\\r", "")',
             'with open(p, "r") as f: data = f.read()',
@@ -1261,45 +1676,75 @@ export class InstallerGeneratorService {
             'PYUNIT',
             '  chmod 644 "$UNIT_PATH"',
             '  systemctl daemon-reload || true',
-            '  (systemctl enable "${SERVICE_NAME}-companion.service" && systemctl restart "${SERVICE_NAME}-companion.service") || nohup python3 "$INSTALL_DIR/vitrine-companion.py" >/dev/null 2>&1 &',
+            '  (systemctl enable "${SERVICE_NAME}-companion.service" && systemctl restart "${SERVICE_NAME}-companion.service") || nohup $EXEC_START >/dev/null 2>&1 &',
             'else',
-            '  nohup python3 "$INSTALL_DIR/vitrine-companion.py" >/dev/null 2>&1 &',
+            '  nohup $EXEC_START >/dev/null 2>&1 &',
             'fi',
-            '',
-            '# Install XDG Autostart entry & launch theme-aware Desktop Tray if a graphical session is active',
-            'if [ -d /etc/xdg/autostart ] || mkdir -p /etc/xdg/autostart 2>/dev/null; then',
-            '  cat > "/etc/xdg/autostart/${SERVICE_NAME}-tray.desktop" <<DESKEOF',
-            '[Desktop Entry]',
-            'Type=Application',
-            'Name=${SAFE_UNIT_BRAND} Support Tray',
-            'Exec=/usr/bin/env python3 ${INSTALL_DIR}/vitrine-tray.py',
-            'Terminal=false',
-            'X-GNOME-Autostart-enabled=true',
-            'DESKEOF',
-            '  chmod 644 "/etc/xdg/autostart/${SERVICE_NAME}-tray.desktop"',
-            'fi',
-            'pkill -f "${INSTALL_DIR}/vitrine-tray.py" >/dev/null 2>&1 || true',
-            'GUI_USER="${SUDO_USER:-}"',
-            'if [ -z "$GUI_USER" ] || [ "$GUI_USER" = "root" ]; then',
-            '  GUI_USER="$(who | awk \'{print $1; exit}\' || true)"',
-            'fi',
-            'if [ -n "$GUI_USER" ] && [ "$GUI_USER" != "root" ] && id "$GUI_USER" >/dev/null 2>&1; then',
-            '  GUI_UID="$(id -u "$GUI_USER")"',
-            '  GUI_RT="/run/user/$GUI_UID"',
-            '  if [ -d "$GUI_RT" ]; then',
-            '    GUI_DISP=""',
-            '    GUI_WL=""',
-            '    for s in "$GUI_RT"/wayland-[0-9]*; do [ -S "$s" ] && GUI_WL="$(basename "$s")" && break; done',
-            '    if [ -n "${DISPLAY:-}" ]; then GUI_DISP="$DISPLAY"; elif [ -S /tmp/.X11-unix/X0 ]; then GUI_DISP=":0"; elif [ -S /tmp/.X11-unix/X1 ]; then GUI_DISP=":1"; fi',
-            '    if [ -n "$GUI_DISP" ] || [ -n "$GUI_WL" ]; then',
-            '      GUI_CMD=(env "XDG_RUNTIME_DIR=$GUI_RT")',
-            '      [ -n "$GUI_DISP" ] && GUI_CMD+=("DISPLAY=$GUI_DISP")',
-            '      [ -n "$GUI_WL" ] && GUI_CMD+=("WAYLAND_DISPLAY=$GUI_WL")',
-            '      [ -S "$GUI_RT/bus" ] && GUI_CMD+=("DBUS_SESSION_BUS_ADDRESS=unix:path=$GUI_RT/bus")',
-            '      nohup su -s /bin/sh "$GUI_USER" -c "${GUI_CMD[*]} python3 ${INSTALL_DIR}/vitrine-tray.py >/dev/null 2>&1 &" >/dev/null 2>&1 || true',
-            '    fi',
-            '  fi',
-            'fi'
+            ...(isHeadless
+              ? []
+              : [
+                  '',
+                  '# Install XDG Autostart entry ONLY if tray is enabled, and show install confirmation in desktop session',
+                  `TRAY_ENABLED=${quoteBashLiteral(vars.trayEnabled !== false ? '1' : '0')}`,
+                  'if [ "$TRAY_ENABLED" = "1" ]; then',
+                  '  if [ -d /etc/xdg/autostart ] || mkdir -p /etc/xdg/autostart 2>/dev/null; then',
+                  '    cat > "/etc/xdg/autostart/${SERVICE_NAME}-tray.desktop" <<DESKEOF',
+                  '[Desktop Entry]',
+                  'Type=Application',
+                  'Name=${SAFE_UNIT_BRAND} Support Tray',
+                  'Exec=/usr/bin/env python3 ${INSTALL_DIR}/vitrine-tray.py',
+                  'Terminal=false',
+                  'X-GNOME-Autostart-enabled=true',
+                  'DESKEOF',
+                  '    chmod 644 "/etc/xdg/autostart/${SERVICE_NAME}-tray.desktop"',
+                  '  fi',
+                  'fi',
+                  'if [ -f "$TRAY_DIR/tray-icon.png" ]; then cp "$TRAY_DIR/tray-icon.png" "$INSTALL_DIR/brand-icon.png" 2>/dev/null || true; fi',
+                  'python3 - "$INSTALL_DIR/install-confirm.json" "$BRAND_NAME" ' + quoteBashLiteral(vars.tenantName || '') + ' "$HOSTNAME_VAL" "$ENROLLED_OK" "$TRAY_THEME" <<\'PYCONFJSON\'',
+                  'import json, os, sys',
+                  'with open(sys.argv[1], "w", encoding="utf-8") as f:',
+                  '    json.dump({"brandName": sys.argv[2], "tenantName": sys.argv[3], "hostname": sys.argv[4], "enrolled": sys.argv[5] == "1", "themeMode": sys.argv[6]}, f)',
+                  'os.chmod(sys.argv[1], 0o644)',
+                  'PYCONFJSON',
+                  'pkill -f "${INSTALL_DIR}/vitrine-tray.py" >/dev/null 2>&1 || true',
+                  'GUI_USER="${SUDO_USER:-}"',
+                  'if [ -z "$GUI_USER" ] || [ "$GUI_USER" = "root" ]; then',
+                  '  GUI_USER="$(loginctl list-sessions --no-legend 2>/dev/null | awk \'$3 != "" && $3 != "root" && $3 != "gdm" && $3 != "lightdm" && $3 != "sddm" {print $3; exit}\' || true)"',
+                  'fi',
+                  'if [ -z "$GUI_USER" ] || [ "$GUI_USER" = "root" ]; then',
+                  '  for sock in /run/user/*/wayland-[0-9]* /run/user/*/bus; do',
+                  '    if [ -S "$sock" ]; then',
+                  '      CAND_UID="$(basename "$(dirname "$sock")")"',
+                  '      CAND_USER="$(id -nu "$CAND_UID" 2>/dev/null || true)"',
+                  '      if [ -n "$CAND_USER" ] && [ "$CAND_USER" != "root" ] && [ "$CAND_USER" != "gdm" ] && [ "$CAND_USER" != "lightdm" ]; then GUI_USER="$CAND_USER"; break; fi',
+                  '    fi',
+                  '  done',
+                  'fi',
+                  'if [ -z "$GUI_USER" ] || [ "$GUI_USER" = "root" ]; then',
+                  '  RAW_WHO="$(who | awk \'{print $1; exit}\' || true)"',
+                  '  case "$RAW_WHO" in [0-9]*) GUI_USER="$(id -nu "$RAW_WHO" 2>/dev/null || true)";; *) GUI_USER="$RAW_WHO";; esac',
+                  'fi',
+                  'if [ -n "$GUI_USER" ] && [ "$GUI_USER" != "root" ] && id "$GUI_USER" >/dev/null 2>&1; then',
+                  '  GUI_UID="$(id -u "$GUI_USER")"',
+                  '  GUI_RT="/run/user/$GUI_UID"',
+                  '  if [ -d "$GUI_RT" ]; then',
+                  '    GUI_DISP=""',
+                  '    GUI_WL=""',
+                  '    for s in "$GUI_RT"/wayland-[0-9]*; do [ -S "$s" ] && GUI_WL="$(basename "$s")" && break; done',
+                  '    if [ -n "${DISPLAY:-}" ]; then GUI_DISP="$DISPLAY"; elif [ -S /tmp/.X11-unix/X0 ]; then GUI_DISP=":0"; elif [ -S /tmp/.X11-unix/X1 ]; then GUI_DISP=":1"; fi',
+                  '    if [ -n "$GUI_DISP" ] || [ -n "$GUI_WL" ]; then',
+                  '      GUI_CMD=(env "XDG_RUNTIME_DIR=$GUI_RT")',
+                  '      [ -n "$GUI_DISP" ] && GUI_CMD+=("DISPLAY=$GUI_DISP")',
+                  '      [ -n "$GUI_WL" ] && GUI_CMD+=("WAYLAND_DISPLAY=$GUI_WL")',
+                  '      [ -S "$GUI_RT/bus" ] && GUI_CMD+=("DBUS_SESSION_BUS_ADDRESS=unix:path=$GUI_RT/bus")',
+                  '      nohup su -s /bin/sh "$GUI_USER" -c "${GUI_CMD[*]} python3 ${INSTALL_DIR}/vitrine-install-confirm.py >/dev/null 2>&1 &" >/dev/null 2>&1 || true',
+                  '      if [ "$TRAY_ENABLED" = "1" ]; then',
+                  '        nohup su -s /bin/sh "$GUI_USER" -c "${GUI_CMD[*]} python3 ${INSTALL_DIR}/vitrine-tray.py >/dev/null 2>&1 &" >/dev/null 2>&1 || true',
+                  '      fi',
+                  '    fi',
+                  '  fi',
+                  'fi'
+                ])
           ]),
       '',
       'printf "[OK] %s Linux deployment completed.\\n" "$BRAND_NAME"'
@@ -1404,12 +1849,28 @@ export class InstallerGeneratorService {
       '  fi',
       'fi',
       '',
+      '# Attempt native universal macOS C++ binary first (supports WSS + HTTP fallback), retaining Python companion fallback',
+      'USE_NATIVE_BIN=0',
+      'BIN_DL_URL="$VITRINE_SERVER_URL/api/agent/binary?component=macos&arch=universal&token=$ENROLLMENT_TOKEN"',
+      `if curl \${curlTlsFlag}-fsSL "$BIN_DL_URL" -o "$INSTALL_DIR/vitrine-agent" 2>/dev/null && [ -s "$INSTALL_DIR/vitrine-agent" ]; then`,
+      '  chmod 755 "$INSTALL_DIR/vitrine-agent"',
+      '  if "$INSTALL_DIR/vitrine-agent" --version >/dev/null 2>&1; then',
+      '    USE_NATIVE_BIN=1',
+      '  else',
+      '    rm -f "$INSTALL_DIR/vitrine-agent"',
+      '  fi',
+      'fi',
+      '',
       'HOSTNAME_VAL="$(scutil --get LocalHostName 2>/dev/null || hostname)"',
       'OS_VER="macOS $(sw_vers -productVersion 2>/dev/null || uname -r)"',
       'DEF_IFACE="$(route -n get default 2>/dev/null | awk \'/interface:/ {print $2; exit}\')"',
       'IP_ADDR="$(ipconfig getifaddr "${DEF_IFACE:-en0}" 2>/dev/null || echo "")"',
       'MAC_ADDR="$(ifconfig "${DEF_IFACE:-en0}" 2>/dev/null | awk \'/ether / {print $2; exit}\')"',
-      'ENROLL_JSON="$(python3 -c \'import json,sys; print(json.dumps({"token":sys.argv[1],"enrollmentToken":sys.argv[1],"tenantId":sys.argv[2],"hostname":sys.argv[3],"osType":"macos","osVersion":sys.argv[4],"ipAddress":sys.argv[5] or "127.0.0.1","macAddress":sys.argv[6] or "","deviceId":sys.argv[7] or None}))\' "$ENROLLMENT_TOKEN" "$TENANT_ID" "$HOSTNAME_VAL" "$OS_VER" "$IP_ADDR" "$MAC_ADDR" ' + quoteBashLiteral(vars.targetDeviceId || '') + ')"',
+      'HW_ENROLL_JSON="{}"',
+      'if [ "$USE_NATIVE_BIN" = "1" ]; then',
+      '  HW_ENROLL_JSON="$("$INSTALL_DIR/vitrine-agent" --print-enroll-hw 2>/dev/null || echo \'{}\')"',
+      'fi',
+      'ENROLL_JSON="$(python3 -c \'import json,sys; hw=json.loads(sys.argv[8]) if sys.argv[8].strip().startswith("{") else {}; d={"token":sys.argv[1],"enrollmentToken":sys.argv[1],"tenantId":sys.argv[2],"hostname":sys.argv[3],"osType":"macos","osVersion":sys.argv[4],"ipAddress":sys.argv[5] or "127.0.0.1","macAddress":sys.argv[6] or "","deviceId":sys.argv[7] or None,"agentVariant":sys.argv[9]}; d.update(hw); print(json.dumps(d))\' "$ENROLLMENT_TOKEN" "$TENANT_ID" "$HOSTNAME_VAL" "$OS_VER" "$IP_ADDR" "$MAC_ADDR" ' + quoteBashLiteral(vars.targetDeviceId || '') + ' "$HW_ENROLL_JSON" "$( [ "$USE_NATIVE_BIN" = "1" ] && echo "macos-native" || echo "macos-python" )")"',
       `if ENROLL_RESP="$(curl ${curlTlsFlag}-fsSL -X POST "$VITRINE_SERVER_URL/api/agent/enroll" -H "Content-Type: application/json" -d "$ENROLL_JSON" 2>/dev/null)"; then`,
       '  python3 - "$ENROLL_RESP" "$VITRINE_SERVER_URL" "$TENANT_ID" "$INSTALL_DIR/agent-identity.json" "$CURL_TLS_FLAG" "$SERVICE_SLUG" <<\'PYEOF\'',
       'import json, os, sys',
@@ -1712,10 +2173,40 @@ export class InstallerGeneratorService {
       'chmod 700 "$INSTALL_DIR/vitrine-companion.py"',
       '',
       ...(vars.isQuickSupport
-        ? ['nohup python3 "$INSTALL_DIR/vitrine-companion.py" >/dev/null 2>&1 &']
+        ? [
+            'if [ "$USE_NATIVE_BIN" = "1" ]; then',
+            '  nohup "$INSTALL_DIR/vitrine-agent" >/dev/null 2>&1 &',
+            'else',
+            '  nohup python3 "$INSTALL_DIR/vitrine-companion.py" >/dev/null 2>&1 &',
+            'fi'
+          ]
         : [
             `PLIST_PATH="/Library/LaunchDaemons/com.${safeService}.companion.plist"`,
-            'cat > "$PLIST_PATH" <<EOF',
+            'if [ "$USE_NATIVE_BIN" = "1" ]; then',
+            '  cat > "$PLIST_PATH" <<EOF',
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+            '<plist version="1.0">',
+            '<dict>',
+            '  <key>Label</key>',
+            `  <string>com.${safeService}.companion</string>`,
+            '  <key>ProgramArguments</key>',
+            '  <array>',
+            '    <string>${INSTALL_DIR}/vitrine-agent</string>',
+            '  </array>',
+            '  <key>RunAtLoad</key>',
+            '  <true/>',
+            '  <key>KeepAlive</key>',
+            '  <true/>',
+            '  <key>StandardOutPath</key>',
+            `  <string>/var/log/${safeService}-companion.log</string>`,
+            '  <key>StandardErrorPath</key>',
+            `  <string>/var/log/${safeService}-companion.err.log</string>`,
+            '</dict>',
+            '</plist>',
+            'EOF',
+            'else',
+            '  cat > "$PLIST_PATH" <<EOF',
             '<?xml version="1.0" encoding="UTF-8"?>',
             '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
             '<plist version="1.0">',
@@ -1738,6 +2229,7 @@ export class InstallerGeneratorService {
             '</dict>',
             '</plist>',
             'EOF',
+            'fi',
             'chmod 644 "$PLIST_PATH"',
             'chown root:wheel "$PLIST_PATH" 2>/dev/null || true',
             'launchctl bootout system "$PLIST_PATH" 2>/dev/null || true',

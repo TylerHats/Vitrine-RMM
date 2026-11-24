@@ -13,6 +13,7 @@ export function matchesDeviceSearch(
   const fields: Array<string | null | undefined> = [
     device.hostname,
     device.ip_address,
+    device.public_ip,
     device.mac_address,
     device.serial_number,
     device.manufacturer,

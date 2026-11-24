@@ -49,7 +49,7 @@ run_as_owner() {
     fi
 }
 
-APP_VERSION="$(node -p "try { require('./package.json').version || require('./backend/package.json').version } catch { '2.7.0' }" 2>/dev/null || echo "2.7.0")"
+APP_VERSION="$(node -p "try { require('./package.json').version || require('./backend/package.json').version } catch { '2.8.0' }" 2>/dev/null || echo "2.8.0")"
 
 LOCAL_MS2_FOUND=0
 LOCAL_MS2_DIR=""
@@ -267,6 +267,20 @@ if ! command -v x86_64-w64-mingw32-g++ &> /dev/null || ! command -v x86_64-w64-m
         run_priv apt-get install -y --no-install-recommends clang lld || echo "    [!] Warning: clang/lld unavailable on this apt suite; falling back to g++ PE pipeline."
     else
         echo "    [!] Warning: x86_64-w64-mingw32-g++ / windres / clang++ / ld.lld not found; native Windows PE (.exe) template build requires mingw-w64 (and clang + lld for 6-section UCRT PEs)."
+    fi
+fi
+
+# Ensure Linux POSIX cross-compiler for companion architecture (amd64 <-> arm64) is present when available
+if command -v apt-get &> /dev/null; then
+    HOST_MACHINE="$(uname -m 2>/dev/null || echo unknown)"
+    if [ "$HOST_MACHINE" = "x86_64" ] && ! command -v aarch64-linux-gnu-g++ &> /dev/null; then
+        echo "--> Installing Linux ARM64 POSIX cross-compiler (g++-aarch64-linux-gnu)..."
+        run_priv apt-get install -y --no-install-recommends g++-aarch64-linux-gnu || true
+    elif [ "$HOST_MACHINE" = "aarch64" ] || [ "$HOST_MACHINE" = "arm64" ]; then
+        if ! command -v x86_64-linux-gnu-g++ &> /dev/null; then
+            echo "--> Installing Linux x86_64 POSIX cross-compiler (g++-x86-64-linux-gnu)..."
+            run_priv apt-get install -y --no-install-recommends g++-x86-64-linux-gnu || true
+        fi
     fi
 fi
 

@@ -101,8 +101,8 @@ export const BRANDING_DIR_PATH = BRANDING_DIR;
 export const RECORDINGS_DIR_PATH = RECORDINGS_DIR;
 export const PACKAGES_DIR_PATH = PACKAGES_DIR;
 export const DB_FILE_PATH = DB_PATH;
-export const APP_VERSION = '2.7.0';
-export const APP_SCHEMA_VERSION = 18;
+export const APP_VERSION = '2.8.0';
+export const APP_SCHEMA_VERSION = 19;
 
 function detectInstalledCommit(): string {
   if (process.env.VITRINE_GIT_COMMIT && process.env.VITRINE_GIT_COMMIT.trim()) {
@@ -140,7 +140,7 @@ function detectInstalledCommit(): string {
   } catch {
     // Git binary or repo unavailable
   }
-  return 'v2.7.0';
+  return 'v2.8.0';
 }
 
 export const APP_INSTALLED_COMMIT = detectInstalledCommit();
@@ -704,9 +704,9 @@ export function initDatabase() {
       file_path TEXT NOT NULL,
       size_bytes INTEGER NOT NULL DEFAULT 0,
       trigger_type TEXT NOT NULL DEFAULT 'manual',
-      app_version TEXT NOT NULL DEFAULT '2.7.0',
-      git_commit TEXT NOT NULL DEFAULT 'v2.7.0',
-      db_schema_version INTEGER NOT NULL DEFAULT 18,
+      app_version TEXT NOT NULL DEFAULT '2.8.0',
+      git_commit TEXT NOT NULL DEFAULT 'v2.8.0',
+      db_schema_version INTEGER NOT NULL DEFAULT 19,
       sha256_hash TEXT NOT NULL,
       includes_branding INTEGER NOT NULL DEFAULT 1,
       includes_mesh_config INTEGER NOT NULL DEFAULT 1,
@@ -1009,6 +1009,51 @@ export function initDatabase() {
 
     CREATE INDEX IF NOT EXISTS idx_telemetry_history_device_time
       ON device_telemetry_history (device_id, recorded_at DESC);
+
+    CREATE TABLE IF NOT EXISTS itflow_tenant_mappings (
+      tenant_id TEXT PRIMARY KEY,
+      itflow_client_id INTEGER,
+      itflow_client_name TEXT,
+      itflow_default_location_id INTEGER,
+      sync_enabled INTEGER NOT NULL DEFAULT 0,
+      auto_created INTEGER NOT NULL DEFAULT 0,
+      last_synced_at TEXT,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS itflow_site_mappings (
+      site_id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      itflow_client_id INTEGER NOT NULL,
+      itflow_location_id INTEGER,
+      itflow_location_name TEXT,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (site_id) REFERENCES sites(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS itflow_asset_links (
+      device_id TEXT PRIMARY KEY,
+      itflow_client_id INTEGER NOT NULL,
+      itflow_asset_id INTEGER NOT NULL,
+      last_payload_hash TEXT NOT NULL DEFAULT '',
+      last_synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      last_error TEXT,
+      FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS psa_ticket_notes (
+      id TEXT PRIMARY KEY,
+      ticket_id TEXT NOT NULL,
+      author TEXT NOT NULL,
+      note_type TEXT NOT NULL DEFAULT 'Internal',
+      body TEXT NOT NULL,
+      time_worked_sec INTEGER NOT NULL DEFAULT 0,
+      synced_external INTEGER NOT NULL DEFAULT 0,
+      external_reply_id TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (ticket_id) REFERENCES psa_tickets(id) ON DELETE CASCADE
+    );
   `);
 
   runDatabaseMigrations();
@@ -1130,11 +1175,30 @@ export function runDatabaseMigrations() {
   safeAddColumn('devices', "mdm_compliance_status TEXT NOT NULL DEFAULT 'Unmanaged'");
   safeAddColumn('devices', "last_backup_status TEXT NOT NULL DEFAULT 'Unconfigured'");
   safeAddColumn('devices', 'last_backup_at TEXT');
-  safeAddColumn('devices', "companion_version TEXT NOT NULL DEFAULT '2.7.0'");
+  safeAddColumn('devices', "companion_version TEXT NOT NULL DEFAULT '2.8.0'");
   safeAddColumn('devices', 'logged_in_user TEXT');
   safeAddColumn('devices', 'reboot_required INTEGER NOT NULL DEFAULT 0');
   safeAddColumn('devices', 'uptime_seconds INTEGER NOT NULL DEFAULT 0');
   safeAddColumn('devices', 'device_role_manual INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('devices', "public_ip TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('devices', 'ws_connected INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('devices', "agent_transport TEXT NOT NULL DEFAULT 'http'");
+  safeAddColumn('devices', "agent_binary_variant TEXT NOT NULL DEFAULT ''");
+
+  // PSA Tickets & Notes + ITFlow Extended Settings
+  safeAddColumn('psa_tickets', "description TEXT NOT NULL DEFAULT ''");
+  safeAddColumn('psa_tickets', 'external_provider TEXT');
+  safeAddColumn('psa_tickets', 'external_ticket_id TEXT');
+  safeAddColumn('psa_tickets', 'external_client_id INTEGER');
+  safeAddColumn('psa_tickets', 'external_asset_id INTEGER');
+  safeAddColumn('psa_tickets', 'updated_at TEXT');
+
+  safeAddColumn('settings', 'itflow_enabled INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('settings', 'itflow_setup_completed INTEGER NOT NULL DEFAULT 0');
+  safeAddColumn('settings', 'itflow_sync_interval_min INTEGER NOT NULL DEFAULT 60');
+  safeAddColumn('settings', 'itflow_last_asset_sync_at TEXT');
+  safeAddColumn('settings', 'itflow_last_asset_sync_summary TEXT');
+  safeAddColumn('settings', "itflow_config_json TEXT NOT NULL DEFAULT '{}'");
 
   // Patches, Hardware & Network History
   safeAddColumn('patches', 'cve_id TEXT');
@@ -1240,9 +1304,9 @@ export function runDatabaseMigrations() {
   safeAddColumn('settings', "reverse_proxy_type TEXT NOT NULL DEFAULT 'nginx'");
   safeAddColumn('settings', "letsencrypt_email TEXT NOT NULL DEFAULT ''");
   safeAddColumn('settings', "update_channel TEXT NOT NULL DEFAULT 'stable'");
-  safeAddColumn('settings', "installed_version TEXT NOT NULL DEFAULT '2.7.0'");
-  safeAddColumn('settings', "installed_commit TEXT NOT NULL DEFAULT 'v2.7.0'");
-  safeAddColumn('settings', 'db_schema_version INTEGER NOT NULL DEFAULT 18');
+  safeAddColumn('settings', "installed_version TEXT NOT NULL DEFAULT '2.8.0'");
+  safeAddColumn('settings', "installed_commit TEXT NOT NULL DEFAULT 'v2.8.0'");
+  safeAddColumn('settings', 'db_schema_version INTEGER NOT NULL DEFAULT 19');
   safeAddColumn('settings', 'update_auto_backup INTEGER NOT NULL DEFAULT 1');
   safeAddColumn('settings', 'update_auto_rollback INTEGER NOT NULL DEFAULT 1');
   safeAddColumn('settings', 'update_notify_webui INTEGER NOT NULL DEFAULT 1');

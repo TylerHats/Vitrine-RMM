@@ -721,6 +721,238 @@ inline bool httpDownloadToFile(const std::string& url, const std::wstring& destP
 }
 
 // ============================================================================
+// Dynamic WinHTTP WebSocket Client (WSS/WS with runtime Win8+ API resolution)
+// ============================================================================
+#ifndef WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET
+#define WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET 114
+#endif
+
+enum VitrineWsBufferType : DWORD {
+  VWS_BINARY_MESSAGE = 0,
+  VWS_BINARY_FRAGMENT = 1,
+  VWS_UTF8_MESSAGE = 2,
+  VWS_UTF8_FRAGMENT = 3,
+  VWS_CLOSE = 4
+};
+
+class WinHttpWsClient {
+ public:
+  HINTERNET hSession = nullptr;
+  HINTERNET hConn = nullptr;
+  HINTERNET hWs = nullptr;
+  HANDLE hReaderThread = nullptr;
+  HANDLE msgEvent = nullptr;
+  CRITICAL_SECTION queueCs{};
+  CRITICAL_SECTION sendCs{};
+  bool csInitialized = false;
+  volatile LONG closedFlag = 1;
+  std::vector<std::string> rxQueue;
+
+  typedef HINTERNET(WINAPI * FnCompleteUpgrade)(HINTERNET, DWORD_PTR);
+  typedef DWORD(WINAPI * FnWsSend)(HINTERNET, DWORD, PVOID, DWORD);
+  typedef DWORD(WINAPI * FnWsReceive)(HINTERNET, PVOID, DWORD, DWORD*, DWORD*);
+  typedef DWORD(WINAPI * FnWsClose)(HINTERNET, USHORT, PVOID, DWORD);
+
+  FnWsSend fnSend = nullptr;
+  FnWsReceive fnReceive = nullptr;
+  FnWsClose fnClose = nullptr;
+
+  WinHttpWsClient() {
+    InitializeCriticalSection(&queueCs);
+    InitializeCriticalSection(&sendCs);
+    csInitialized = true;
+    msgEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  }
+
+  ~WinHttpWsClient() {
+    close();
+    if (msgEvent) {
+      CloseHandle(msgEvent);
+      msgEvent = nullptr;
+    }
+    if (csInitialized) {
+      DeleteCriticalSection(&queueCs);
+      DeleteCriticalSection(&sendCs);
+      csInitialized = false;
+    }
+  }
+
+  bool isConnected() const {
+    return InterlockedCompareExchange(const_cast<LONG*>(&closedFlag), 0, 0) == 0 && hWs != nullptr;
+  }
+
+  static DWORD WINAPI readerThreadProc(LPVOID param) {
+    auto* self = static_cast<WinHttpWsClient*>(param);
+    std::string accum;
+    std::vector<char> buf(16384);
+    while (self->isConnected()) {
+      DWORD bytesRead = 0;
+      DWORD bufType = 0;
+      DWORD err = self->fnReceive(self->hWs, buf.data(), static_cast<DWORD>(buf.size()), &bytesRead, &bufType);
+      if (err != ERROR_SUCCESS) break;
+      if (bufType == VWS_CLOSE) break;
+      if (bufType == VWS_UTF8_FRAGMENT || bufType == VWS_UTF8_MESSAGE ||
+          bufType == VWS_BINARY_FRAGMENT || bufType == VWS_BINARY_MESSAGE) {
+        if (bytesRead > 0) {
+          if (accum.size() + bytesRead > 4 * 1024 * 1024) break;
+          accum.append(buf.data(), bytesRead);
+        }
+        if (bufType == VWS_UTF8_MESSAGE || bufType == VWS_BINARY_MESSAGE) {
+          EnterCriticalSection(&self->queueCs);
+          self->rxQueue.push_back(std::move(accum));
+          LeaveCriticalSection(&self->queueCs);
+          accum.clear();
+          if (self->msgEvent) SetEvent(self->msgEvent);
+        }
+      }
+    }
+    InterlockedExchange(&self->closedFlag, 1);
+    if (self->msgEvent) SetEvent(self->msgEvent);
+    return 0;
+  }
+
+  bool connect(
+      const std::string& wsUrl,
+      const std::vector<std::pair<std::string, std::string>>& headers,
+      bool allowSelfSignedTls,
+      DWORD timeoutMs = 10000) {
+    close();
+
+    HMODULE hWinHttp = GetModuleHandleW(L"winhttp.dll");
+    if (!hWinHttp) hWinHttp = LoadLibraryW(L"winhttp.dll");
+    if (!hWinHttp) return false;
+
+    auto fnUpgrade = reinterpret_cast<FnCompleteUpgrade>(
+        reinterpret_cast<void*>(GetProcAddress(hWinHttp, "WinHttpWebSocketCompleteUpgrade")));
+    fnSend = reinterpret_cast<FnWsSend>(
+        reinterpret_cast<void*>(GetProcAddress(hWinHttp, "WinHttpWebSocketSend")));
+    fnReceive = reinterpret_cast<FnWsReceive>(
+        reinterpret_cast<void*>(GetProcAddress(hWinHttp, "WinHttpWebSocketReceive")));
+    fnClose = reinterpret_cast<FnWsClose>(
+        reinterpret_cast<void*>(GetProcAddress(hWinHttp, "WinHttpWebSocketClose")));
+    if (!fnUpgrade || !fnSend || !fnReceive || !fnClose) return false;
+
+    std::string httpEquiv = wsUrl;
+    if (httpEquiv.rfind("wss://", 0) == 0) httpEquiv = "https://" + httpEquiv.substr(6);
+    else if (httpEquiv.rfind("ws://", 0) == 0) httpEquiv = "http://" + httpEquiv.substr(5);
+
+    ParsedUrl u = crackHttpUrl(httpEquiv);
+    if (!u.valid) return false;
+
+    hSession = WinHttpOpen(L"VitrineRMM-Agent/3.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) hSession = WinHttpOpen(L"VitrineRMM-Agent/3.0", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return false;
+
+    WinHttpSetTimeouts(hSession, timeoutMs, timeoutMs, timeoutMs, INFINITE);
+    DWORD secProto = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+    WinHttpSetOption(hSession, WINHTTP_OPTION_SECURE_PROTOCOLS, &secProto, sizeof(secProto));
+
+    hConn = WinHttpConnect(hSession, u.host.c_str(), u.port, 0);
+    if (!hConn) { close(); return false; }
+
+    DWORD flags = u.isHttps ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET hReq = WinHttpOpenRequest(hConn, L"GET", u.pathAndQuery.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!hReq) { close(); return false; }
+
+    if (u.isHttps && allowSelfSignedTls) {
+      DWORD secFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
+      WinHttpSetOption(hReq, WINHTTP_OPTION_SECURITY_FLAGS, &secFlags, sizeof(secFlags));
+    }
+
+    if (!WinHttpSetOption(hReq, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0)) {
+      WinHttpCloseHandle(hReq);
+      close();
+      return false;
+    }
+
+    std::wstring hdrBlock;
+    for (const auto& kv : headers) {
+      hdrBlock += utf8ToWide(kv.first) + L": " + utf8ToWide(kv.second) + L"\r\n";
+    }
+
+    BOOL ok = WinHttpSendRequest(
+        hReq,
+        hdrBlock.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : hdrBlock.c_str(),
+        hdrBlock.empty() ? 0 : static_cast<DWORD>(hdrBlock.size()),
+        WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+    if (!ok || !WinHttpReceiveResponse(hReq, nullptr)) {
+      WinHttpCloseHandle(hReq);
+      close();
+      return false;
+    }
+
+    hWs = fnUpgrade(hReq, 0);
+    WinHttpCloseHandle(hReq);
+    if (!hWs) {
+      close();
+      return false;
+    }
+
+    rxQueue.clear();
+    if (msgEvent) ResetEvent(msgEvent);
+    InterlockedExchange(&closedFlag, 0);
+    hReaderThread = CreateThread(nullptr, 0, readerThreadProc, this, 0, nullptr);
+    if (!hReaderThread) {
+      close();
+      return false;
+    }
+    return true;
+  }
+
+  bool sendText(const std::string& utf8Text) {
+    if (!isConnected() || !fnSend) return false;
+    EnterCriticalSection(&sendCs);
+    DWORD err = fnSend(hWs, VWS_UTF8_MESSAGE,
+        utf8Text.empty() ? nullptr : const_cast<char*>(utf8Text.data()),
+        static_cast<DWORD>(utf8Text.size()));
+    LeaveCriticalSection(&sendCs);
+    if (err != ERROR_SUCCESS) {
+      InterlockedExchange(&closedFlag, 1);
+      return false;
+    }
+    return true;
+  }
+
+  bool popMessage(std::string& outMsg) {
+    EnterCriticalSection(&queueCs);
+    if (rxQueue.empty()) {
+      LeaveCriticalSection(&queueCs);
+      return false;
+    }
+    outMsg = std::move(rxQueue.front());
+    rxQueue.erase(rxQueue.begin());
+    LeaveCriticalSection(&queueCs);
+    return true;
+  }
+
+  void close() {
+    InterlockedExchange(&closedFlag, 1);
+    if (hWs && fnClose) {
+      EnterCriticalSection(&sendCs);
+      fnClose(hWs, 1000 /* WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS */, nullptr, 0);
+      LeaveCriticalSection(&sendCs);
+    }
+    if (hWs) {
+      WinHttpCloseHandle(hWs);
+      hWs = nullptr;
+    }
+    if (hConn) {
+      WinHttpCloseHandle(hConn);
+      hConn = nullptr;
+    }
+    if (hSession) {
+      WinHttpCloseHandle(hSession);
+      hSession = nullptr;
+    }
+    if (hReaderThread) {
+      WaitForSingleObject(hReaderThread, 3000);
+      CloseHandle(hReaderThread);
+      hReaderThread = nullptr;
+    }
+  }
+};
+
+// ============================================================================
 // Native Authenticode Verification via WinVerifyTrust (wintrust.dll)
 // ============================================================================
 inline bool verifyAuthenticodeSignature(const std::wstring& filePath, std::string& outStatusMsg) {

@@ -8,6 +8,9 @@ import { MfaChallengeModal } from './components/MfaChallengeModal.js';
 import { isSuperAdmin as checkIsSuperAdmin, canMutateFleet } from './utils/permissions.js';
 import { sanitizeSafeUrl } from './utils/urlSafety.js';
 
+const DevicesView = lazy(() =>
+  import('./views/DevicesView.js').then((m) => ({ default: m.DevicesView }))
+);
 const DeviceDetailView = lazy(() =>
   import('./views/DeviceDetailView.js').then((m) => ({ default: m.DeviceDetailView }))
 );
@@ -97,7 +100,8 @@ import {
   UpdaterStatus,
   AuthUser,
   PublicPortalConfig,
-  QuickSupportSession
+  QuickSupportSession,
+  DevicesPresetFilter
 } from './types/index.js';
 
 import './styles/theme.css';
@@ -233,6 +237,8 @@ export function App() {
   const [selectedTenantId, setSelectedTenantId] = useState('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
+  const [deviceDetailReturnView, setDeviceDetailReturnView] = useState<'dashboard' | 'devices'>('devices');
+  const [devicesPresetFilter, setDevicesPresetFilter] = useState<DevicesPresetFilter | null>(null);
   const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
 
   const [remoteModal, setRemoteModal] = useState<{ open: boolean; device: Device | null; isGhost: boolean }>({
@@ -643,8 +649,17 @@ export function App() {
   };
 
   const handleDeviceSelect = (dev: Device) => {
+    setDeviceDetailReturnView(currentView === 'dashboard' ? 'dashboard' : 'devices');
     setSelectedDeviceId(dev.id);
     setCurrentView('device-detail');
+  };
+
+  const handleNavigateToDevices = (preset?: DevicesPresetFilter) => {
+    if (preset) {
+      setDevicesPresetFilter(preset);
+    }
+    setSelectedDeviceId(null);
+    setCurrentView('devices');
   };
 
   const handleDeviceQuarantineUpdated = (quarantined: boolean) => {
@@ -711,7 +726,7 @@ export function App() {
         onCloseMobile={() => setIsMobileSidebarOpen(false)}
         currentUser={currentUser}
         meshConnected={Boolean(settings?.meshcentral_connected)}
-        appVersion={updaterStatus?.installedVersion || '2.7.0'}
+        appVersion={updaterStatus?.installedVersion || '2.8.0'}
       />
 
       <div className="main-wrapper">
@@ -797,19 +812,13 @@ export function App() {
           {currentView === 'dashboard' && (
             <FleetDashboard
               devices={devices}
-              searchQuery={searchQuery}
+              tenants={tenants}
               selectedTenantId={selectedTenantId}
-              onOpenRemote={(device, isGhost) => setRemoteModal({ open: true, device, isGhost })}
-              onOpenBgTools={(device, initialTab) =>
-                setBgToolsModal({ open: true, device, initialTab: initialTab || 'terminal' })
-              }
-              onOpenLaps={(device) => setLapsModal({ open: true, device })}
-              onOpenQuarantine={(device) => setQuarantineModal({ open: true, device })}
               onSelectDevice={handleDeviceSelect}
+              onNavigateDevices={handleNavigateToDevices}
               onOpenInstaller={() => setInstallerModalOpen(true)}
               onOpenOnboarding={() => setOnboardingOpen(true)}
               onRefreshFleet={loadData}
-              onResetTenantFilter={() => setSelectedTenantId('all')}
               currentUser={currentUser}
             />
           )}
@@ -821,10 +830,33 @@ export function App() {
               </div>
             }
           >
+            {currentView === 'devices' && (
+              <DevicesView
+                devices={devices}
+                tenants={tenants}
+                searchQuery={searchQuery}
+                selectedTenantId={selectedTenantId}
+                onTenantChange={setSelectedTenantId}
+                presetFilter={devicesPresetFilter}
+                onConsumePreset={() => setDevicesPresetFilter(null)}
+                onOpenRemote={(device, isGhost) => setRemoteModal({ open: true, device, isGhost })}
+                onOpenBgTools={(device, initialTab) =>
+                  setBgToolsModal({ open: true, device, initialTab: initialTab || 'terminal' })
+                }
+                onOpenLaps={(device) => setLapsModal({ open: true, device })}
+                onOpenQuarantine={(device) => setQuarantineModal({ open: true, device })}
+                onSelectDevice={handleDeviceSelect}
+                onOpenInstaller={() => setInstallerModalOpen(true)}
+                onOpenOnboarding={() => setOnboardingOpen(true)}
+                onRefreshFleet={loadData}
+                currentUser={currentUser}
+              />
+            )}
+
             {currentView === 'device-detail' && activeDeviceForDetail && (
               <DeviceDetailView
                 device={activeDeviceForDetail}
-                onBack={() => setCurrentView('dashboard')}
+                onBack={() => setCurrentView(deviceDetailReturnView)}
                 onOpenRemote={(device, isGhost) => setRemoteModal({ open: true, device, isGhost })}
                 onOpenBgTools={(device, initialTab) =>
                   setBgToolsModal({ open: true, device, initialTab: initialTab || 'terminal' })

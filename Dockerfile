@@ -1,7 +1,8 @@
-# Multi-stage Docker build for Vitrine RMM v2.7.0 (linux/amd64 & linux/arm64)
+# Multi-stage Docker build for Vitrine RMM v2.8.0 (linux/amd64 & linux/arm64)
 # Stage 1: Build Frontend and Backend (with native better-sqlite3 toolchain)
 FROM node:22-slim AS builder
 
+ARG TARGETARCH
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     make \
@@ -10,6 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     lld \
     g++-mingw-w64-x86-64 \
     binutils-mingw-w64-x86-64 \
+    $([ "$TARGETARCH" = "arm64" ] && echo "g++-x86-64-linux-gnu" || echo "g++-aarch64-linux-gnu") \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -36,7 +38,7 @@ FROM node:22-slim AS runner
 
 WORKDIR /app
 
-ARG VITRINE_GIT_COMMIT=v2.7.0
+ARG VITRINE_GIT_COMMIT=v2.8.0
 ENV NODE_ENV=production
 ENV PORT=8080
 ENV DATA_DIR=/app/data

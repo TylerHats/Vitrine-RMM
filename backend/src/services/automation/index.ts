@@ -7,22 +7,28 @@ import { codeSigningService } from '../signing/index.js';
 const ALLOWED_SMART_GROUP_COLUMNS = new Set([
   'id',
   'tenant_id',
+  'tenant_name',
   'site_id',
+  'site_name',
   'hostname',
   'os_type',
   'os_version',
   'os_build',
   'ip_address',
+  'public_ip',
   'mac_address',
   'status',
+  'lifecycle_state',
   'manufacturer',
   'model',
   'cpu_model',
   'cpu_cores',
+  'cpu_usage',
   'ram_total_gb',
   'ram_used_gb',
   'disk_total_gb',
   'disk_free_gb',
+  'smart_status',
   'serial_number',
   'bios_version',
   'tpm_version',
@@ -37,12 +43,37 @@ const ALLOWED_SMART_GROUP_COLUMNS = new Set([
   'quarantined',
   'wol_supported',
   'amt_supported',
-  'companion_installed'
+  'companion_installed',
+  'agent_privilege_mode',
+  'agent_transport',
+  'ws_connected',
+  'agent_binary_variant',
+  'pending_patch_count',
+  'software_count',
+  'uptime_seconds',
+  'last_seen',
+  'created_at',
+  'enrolled_at'
 ]);
 
 export interface SmartGroupRule {
   field: string;
-  operator: 'eq' | 'neq' | 'contains' | 'not_contains' | 'gt' | 'gte' | 'lt' | 'lte' | 'in';
+  operator:
+    | 'eq'
+    | 'is'
+    | 'neq'
+    | 'is_not'
+    | 'contains'
+    | 'not_contains'
+    | 'starts_with'
+    | 'ends_with'
+    | 'gt'
+    | 'gte'
+    | 'lt'
+    | 'lte'
+    | 'in'
+    | 'is_empty'
+    | 'is_not_empty';
   value: any;
 }
 
@@ -51,10 +82,108 @@ export interface SmartGroupRuleSet {
   rules: SmartGroupRule[];
 }
 
+function compareScalarValue(actual: any, op: string, targetVal: any): boolean {
+  const actualStr = String(actual ?? '').trim();
+  const actualLower = actualStr.toLowerCase();
+  const targetStr = String(targetVal ?? '').trim();
+  const targetLower = targetStr.toLowerCase();
+  const numActual = Number(actual);
+  const numTarget = Number(targetVal);
+
+  switch (op) {
+    case 'is_empty':
+      return actualStr === '' || actual === null || actual === undefined;
+    case 'is_not_empty':
+      return actualStr !== '' && actual !== null && actual !== undefined;
+    case 'eq':
+    case 'is':
+    case '=':
+    case '==':
+      return actualLower === targetLower;
+    case 'neq':
+    case 'is_not':
+    case '!=':
+    case '<>':
+      return actualLower !== targetLower;
+    case 'contains':
+      return actualLower.includes(targetLower);
+    case 'not_contains':
+      return !actualLower.includes(targetLower);
+    case 'starts_with':
+      return actualLower.startsWith(targetLower);
+    case 'ends_with':
+      return actualLower.endsWith(targetLower);
+    case 'gt':
+    case '>':
+      return actualStr !== '' && targetStr !== '' && !Number.isNaN(numActual) && !Number.isNaN(numTarget) && numActual > numTarget;
+    case 'gte':
+    case '>=':
+      return actualStr !== '' && targetStr !== '' && !Number.isNaN(numActual) && !Number.isNaN(numTarget) && numActual >= numTarget;
+    case 'lt':
+    case '<':
+      return actualStr !== '' && targetStr !== '' && !Number.isNaN(numActual) && !Number.isNaN(numTarget) && numActual < numTarget;
+    case 'lte':
+    case '<=':
+      return actualStr !== '' && targetStr !== '' && !Number.isNaN(numActual) && !Number.isNaN(numTarget) && numActual <= numTarget;
+    case 'in': {
+      const arr = Array.isArray(targetVal)
+        ? targetVal.map((x) => String(x).trim().toLowerCase())
+        : String(targetVal ?? '')
+            .split(',')
+            .map((s) => s.trim().toLowerCase());
+      return arr.includes(actualLower);
+    }
+    default:
+      return false;
+  }
+}
+
 export function evaluateDeviceAgainstRule(device: any, rule: SmartGroupRule): boolean {
   const field = String(rule.field || '').trim();
-  const op = rule.operator || 'eq';
+  const op = String(rule.operator || (rule as any).op || 'eq').trim();
   const targetVal = rule.value;
+
+  if (field === 'installed_software') {
+    const swTerm = String(targetVal ?? '').trim().toLowerCase();
+    if (op === 'is_empty') {
+      const hasAny = db.prepare('SELECT 1 FROM software_inventory WHERE device_id = ? LIMIT 1').get(device.id);
+      return !hasAny;
+    }
+    if (op === 'is_not_empty') {
+      const hasAny = db.prepare('SELECT 1 FROM software_inventory WHERE device_id = ? LIMIT 1').get(device.id);
+      return Boolean(hasAny);
+    }
+    if (!swTerm) return true;
+    const rows = db
+      .prepare('SELECT name, version, publisher FROM software_inventory WHERE device_id = ?')
+      .all(device.id) as Array<{ name: string; version?: string; publisher?: string }>;
+    const matches = rows.some((sw) => {
+      const nameL = String(sw.name || '').toLowerCase();
+      const fullL = `${nameL} ${String(sw.version || '').toLowerCase()} ${String(sw.publisher || '').toLowerCase()}`.trim();
+      if (op === 'eq' || op === 'is' || op === '=' || op === '==') return nameL === swTerm;
+      if (op === 'neq' || op === 'is_not' || op === '!=' || op === '<>') return nameL === swTerm;
+      if (op === 'starts_with') return nameL.startsWith(swTerm);
+      if (op === 'ends_with') return nameL.endsWith(swTerm);
+      return fullL.includes(swTerm);
+    });
+    if (op === 'not_contains' || op === 'neq' || op === 'is_not' || op === '!=' || op === '<>') {
+      return !matches;
+    }
+    return matches;
+  }
+
+  if (field.startsWith('custom_field:')) {
+    const cfKey = field.slice('custom_field:'.length).trim();
+    if (!cfKey) return false;
+    const def = db
+      .prepare("SELECT id, field_type FROM custom_field_definitions WHERE key = ? AND field_type != 'secret' LIMIT 1")
+      .get(cfKey) as { id: string; field_type: string } | undefined;
+    if (!def) return false;
+    const valRow = db
+      .prepare('SELECT value FROM custom_field_values WHERE field_id = ? AND entity_id = ? LIMIT 1')
+      .get(def.id, device.id) as { value?: string | null } | undefined;
+    return compareScalarValue(valRow?.value ?? '', op, targetVal);
+  }
 
   let actual: any;
   switch (field) {
@@ -67,13 +196,18 @@ export function evaluateDeviceAgainstRule(device: any, rule: SmartGroupRule): bo
     case 'tags':
       actual = String(device.tags_json || '[]');
       break;
-    case 'installed_software': {
-      const swName = String(targetVal || '').trim();
-      if (!swName) return false;
-      const found = db
-        .prepare('SELECT 1 FROM software_inventory WHERE device_id = ? AND LOWER(name) LIKE ? LIMIT 1')
-        .get(device.id, `%${swName.toLowerCase()}%`);
-      return op === 'not_contains' || op === 'neq' ? !found : Boolean(found);
+    case 'maintenance_active': {
+      const nowIso = new Date().toISOString();
+      const hasUntil = Boolean(device.maintenance_until && String(device.maintenance_until) > nowIso);
+      const hasWin = Boolean(
+        db
+          .prepare(
+            'SELECT 1 FROM maintenance_windows WHERE (device_id = ? OR tenant_id = ?) AND is_active = 1 AND start_time <= ? AND end_time >= ? LIMIT 1'
+          )
+          .get(device.id, device.tenant_id, nowIso, nowIso)
+      );
+      actual = hasUntil || hasWin ? '1' : '0';
+      break;
     }
     default:
       if (!ALLOWED_SMART_GROUP_COLUMNS.has(field)) return false;
@@ -81,45 +215,7 @@ export function evaluateDeviceAgainstRule(device: any, rule: SmartGroupRule): bo
       break;
   }
 
-  const numActual = Number(actual);
-  const numTarget = Number(targetVal);
-
-  switch (op as string) {
-    case 'eq':
-    case '=':
-    case '==':
-      return String(actual ?? '').toLowerCase() === String(targetVal ?? '').toLowerCase();
-    case 'neq':
-    case '!=':
-    case '<>':
-      return String(actual ?? '').toLowerCase() !== String(targetVal ?? '').toLowerCase();
-    case 'contains':
-      return String(actual ?? '').toLowerCase().includes(String(targetVal ?? '').toLowerCase());
-    case 'not_contains':
-      return !String(actual ?? '').toLowerCase().includes(String(targetVal ?? '').toLowerCase());
-    case 'gt':
-    case '>':
-      return !Number.isNaN(numActual) && !Number.isNaN(numTarget) && numActual > numTarget;
-    case 'gte':
-    case '>=':
-      return !Number.isNaN(numActual) && !Number.isNaN(numTarget) && numActual >= numTarget;
-    case 'lt':
-    case '<':
-      return !Number.isNaN(numActual) && !Number.isNaN(numTarget) && numActual < numTarget;
-    case 'lte':
-    case '<=':
-      return !Number.isNaN(numActual) && !Number.isNaN(numTarget) && numActual <= numTarget;
-    case 'in': {
-      const arr = Array.isArray(targetVal)
-        ? targetVal.map((x) => String(x).toLowerCase())
-        : String(targetVal ?? '')
-            .split(',')
-            .map((s) => s.trim().toLowerCase());
-      return arr.includes(String(actual ?? '').toLowerCase());
-    }
-    default:
-      return false;
-  }
+  return compareScalarValue(actual, op, targetVal);
 }
 
 export function parseSmartGroupRuleSet(rawRulesJson?: string | null): SmartGroupRuleSet {

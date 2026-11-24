@@ -32,6 +32,24 @@ import {
   syncTicketWithExternalPsas
 } from '../services/policy/index.js';
 import { installerGenerator, quotePowerShellLiteral } from '../services/agent/installerGenerator.js';
+import { resolveCompiledPosixBinary } from '../services/agent/linuxPackageBuilder.js';
+import { resolvePublicIpForDevice } from '../services/agent/checkinProcessor.js';
+import { agentSocketHub } from '../services/agent/socketHub.js';
+import {
+  getItflowRuntimeConfig,
+  testItflowConnection,
+  discoverItflowClientsAndSuggestMappings,
+  getTenantRemappingImpact,
+  applyItflowMappings,
+  syncDeviceAssetToItflow,
+  syncAllItflowAssets,
+  pullItflowTicketUpdates,
+  getDeviceItflowStatus,
+  mapItflowStatusToVitrine,
+  updateItflowTicket,
+  addItflowTicketNote,
+  DEFAULT_ITFLOW_CONFIG_OPTIONS
+} from '../services/itflow/index.js';
 import { sanitizeAndSquareBrandingPng } from '../services/agent/iconProcessor.js';
 import { codeSigningService } from '../services/signing/index.js';
 import { backupService } from '../services/backup/index.js';
@@ -73,7 +91,10 @@ import {
 } from '../services/network/index.js';
 import {
   evaluateSmartGroupDevices,
-  buildSafeScriptEnvParams
+  evaluateDeviceAgainstRule,
+  parseSmartGroupRuleSet,
+  buildSafeScriptEnvParams,
+  type SmartGroupRule
 } from '../services/automation/index.js';
 import {
   recordDeviceTelemetrySample,
@@ -541,11 +562,17 @@ export async function registerApiRoutes(server: FastifyInstance) {
     if (pathname.startsWith('/api/backups') && !isSafe) {
       return 'backups:manage';
     }
+    if (pathname.startsWith('/api/itflow')) {
+      return 'settings:write';
+    }
     if (pathname.startsWith('/api/settings') && !isSafe) {
       return 'settings:write';
     }
     if (pathname === '/api/audit-logs/export') {
       return 'audit:export';
+    }
+    if (pathname === '/api/devices/query') {
+      return 'devices:read';
     }
     if (pathname.startsWith('/api/devices') && !isSafe) {
       return 'devices:manage';
@@ -581,7 +608,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
     }
     if (pathname.startsWith('/api/notification-channels')) return 'alerts:triage';
     if (pathname.startsWith('/api/documentation')) return 'docs:read';
-    if (pathname.startsWith('/api/psa/integrations')) return 'settings:write';
+    if (pathname.startsWith('/api/psa/integrations') || pathname.startsWith('/api/itflow')) return 'settings:write';
     if (pathname.startsWith('/api/psa')) return 'psa:manage';
     if (
       pathname.startsWith('/api/users') ||
@@ -734,6 +761,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
           pathname.endsWith('/offboard') ||
           pathname.endsWith('/reactivate'))) ||
       (pathname.startsWith('/api/recordings/') && request.method === 'DELETE') ||
+      pathname.startsWith('/api/itflow') ||
       pathname.endsWith('/archive-purge');
 
     if (isSuperAdminOnly && !isSuperAdminRole(userRole)) {
@@ -772,7 +800,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
         pathname.startsWith('/api/psa/integrations') ||
         pathname.startsWith('/api/notification-channels') ||
         pathname.startsWith('/api/backup-policies');
-      if ((!isSafeMethod && !isAllowedAuditorWrite) || isBlockedVaultOrInternalRead) {
+      if ((!isSafeMethod && !isAllowedAuditorWrite && pathname !== '/api/devices/query') || isBlockedVaultOrInternalRead) {
         return reply.status(403).send({
           error: 'Forbidden: Compliance Auditor accounts are strictly read-only and cannot access endpoint vaults.'
         });
@@ -790,9 +818,11 @@ export async function registerApiRoutes(server: FastifyInstance) {
     const isAllowedForClientAdmin =
       pathname.startsWith('/api/auth/') ||
       (request.method === 'POST' && /^\/api\/notifications\/[^/]+\/read$/.test(pathname)) ||
+      (request.method === 'POST' && pathname === '/api/devices/query') ||
       (isReadMethod &&
         (pathname === '/api/tenants' ||
           pathname === '/api/devices' ||
+          pathname === '/api/devices/filter-options' ||
           isSafeClientAdminDeviceSubroute ||
           pathname === '/api/patches' ||
           pathname === '/api/alerts' ||
@@ -941,6 +971,8 @@ export async function registerApiRoutes(server: FastifyInstance) {
       osBuild?: string;
       deviceRole?: string;
       ipAddress?: string;
+      publicIp?: string;
+      agentVariant?: string;
       macAddress?: string;
       cpuModel?: string;
       cpuCores?: number;
@@ -972,6 +1004,8 @@ export async function registerApiRoutes(server: FastifyInstance) {
       rawReportedIp && (!reportedIsLoopback || reqIsLoopback)
         ? rawReportedIp
         : reqIp || null;
+    const enrollPublicIp = resolvePublicIpForDevice(body.publicIp, request.ip, null);
+    const enrollVariant = body.agentVariant ? String(body.agentVariant).trim().slice(0, 48) : '';
 
     const enrollTx = db.transaction((): { status: number; payload: Record<string, any> } => {
       const tokenRow = db.prepare('SELECT * FROM installer_audit_log WHERE token_id = ?').get(token) as any;
@@ -1001,9 +1035,9 @@ export async function registerApiRoutes(server: FastifyInstance) {
         db.prepare(`
           INSERT INTO devices (
             id, mesh_node_id, tenant_id, site_id, hostname, os_type, os_version, os_build,
-            ip_address, mac_address, status, device_role, device_role_manual, manufacturer, model, cpu_model, cpu_cores,
-            ram_total_gb, disk_total_gb, disk_free_gb, serial_number, hardware_details_json, companion_installed, agent_auth_token
-          ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 'online', 'QuickSupport', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            ip_address, public_ip, mac_address, status, device_role, device_role_manual, manufacturer, model, cpu_model, cpu_cores,
+            ram_total_gb, disk_total_gb, disk_free_gb, serial_number, hardware_details_json, companion_installed, agent_binary_variant, agent_auth_token
+          ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 'online', 'QuickSupport', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
         `).run(
           qsDeviceId,
           body.meshNodeId || `node//${qsDeviceId}`,
@@ -1013,6 +1047,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
           body.osVersion || 'Unknown OS',
           body.osBuild || '',
           safeIpAddress || '0.0.0.0',
+          enrollPublicIp,
           body.macAddress || '00:00:00:00:00:00',
           body.manufacturer || '',
           body.model || '',
@@ -1023,6 +1058,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
           Number(body.diskFreeGb || 128),
           body.serialNumber || '',
           qsHwJson,
+          enrollVariant,
           qsEncToken
         );
 
@@ -1177,6 +1213,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
           SET status = CASE WHEN quarantined = 1 THEN 'isolated' ELSE 'online' END,
               os_type = ?,
               ip_address = COALESCE(?, ip_address),
+              public_ip = COALESCE(NULLIF(?, ''), public_ip),
               os_version = COALESCE(?, os_version),
               manufacturer = COALESCE(NULLIF(?, ''), manufacturer),
               model = COALESCE(NULLIF(?, ''), model),
@@ -1189,12 +1226,14 @@ export async function registerApiRoutes(server: FastifyInstance) {
               hardware_details_json = ?,
               companion_installed = 1,
               companion_deploy_pending = 0,
+              agent_binary_variant = COALESCE(NULLIF(?, ''), agent_binary_variant),
               agent_auth_token = ?,
               last_seen = CURRENT_TIMESTAMP
           WHERE id = ? AND tenant_id = ?
         `).run(
           normalizedOs,
           safeIpAddress,
+          enrollPublicIp,
           body.osVersion || null,
           body.manufacturer || '',
           body.model || '',
@@ -1205,6 +1244,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
           nextRole,
           nextRoleManual,
           mergedEnrollHwJson,
+          enrollVariant,
           encryptedAgentToken,
           deviceId,
           tokenRow.tenant_id
@@ -1217,9 +1257,9 @@ export async function registerApiRoutes(server: FastifyInstance) {
         db.prepare(`
           INSERT INTO devices (
             id, mesh_node_id, tenant_id, site_id, hostname, os_type, os_version, os_build,
-            ip_address, mac_address, status, device_role, device_role_manual, manufacturer, model, bios_version, cpu_model, cpu_cores,
-            ram_total_gb, disk_total_gb, disk_free_gb, serial_number, hardware_details_json, companion_installed, agent_auth_token
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'online', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            ip_address, public_ip, mac_address, status, device_role, device_role_manual, manufacturer, model, bios_version, cpu_model, cpu_cores,
+            ram_total_gb, disk_total_gb, disk_free_gb, serial_number, hardware_details_json, companion_installed, agent_binary_variant, agent_auth_token
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'online', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
         `).run(
           deviceId,
           body.meshNodeId || `node//${deviceId}`,
@@ -1230,6 +1270,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
           body.osVersion || 'Unknown OS',
           body.osBuild || '',
           safeIpAddress || '0.0.0.0',
+          enrollPublicIp,
           body.macAddress || '00:00:00:00:00:00',
           initialRole,
           initialManual,
@@ -1243,6 +1284,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
           Number(body.diskFreeGb || 128),
           body.serialNumber || '',
           mergedEnrollHwJson,
+          enrollVariant,
           encryptedAgentToken
         );
       }
@@ -1260,6 +1302,12 @@ export async function registerApiRoutes(server: FastifyInstance) {
     });
 
     const outcome = enrollTx.immediate();
+    if (outcome.status === 200 && outcome.payload?.deviceId) {
+      const itflowCfg = getItflowRuntimeConfig();
+      if (itflowCfg.enabled && itflowCfg.options.autoSyncNewDevices) {
+        syncDeviceAssetToItflow(outcome.payload.deviceId).catch(() => {});
+      }
+    }
     return reply.status(outcome.status).send(outcome.payload);
   });
 
@@ -2497,42 +2545,303 @@ export async function registerApiRoutes(server: FastifyInstance) {
   });
 
   // ============================================================================
-  // Devices Inventory, MFA-Gated BitLocker & LAPS, and Background Endpoint Tools
+  // Devices Inventory, Advanced Querying/Sorting, MFA-Gated BitLocker & LAPS
   // ============================================================================
-  server.get('/api/devices', async (request) => {
-    sweepPendingOffboards();
-    const user = request.auth?.user;
+  const listScopedDevicesWithMetrics = (user: any): any[] => {
     const allowedTenants = getAllowedTenantIds(user);
     if (allowedTenants !== null && allowedTenants.length === 0) {
       return [];
     }
 
+    const baseSelect = `
+      SELECT d.*,
+             t.name as tenant_name,
+             t.lifecycle_state as tenant_lifecycle_state,
+             s.name as site_name,
+             l.account_name as laps_account,
+             COALESCE(
+               NULLIF(d.public_ip, ''),
+               (SELECT nh.public_ip FROM network_history nh WHERE nh.device_id = d.id AND nh.public_ip IS NOT NULL AND nh.public_ip != '' ORDER BY nh.connected_at DESC LIMIT 1),
+               ''
+             ) as public_ip,
+             (SELECT COUNT(*) FROM patches p WHERE p.device_id = d.id AND p.status = 'Pending') as pending_patch_count,
+             (SELECT COUNT(*) FROM software_inventory sw WHERE sw.device_id = d.id) as software_count
+      FROM devices d
+      LEFT JOIN tenants t ON d.tenant_id = t.id
+      LEFT JOIN sites s ON d.site_id = s.id
+      LEFT JOIN laps_vault l ON d.id = l.device_id
+    `;
+
     const rows = (allowedTenants !== null
       ? db
-          .prepare(`
-            SELECT d.*, t.name as tenant_name, t.lifecycle_state as tenant_lifecycle_state, s.name as site_name,
-                   l.account_name as laps_account
-            FROM devices d
-            LEFT JOIN tenants t ON d.tenant_id = t.id
-            LEFT JOIN sites s ON d.site_id = s.id
-            LEFT JOIN laps_vault l ON d.id = l.device_id
-            WHERE d.tenant_id IN (${allowedTenants.map(() => '?').join(',')})
-            ORDER BY d.hostname ASC
-          `)
+          .prepare(`${baseSelect} WHERE d.tenant_id IN (${allowedTenants.map(() => '?').join(',')}) ORDER BY d.hostname ASC`)
           .all(...allowedTenants)
-      : db
-          .prepare(`
-            SELECT d.*, t.name as tenant_name, t.lifecycle_state as tenant_lifecycle_state, s.name as site_name,
-                   l.account_name as laps_account
-            FROM devices d
-            LEFT JOIN tenants t ON d.tenant_id = t.id
-            LEFT JOIN sites s ON d.site_id = s.id
-            LEFT JOIN laps_vault l ON d.id = l.device_id
-            ORDER BY d.hostname ASC
-          `)
-          .all()) as any[];
+      : db.prepare(`${baseSelect} ORDER BY d.hostname ASC`).all()) as any[];
 
-    return rows.filter((d) => canUserAccessTenant(user, d.tenant_id)).map(sanitizeDeviceRowForResponse);
+    const nowIso = new Date().toISOString();
+    return rows
+      .filter((d) => canUserAccessTenant(user, d.tenant_id))
+      .map((d) => {
+        const sanitized = sanitizeDeviceRowForResponse(d);
+        sanitized.maintenance_active = Boolean(d.maintenance_until && String(d.maintenance_until) > nowIso);
+        return sanitized;
+      });
+  };
+
+  function ipToSortableTuple(ip: string | null | undefined): string {
+    const clean = String(ip || '').trim();
+    const parts = clean.split('.');
+    if (parts.length === 4 && parts.every((p) => /^\d+$/.test(p))) {
+      return parts.map((p) => p.padStart(3, '0')).join('.');
+    }
+    return clean.toLowerCase();
+  }
+
+  function getDeviceStatusRank(d: any): number {
+    if (d.lifecycle_state === 'archived') return 5;
+    if (d.lifecycle_state === 'pending_offboard') return 4;
+    if (d.quarantined) return 3;
+    if (d.pending_reboot) return 2;
+    if (d.status === 'online') return 0;
+    return 1;
+  }
+
+  function compareDevicesForSort(a: any, b: any, sortBy: string, sortDir: 'asc' | 'desc'): number {
+    const mul = sortDir === 'desc' ? -1 : 1;
+    let cmp = 0;
+
+    switch (sortBy) {
+      case 'status':
+        cmp = getDeviceStatusRank(a) - getDeviceStatusRank(b);
+        if (cmp === 0) cmp = String(a.status || '').localeCompare(String(b.status || ''));
+        break;
+      case 'hostname':
+        cmp = String(a.hostname || '').localeCompare(String(b.hostname || ''), undefined, { numeric: true, sensitivity: 'base' });
+        break;
+      case 'device_role':
+        cmp = String(a.device_role || '').localeCompare(String(b.device_role || ''), undefined, { sensitivity: 'base' });
+        break;
+      case 'tenant_name':
+        cmp = String(a.tenant_name || 'Unassigned').localeCompare(String(b.tenant_name || 'Unassigned'), undefined, { sensitivity: 'base' });
+        if (cmp === 0) {
+          cmp = String(a.site_name || 'Default Site').localeCompare(String(b.site_name || 'Default Site'), undefined, { sensitivity: 'base' });
+        }
+        break;
+      case 'site_name':
+        cmp = String(a.site_name || 'Default Site').localeCompare(String(b.site_name || 'Default Site'), undefined, { sensitivity: 'base' });
+        break;
+      case 'logged_in_user':
+        cmp = String(a.logged_in_user || '').localeCompare(String(b.logged_in_user || ''), undefined, { sensitivity: 'base' });
+        break;
+      case 'ip_address':
+        cmp = ipToSortableTuple(a.ip_address).localeCompare(ipToSortableTuple(b.ip_address));
+        break;
+      case 'public_ip':
+        cmp = ipToSortableTuple(a.public_ip).localeCompare(ipToSortableTuple(b.public_ip));
+        break;
+      case 'os_version':
+        cmp = String(a.os_version || '').localeCompare(String(b.os_version || ''), undefined, { numeric: true, sensitivity: 'base' });
+        break;
+      case 'cpu_usage':
+        cmp = Number(a.cpu_usage ?? 0) - Number(b.cpu_usage ?? 0);
+        break;
+      case 'ram_used_gb':
+        cmp = Number(a.ram_used_gb ?? 0) - Number(b.ram_used_gb ?? 0);
+        break;
+      case 'disk_free_gb':
+        cmp = Number(a.disk_free_gb ?? 0) - Number(b.disk_free_gb ?? 0);
+        break;
+      case 'edr_status':
+        cmp = String(a.edr_status || '').localeCompare(String(b.edr_status || ''), undefined, { sensitivity: 'base' });
+        break;
+      case 'bitlocker_status':
+        cmp = String(a.bitlocker_status || '').localeCompare(String(b.bitlocker_status || ''), undefined, { sensitivity: 'base' });
+        break;
+      case 'pending_patch_count':
+        cmp = Number(a.pending_patch_count ?? 0) - Number(b.pending_patch_count ?? 0);
+        break;
+      case 'uptime_seconds':
+        cmp = Number(a.uptime_seconds ?? 0) - Number(b.uptime_seconds ?? 0);
+        break;
+      case 'last_seen':
+      default: {
+        const ta = a.last_seen ? new Date(String(a.last_seen).replace(' ', 'T')).getTime() || 0 : 0;
+        const tb = b.last_seen ? new Date(String(b.last_seen).replace(' ', 'T')).getTime() || 0 : 0;
+        cmp = ta - tb;
+        break;
+      }
+    }
+
+    if (cmp !== 0) return cmp * mul;
+    return String(a.hostname || '').localeCompare(String(b.hostname || ''), undefined, { numeric: true, sensitivity: 'base' });
+  }
+
+  server.get('/api/devices', async (request) => {
+    sweepPendingOffboards();
+    return listScopedDevicesWithMetrics(request.auth?.user);
+  });
+
+  server.get('/api/devices/filter-options', async (request) => {
+    const user = request.auth?.user;
+    const allowedTenants = getAllowedTenantIds(user);
+    const devices = listScopedDevicesWithMetrics(user);
+
+    const roles = Array.from(new Set(devices.map((d) => String(d.device_role || '').trim()).filter(Boolean))).sort();
+    const osVersions = Array.from(new Set(devices.map((d) => String(d.os_version || '').trim()).filter(Boolean))).sort();
+    const users = Array.from(new Set(devices.map((d) => String(d.logged_in_user || '').trim()).filter(Boolean))).sort();
+
+    let softwareNames: string[] = [];
+    if (allowedTenants === null) {
+      softwareNames = (
+        db
+          .prepare("SELECT DISTINCT name FROM software_inventory WHERE name IS NOT NULL AND name != '' ORDER BY name ASC LIMIT 400")
+          .all() as Array<{ name: string }>
+      ).map((r) => r.name);
+    } else if (allowedTenants.length > 0) {
+      const ph = allowedTenants.map(() => '?').join(',');
+      softwareNames = (
+        db
+          .prepare(
+            `SELECT DISTINCT sw.name
+             FROM software_inventory sw
+             JOIN devices d ON sw.device_id = d.id
+             WHERE d.tenant_id IN (${ph}) AND sw.name IS NOT NULL AND sw.name != ''
+             ORDER BY sw.name ASC
+             LIMIT 400`
+          )
+          .all(...allowedTenants) as Array<{ name: string }>
+      ).map((r) => r.name);
+    }
+
+    const customFields = (
+      db
+        .prepare("SELECT key, label, field_type, options FROM custom_field_definitions WHERE scope = 'device' AND field_type != 'secret' ORDER BY label ASC")
+        .all() as Array<{ key: string; label: string; field_type: string; options?: string | null }>
+    ).filter(Boolean);
+
+    return {
+      roles,
+      osVersions,
+      users,
+      softwareNames,
+      customFields
+    };
+  });
+
+  server.post('/api/devices/query', async (request) => {
+    sweepPendingOffboards();
+    const user = request.auth?.user;
+    const body = (request.body || {}) as {
+      tenantId?: string;
+      siteId?: string;
+      deviceRole?: string;
+      status?: string;
+      lifecycleState?: string;
+      search?: string;
+      smartGroupId?: string;
+      combinator?: 'AND' | 'OR';
+      filters?: SmartGroupRule[];
+      sortBy?: string;
+      sortDir?: 'asc' | 'desc';
+    };
+
+    const allDevices = listScopedDevicesWithMetrics(user);
+    const lifecycleFilter = body.lifecycleState && body.lifecycleState !== 'all' ? body.lifecycleState : null;
+    const tenantFilter = body.tenantId && body.tenantId !== 'all' ? body.tenantId : null;
+    const siteFilter = body.siteId && body.siteId !== 'all' ? body.siteId : null;
+    const roleFilter = body.deviceRole && body.deviceRole !== 'all' ? body.deviceRole.toLowerCase() : null;
+    const statusFilter = body.status && body.status !== 'all' ? body.status.toLowerCase() : null;
+    const searchQ = String(body.search || '').trim().toLowerCase();
+
+    let customGroupRow: any = null;
+    if (body.smartGroupId && !['all', 'servers', 'pending_reboot', 'isolated', 'unencrypted', 'multi_os'].includes(body.smartGroupId)) {
+      customGroupRow = db.prepare('SELECT * FROM smart_groups WHERE id = ?').get(body.smartGroupId) as any;
+    }
+
+    const advancedRules = Array.isArray(body.filters) ? body.filters.filter((r) => r && r.field) : [];
+    const comb = String(body.combinator || 'AND').toUpperCase() === 'OR' ? 'OR' : 'AND';
+
+    const filtered = allDevices.filter((d) => {
+      const state = d.lifecycle_state || 'active';
+      if (lifecycleFilter && state !== lifecycleFilter) return false;
+      if (tenantFilter && d.tenant_id !== tenantFilter) return false;
+      if (siteFilter && d.site_id !== siteFilter) return false;
+
+      if (roleFilter) {
+        if (String(d.device_role || '').toLowerCase() !== roleFilter) return false;
+      }
+
+      if (statusFilter) {
+        if (statusFilter === 'online' && !(d.status === 'online' && !d.quarantined)) return false;
+        else if (statusFilter === 'offline' && d.status !== 'offline') return false;
+        else if (statusFilter === 'isolated' && !d.quarantined) return false;
+        else if (statusFilter === 'reboot_pending' && !d.pending_reboot) return false;
+        else if (statusFilter === 'maintenance' && !d.maintenance_active) return false;
+      }
+
+      if (searchQ) {
+        const haystack = [
+          d.hostname,
+          d.ip_address,
+          d.public_ip,
+          d.mac_address,
+          d.serial_number,
+          d.manufacturer,
+          d.model,
+          d.cpu_model,
+          d.os_version,
+          d.os_build,
+          d.device_role,
+          d.logged_in_user,
+          d.bios_version,
+          d.tenant_name,
+          d.site_name
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase();
+        if (!haystack.includes(searchQ)) return false;
+      }
+
+      if (body.smartGroupId && body.smartGroupId !== 'all') {
+        if (body.smartGroupId === 'pending_reboot' && d.pending_reboot !== 1) return false;
+        else if (body.smartGroupId === 'isolated' && d.quarantined !== 1) return false;
+        else if (body.smartGroupId === 'unencrypted' && d.bitlocker_status?.includes('Encrypted')) return false;
+        else if (body.smartGroupId === 'multi_os' && d.os_type !== 'linux' && d.os_type !== 'macos') return false;
+        else if (body.smartGroupId === 'servers') {
+          const r = String(d.device_role || '').toLowerCase();
+          if (!r.includes('server') && !r.includes('controller') && !r.includes('hypervisor')) return false;
+        } else if (customGroupRow) {
+          const ruleSet = parseSmartGroupRuleSet(customGroupRow.criteria_json);
+          if (ruleSet.rules.length > 0) {
+            const ok =
+              ruleSet.combinator === 'OR'
+                ? ruleSet.rules.some((rl) => evaluateDeviceAgainstRule(d, rl))
+                : ruleSet.rules.every((rl) => evaluateDeviceAgainstRule(d, rl));
+            if (!ok) return false;
+          }
+        }
+      }
+
+      if (advancedRules.length > 0) {
+        const matchesAdv =
+          comb === 'OR'
+            ? advancedRules.some((rl) => evaluateDeviceAgainstRule(d, rl))
+            : advancedRules.every((rl) => evaluateDeviceAgainstRule(d, rl));
+        if (!matchesAdv) return false;
+      }
+
+      return true;
+    });
+
+    const sortBy = String(body.sortBy || 'hostname').trim();
+    const sortDir: 'asc' | 'desc' = body.sortDir === 'desc' ? 'desc' : 'asc';
+    filtered.sort((a, b) => compareDevicesForSort(a, b, sortBy, sortDir));
+
+    return {
+      devices: filtered,
+      totalCount: filtered.length
+    };
   });
 
   server.get('/api/devices/:id', async (request, reply) => {
@@ -2574,8 +2883,24 @@ export async function registerApiRoutes(server: FastifyInstance) {
       (device.maintenance_until && device.maintenance_until > nowIso
         ? { title: 'Emergency Mute Active', end_time: device.maintenance_until }
         : null);
+    safeDevice.itflow = getDeviceItflowStatus(id);
 
     return safeDevice;
+  });
+
+  server.post('/api/devices/:id/itflow-sync', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const access = ensureDeviceTenantAccess(request, reply, id);
+    if (!access.allowed || !access.device) return reply;
+    if (!isTechnicianOrAbove(request.auth?.user.role)) {
+      return reply.status(403).send({ error: 'Technician privileges required to trigger ITFlow asset sync.' });
+    }
+    const result = await syncDeviceAssetToItflow(id, { force: true });
+    const statusObj = getDeviceItflowStatus(id);
+    if (!result.ok || result.action === 'failed') {
+      return reply.status(400).send({ success: false, ...result, itflow: statusObj });
+    }
+    return { success: true, ...result, itflow: statusObj };
   });
 
   // Historical Telemetry Series & Live Telemetry Sampling + Detailed Hardware Inventory
@@ -4368,21 +4693,19 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
       if (!execRes.live && !isQueuedCompanion && dev.companion_installed) {
         const taskId = `task-${crypto.randomUUID().slice(0, 10)}`;
+        const payloadStr = JSON.stringify({
+          executionId: execId,
+          language: shellLang,
+          shell: shellLang,
+          code: safeRenderedCode,
+          env: envVars,
+          runAs
+        });
         db.prepare(`
           INSERT INTO agent_tasks (id, device_id, task_type, payload_json, status)
           VALUES (?, ?, 'script', ?, 'queued')
-        `).run(
-          taskId,
-          dev.id,
-          JSON.stringify({
-            executionId: execId,
-            language: shellLang,
-            shell: shellLang,
-            code: safeRenderedCode,
-            env: envVars,
-            runAs
-          })
-        );
+        `).run(taskId, dev.id, payloadStr);
+        agentSocketHub.dispatchTaskIfConnected(dev.id, { id: taskId, task_type: 'script', payload_json: payloadStr });
         statusLabel = 'Queued (Companion)';
       }
 
@@ -4785,18 +5108,21 @@ export async function registerApiRoutes(server: FastifyInstance) {
     const id = `tkt-${crypto.randomUUID().slice(0, 8)}`;
     const ticketNum = `ITF-${crypto.randomInt(1000, 9999)}`;
     const priority = body.priority || 'Medium';
+    const description = String(body.description || '').trim();
     db.prepare(`
-      INSERT INTO psa_tickets (id, ticket_number, title, client_name, device_id, status, priority)
-      VALUES (?, ?, ?, ?, ?, 'Open', ?)
-    `).run(id, ticketNum, body.title.trim(), clientName, resolvedDeviceId, priority);
+      INSERT INTO psa_tickets (id, ticket_number, title, description, client_name, device_id, status, priority, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'Open', ?, CURRENT_TIMESTAMP)
+    `).run(id, ticketNum, body.title.trim(), description, clientName, resolvedDeviceId, priority);
 
     await syncTicketWithExternalPsas({
       localTicketId: id,
       ticketNumber: ticketNum,
       title: body.title.trim(),
-      details: body.description || body.title.trim(),
+      details: description || body.title.trim(),
       clientName,
-      priority
+      priority,
+      deviceId: resolvedDeviceId,
+      tenantId: effectiveTenant
     });
 
     return { success: true, id, ticketNumber: ticketNum };
@@ -4819,25 +5145,337 @@ export async function registerApiRoutes(server: FastifyInstance) {
     if (tid ? !canUserAccessTenant(user, tid) : getAllowedTenantIds(user) !== null) {
       return reply.status(403).send({ error: 'Forbidden' });
     }
-    const body = (request.body || {}) as { status?: string; priority?: string };
+    const body = (request.body || {}) as {
+      title?: string;
+      description?: string;
+      status?: string;
+      priority?: string;
+      note?: string;
+      note_type?: 'Internal' | 'Public';
+      time_worked_sec?: number;
+    };
     db.prepare(`
       UPDATE psa_tickets SET
+        title = COALESCE(NULLIF(TRIM(?), ''), title),
+        description = COALESCE(?, description),
         status = COALESCE(?, status),
-        priority = COALESCE(?, priority)
+        priority = COALESCE(?, priority),
+        updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
-    `).run(body.status ?? null, body.priority ?? null, id);
+    `).run(
+      body.title ?? null,
+      body.description ?? null,
+      body.status ?? null,
+      body.priority ?? null,
+      id
+    );
     const updated = db.prepare('SELECT * FROM psa_tickets WHERE id = ?').get(id) as any;
-    if (updated && body.status === 'Resolved') {
-      await syncTicketWithExternalPsas({
-        localTicketId: id,
-        ticketNumber: updated.ticket_number || id,
-        title: `[RESOLVED] ${updated.title}`,
-        details: `Ticket marked Resolved by ${getActorUsername(request)}`,
-        clientName: updated.client_name,
+    if (updated?.external_provider === 'itflow' && updated?.external_ticket_id) {
+      await updateItflowTicket(id, {
+        subject: updated.title,
+        status: updated.status,
         priority: updated.priority
-      });
+      }).catch(() => {});
+      if (body.note && body.note.trim()) {
+        await addItflowTicketNote({
+          localTicketId: id,
+          author: getActorUsername(request),
+          body: body.note.trim(),
+          noteType: body.note_type === 'Public' ? 'Public' : 'Internal',
+          timeWorkedSec: Number(body.time_worked_sec || 0),
+          status: updated.status
+        }).catch(() => {});
+      } else if (body.status === 'Resolved' && existing.status !== 'Resolved') {
+        await addItflowTicketNote({
+          localTicketId: id,
+          author: getActorUsername(request),
+          body: `Ticket marked Resolved by ${getActorUsername(request)}`,
+          noteType: 'Internal',
+          status: 'Resolved'
+        }).catch(() => {});
+      }
+    } else if (updated) {
+      if (body.note && body.note.trim()) {
+        await addItflowTicketNote({
+          localTicketId: id,
+          author: getActorUsername(request),
+          body: body.note.trim(),
+          noteType: body.note_type === 'Public' ? 'Public' : 'Internal',
+          timeWorkedSec: Number(body.time_worked_sec || 0)
+        }).catch(() => {});
+      }
+      if (body.status === 'Resolved' && existing.status !== 'Resolved') {
+        await syncTicketWithExternalPsas({
+          localTicketId: id,
+          ticketNumber: updated.ticket_number || id,
+          title: `[RESOLVED] ${updated.title}`,
+          details: `Ticket marked Resolved by ${getActorUsername(request)}`,
+          clientName: updated.client_name,
+          priority: updated.priority,
+          deviceId: updated.device_id || null,
+          tenantId: tid || null
+        });
+      }
     }
-    return { success: true };
+    return { success: true, ticket: updated };
+  });
+
+  server.get('/api/psa/tickets/:id/notes', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const existing = db
+      .prepare(`
+        SELECT p.*, d.tenant_id as device_tenant_id, t.id as matched_tenant_id
+        FROM psa_tickets p
+        LEFT JOIN devices d ON p.device_id = d.id
+        LEFT JOIN tenants t ON LOWER(p.client_name) = LOWER(t.name)
+        WHERE p.id = ?
+      `)
+      .get(id) as any;
+    if (!existing) return reply.status(404).send({ error: 'Ticket not found' });
+    const tid = existing.device_tenant_id || existing.matched_tenant_id;
+    const user = request.auth?.user;
+    if (tid ? !canUserAccessTenant(user, tid) : getAllowedTenantIds(user) !== null) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
+    return db.prepare('SELECT * FROM psa_ticket_notes WHERE ticket_id = ? ORDER BY created_at ASC').all(id);
+  });
+
+  server.post('/api/psa/tickets/:id/notes', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const existing = db
+      .prepare(`
+        SELECT p.*, d.tenant_id as device_tenant_id, t.id as matched_tenant_id
+        FROM psa_tickets p
+        LEFT JOIN devices d ON p.device_id = d.id
+        LEFT JOIN tenants t ON LOWER(p.client_name) = LOWER(t.name)
+        WHERE p.id = ?
+      `)
+      .get(id) as any;
+    if (!existing) return reply.status(404).send({ error: 'Ticket not found' });
+    const tid = existing.device_tenant_id || existing.matched_tenant_id;
+    const user = request.auth?.user;
+    if (tid ? !canUserAccessTenant(user, tid) : getAllowedTenantIds(user) !== null) {
+      return reply.status(403).send({ error: 'Forbidden' });
+    }
+    const body = (request.body || {}) as {
+      body?: string;
+      note_type?: 'Internal' | 'Public';
+      time_worked_sec?: number;
+      status?: string;
+    };
+    if (!body.body?.trim()) {
+      return reply.status(400).send({ error: 'Note text is required.' });
+    }
+    const res = await addItflowTicketNote({
+      localTicketId: id,
+      author: getActorUsername(request),
+      body: body.body.trim(),
+      noteType: body.note_type === 'Public' ? 'Public' : 'Internal',
+      timeWorkedSec: Number(body.time_worked_sec || 0),
+      status: body.status
+    });
+    return {
+      success: res.ok,
+      note: db.prepare('SELECT * FROM psa_ticket_notes WHERE id = ?').get(res.noteId),
+      syncedExternal: res.syncedExternal,
+      error: res.error
+    };
+  });
+
+  // ============================================================================
+  // Guided ITFlow PSA & Asset Sync API (Super Admin Only)
+  // ============================================================================
+  server.get('/api/itflow/status', async () => {
+    const settingsRow = (db
+      .prepare('SELECT itflow_api_key FROM settings WHERE id = 1')
+      .get() || {}) as { itflow_api_key?: string };
+    const cfg = getItflowRuntimeConfig();
+    const mappings = db
+      .prepare(
+        `SELECT t.id as tenant_id, t.name as tenant_name, t.contact_email as tenant_contact_email,
+                m.itflow_client_id, m.itflow_client_name, m.itflow_default_location_id,
+                COALESCE(m.sync_enabled, 0) as sync_enabled, COALESCE(m.auto_created, 0) as auto_created,
+                m.last_synced_at,
+                (SELECT COUNT(*) FROM devices d WHERE d.tenant_id = t.id AND COALESCE(d.status, 'online') != 'archived') as device_count,
+                (SELECT COUNT(*) FROM itflow_asset_links l JOIN devices d ON d.id = l.device_id WHERE d.tenant_id = t.id) as synced_asset_count
+         FROM tenants t
+         LEFT JOIN itflow_tenant_mappings m ON m.tenant_id = t.id
+         ORDER BY t.name ASC`
+      )
+      .all() as any[];
+    const siteMappings = db.prepare('SELECT * FROM itflow_site_mappings').all();
+    return {
+      enabled: cfg.enabled,
+      setupCompleted: cfg.setupCompleted,
+      url: cfg.rawUrl,
+      apiBase: cfg.apiBase,
+      hasApiKey: Boolean(cfg.apiKey),
+      maskedApiKey: cfg.apiKey ? maskSecretValue(settingsRow.itflow_api_key || '') : '',
+      syncIntervalMin: cfg.syncIntervalMin,
+      lastAssetSyncAt: cfg.lastAssetSyncAt,
+      lastAssetSyncSummary: cfg.lastAssetSyncSummary,
+      allowSelfSigned: cfg.allowSelfSigned,
+      options: cfg.options,
+      mappings: mappings.map((m) => ({
+        ...m,
+        sync_enabled: Boolean(m.sync_enabled),
+        auto_created: Boolean(m.auto_created)
+      })),
+      siteMappings
+    };
+  });
+
+  server.post('/api/itflow/test', async (request, reply) => {
+    const body = (request.body || {}) as { url?: string; apiKey?: string; allowSelfSigned?: boolean };
+    const cfg = getItflowRuntimeConfig({
+      url: body.url,
+      apiKey: body.apiKey,
+      allowSelfSigned: body.allowSelfSigned
+    });
+    if (!cfg.apiBase) {
+      return reply.status(400).send({ ok: false, message: 'ITFlow URL is required.' });
+    }
+    const safety = await validateOutboundHostSafety(cfg.apiBase, {
+      allowLoopback: process.env.VITRINE_ALLOW_LOOPBACK_INTEGRATIONS === 'true',
+      allowPrivateLan: true
+    });
+    if (!safety.safe) {
+      return reply.status(400).send({ ok: false, message: safety.reason || 'ITFlow URL blocked by outbound safety policy.' });
+    }
+    return await testItflowConnection({
+      url: body.url,
+      apiKey: body.apiKey,
+      allowSelfSigned: body.allowSelfSigned
+    });
+  });
+
+  server.post('/api/itflow/discover', async (request, reply) => {
+    const body = (request.body || {}) as { url?: string; apiKey?: string; allowSelfSigned?: boolean };
+    try {
+      const result = await discoverItflowClientsAndSuggestMappings({
+        url: body.url,
+        apiKey: body.apiKey,
+        allowSelfSigned: body.allowSelfSigned
+      });
+      return { success: true, ...result };
+    } catch (err: any) {
+      return reply.status(400).send({ success: false, error: err?.message || 'Unable to scan ITFlow clients.' });
+    }
+  });
+
+  server.put('/api/itflow/config', async (request, reply) => {
+    const body = (request.body || {}) as {
+      url?: string;
+      apiKey?: string;
+      enabled?: boolean;
+      setupCompleted?: boolean;
+      syncIntervalMin?: number;
+      options?: Partial<typeof DEFAULT_ITFLOW_CONFIG_OPTIONS>;
+    };
+    const current = getItflowRuntimeConfig();
+    const nextUrl = body.url !== undefined ? String(body.url).trim() : current.rawUrl;
+    if (nextUrl) {
+      const safety = await validateOutboundHostSafety(nextUrl, {
+        allowLoopback: process.env.VITRINE_ALLOW_LOOPBACK_INTEGRATIONS === 'true',
+        allowPrivateLan: true
+      });
+      if (!safety.safe) {
+        return reply.status(400).send({ error: safety.reason || 'Unsafe ITFlow URL.' });
+      }
+    }
+
+    const nextKeyPlain = body.apiKey !== undefined ? String(body.apiKey).trim() : '';
+    const shouldUpdateKey = Boolean(nextKeyPlain && !nextKeyPlain.includes('•') && !isMaskedSecret(nextKeyPlain));
+    const mergedOptions = {
+      ...current.options,
+      ...(body.options || {})
+    };
+    const nextInterval =
+      body.syncIntervalMin !== undefined
+        ? Math.max(5, Math.min(1440, Number(body.syncIntervalMin || 60)))
+        : current.syncIntervalMin;
+
+    db.prepare(
+      `UPDATE settings SET
+         itflow_url = ?,
+         itflow_api_key = CASE WHEN ? = 1 THEN ? ELSE itflow_api_key END,
+         itflow_enabled = COALESCE(?, itflow_enabled),
+         itflow_setup_completed = COALESCE(?, itflow_setup_completed),
+         itflow_sync_interval_min = ?,
+         itflow_config_json = ?
+       WHERE id = 1`
+    ).run(
+      nextUrl,
+      shouldUpdateKey ? 1 : 0,
+      shouldUpdateKey ? encryptVaultSecret(nextKeyPlain) : '',
+      body.enabled !== undefined ? (body.enabled ? 1 : 0) : null,
+      body.setupCompleted !== undefined ? (body.setupCompleted ? 1 : 0) : null,
+      nextInterval,
+      JSON.stringify(mergedOptions)
+    );
+
+    return { success: true, config: getItflowRuntimeConfig() };
+  });
+
+  server.get('/api/itflow/remapping-impact/:tenantId', async (request, reply) => {
+    const { tenantId } = request.params as { tenantId: string };
+    const t = db.prepare('SELECT id FROM tenants WHERE id = ?').get(tenantId);
+    if (!t) return reply.status(404).send({ error: 'Tenant not found.' });
+    return getTenantRemappingImpact(tenantId);
+  });
+
+  server.put('/api/itflow/mappings', async (request, reply) => {
+    const body = (request.body || {}) as {
+      assignments?: any[];
+      url?: string;
+      apiKey?: string;
+      allowSelfSigned?: boolean;
+      markSetupCompleted?: boolean;
+      triggerInitialSync?: boolean;
+    };
+    if (!Array.isArray(body.assignments)) {
+      return reply.status(400).send({ error: 'assignments array is required.' });
+    }
+    try {
+      const mappingResult = await applyItflowMappings(body.assignments, {
+        url: body.url,
+        apiKey: body.apiKey,
+        allowSelfSigned: body.allowSelfSigned
+      });
+      if (body.markSetupCompleted) {
+        db.prepare('UPDATE settings SET itflow_enabled = 1, itflow_setup_completed = 1 WHERE id = 1').run();
+      }
+      let syncResult: any = null;
+      if (body.triggerInitialSync) {
+        syncResult = await syncAllItflowAssets({ force: false });
+      }
+      return { success: true, mappingResult, syncResult };
+    } catch (err: any) {
+      return reply.status(400).send({ success: false, error: err?.message || 'Failed to apply ITFlow mappings.' });
+    }
+  });
+
+  server.post('/api/itflow/sync-assets', async (request, reply) => {
+    const body = (request.body || {}) as { force?: boolean; tenantId?: string };
+    try {
+      const res = await syncAllItflowAssets({ force: Boolean(body.force), tenantId: body.tenantId });
+      return { success: true, ...res };
+    } catch (err: any) {
+      return reply.status(500).send({ success: false, error: err?.message || 'ITFlow asset sync failed.' });
+    }
+  });
+
+  server.post('/api/itflow/sync-tickets', async (request, reply) => {
+    if (!isTechnicianOrAbove(request.auth?.user.role)) {
+      return reply.status(403).send({ error: 'Technician privileges required.' });
+    }
+    const body = (request.body || {}) as { localTicketId?: string };
+    try {
+      const res = await pullItflowTicketUpdates({ localTicketId: body.localTicketId });
+      return { success: res.ok, ...res };
+    } catch (err: any) {
+      return reply.status(500).send({ success: false, error: err?.message || 'ITFlow ticket pull failed.' });
+    }
   });
 
   server.post('/api/psa/webhook', async (request, reply) => {
@@ -4854,15 +5492,80 @@ export async function registerApiRoutes(server: FastifyInstance) {
       return reply.status(401).send({ error: 'Invalid or missing x-vitrine-webhook-secret header' });
     }
 
-    const body = (request.body || {}) as { ticket_number?: string; status?: string };
-    if (body.ticket_number && body.status) {
-      db.prepare('UPDATE psa_tickets SET status = ? WHERE ticket_number = ?').run(body.status, body.ticket_number);
+    const body = (request.body || {}) as {
+      ticket_number?: string;
+      external_ticket_id?: string | number;
+      ticket_id?: string | number;
+      status?: string | number;
+      ticket_status?: string | number;
+      priority?: string;
+      ticket_priority?: string;
+      title?: string;
+      ticket_subject?: string;
+      reply?: string;
+      ticket_reply?: string;
+      body?: string;
+      note_type?: string;
+      ticket_reply_type?: string;
+      author?: string;
+      external_reply_id?: string | number;
+      ticket_reply_id?: string | number;
+    };
+
+    const extTicketId = String(body.external_ticket_id ?? body.ticket_id ?? '').trim();
+    let matched: any = null;
+    if (body.ticket_number) {
+      matched = db.prepare('SELECT * FROM psa_tickets WHERE ticket_number = ?').get(String(body.ticket_number).trim());
     }
+    if (!matched && extTicketId) {
+      matched = db
+        .prepare("SELECT * FROM psa_tickets WHERE external_provider = 'itflow' AND external_ticket_id = ?")
+        .get(extTicketId);
+    }
+
+    const rawStatus = body.status ?? body.ticket_status;
+    const mappedStatus = rawStatus !== undefined && String(rawStatus).trim() !== '' ? mapItflowStatusToVitrine(rawStatus) : null;
+    const rawPriority = body.priority ?? body.ticket_priority;
+    const nextTitle = String(body.title ?? body.ticket_subject ?? '').trim();
+
+    if (matched) {
+      db.prepare(
+        `UPDATE psa_tickets
+         SET status = COALESCE(?, status),
+             priority = COALESCE(?, priority),
+             title = COALESCE(NULLIF(?, ''), title),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?`
+      ).run(mappedStatus, rawPriority ? String(rawPriority).trim() : null, nextTitle, matched.id);
+    }
+
+    let noteId: string | null = null;
+    const rawReply = String(body.reply ?? body.ticket_reply ?? body.body ?? '').trim();
+    if (matched && rawReply) {
+      const extReplyId = String(body.external_reply_id ?? body.ticket_reply_id ?? '').trim();
+      const dup = extReplyId
+        ? db.prepare('SELECT id FROM psa_ticket_notes WHERE ticket_id = ? AND external_reply_id = ?').get(matched.id, extReplyId)
+        : null;
+      if (!dup) {
+        noteId = `note-wh-${crypto.randomUUID().slice(0, 8)}`;
+        const rawType = String(body.note_type ?? body.ticket_reply_type ?? '').toLowerCase();
+        const noteType: 'Internal' | 'Public' = rawType === 'public' || rawType === 'client' ? 'Public' : 'Internal';
+        db.prepare(
+          `INSERT INTO psa_ticket_notes (id, ticket_id, author, note_type, body, time_worked_sec, synced_external, external_reply_id)
+           VALUES (?, ?, ?, ?, ?, 0, 1, ?)`
+        ).run(noteId, matched.id, String(body.author || 'ITFlow').trim(), noteType, rawReply, extReplyId || null);
+      }
+    }
+
     db.prepare(`
       INSERT INTO audit_logs (id, username, device_id, action, details)
-      VALUES (?, 'itflow_webhook', NULL, 'PSA Webhook Ingested', ?)
-    `).run(`aud-wh-${crypto.randomUUID()}`, `Ticket ${body.ticket_number || 'unknown'} updated -> ${body.status || 'ack'}`);
-    return { success: true, received: true };
+      VALUES (?, 'itflow_webhook', ?, 'PSA Webhook Ingested', ?)
+    `).run(
+      `aud-wh-${crypto.randomUUID()}`,
+      matched?.device_id || null,
+      `Ticket ${matched?.ticket_number || extTicketId || body.ticket_number || 'unknown'} updated -> ${mappedStatus || 'ack'}${noteId ? ' (+note)' : ''}`
+    );
+    return { success: true, received: true, ticketId: matched?.id || null, mappedStatus, noteId };
   });
 
   // ============================================================================
@@ -6478,14 +7181,27 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
     // Queue notification for Vitrine Companion Tray if installed
     if (role === 'technician' && access.device.companion_installed) {
+      const chatTaskId = `task-chat-${crypto.randomUUID().slice(0, 8)}`;
+      const chatPayload = JSON.stringify({ title: `IT Support (${sender})`, message: cleanMsg });
       db.prepare(`
         INSERT INTO agent_tasks (id, device_id, task_type, payload_json, status)
         VALUES (?, ?, 'tray_notify', ?, 'queued')
-      `).run(
-        `task-chat-${crypto.randomUUID().slice(0, 8)}`,
-        id,
-        JSON.stringify({ title: `IT Support (${sender})`, message: cleanMsg })
-      );
+      `).run(chatTaskId, id, chatPayload);
+      const pushedDirect = agentSocketHub.pushChatIfConnected(id, {
+        id: msgId,
+        sender,
+        message: cleanMsg
+      });
+      if (!pushedDirect) {
+        agentSocketHub.dispatchTaskIfConnected(id, {
+          id: chatTaskId,
+          task_type: 'tray_notify',
+          payload_json: chatPayload
+        });
+      } else {
+        db.prepare("UPDATE chat_messages SET read_status = 1 WHERE id = ?").run(msgId);
+        db.prepare("UPDATE agent_tasks SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ?").run(chatTaskId);
+      }
     }
 
     // Push safe toast/chat notification over MeshCentral bridge if endpoint is online (zero shell/PS interpolation!)
@@ -8174,6 +8890,9 @@ export async function registerApiRoutes(server: FastifyInstance) {
       platform?: string;
       os?: string;
       mode?: 'permanent' | 'quicksupport' | 'companion_only';
+      format?: 'deb' | 'rpm' | 'sh';
+      variant?: 'desktop' | 'headless';
+      arch?: 'amd64' | 'arm64';
       ticket_number?: string;
       mesh_server_id?: string;
       max_uses?: number;
@@ -8277,14 +8996,34 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
     const baseUrl = resolvePublicBaseUrl(request, settings);
     const modeQuery = requestedMode === 'companion_only' ? '&mode=companion' : '';
+    const linuxFormat =
+      osParam === 'linux' && requestedMode === 'permanent' && (body.format === 'deb' || body.format === 'rpm' || body.format === 'sh')
+        ? body.format
+        : undefined;
+    const linuxVariant =
+      osParam === 'linux' && requestedMode === 'permanent' && (body.variant === 'headless' || body.variant === 'desktop')
+        ? body.variant
+        : undefined;
+    const pkgArch = body.arch === 'arm64' ? 'arm64' : 'amd64';
+
+    const dlParams = new URLSearchParams({ token: tokenId, os: osParam });
+    if (requestedMode === 'companion_only') dlParams.set('mode', 'companion');
+    if (linuxFormat) dlParams.set('format', linuxFormat);
+    if (linuxVariant) dlParams.set('variant', linuxVariant);
+    if (osParam === 'linux') dlParams.set('arch', pkgArch);
+
+    const deployParams = new URLSearchParams({ token: tokenId, os: osParam });
+    if (requestedMode === 'companion_only') deployParams.set('mode', 'companion');
+    if (osParam === 'linux') deployParams.set('format', 'sh');
+    if (linuxVariant) deployParams.set('variant', linuxVariant);
 
     return {
       success: true,
       token: tokenId,
       mode: requestedMode,
       expiresAt,
-      downloadUrl: `/api/agent/download?token=${encodeURIComponent(tokenId)}&os=${osParam}${modeQuery}`,
-      deployUrl: `${baseUrl}/api/agent/deploy?token=${encodeURIComponent(tokenId)}&os=${osParam}${modeQuery}`,
+      downloadUrl: `/api/agent/download?${dlParams.toString()}`,
+      deployUrl: `${baseUrl}/api/agent/deploy?${deployParams.toString()}`,
       signingPipeline: pipeline
     };
   });
@@ -8312,7 +9051,15 @@ export async function registerApiRoutes(server: FastifyInstance) {
         retryAfterSec: rate.retryAfterSec
       });
     }
-    const query = (request.query || {}) as { token?: string; os?: string; mode?: string; deviceId?: string };
+    const query = (request.query || {}) as {
+      token?: string;
+      os?: string;
+      mode?: string;
+      deviceId?: string;
+      format?: string;
+      variant?: string;
+      arch?: string;
+    };
     const resolved = resolveValidInstallerToken(query.token);
     if (!resolved) {
       return reply.status(401).send({
@@ -8344,6 +9091,18 @@ export async function registerApiRoutes(server: FastifyInstance) {
     const dlSettings = (db.prepare('SELECT custom_domain FROM settings WHERE id = 1').get() || {}) as { custom_domain?: string };
     const vitrineServerUrl = resolvePublicBaseUrl(request, dlSettings);
 
+    const isDeployRoute = (request.raw.url || '').split('?')[0].endsWith('/deploy');
+    const rawFormat = String(query.format || '').trim().toLowerCase();
+    const linuxFormat: 'deb' | 'rpm' | 'sh' = isDeployRoute
+      ? 'sh'
+      : rawFormat === 'deb' || rawFormat === 'rpm'
+        ? rawFormat
+        : 'sh';
+    const linuxVariant: 'desktop' | 'headless' =
+      String(query.variant || '').trim().toLowerCase() === 'headless' ? 'headless' : 'desktop';
+    const pkgArch: 'amd64' | 'arm64' =
+      String(query.arch || '').trim().toLowerCase() === 'arm64' ? 'arm64' : 'amd64';
+
     const pkg = await installerGenerator.generateInstaller({
       os: osParam,
       tenantId: resolved.tenantId,
@@ -8354,7 +9113,10 @@ export async function registerApiRoutes(server: FastifyInstance) {
       sessionCode: 'sessionCode' in resolved ? resolved.sessionCode : undefined,
       meshServerId: 'meshServerId' in resolved ? resolved.meshServerId : undefined,
       targetDeviceId,
-      vitrineServerUrl
+      vitrineServerUrl,
+      linuxFormat,
+      linuxVariant,
+      arch: pkgArch
     });
 
     reply.header('Content-Type', pkg.contentType);
@@ -8427,6 +9189,7 @@ export async function registerApiRoutes(server: FastifyInstance) {
 
     const query = (request.query || {}) as {
       component?: string;
+      arch?: string;
       token?: string;
       deviceId?: string;
       tenant_id?: string;
@@ -8445,8 +9208,28 @@ export async function registerApiRoutes(server: FastifyInstance) {
       });
     }
 
-    const component: 'companion' | 'tray' =
-      String(query.component || '').trim().toLowerCase() === 'tray' ? 'tray' : 'companion';
+    const rawComp = String(query.component || '').trim().toLowerCase();
+    if (rawComp === 'posix-desktop' || rawComp === 'posix-headless' || rawComp === 'macos') {
+      const target =
+        rawComp === 'macos' ? 'macos' : rawComp === 'posix-headless' ? 'linux-headless' : 'linux-desktop';
+      const reqArch =
+        rawComp === 'macos'
+          ? 'universal'
+          : String(query.arch || '').toLowerCase() === 'arm64' || String(query.arch || '').toLowerCase() === 'aarch64'
+            ? 'arm64'
+            : 'amd64';
+      const binBuf = resolveCompiledPosixBinary(target, reqArch);
+      if (!binBuf) {
+        return reply.status(404).send({ error: `Compiled native binary for ${target}/${reqArch} not built.` });
+      }
+      const sha256 = crypto.createHash('sha256').update(binBuf).digest('hex');
+      reply.header('Content-Type', 'application/octet-stream');
+      reply.header('Content-Disposition', buildSafeContentDisposition(`vitrine-agent-${target}`));
+      reply.header('X-Content-SHA256', sha256);
+      return reply.send(binBuf);
+    }
+
+    const component: 'companion' | 'tray' = rawComp === 'tray' ? 'tray' : 'companion';
 
     try {
       const requestedMode =

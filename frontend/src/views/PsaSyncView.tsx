@@ -1,9 +1,24 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Plus, CheckCircle2, X, Clock, Plug, Trash2, RefreshCw } from 'lucide-react';
+import {
+  Plus,
+  CheckCircle2,
+  X,
+  Clock,
+  Plug,
+  Trash2,
+  RefreshCw,
+  Edit3,
+  MessageSquare,
+  Sparkles,
+  Server,
+  AlertTriangle
+} from 'lucide-react';
 import {
   fetchPsaTickets,
   createPsaTicket,
   updatePsaTicket,
+  fetchPsaTicketNotes,
+  addPsaTicketNote,
   fetchTenants,
   fetchDevices,
   fetchPsaIntegrations,
@@ -12,19 +27,38 @@ import {
   deletePsaIntegration,
   fetchTicketTimeEntries,
   addTicketTimeEntry,
-  deleteTicketTimeEntry
+  deleteTicketTimeEntry,
+  fetchItflowStatus,
+  discoverItflowClients,
+  applyItflowMappings,
+  triggerItflowAssetSync,
+  triggerItflowTicketPull
 } from '../services/api.js';
-import { Tenant, Device, PsaIntegration, PsaTimeEntry, AuthUser } from '../types/index.js';
+import {
+  Tenant,
+  Device,
+  PsaIntegration,
+  PsaTimeEntry,
+  PsaTicketNote,
+  ItflowClientRecord,
+  AuthUser
+} from '../types/index.js';
 import { canMutateFleet, isSuperAdmin as checkIsSuperAdmin } from '../utils/permissions.js';
+import { ItflowSetupWizardModal } from '../components/ItflowSetupWizardModal.js';
 
 interface PsaTicket {
   id: string;
   ticket_number: string;
   title: string;
+  description?: string;
   client_name: string;
   device_id?: string;
   priority: string;
   status: string;
+  external_provider?: string | null;
+  external_ticket_id?: string | null;
+  external_client_id?: number | null;
+  external_asset_id?: number | null;
 }
 
 interface PsaSyncViewProps {
@@ -36,15 +70,51 @@ interface PsaSyncViewProps {
 export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, devices: propDevices, currentUser }) => {
   const canMutate = canMutateFleet(currentUser);
   const isSuperAdmin = Boolean(currentUser && checkIsSuperAdmin(currentUser));
-  const [activeTab, setActiveTab] = useState<'tickets' | 'connectors'>('tickets');
+  const [activeTab, setActiveTab] = useState<'tickets' | 'itflow' | 'connectors'>('tickets');
   const [tickets, setTickets] = useState<PsaTicket[]>([]);
   const [tenants, setTenants] = useState<Tenant[]>(propTenants || []);
   const [devices, setDevices] = useState<Device[]>(propDevices || []);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [newTitle, setNewTitle] = useState('');
+  const [newDescription, setNewDescription] = useState('');
   const [newClient, setNewClient] = useState('');
   const [newDeviceId, setNewDeviceId] = useState('');
   const [newPriority, setNewPriority] = useState('High');
+
+  // Edit Ticket & Notes modal state
+  const [editingTicket, setEditingTicket] = useState<PsaTicket | null>(null);
+  const [editTitle, setEditTitle] = useState('');
+  const [editDescription, setEditDescription] = useState('');
+  const [editStatus, setEditStatus] = useState('Open');
+  const [editPriority, setEditPriority] = useState('Medium');
+  const [ticketNotes, setTicketNotes] = useState<PsaTicketNote[]>([]);
+  const [noteBody, setNoteBody] = useState('');
+  const [noteType, setNoteType] = useState<'Internal' | 'Public'>('Internal');
+  const [noteMinutes, setNoteMinutes] = useState(0);
+  const [savingTicket, setSavingTicket] = useState(false);
+
+  // ITFlow guided setup & live client mapping state
+  const [showItflowWizard, setShowItflowWizard] = useState(false);
+  const [itflowStatus, setItflowStatus] = useState<any>(null);
+  const [itflowClients, setItflowClients] = useState<ItflowClientRecord[]>([]);
+  const [syncingAssets, setSyncingAssets] = useState(false);
+  const [pullingTickets, setPullingTickets] = useState(false);
+  const [remapModal, setRemapModal] = useState<{
+    tenantId: string;
+    tenantName: string;
+    currentClientId: number | null;
+    currentClientName: string | null;
+    syncedAssetCount: number;
+    action: 'link' | 'create_new' | 'disable';
+    itflowClientId: number | null;
+    itflowClientName: string | null;
+    onExistingAssets: 'move' | 'duplicate';
+    newClientName: string;
+    newContactName: string;
+    newContactEmail: string;
+    newLocationName: string;
+    newAddress: string;
+  } | null>(null);
 
   // Multi-PSA Connectors state
   const [integrations, setIntegrations] = useState<PsaIntegration[]>([]);
@@ -75,9 +145,27 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
       .catch(() => {});
   }, []);
 
+  const loadItflowState = useCallback(() => {
+    fetchItflowStatus()
+      .then((st) => {
+        setItflowStatus(st);
+        if (st.url && st.hasApiKey) {
+          discoverItflowClients()
+            .then((d) => {
+              if (d.success && Array.isArray(d.clients)) setItflowClients(d.clients);
+            })
+            .catch(() => {});
+        }
+      })
+      .catch(() => {});
+  }, []);
+
   useEffect(() => {
     loadTickets();
-    if (isSuperAdmin) loadIntegrations();
+    if (isSuperAdmin) {
+      loadIntegrations();
+      loadItflowState();
+    }
     if (!propTenants) {
       fetchTenants()
         .then((t) => {
@@ -109,6 +197,7 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
     if (!newTitle.trim()) return;
     await createPsaTicket({
       title: newTitle.trim(),
+      description: newDescription.trim() || undefined,
       client_name: newClient.trim() || 'General MSP Service Desk',
       device_id: newDeviceId.trim() || undefined,
       priority: newPriority
@@ -116,7 +205,191 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
     loadTickets();
     setShowCreateModal(false);
     setNewTitle('');
+    setNewDescription('');
     setNewDeviceId('');
+  };
+
+  const handleOpenEditTicket = async (t: PsaTicket) => {
+    setEditingTicket(t);
+    setEditTitle(t.title);
+    setEditDescription(t.description || '');
+    setEditStatus(t.status);
+    setEditPriority(t.priority);
+    setNoteBody('');
+    setNoteMinutes(0);
+    const notes = await fetchPsaTicketNotes(t.id).catch(() => []);
+    setTicketNotes(notes);
+  };
+
+  const handleSaveTicketEdit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingTicket) return;
+    setSavingTicket(true);
+    try {
+      await updatePsaTicket(editingTicket.id, {
+        title: editTitle.trim(),
+        description: editDescription,
+        status: editStatus,
+        priority: editPriority
+      });
+      loadTickets();
+      setConnectorNotice(`✓ Ticket ${editingTicket.ticket_number} updated.`);
+      setEditingTicket((prev) =>
+        prev
+          ? { ...prev, title: editTitle.trim(), description: editDescription, status: editStatus, priority: editPriority }
+          : null
+      );
+    } finally {
+      setSavingTicket(false);
+    }
+  };
+
+  const handleSubmitTicketNote = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingTicket || !noteBody.trim()) return;
+    setSavingTicket(true);
+    try {
+      const res = await addPsaTicketNote(editingTicket.id, {
+        body: noteBody.trim(),
+        note_type: noteType,
+        time_worked_sec: Math.max(0, noteMinutes) * 60
+      });
+      if (res.success) {
+        const refreshed = await fetchPsaTicketNotes(editingTicket.id).catch(() => []);
+        setTicketNotes(refreshed);
+        setNoteBody('');
+        setNoteMinutes(0);
+        if (res.syncedExternal) {
+          setConnectorNotice(`✓ Note added & synced to ITFlow Ticket #${editingTicket.external_ticket_id}.`);
+        }
+      }
+    } finally {
+      setSavingTicket(false);
+    }
+  };
+
+  const handleSyncAssetsNow = async () => {
+    setSyncingAssets(true);
+    try {
+      const res = await triggerItflowAssetSync({ force: false });
+      setConnectorNotice(
+        res.success
+          ? `✓ ITFlow Asset Sync complete: ${res.created} created, ${res.updated} updated, ${res.skipped} unchanged, ${res.failed} failed.`
+          : `⚠ Asset sync failed: ${res.error || 'Error'}`
+      );
+      loadItflowState();
+    } finally {
+      setSyncingAssets(false);
+    }
+  };
+
+  const handlePullItflowTickets = async () => {
+    setPullingTickets(true);
+    try {
+      const res = await triggerItflowTicketPull();
+      if (res.success) {
+        setConnectorNotice(
+          `✓ ITFlow Ticket Pull complete (${res.checked} checked): ${res.updatedTickets} ticket(s) updated, ${res.importedNotes} new note(s) imported.`
+        );
+        loadTickets();
+        if (editingTicket) {
+          const refreshedNotes = await fetchPsaTicketNotes(editingTicket.id).catch(() => null);
+          if (refreshedNotes) setTicketNotes(refreshedNotes);
+        }
+      } else {
+        setConnectorNotice(`⚠ Ticket pull failed: ${res.error || res.errors?.[0] || 'Error'}`);
+      }
+    } finally {
+      setPullingTickets(false);
+    }
+  };
+
+  const handleSelectTenantMappingChange = async (
+    m: any,
+    nextAction: 'link' | 'create_new' | 'disable',
+    nextClientId: number | null
+  ) => {
+    const targetClient = itflowClients.find((c) => c.client_id === nextClientId);
+    const hasSynced = Number(m.synced_asset_count || 0) > 0;
+    const changedClient =
+      nextAction === 'create_new' ||
+      (nextAction === 'disable' && m.itflow_client_id !== null) ||
+      (nextAction === 'link' && m.itflow_client_id !== null && nextClientId !== m.itflow_client_id);
+
+    if (nextAction === 'create_new' || (hasSynced && changedClient)) {
+      setRemapModal({
+        tenantId: m.tenant_id,
+        tenantName: m.tenant_name,
+        currentClientId: m.itflow_client_id,
+        currentClientName: m.itflow_client_name,
+        syncedAssetCount: Number(m.synced_asset_count || 0),
+        action: nextAction,
+        itflowClientId: nextClientId,
+        itflowClientName: targetClient?.client_name || null,
+        onExistingAssets: 'duplicate',
+        newClientName: m.tenant_name,
+        newContactName: '',
+        newContactEmail: m.tenant_contact_email || '',
+        newLocationName: 'Primary Office',
+        newAddress: ''
+      });
+      return;
+    }
+
+    const res = await applyItflowMappings({
+      assignments: [
+        {
+          tenantId: m.tenant_id,
+          action: nextAction,
+          itflowClientId: nextClientId,
+          itflowClientName: targetClient?.client_name || null
+        }
+      ],
+      triggerInitialSync: nextAction !== 'disable'
+    });
+    if (res.success) {
+      setConnectorNotice(`✓ Updated ITFlow sync mapping for ${m.tenant_name}.`);
+      loadItflowState();
+    } else {
+      setConnectorNotice(`⚠ ${res.error || 'Failed to update client mapping'}`);
+    }
+  };
+
+  const handleConfirmRemapModal = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!remapModal) return;
+    const res = await applyItflowMappings({
+      assignments: [
+        {
+          tenantId: remapModal.tenantId,
+          action: remapModal.action,
+          itflowClientId: remapModal.action === 'link' ? remapModal.itflowClientId : null,
+          itflowClientName: remapModal.action === 'link' ? remapModal.itflowClientName : null,
+          onExistingAssets: remapModal.syncedAssetCount > 0 ? remapModal.onExistingAssets : undefined,
+          newClient:
+            remapModal.action === 'create_new'
+              ? {
+                  name: remapModal.newClientName.trim(),
+                  contactName: remapModal.newContactName.trim(),
+                  email: remapModal.newContactEmail.trim(),
+                  locationName: remapModal.newLocationName.trim() || 'Primary Office',
+                  address: remapModal.newAddress.trim()
+                }
+              : undefined
+        }
+      ],
+      triggerInitialSync: remapModal.action !== 'disable'
+    });
+    if (res.success) {
+      const moved = res.mappingResult?.assetsMovedDeletedOld || 0;
+      setConnectorNotice(
+        `✓ Updated mapping for ${remapModal.tenantName}${moved > 0 ? ` (${moved} prior asset(s) deleted & moved)` : ''}.`
+      );
+      setRemapModal(null);
+      loadItflowState();
+    } else {
+      setConnectorNotice(`⚠ ${res.error || 'Failed applying remapping'}`);
+    }
   };
 
   const handleToggleStatus = async (t: PsaTicket) => {
@@ -231,6 +504,14 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
           </button>
           {isSuperAdmin && (
             <button
+              className={`btn-glass ${activeTab === 'itflow' ? 'btn-primary' : ''}`}
+              onClick={() => setActiveTab('itflow')}
+            >
+              <Sparkles size={14} /> ITFlow Sync ({itflowStatus?.mappings?.filter((m: any) => m.sync_enabled).length || 0})
+            </button>
+          )}
+          {isSuperAdmin && (
+            <button
               className={`btn-glass ${activeTab === 'connectors' ? 'btn-primary' : ''}`}
               onClick={() => setActiveTab('connectors')}
             >
@@ -239,8 +520,26 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
           )}
           {canMutate &&
             (activeTab === 'tickets' || !isSuperAdmin ? (
-              <button className="btn-glass btn-primary" onClick={() => setShowCreateModal(true)}>
-                <Plus size={15} /> Create Support Ticket
+              <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                {itflowStatus?.enabled && (
+                  <button
+                    type="button"
+                    className="btn-glass"
+                    disabled={pullingTickets}
+                    onClick={handlePullItflowTickets}
+                    title="Pull latest ticket status updates & replies from ITFlow"
+                  >
+                    <RefreshCw size={14} className={pullingTickets ? 'animate-spin' : ''} />
+                    <span>{pullingTickets ? 'Pulling ITFlow...' : 'Pull ITFlow Ticket Updates'}</span>
+                  </button>
+                )}
+                <button className="btn-glass btn-primary" onClick={() => setShowCreateModal(true)}>
+                  <Plus size={15} /> Create Support Ticket
+                </button>
+              </div>
+            ) : activeTab === 'itflow' ? (
+              <button className="btn-glass btn-primary" onClick={() => setShowItflowWizard(true)}>
+                <Sparkles size={15} /> Guided Setup Wizard
               </button>
             ) : (
               <button className="btn-glass btn-primary" onClick={() => setShowAddConnector(true)}>
@@ -282,9 +581,9 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
             style={{
               padding: '0.75rem 1.15rem',
               fontSize: '0.82rem',
-              background: isConnErr ? 'rgba(239, 68, 68, 0.12)' : undefined,
-              color: isConnErr ? '#fca5a5' : '#7dd3fc',
-              borderColor: isConnErr ? 'rgba(239, 68, 68, 0.35)' : 'rgba(56, 189, 248, 0.35)'
+              background: isConnErr ? 'rgba(239, 68, 68, 0.12)' : 'rgba(14, 165, 233, 0.1)',
+              color: isConnErr ? '#ef4444' : '#0284c7',
+              borderColor: isConnErr ? 'rgba(239, 68, 68, 0.35)' : 'rgba(14, 165, 233, 0.35)'
             }}
           >
             {connectorNotice}
@@ -310,7 +609,14 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
               <tbody>
                 {tickets.map((t) => (
                   <tr key={t.id}>
-                    <td><strong>{t.ticket_number}</strong></td>
+                    <td>
+                      <strong>{t.ticket_number}</strong>
+                      {t.external_provider === 'itflow' && t.external_ticket_id && (
+                        <div style={{ fontSize: '0.67rem', color: '#38bdf8', marginTop: '0.15rem' }}>
+                          ITFlow #{t.external_ticket_id}
+                        </div>
+                      )}
+                    </td>
                     <td>{t.title}</td>
                     <td>{t.client_name}</td>
                     <td><code>{resolveDeviceLabel(t.device_id)}</code></td>
@@ -335,6 +641,14 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
                     <td style={{ textAlign: 'right' }}>
                       {canMutate ? (
                         <div style={{ display: 'inline-flex', gap: '0.4rem' }}>
+                          <button
+                            className="btn-glass"
+                            style={{ padding: '0.25rem 0.6rem', fontSize: '0.74rem' }}
+                            onClick={() => handleOpenEditTicket(t)}
+                            title="Edit ticket properties & view/add ITFlow notes"
+                          >
+                            <Edit3 size={12} /> Edit &amp; Notes
+                          </button>
                           <button
                             className="btn-glass"
                             style={{ padding: '0.25rem 0.6rem', fontSize: '0.74rem' }}
@@ -366,6 +680,132 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
                 )}
               </tbody>
             </table>
+          </div>
+        </div>
+      )}
+
+      {isSuperAdmin && activeTab === 'itflow' && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+          <div className="glass-card" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem' }}>
+            <div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                <Server size={18} color="var(--primary)" />
+                <strong style={{ fontSize: '1rem' }}>ITFlow Bi-Directional Ticket &amp; Asset Sync</strong>
+                <span className={`status-pill ${itflowStatus?.enabled && itflowStatus?.setupCompleted ? 'status-online' : 'status-reboot'}`}>
+                  {itflowStatus?.enabled && itflowStatus?.setupCompleted ? 'Configured & Active' : 'Setup Incomplete'}
+                </span>
+              </div>
+              <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginTop: '0.35rem' }}>
+                Endpoint: <code>{itflowStatus?.apiBase || 'Not set'}</code> • Sync Interval: Every {itflowStatus?.syncIntervalMin || 60}m
+                {itflowStatus?.lastAssetSyncSummary ? ` • Last Sync: ${itflowStatus.lastAssetSyncSummary}` : ''}
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: '0.6rem', flexWrap: 'wrap' }}>
+              <button
+                type="button"
+                className="btn-glass"
+                disabled={pullingTickets || !itflowStatus?.enabled}
+                onClick={handlePullItflowTickets}
+              >
+                <RefreshCw size={14} className={pullingTickets ? 'animate-spin' : ''} />
+                <span>{pullingTickets ? 'Pulling Tickets...' : 'Pull ITFlow Ticket Updates'}</span>
+              </button>
+              <button
+                type="button"
+                className="btn-glass"
+                disabled={syncingAssets || !itflowStatus?.enabled}
+                onClick={handleSyncAssetsNow}
+              >
+                <RefreshCw size={14} className={syncingAssets ? 'animate-spin' : ''} />
+                <span>{syncingAssets ? 'Syncing Assets...' : 'Sync All Assets Now'}</span>
+              </button>
+              <button type="button" className="btn-glass btn-primary" onClick={() => setShowItflowWizard(true)}>
+                <Sparkles size={14} /> Launch Guided Setup Wizard
+              </button>
+            </div>
+          </div>
+
+          <div className="glass-card" style={{ padding: 0 }}>
+            <div style={{ padding: '0.85rem 1.15rem', borderBottom: '1px solid var(--glass-border)', fontSize: '0.82rem', color: 'var(--text-muted)' }}>
+              Client Sync Mapping Overrides — Change any Vitrine client between existing ITFlow clients, Create New ITFlow Client, or Disable Sync anytime. Moving away from a synced client prompts Move vs Duplicate assets.
+            </div>
+            <div className="table-wrapper" style={{ border: 'none', borderRadius: 0 }}>
+              <table className="glass-table">
+                <thead>
+                  <tr>
+                    <th>Vitrine Organization</th>
+                    <th>Devices / Linked Assets</th>
+                    <th>Sync Mode</th>
+                    <th>Target ITFlow Client</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(itflowStatus?.mappings || []).map((m: any) => (
+                    <tr key={m.tenant_id}>
+                      <td><strong>{m.tenant_name}</strong></td>
+                      <td style={{ fontSize: '0.8rem' }}>
+                        {m.device_count} devices / <span style={{ color: '#34d399' }}>{m.synced_asset_count} synced</span>
+                      </td>
+                      <td>
+                        <select
+                          className="glass-select"
+                          style={{ fontSize: '0.76rem', padding: '0.25rem 0.45rem' }}
+                          value={!m.sync_enabled ? 'disable' : 'link'}
+                          disabled={itflowClients.length === 0}
+                          onChange={(e) => {
+                            const act = e.target.value as 'link' | 'create_new' | 'disable';
+                            const nextId = act === 'link' ? m.itflow_client_id || itflowClients[0]?.client_id || null : null;
+                            handleSelectTenantMappingChange(m, act, nextId);
+                          }}
+                        >
+                          <option value="link">Sync to ITFlow Client</option>
+                          <option value="create_new">+ Create New Client</option>
+                          <option value="disable">Disable Sync</option>
+                        </select>
+                      </td>
+                      <td>
+                        {m.sync_enabled ? (
+                          <select
+                            className="glass-select"
+                            style={{ fontSize: '0.76rem', padding: '0.25rem 0.45rem' }}
+                            value={m.itflow_client_id || ''}
+                            onChange={(e) =>
+                              handleSelectTenantMappingChange(
+                                m,
+                                'link',
+                                e.target.value ? Number(e.target.value) : null
+                              )
+                            }
+                          >
+                            <option value="">-- Select ITFlow Client --</option>
+                            {m.itflow_client_id &&
+                              !itflowClients.some((c) => c.client_id === m.itflow_client_id) && (
+                                <option value={m.itflow_client_id}>
+                                  {m.itflow_client_name || `Client #${m.itflow_client_id}`}
+                                </option>
+                              )}
+                            {itflowClients.map((c) => (
+                              <option key={c.client_id} value={c.client_id}>
+                                {c.client_name} (#{c.client_id})
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          <span style={{ fontSize: '0.76rem', color: 'var(--text-dim)' }}>Sync disabled for this client</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                  {(!itflowStatus?.mappings || itflowStatus.mappings.length === 0) && (
+                    <tr>
+                      <td colSpan={4} style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-muted)' }}>
+                        Launch the Guided Setup Wizard to connect ITFlow and review client mappings.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       )}
@@ -461,6 +901,18 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
                   placeholder="e.g. Disk space critical on SQL volume"
                   value={newTitle}
                   onChange={(e) => setNewTitle(e.target.value)}
+                />
+              </div>
+              <div>
+                <label style={{ fontSize: '0.78rem', color: 'var(--text-dim)', display: 'block', marginBottom: '0.25rem' }}>
+                  Detailed Incident Notes (Optional)
+                </label>
+                <textarea
+                  className="glass-input"
+                  rows={3}
+                  placeholder="Initial diagnostic details or condition notes..."
+                  value={newDescription}
+                  onChange={(e) => setNewDescription(e.target.value)}
                 />
               </div>
               <div>
@@ -721,6 +1173,275 @@ export const PsaSyncView: React.FC<PsaSyncViewProps> = ({ tenants: propTenants, 
           </div>
         </div>
       )}
+
+      {/* Edit Ticket & ITFlow Notes Modal */}
+      {editingTicket && (
+        <div className="modal-overlay" onClick={() => setEditingTicket(null)}>
+          <div className="glass-modal" style={{ maxWidth: '640px', width: '95vw', maxHeight: '88vh', overflowY: 'auto', padding: '1.5rem' }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+              <div>
+                <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 700 }}>
+                  {editingTicket.ticket_number} — Edit Ticket &amp; Notes
+                </h3>
+                {editingTicket.external_provider === 'itflow' && editingTicket.external_ticket_id && (
+                  <span style={{ fontSize: '0.74rem', color: '#38bdf8' }}>
+                    Linked to ITFlow Ticket #{editingTicket.external_ticket_id}
+                  </span>
+                )}
+              </div>
+              <button className="btn-glass btn-icon" onClick={() => setEditingTicket(null)}>
+                <X size={16} />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveTicketEdit} style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', paddingBottom: '1rem', borderBottom: '1px solid var(--glass-border)', marginBottom: '1rem' }}>
+              <div>
+                <label className="form-label" style={{ fontSize: '0.74rem' }}>Subject</label>
+                <input
+                  type="text"
+                  required
+                  className="glass-input"
+                  value={editTitle}
+                  onChange={(e) => setEditTitle(e.target.value)}
+                />
+              </div>
+              <div>
+                <label className="form-label" style={{ fontSize: '0.74rem' }}>Description / Details</label>
+                <textarea
+                  className="glass-input"
+                  rows={2}
+                  value={editDescription}
+                  onChange={(e) => setEditDescription(e.target.value)}
+                />
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: '0.65rem', alignItems: 'end' }}>
+                <div>
+                  <label className="form-label" style={{ fontSize: '0.74rem' }}>Status</label>
+                  <select className="glass-select" value={editStatus} onChange={(e) => setEditStatus(e.target.value)}>
+                    <option value="Open">Open</option>
+                    <option value="In Progress">In Progress</option>
+                    <option value="Resolved">Resolved</option>
+                    <option value="Closed">Closed</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="form-label" style={{ fontSize: '0.74rem' }}>Priority</label>
+                  <select className="glass-select" value={editPriority} onChange={(e) => setEditPriority(e.target.value)}>
+                    <option value="Low">Low</option>
+                    <option value="Medium">Medium</option>
+                    <option value="High">High</option>
+                    <option value="Urgent">Urgent</option>
+                    <option value="Critical">Critical</option>
+                  </select>
+                </div>
+                <button type="submit" className="btn-glass btn-primary" disabled={savingTicket}>
+                  Save Ticket Updates
+                </button>
+              </div>
+            </form>
+
+            <div>
+              <h4 style={{ margin: '0 0 0.6rem 0', fontSize: '0.88rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                <MessageSquare size={15} color="var(--primary)" />
+                <span>Ticket Notes &amp; Worklog ({ticketNotes.length})</span>
+              </h4>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem', maxHeight: '200px', overflowY: 'auto', marginBottom: '0.85rem' }}>
+                {ticketNotes.length === 0 ? (
+                  <div style={{ fontSize: '0.78rem', color: 'var(--text-dim)', padding: '0.75rem', textAlign: 'center' }}>
+                    No notes recorded yet.
+                  </div>
+                ) : (
+                  ticketNotes.map((n) => (
+                    <div
+                      key={n.id}
+                      style={{
+                        padding: '0.6rem 0.8rem',
+                        borderRadius: '8px',
+                        background: 'rgba(255,255,255,0.03)',
+                        border: '1px solid var(--glass-border)',
+                        fontSize: '0.78rem'
+                      }}
+                    >
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.2rem' }}>
+                        <span>
+                          <strong>{n.author}</strong> •{' '}
+                          <span className="status-pill status-online" style={{ fontSize: '0.64rem' }}>{n.note_type}</span>
+                          {n.time_worked_sec > 0 && (
+                            <span style={{ color: '#38bdf8', marginLeft: '0.4rem' }}>{Math.round(n.time_worked_sec / 60)}m</span>
+                          )}
+                        </span>
+                        <span style={{ fontSize: '0.68rem', color: n.synced_external ? '#34d399' : 'var(--text-dim)' }}>
+                          {n.synced_external ? 'Synced to ITFlow' : 'Local Only'}
+                        </span>
+                      </div>
+                      <div style={{ whiteSpace: 'pre-wrap', color: 'var(--text-muted)' }}>{n.body}</div>
+                    </div>
+                  ))
+                )}
+              </div>
+
+              {canMutate && (
+                <form onSubmit={handleSubmitTicketNote} style={{ display: 'flex', flexDirection: 'column', gap: '0.55rem' }}>
+                  <textarea
+                    required
+                    className="glass-input"
+                    rows={2}
+                    placeholder="Add technician progress note or resolution summary..."
+                    value={noteBody}
+                    onChange={(e) => setNoteBody(e.target.value)}
+                  />
+                  <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap' }}>
+                    <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                      <select
+                        className="glass-select"
+                        style={{ width: 'auto', fontSize: '0.76rem' }}
+                        value={noteType}
+                        onChange={(e) => setNoteType(e.target.value as 'Internal' | 'Public')}
+                      >
+                        <option value="Internal">Internal Note</option>
+                        <option value="Public">Public Customer Reply</option>
+                      </select>
+                      <input
+                        type="number"
+                        min={0}
+                        max={480}
+                        className="glass-input"
+                        style={{ width: '110px', fontSize: '0.76rem' }}
+                        placeholder="Mins (opt)"
+                        value={noteMinutes || ''}
+                        onChange={(e) => setNoteMinutes(Number(e.target.value) || 0)}
+                      />
+                    </div>
+                    <button type="submit" className="btn-glass btn-primary" disabled={savingTicket || !noteBody.trim()}>
+                      <Plus size={14} /> Add Note
+                    </button>
+                  </div>
+                </form>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Client Remapping Move vs Duplicate Prompt */}
+      {remapModal && (
+        <div className="modal-overlay" onClick={() => setRemapModal(null)}>
+          <div className="glass-modal" style={{ maxWidth: '540px', padding: '1.5rem' }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.85rem' }}>
+              <h3 style={{ margin: 0, fontSize: '1.05rem', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                <AlertTriangle size={17} color="#fbbf24" />
+                <span>Confirm ITFlow Client Change — {remapModal.tenantName}</span>
+              </h3>
+              <button className="btn-glass btn-icon" onClick={() => setRemapModal(null)}>
+                <X size={16} />
+              </button>
+            </div>
+            <form onSubmit={handleConfirmRemapModal} style={{ display: 'flex', flexDirection: 'column', gap: '0.85rem' }}>
+              {remapModal.action === 'create_new' && (
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.55rem' }}>
+                  <div>
+                    <label className="form-label" style={{ fontSize: '0.72rem' }}>New ITFlow Client Name *</label>
+                    <input
+                      type="text"
+                      required
+                      className="glass-input"
+                      value={remapModal.newClientName}
+                      onChange={(e) => setRemapModal({ ...remapModal, newClientName: e.target.value })}
+                    />
+                  </div>
+                  <div>
+                    <label className="form-label" style={{ fontSize: '0.72rem' }}>Primary Contact Name</label>
+                    <input
+                      type="text"
+                      className="glass-input"
+                      value={remapModal.newContactName}
+                      onChange={(e) => setRemapModal({ ...remapModal, newContactName: e.target.value })}
+                    />
+                  </div>
+                  <div>
+                    <label className="form-label" style={{ fontSize: '0.72rem' }}>Contact Email</label>
+                    <input
+                      type="email"
+                      className="glass-input"
+                      value={remapModal.newContactEmail}
+                      onChange={(e) => setRemapModal({ ...remapModal, newContactEmail: e.target.value })}
+                    />
+                  </div>
+                  <div>
+                    <label className="form-label" style={{ fontSize: '0.72rem' }}>Primary Location Name</label>
+                    <input
+                      type="text"
+                      className="glass-input"
+                      value={remapModal.newLocationName}
+                      onChange={(e) => setRemapModal({ ...remapModal, newLocationName: e.target.value })}
+                    />
+                  </div>
+                </div>
+              )}
+
+              {remapModal.syncedAssetCount > 0 && (
+                <div
+                  style={{
+                    padding: '0.85rem',
+                    borderRadius: '8px',
+                    background: 'rgba(245, 158, 11, 0.1)',
+                    border: '1px solid rgba(245, 158, 11, 0.35)',
+                    fontSize: '0.8rem',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '0.5rem'
+                  }}
+                >
+                  <div>
+                    <strong>{remapModal.syncedAssetCount} asset(s)</strong> were previously synced to{' '}
+                    <strong>{remapModal.currentClientName}</strong>. Choose how Vitrine should handle them:
+                  </div>
+                  <label style={{ display: 'flex', alignItems: 'flex-start', gap: '0.45rem', cursor: 'pointer' }}>
+                    <input
+                      type="radio"
+                      checked={remapModal.onExistingAssets === 'move'}
+                      onChange={() => setRemapModal({ ...remapModal, onExistingAssets: 'move' })}
+                    />
+                    <span>
+                      <strong>Move Assets</strong> — Delete the existing assets from <em>{remapModal.currentClientName}</em>{' '}
+                      and create them under {remapModal.action === 'disable' ? 'no client (unlinked)' : 'the new client'}.
+                    </span>
+                  </label>
+                  <label style={{ display: 'flex', alignItems: 'flex-start', gap: '0.45rem', cursor: 'pointer' }}>
+                    <input
+                      type="radio"
+                      checked={remapModal.onExistingAssets === 'duplicate'}
+                      onChange={() => setRemapModal({ ...remapModal, onExistingAssets: 'duplicate' })}
+                    />
+                    <span>
+                      <strong>Duplicate / Keep Prior Assets</strong> — Leave existing assets untouched in{' '}
+                      <em>{remapModal.currentClientName}</em> and create fresh records under the new destination.
+                    </span>
+                  </label>
+                </div>
+              )}
+
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem' }}>
+                <button type="button" className="btn-glass" onClick={() => setRemapModal(null)}>
+                  Cancel
+                </button>
+                <button type="submit" className="btn-glass btn-primary">
+                  Apply Mapping Change
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      <ItflowSetupWizardModal
+        isOpen={showItflowWizard}
+        onClose={() => setShowItflowWizard(false)}
+        onCompleted={() => {
+          loadItflowState();
+          loadTickets();
+        }}
+      />
     </div>
   );
 };

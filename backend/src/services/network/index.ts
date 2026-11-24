@@ -3,6 +3,7 @@ import net from 'net';
 import os from 'os';
 import crypto from 'crypto';
 import { db } from '../../db/index.js';
+import { agentSocketHub } from '../agent/socketHub.js';
 import {
   decryptVaultSecret,
   encryptVaultSecret,
@@ -590,6 +591,11 @@ export async function sendWakeOnLanMagicPacket(params: {
           VALUES (?, ?, 'wol_relay', ?, 'queued')
         `).run(taskId, chosenPeer.id, payloadStr);
       }
+      agentSocketHub.dispatchTaskIfConnected(chosenPeer.id, {
+        id: taskId,
+        task_type: 'wol_relay',
+        payload_json: payloadStr
+      });
       relayedViaProbeDeviceId = chosenPeer.id;
     }
   }

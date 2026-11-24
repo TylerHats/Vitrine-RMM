@@ -249,6 +249,246 @@ static void writeAgentStatusFile(
   }
 }
 
+static std::string buildWsUrlWin(const std::string& srvUrl, const std::string& tok, const std::string& devId) {
+  std::string base = srvUrl;
+  while (!base.empty() && base.back() == '/') base.pop_back();
+  std::string wsBase;
+  if (base.rfind("https://", 0) == 0) wsBase = "wss://" + base.substr(8);
+  else if (base.rfind("http://", 0) == 0) wsBase = "ws://" + base.substr(7);
+  else wsBase = "wss://" + base;
+  return wsBase + "/ws/agent?token=" + tok + "&deviceId=" + devId + "&variant=windows-native";
+}
+
+static bool hasSeenOrAddTaskId(std::vector<std::string>& cache, const std::string& id) {
+  if (id.empty()) return false;
+  for (const auto& s : cache) {
+    if (s == id) return true;
+  }
+  cache.push_back(id);
+  if (cache.size() > 128) cache.erase(cache.begin());
+  return false;
+}
+
+static void sendTaskResultDual(
+    const std::string& serverUrl,
+    const std::string& token,
+    const std::string& deviceId,
+    const std::string& taskId,
+    int exitCode,
+    const std::string& stdoutStr,
+    const std::string& stderrStr,
+    const std::string& backupJobId,
+    bool allowSelfSigned,
+    WinHttpWsClient* ws) {
+  if (ws && ws->isConnected()) {
+    std::string body = "{\"type\":\"task_result\",\"taskId\":\"" + jsonEscape(taskId) + "\","
+        "\"deviceId\":\"" + jsonEscape(deviceId) + "\","
+        "\"exitCode\":" + fmtInt(exitCode) + ","
+        "\"stdout\":\"" + jsonEscape(stdoutStr) + "\","
+        "\"stderr\":\"" + jsonEscape(stderrStr) + "\"";
+    if (!backupJobId.empty()) body += ",\"backupJobId\":\"" + jsonEscape(backupJobId) + "\"";
+    body += "}";
+    if (ws->sendText(body)) return;
+  }
+  postTaskResult(serverUrl, token, deviceId, taskId, exitCode, stdoutStr, stderrStr, backupJobId, allowSelfSigned);
+}
+
+static ExecResult runWindowsScriptObject(
+    const std::wstring& selfDir,
+    const std::string& safeTaskId,
+    const JsonVal& pObj,
+    const std::string& body) {
+  std::string lang = pObj.getStr("language");
+  std::string sh = pObj.getStr("shell");
+  bool isPy = (sh == "python" || lang == "python");
+  bool isCmd = (sh == "cmd" || lang == "cmd");
+
+  std::wstring tmpDir = getEnvVar(L"TEMP");
+  if (tmpDir.empty()) tmpDir = selfDir;
+  std::wstring tmpFile = joinPath(tmpDir, L"vitrine-task-" + utf8ToWide(safeTaskId) + (isPy ? L".py" : isCmd ? L".bat" : L".ps1"));
+
+  std::vector<std::wstring> setVars;
+  if (const JsonVal* envObj = pObj.get("env")) {
+    if (envObj->type == JsonVal::J_OBJ) {
+      for (const auto& kv : envObj->objVal) {
+        if (kv.first.rfind("VITRINE_PARAM_", 0) == 0 && kv.second.type == JsonVal::J_STR) {
+          std::wstring wk = utf8ToWide(kv.first);
+          SetEnvironmentVariableW(wk.c_str(), utf8ToWide(kv.second.strVal).c_str());
+          setVars.push_back(wk);
+        }
+      }
+    }
+  }
+
+  writeTextFile(tmpFile, body);
+  DWORD tOutMs = static_cast<DWORD>(std::max<int64_t>(5000, std::min<int64_t>(1800000, pObj.getInt("timeoutSec", 180) * 1000)));
+  ExecResult er{};
+  if (isPy) {
+    er = runProcessCapture(L"python.exe \"" + tmpFile + L"\"", true, tOutMs);
+    if (!er.launched) er = runProcessCapture(L"python3.exe \"" + tmpFile + L"\"", true, tOutMs);
+    if (!er.launched) er = runProcessCapture(L"py.exe -3 \"" + tmpFile + L"\"", true, tOutMs);
+  } else if (isCmd) {
+    er = runProcessCapture(L"cmd.exe /c \"" + tmpFile + L"\"", true, tOutMs);
+  } else {
+    wchar_t sysDir[MAX_PATH]{};
+    UINT sysLen = GetSystemDirectoryW(sysDir, MAX_PATH);
+    std::wstring psExe = (sysLen > 0 && sysLen < MAX_PATH)
+        ? joinPath(std::wstring(sysDir, sysLen), L"WindowsPowerShell\\v1.0\\powershell.exe")
+        : L"powershell.exe";
+    if (!fileExists(psExe)) psExe = L"powershell.exe";
+
+    std::string execPol = pObj.getStr("executionPolicy");
+    bool allowExplicitBypass = execPol.size() == 6 &&
+        execPol[0] == 'B' && execPol[1] == 'y' && execPol[2] == 'p' &&
+        execPol[3] == 'a' && execPol[4] == 's' && execPol[5] == 's';
+    std::wstring wExecPol = L"RemoteSigned";
+    if (execPol == "AllSigned" || execPol == "RemoteSigned" || execPol == "Unrestricted" ||
+        execPol == "Default" || allowExplicitBypass) {
+      wExecPol = utf8ToWide(execPol);
+    }
+    std::wstring cmd = L"\"" + psExe + L"\" -NoProfile -NonInteractive -ExecutionPolicy " + wExecPol + L" -File \"" + tmpFile + L"\"";
+    er = runProcessCapture(cmd, true, tOutMs);
+  }
+  DeleteFileW(tmpFile.c_str());
+  for (const auto& wk : setVars) SetEnvironmentVariableW(wk.c_str(), nullptr);
+  return er;
+}
+
+static bool executeSingleAgentTask(
+    const std::wstring& selfDir,
+    const std::string& svcName,
+    const std::wstring& trayDir,
+    const std::string& srv,
+    const std::string& tok,
+    const std::string& devId,
+    bool allowSelfSigned,
+    const JsonVal& t,
+    uint64_t& traySeq,
+    WinHttpWsClient* ws) {
+  std::string taskId = t.getStr("id");
+  std::string safeTaskId = sanitizeIdentifier(taskId, "task", 64);
+  std::string ttype = t.getStr("type");
+  if (ttype.empty()) ttype = t.getStr("task_type");
+
+  JsonVal pObj;
+  if (const JsonVal* pv = t.get("payload")) {
+    if (pv->type == JsonVal::J_OBJ) pObj = *pv;
+  }
+  if (pObj.type != JsonVal::J_OBJ) {
+    std::string pj = t.getStr("payload_json");
+    if (!pj.empty()) parseJson(pj, pObj);
+  }
+
+  if (ttype == "tray_notify" || ttype == "reboot_prompt") {
+    enqueueTrayInboxItem(trayDir, ++traySeq, serializeJson(t));
+    sendTaskResultDual(srv, tok, devId, taskId, 0, "Delivered to user tray", "", "", allowSelfSigned, ws);
+    return true;
+  } else if (ttype == "wol_relay") {
+    std::string wErr;
+    int bPort = static_cast<int>(pObj.getInt("port", 9));
+    bool ok = relayWolMagicPacket(pObj.getStr("mac"), pObj.getStr("broadcastIp"), bPort, wErr);
+    sendTaskResultDual(srv, tok, devId, taskId, ok ? 0 : 1,
+        ok ? ("Magic packet relayed to " + pObj.getStr("mac")) : "", wErr, "", allowSelfSigned, ws);
+    return true;
+  } else if (ttype == "self_uninstall") {
+    sendTaskResultDual(srv, tok, devId, taskId, 0, "Self-uninstall initiated", "", "", allowSelfSigned, ws);
+    performSelfUninstall(selfDir, svcName, &pObj, false);
+    return false;
+  } else if (ttype == "script" || ttype == "run_script" || ttype == "patch_scan" ||
+             ttype == "patch_install" || ttype == "software_deploy" || ttype == "backup_job") {
+    std::string body = pObj.getStr("code");
+    if (body.empty()) body = pObj.getStr("command");
+    if (body.empty() && ttype == "software_deploy") {
+      std::string pkgId = sanitizeIdentifier(pObj.getStr("packageId"), "", 128);
+      if (!pkgId.empty()) body = "winget install --id " + pkgId + " --silent --accept-package-agreements --accept-source-agreements";
+    }
+    if (body.empty() && ttype == "backup_job") {
+      sendTaskResultDual(srv, tok, devId, taskId, 1, "", "No backup script command provided in task payload",
+          pObj.getStr("backupJobId"), allowSelfSigned, ws);
+      return true;
+    }
+    if (body.empty()) body = "Write-Output ok";
+
+    ExecResult er = runWindowsScriptObject(selfDir, safeTaskId, pObj, body);
+    sendTaskResultDual(srv, tok, devId, taskId, static_cast<int>(er.exitCode),
+        er.output, er.launched ? "" : "Failed to launch script runtime",
+        pObj.getStr("backupJobId"), allowSelfSigned, ws);
+  }
+  return true;
+}
+
+static bool applyCheckinResponsePayload(
+    const JsonVal& rJson,
+    JsonVal& cfg,
+    const std::wstring& cfgPath,
+    const std::wstring& selfDir,
+    const std::string& svcName,
+    const std::wstring& trayDir,
+    const std::string& srv,
+    const std::string& tok,
+    const std::string& devId,
+    bool allowSelfSigned,
+    uint64_t& traySeq,
+    std::vector<std::string>& seenTaskIds,
+    WinHttpWsClient* ws) {
+  const JsonVal* tc = rJson.get("trayConfig");
+  if (tc && tc->type == JsonVal::J_OBJ && cfg.type == JsonVal::J_OBJ) {
+    JsonVal nextCfg = cfg;
+    if (!tc->getStr("brandName").empty()) {
+      JsonVal bn; bn.type = JsonVal::J_STR; bn.strVal = tc->getStr("brandName");
+      nextCfg.setObj("BrandName", std::move(bn));
+    }
+    if (const JsonVal* v = tc->get("iconUrl")) nextCfg.setObj("IconUrl", *v);
+    if (const JsonVal* v = tc->get("themeMode")) nextCfg.setObj("ThemeMode", *v);
+    if (const JsonVal* v = tc->get("enabled")) nextCfg.setObj("TrayEnabled", *v);
+    if (const JsonVal* v = tc->get("tooltip")) nextCfg.setObj("Tooltip", *v);
+    if (const JsonVal* v = tc->get("supportUrl")) nextCfg.setObj("SupportUrl", *v);
+    if (const JsonVal* v = tc->get("supportPhone")) nextCfg.setObj("SupportPhone", *v);
+    if (const JsonVal* v = tc->get("supportEmail")) nextCfg.setObj("SupportEmail", *v);
+    if (const JsonVal* v = tc->get("menuItems")) nextCfg.setObj("MenuItems", *v);
+    std::string nextStr = serializeJson(nextCfg);
+    if (trimAscii(nextStr) != trimAscii(readTextFile(cfgPath))) {
+      writeTextFile(cfgPath, nextStr);
+      cfg = std::move(nextCfg);
+    }
+  }
+
+  const JsonVal* chats = rJson.get("unreadChats");
+  if (chats && chats->type == JsonVal::J_ARR) {
+    for (const auto& ch : chats->arrVal) {
+      std::string sender = ch.getStr("sender", "IT Support");
+      std::string msg = ch.getStr("message");
+      if (msg.empty()) continue;
+      std::string noteJson = "{\"title\":\"" + jsonEscape("Message from " + sender) + "\",\"message\":\"" + jsonEscape(msg) + "\"}";
+      enqueueTrayInboxItem(trayDir, ++traySeq, noteJson);
+    }
+  }
+
+  const JsonVal* tasks = rJson.get("tasks");
+  if (tasks && tasks->type == JsonVal::J_ARR) {
+    for (const auto& t : tasks->arrVal) {
+      std::string tid = t.getStr("id");
+      if (hasSeenOrAddTaskId(seenTaskIds, tid)) continue;
+      if (!executeSingleAgentTask(selfDir, svcName, trayDir, srv, tok, devId, allowSelfSigned, t, traySeq, ws)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+static void handleRpcExecWin(WinHttpWsClient& ws, const std::wstring& selfDir, const JsonVal& msg) {
+  std::string reqId = msg.getStr("reqId");
+  std::string cmd = msg.getStr("command");
+  if (reqId.empty()) return;
+  ExecResult er = runWindowsScriptObject(selfDir, sanitizeIdentifier(reqId, "rpc", 48), msg, cmd.empty() ? "Write-Output ok" : cmd);
+  std::string resp = "{\"type\":\"rpc_response\",\"reqId\":\"" + jsonEscape(reqId) + "\","
+      "\"exitCode\":" + fmtInt(static_cast<int>(er.exitCode)) + ","
+      "\"stdout\":\"" + jsonEscape(er.output) + "\","
+      "\"stderr\":\"" + jsonEscape(er.launched ? "" : "Failed to launch script runtime") + "\"}";
+  ws.sendText(resp);
+}
+
 static void runWorkerLoop() {
   std::wstring selfDir = getSelfDir();
   TelemetrySampler sampler;
@@ -260,6 +500,10 @@ static void runWorkerLoop() {
   int64_t lastOkEpoch = 0;
   std::wstring lastTrayDir;
   int64_t lastIntervalSec = 25;
+  int64_t wsBackoffSec = 5;
+  int64_t nextWsRetryEpoch = 0;
+  std::vector<std::string> seenTaskIds;
+
   while (true) {
     if (g_stopEvent && WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0) break;
 
@@ -286,6 +530,104 @@ static void runWorkerLoop() {
       while (!srv.empty() && srv.back() == '/') srv.pop_back();
 
       if (!tok.empty() && !srv.empty() && !devId.empty()) {
+        int64_t nowEpoch = getCurrentUnixEpochSec();
+
+        // 1. Primary Persistent WinHTTP WSS WebSocket Session
+        if (nowEpoch >= nextWsRetryEpoch) {
+          WinHttpWsClient ws;
+          std::string wsUrl = buildWsUrlWin(srv, tok, devId);
+          if (ws.connect(wsUrl, {{"x-vitrine-agent-token", tok}}, allowSelfSigned, 10000)) {
+            int64_t sessStart = getCurrentUnixEpochSec();
+            lastOkEpoch = sessStart;
+            writeAgentStatusFile(trayDir, true, lastOkEpoch, sessStart, sleepSec, 101);
+            ws.sendText("{\"type\":\"hello\",\"variant\":\"windows-native\",\"osType\":\"windows\",\"version\":\"3.0.0\"}");
+
+            bool fullInv = (checkinCount % 24 == 0);
+            checkinCount++;
+            std::string initTel = collectCheckinPayloadJson(devId, sampler, fullInv);
+            ws.sendText("{\"type\":\"telemetry\",\"payload\":" + initTel + "}");
+            int64_t lastSentEpoch = getCurrentUnixEpochSec();
+
+            while (ws.isConnected()) {
+              if (g_stopEvent && WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0) break;
+              flushTrayOutbox(trayDir, srv, tok, devId, allowSelfSigned);
+
+              std::string inbound;
+              while (ws.popMessage(inbound)) {
+                JsonVal msg;
+                if (parseJson(inbound, msg) && msg.type == JsonVal::J_OBJ) {
+                  std::string mtype = msg.getStr("type");
+                  if (mtype == "ping") {
+                    ws.sendText("{\"type\":\"pong\"}");
+                  } else if (mtype == "task") {
+                    if (const JsonVal* tv = msg.get("task"); tv && tv->type == JsonVal::J_OBJ) {
+                      if (!hasSeenOrAddTaskId(seenTaskIds, tv->getStr("id"))) {
+                        if (!executeSingleAgentTask(selfDir, svcName, trayDir, srv, tok, devId, allowSelfSigned, *tv, traySeq, &ws)) {
+                          ws.close();
+                          return;
+                        }
+                      }
+                    }
+                  } else if (mtype == "rpc_exec") {
+                    handleRpcExecWin(ws, selfDir, msg);
+                  } else if (mtype == "chat") {
+                    std::string cmsg = msg.getStr("message");
+                    if (!cmsg.empty()) {
+                      std::string sender = msg.getStr("sender", "IT Support");
+                      std::string noteJson = "{\"title\":\"" + jsonEscape("Message from " + sender) + "\",\"message\":\"" + jsonEscape(cmsg) + "\"}";
+                      enqueueTrayInboxItem(trayDir, ++traySeq, noteJson);
+                    }
+                  } else if (mtype == "checkin_ack") {
+                    lastOkEpoch = getCurrentUnixEpochSec();
+                    writeAgentStatusFile(trayDir, true, lastOkEpoch, lastOkEpoch, sleepSec, 200);
+                    if (!applyCheckinResponsePayload(
+                            msg, cfg, cfgPath, selfDir, svcName, trayDir, srv, tok, devId, allowSelfSigned, traySeq, seenTaskIds, &ws)) {
+                      ws.close();
+                      return;
+                    }
+                  }
+                }
+              }
+
+              int64_t curEp = getCurrentUnixEpochSec();
+              if (curEp - lastSentEpoch >= sleepSec) {
+                if (parseJson(readTextFile(cfgPath), cfg)) {
+                  sleepSec = std::max<int64_t>(10, std::min<int64_t>(3600, cfg.getInt("TelemetryIntervalSec", 25)));
+                }
+                bool doFull = (checkinCount % 24 == 0);
+                checkinCount++;
+                std::string payload = collectCheckinPayloadJson(devId, sampler, doFull);
+                if (!ws.sendText("{\"type\":\"telemetry\",\"payload\":" + payload + "}")) break;
+                lastSentEpoch = curEp;
+                lastOkEpoch = curEp;
+                writeAgentStatusFile(trayDir, true, lastOkEpoch, curEp, sleepSec, 200);
+              }
+
+              if (g_stopEvent && ws.msgEvent) {
+                HANDLE handles[2] = {g_stopEvent, ws.msgEvent};
+                if (WaitForMultipleObjects(2, handles, FALSE, 1500) == WAIT_OBJECT_0) break;
+              } else if (ws.msgEvent) {
+                WaitForSingleObject(ws.msgEvent, 1500);
+              } else {
+                Sleep(1500);
+              }
+            }
+
+            ws.close();
+            if (getCurrentUnixEpochSec() - sessStart >= 15) {
+              wsBackoffSec = 5;
+            } else {
+              wsBackoffSec = std::min<int64_t>(60, wsBackoffSec * 2);
+            }
+            nextWsRetryEpoch = getCurrentUnixEpochSec() + wsBackoffSec;
+          } else {
+            wsBackoffSec = std::min<int64_t>(60, wsBackoffSec * 2);
+            nextWsRetryEpoch = getCurrentUnixEpochSec() + wsBackoffSec;
+          }
+          if (g_stopEvent && WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0) break;
+        }
+
+        // 2. Automatic HTTP Fallback Check-in
         flushTrayOutbox(trayDir, srv, tok, devId, allowSelfSigned);
 
         bool includeFullInventory = (checkinCount % 24 == 0);
@@ -299,144 +641,14 @@ static void runWorkerLoop() {
             allowSelfSigned,
             20000);
 
-        int64_t nowEpoch = getCurrentUnixEpochSec();
+        nowEpoch = getCurrentUnixEpochSec();
         JsonVal rJson;
         if (resp.statusCode >= 200 && resp.statusCode < 300 && parseJson(resp.body, rJson)) {
           lastOkEpoch = nowEpoch;
           writeAgentStatusFile(trayDir, true, lastOkEpoch, nowEpoch, sleepSec, resp.statusCode);
-          const JsonVal* tc = rJson.get("trayConfig");
-          if (tc && tc->type == JsonVal::J_OBJ && cfg.type == JsonVal::J_OBJ) {
-            JsonVal nextCfg = cfg;
-            if (!tc->getStr("brandName").empty()) {
-              JsonVal bn; bn.type = JsonVal::J_STR; bn.strVal = tc->getStr("brandName");
-              nextCfg.setObj("BrandName", std::move(bn));
-            }
-            if (const JsonVal* v = tc->get("iconUrl")) nextCfg.setObj("IconUrl", *v);
-            if (const JsonVal* v = tc->get("themeMode")) nextCfg.setObj("ThemeMode", *v);
-            if (const JsonVal* v = tc->get("enabled")) nextCfg.setObj("TrayEnabled", *v);
-            if (const JsonVal* v = tc->get("tooltip")) nextCfg.setObj("Tooltip", *v);
-            if (const JsonVal* v = tc->get("supportUrl")) nextCfg.setObj("SupportUrl", *v);
-            if (const JsonVal* v = tc->get("supportPhone")) nextCfg.setObj("SupportPhone", *v);
-            if (const JsonVal* v = tc->get("supportEmail")) nextCfg.setObj("SupportEmail", *v);
-            if (const JsonVal* v = tc->get("menuItems")) nextCfg.setObj("MenuItems", *v);
-            std::string nextStr = serializeJson(nextCfg);
-            if (trimAscii(nextStr) != trimAscii(readTextFile(cfgPath))) {
-              writeTextFile(cfgPath, nextStr);
-            }
-          }
-
-          // Deliver unread technician chat messages to the interactive desktop tray session
-          const JsonVal* chats = rJson.get("unreadChats");
-          if (chats && chats->type == JsonVal::J_ARR) {
-            for (const auto& ch : chats->arrVal) {
-              std::string sender = ch.getStr("sender", "IT Support");
-              std::string msg = ch.getStr("message");
-              if (msg.empty()) continue;
-              std::string noteJson = "{\"title\":\"" + jsonEscape("Message from " + sender) + "\",\"message\":\"" + jsonEscape(msg) + "\"}";
-              enqueueTrayInboxItem(trayDir, ++traySeq, noteJson);
-            }
-          }
-
-          const JsonVal* tasks = rJson.get("tasks");
-          if (tasks && tasks->type == JsonVal::J_ARR) {
-            for (const auto& t : tasks->arrVal) {
-              std::string taskId = t.getStr("id");
-              std::string safeTaskId = sanitizeIdentifier(taskId, "task", 64);
-              std::string ttype = t.getStr("type");
-              if (ttype.empty()) ttype = t.getStr("task_type");
-
-              JsonVal pObj;
-              if (const JsonVal* pv = t.get("payload")) {
-                if (pv->type == JsonVal::J_OBJ) pObj = *pv;
-              }
-              if (pObj.type != JsonVal::J_OBJ) {
-                std::string pj = t.getStr("payload_json");
-                if (!pj.empty()) parseJson(pj, pObj);
-              }
-
-              if (ttype == "tray_notify" || ttype == "reboot_prompt") {
-                enqueueTrayInboxItem(trayDir, ++traySeq, serializeJson(t));
-                postTaskResult(srv, tok, devId, taskId, 0, "Delivered to user tray", "", "", allowSelfSigned);
-              } else if (ttype == "wol_relay") {
-                std::string wErr;
-                int bPort = static_cast<int>(pObj.getInt("port", 9));
-                bool ok = relayWolMagicPacket(pObj.getStr("mac"), pObj.getStr("broadcastIp"), bPort, wErr);
-                postTaskResult(srv, tok, devId, taskId, ok ? 0 : 1,
-                    ok ? ("Magic packet relayed to " + pObj.getStr("mac")) : "", wErr, "", allowSelfSigned);
-              } else if (ttype == "self_uninstall") {
-                postTaskResult(srv, tok, devId, taskId, 0, "Self-uninstall initiated", "", "", allowSelfSigned);
-                performSelfUninstall(selfDir, svcName, &pObj, false);
-                return;
-              } else if (ttype == "script" || ttype == "run_script" || ttype == "patch_scan" ||
-                         ttype == "patch_install" || ttype == "software_deploy" || ttype == "backup_job") {
-                std::string body = pObj.getStr("code");
-                if (body.empty()) body = pObj.getStr("command");
-                if (body.empty() && ttype == "software_deploy") {
-                  std::string pkgId = sanitizeIdentifier(pObj.getStr("packageId"), "", 128);
-                  if (!pkgId.empty()) body = "winget install --id " + pkgId + " --silent --accept-package-agreements --accept-source-agreements";
-                }
-                if (body.empty() && ttype == "backup_job") {
-                  postTaskResult(srv, tok, devId, taskId, 1, "", "No backup script command provided in task payload",
-                      pObj.getStr("backupJobId"), allowSelfSigned);
-                  continue;
-                }
-                if (body.empty()) body = "Write-Output ok";
-
-                std::string lang = pObj.getStr("language");
-                std::string sh = pObj.getStr("shell");
-                bool isPy = (sh == "python" || lang == "python");
-
-                std::wstring tmpDir = getEnvVar(L"TEMP");
-                if (tmpDir.empty()) tmpDir = selfDir;
-                std::wstring tmpFile = joinPath(tmpDir, L"vitrine-task-" + utf8ToWide(safeTaskId) + (isPy ? L".py" : L".ps1"));
-
-                std::vector<std::wstring> setVars;
-                if (const JsonVal* envObj = pObj.get("env")) {
-                  if (envObj->type == JsonVal::J_OBJ) {
-                    for (const auto& kv : envObj->objVal) {
-                      if (kv.first.rfind("VITRINE_PARAM_", 0) == 0 && kv.second.type == JsonVal::J_STR) {
-                        std::wstring wk = utf8ToWide(kv.first);
-                        SetEnvironmentVariableW(wk.c_str(), utf8ToWide(kv.second.strVal).c_str());
-                        setVars.push_back(wk);
-                      }
-                    }
-                  }
-                }
-
-                writeTextFile(tmpFile, body);
-                ExecResult er{};
-                if (isPy) {
-                  er = runProcessCapture(L"python.exe \"" + tmpFile + L"\"", true, 180000);
-                  if (!er.launched) er = runProcessCapture(L"python3.exe \"" + tmpFile + L"\"", true, 180000);
-                  if (!er.launched) er = runProcessCapture(L"py.exe -3 \"" + tmpFile + L"\"", true, 180000);
-                } else {
-                  wchar_t sysDir[MAX_PATH]{};
-                  UINT sysLen = GetSystemDirectoryW(sysDir, MAX_PATH);
-                  std::wstring psExe = (sysLen > 0 && sysLen < MAX_PATH)
-                      ? joinPath(std::wstring(sysDir, sysLen), L"WindowsPowerShell\\v1.0\\powershell.exe")
-                      : L"powershell.exe";
-                  if (!fileExists(psExe)) psExe = L"powershell.exe";
-
-                  std::string execPol = pObj.getStr("executionPolicy");
-                  bool allowExplicitBypass = execPol.size() == 6 &&
-                      execPol[0] == 'B' && execPol[1] == 'y' && execPol[2] == 'p' &&
-                      execPol[3] == 'a' && execPol[4] == 's' && execPol[5] == 's';
-                  std::wstring wExecPol = L"RemoteSigned";
-                  if (execPol == "AllSigned" || execPol == "RemoteSigned" || execPol == "Unrestricted" ||
-                      execPol == "Default" || allowExplicitBypass) {
-                    wExecPol = utf8ToWide(execPol);
-                  }
-                  std::wstring cmd = L"\"" + psExe + L"\" -NoProfile -NonInteractive -ExecutionPolicy " + wExecPol + L" -File \"" + tmpFile + L"\"";
-                  er = runProcessCapture(cmd, true, 180000);
-                }
-                DeleteFileW(tmpFile.c_str());
-                for (const auto& wk : setVars) SetEnvironmentVariableW(wk.c_str(), nullptr);
-
-                postTaskResult(srv, tok, devId, taskId, static_cast<int>(er.exitCode),
-                    er.output, er.launched ? "" : "Failed to launch script runtime",
-                    pObj.getStr("backupJobId"), allowSelfSigned);
-              }
-            }
+          if (!applyCheckinResponsePayload(
+                  rJson, cfg, cfgPath, selfDir, svcName, trayDir, srv, tok, devId, allowSelfSigned, traySeq, seenTaskIds, nullptr)) {
+            return;
           }
         } else {
           writeAgentStatusFile(trayDir, false, lastOkEpoch, nowEpoch, sleepSec, resp.statusCode);

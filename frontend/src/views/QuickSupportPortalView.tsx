@@ -7,11 +7,14 @@ import {
   Sun,
   Moon,
   Terminal,
-  KeyRound
+  KeyRound,
+  Copy,
+  Check
 } from 'lucide-react';
 import { createQuickSupportSession, fetchPublicPortalConfig } from '../services/api.js';
 import { PublicPortalConfig, SigningStageReport } from '../types/index.js';
 import { sanitizeSafeUrl } from '../utils/urlSafety.js';
+import { copyToClipboard } from '../utils/clipboard.js';
 
 export const QuickSupportPortalView: React.FC = () => {
   const [portalConfig, setPortalConfig] = useState<PublicPortalConfig | null>(null);
@@ -29,9 +32,11 @@ export const QuickSupportPortalView: React.FC = () => {
 
   const [preparing, setPreparing] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [copiedCmd, setCopiedCmd] = useState(false);
   const [sessionResult, setSessionResult] = useState<{
     sessionCode: string;
     downloadUrl: string;
+    deployUrl?: string;
     allSigned: boolean;
     stages: SigningStageReport[];
   } | null>(null);
@@ -81,6 +86,7 @@ export const QuickSupportPortalView: React.FC = () => {
       setSessionResult({
         sessionCode: res.session.session_code,
         downloadUrl: res.downloadUrl,
+        deployUrl: res.deployUrl || res.downloadUrl,
         allSigned: Boolean(res.signingPipeline?.allSigned),
         stages: res.signingPipeline?.stages || []
       });
@@ -100,6 +106,10 @@ export const QuickSupportPortalView: React.FC = () => {
   const accent = isLight ? '#0284c7' : portalConfig?.primary_color || '#00f2fe';
   const isPortalDisabled = portalConfig !== null && portalConfig.quicksupport_enabled === false;
   const safeDownloadUrl = sanitizeSafeUrl(sessionResult?.downloadUrl);
+  const safeDeployUrl = sanitizeSafeUrl(sessionResult?.deployUrl || sessionResult?.downloadUrl);
+  const unixOneLiner = safeDeployUrl
+    ? `(command -v curl >/dev/null 2>&1 && curl -fsSL '${safeDeployUrl}' || wget -qO- '${safeDeployUrl}') | bash`
+    : '';
 
   return (
     <div
@@ -379,6 +389,52 @@ export const QuickSupportPortalView: React.FC = () => {
                   </a>
                 )}
               </div>
+
+              {platform !== 'windows' && (
+                <div
+                  style={{
+                    marginTop: '0.35rem',
+                    paddingTop: '0.85rem',
+                    borderTop: '1px solid rgba(16, 185, 129, 0.25)',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '0.55rem'
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.78rem', fontWeight: 700, color: '#34d399' }}>
+                    <Terminal size={14} />
+                    <span>No-Install Portable Launch ({platform === 'macos' ? 'macOS' : 'Linux'} Terminal One-Liner or Script)</span>
+                  </div>
+                  {unixOneLiner && (
+                    <div style={{ display: 'flex', gap: '0.45rem', alignItems: 'center' }}>
+                      <input
+                        type="text"
+                        className="glass-input"
+                        readOnly
+                        value={unixOneLiner}
+                        style={{ fontFamily: 'var(--font-mono)', fontSize: '0.74rem', flex: 1 }}
+                      />
+                      <button
+                        type="button"
+                        className="btn-glass"
+                        onClick={async () => {
+                          await copyToClipboard(unixOneLiner);
+                          setCopiedCmd(true);
+                          setTimeout(() => setCopiedCmd(false), 2000);
+                        }}
+                        title="Copy terminal command"
+                      >
+                        {copiedCmd ? <Check size={15} color="#10b981" /> : <Copy size={15} />}
+                      </button>
+                    </div>
+                  )}
+                  <div style={{ fontSize: '0.75rem', opacity: 0.85, lineHeight: 1.45 }}>
+                    <strong>Option 1 (Fastest):</strong> Open Terminal and paste the command above.{' '}
+                    <strong>Option 2 (Downloaded .sh):</strong> Run{' '}
+                    <code style={{ fontFamily: 'var(--font-mono)' }}>bash ~/Downloads/vitrine-quicksupport*.sh</code> in Terminal (nothing is installed permanently).
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </form>

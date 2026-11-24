@@ -14,6 +14,7 @@ import {
   validateOutboundHostSafety
 } from '../vault/index.js';
 import { quotePowerShellLiteral, quoteBashLiteral, installerGenerator } from '../agent/installerGenerator.js';
+import { agentSocketHub } from '../agent/socketHub.js';
 import { mergeHardwareDetailsJson, recordDeviceTelemetrySample } from '../telemetry/index.js';
 import {
   extractSignalsFromHardwareDetails,
@@ -1591,7 +1592,7 @@ export class MeshCentralBridge {
       serverUrl: this.connectedServerUrl,
       lastError: this.lastConnectionError,
       engine: 'MeshCentral 2 Micro-Agent Relay + Vitrine Companion',
-      version: '2.7.0',
+      version: '2.8.0',
       activeTunnels,
       federatedServers
     };
@@ -1861,6 +1862,18 @@ export class MeshCentralBridge {
       }
     }
 
+    // 1b. Persistent Vitrine Agent WebSocket Hub (WSS direct RPC without MeshCentral dependency)
+    if (agentSocketHub.isConnected(dev.id)) {
+      const wsRes = await agentSocketHub.executeRpcCommand(dev.id, {
+        command: `${envPrefix}${execCommand}`,
+        shell,
+        timeoutMs
+      });
+      if (wsRes !== null) {
+        return wsRes;
+      }
+    }
+
     // 2. Enrolled Local Host Companion Fast-Path (executes directly on local Linux host when strictly enabled & verified)
     if (os.platform() === 'linux' && osType === 'linux' && this.isLocalEnrolledHost(dev)) {
       const localRes = await this.execLocalBash(execCommand, options?.env, timeoutMs);
@@ -1874,6 +1887,15 @@ export class MeshCentralBridge {
     // 3. Enrolled Remote Vitrine Companion Agent Queue (`agent_tasks`)
     if (dev.agent_auth_token && !options?.noQueue) {
       const taskId = `task-cmd-${crypto.randomUUID()}`;
+      const taskPayloadJson = JSON.stringify({
+        executionId: options?.executionId || undefined,
+        language: shell,
+        shell,
+        code: command,
+        env: options?.env || {},
+        runAs,
+        timeoutSec: Math.ceil(timeoutMs / 1000)
+      });
       db.prepare(`
         INSERT INTO agent_tasks (id, device_id, tenant_id, task_type, payload_json, status)
         VALUES (?, ?, ?, 'script', ?, 'queued')
@@ -1881,16 +1903,13 @@ export class MeshCentralBridge {
         taskId,
         dev.id,
         dev.tenant_id || null,
-        JSON.stringify({
-          executionId: options?.executionId || undefined,
-          language: shell,
-          shell,
-          code: command,
-          env: options?.env || {},
-          runAs,
-          timeoutSec: Math.ceil(timeoutMs / 1000)
-        })
+        taskPayloadJson
       );
+      agentSocketHub.dispatchTaskIfConnected(dev.id, {
+        id: taskId,
+        task_type: 'script',
+        payload_json: taskPayloadJson
+      });
 
       // Poll briefly in case Companion checks in during interactive window
       const deadline = Date.now() + Math.min(timeoutMs, 500);
@@ -2872,19 +2891,22 @@ VITRINE_PY`;
     }
 
     // Offline companion-enrolled fallback: queue self_uninstall with preserveMeshAgent = true
+    const rmTaskId = `task-rmcomp-${crypto.randomUUID()}`;
+    const rmPayloadJson = JSON.stringify({
+      preserveMeshAgent: true,
+      serviceName: safeServiceName,
+      lapsAction: opts?.removeLapsAccount ? 'remove_account' : 'keep_account_as_is',
+      lapsAccountName: safeAcc
+    });
     db.prepare(`
       INSERT INTO agent_tasks (id, device_id, task_type, payload_json, status)
       VALUES (?, ?, 'self_uninstall', ?, 'queued')
-    `).run(
-      `task-rmcomp-${crypto.randomUUID()}`,
-      dev.id,
-      JSON.stringify({
-        preserveMeshAgent: true,
-        serviceName: safeServiceName,
-        lapsAction: opts?.removeLapsAccount ? 'remove_account' : 'keep_account_as_is',
-        lapsAccountName: safeAcc
-      })
-    );
+    `).run(rmTaskId, dev.id, rmPayloadJson);
+    agentSocketHub.dispatchTaskIfConnected(dev.id, {
+      id: rmTaskId,
+      task_type: 'self_uninstall',
+      payload_json: rmPayloadJson
+    });
     db.prepare('UPDATE devices SET companion_deploy_pending = 0 WHERE id = ?').run(dev.id);
     return { dispatched: true, live: false, output: 'Queued Vitrine-only uninstall task for next Companion check-in.' };
   }
